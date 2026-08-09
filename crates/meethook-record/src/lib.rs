@@ -20,12 +20,14 @@
 //! timestamp is written to `session.json` as raw mach ticks plus the timebase ratio. The
 //! offset arithmetic is `transcribe`'s job.
 
+mod activity;
 mod clock;
 mod mic;
 mod preflight;
 mod speaker;
 mod track;
 
+pub use activity::{Activity, MicActivityWatcher};
 pub use preflight::{Authorized, MissingPermissions, preflight};
 pub use track::TrackSummary;
 
@@ -67,6 +69,20 @@ pub enum Error {
 
     #[error("AVAudioEngine failed to start: {0}")]
     AudioEngine(String),
+
+    /// Fatal at startup only: without listeners there is no trigger, so the recorder would
+    /// sit there watching nothing while the user believes it is armed.
+    #[error(
+        "CoreAudio refused to watch {what} (status {status}), so meeting starts and ends \
+         cannot be detected"
+    )]
+    CoreAudio { what: &'static str, status: i32 },
+
+    #[error(
+        "no default input device is selected, so there is no microphone to watch; \
+         choose one in System Settings > Sound > Input"
+    )]
+    NoInputDevice,
 
     /// Writing `session.json` for a track that produced nothing would classify a broken
     /// recording as valid, which is the one thing the session contract must never do.
@@ -122,8 +138,8 @@ impl Error {
 /// property of the type system rather than a convention a later edit can quietly break.
 ///
 /// `start` -> [`RunningSession::finish`] may be called more than once on the same
-/// `Recorder`. This slice calls it once; the auto start/stop slice calls it in a loop, and
-/// designing for that now avoids redesigning the API then.
+/// `Recorder`, and is: the CLI drives it in a loop, one session per detected call, for as
+/// long as the process runs.
 pub struct Recorder {
     _authorized: Authorized,
 }
