@@ -1,0 +1,18 @@
+[package]
+name = "meethook"
+version = "0.1.0"
+description = "Local meeting recorder and transcriber for macOS"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "meethook"
+path = "src/main.rs"
+
+[dependencies]
+meethook-session = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+jiff = { workspace = true }

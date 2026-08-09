@@ -1,0 +1,17 @@
+[package]
+name = "meethook-session"
+version = "0.1.0"
+description = "The on-disk session-directory contract shared by every meethook subcommand"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+jiff = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
