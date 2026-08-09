@@ -25,6 +25,24 @@
 //! against -- and it is far better to learn it here than from a transcript that quietly
 //! attributed one person's words to another.
 //!
+//! That matrix on its own cannot move the threshold, though, which is why the turn-to-turn
+//! blocks are here as well. It compares cluster *means*, and a mean only exists because the
+//! grouping already happened -- every distance in it is a distance that survived the cut, so
+//! it reports how far apart the decisions ended up and never how close they came to going
+//! the other way. The two numbers that decide whether 0.45 has room are underneath it: the
+//! largest distance between two turns *inside* one cluster, which is how near one person came
+//! to splitting in two, and the smallest distance between turns of two *different* clusters,
+//! which is how near two people came to merging. Means always look safer than the clouds they
+//! summarize, so both are printed next to each other.
+//!
+//! Those two are still conditional on the grouping being right, and only a person with the
+//! recording can settle that -- hence the turn timings beside every extreme, so the pair that
+//! produced a number can be played before the number is believed. The last block needs no such
+//! trust: two turns the segmentation model heard in the *same* window under different local
+//! speaker indices are two people as a matter of what was in the audio, whatever any threshold
+//! later decides, so their distances are different-speaker evidence that no grouping decision
+//! stands behind.
+//!
 //! The enrolled-reference table at the end answers the other threshold's version of that
 //! question, `IDENTIFY_DISTANCE`. `transcript.json` records a similarity only for clusters
 //! that matched, so the single most useful measurement -- how far one person's stored
@@ -38,8 +56,8 @@ use meethook_session::{
     EnrolledSpeakers, Paths, SessionId, SessionPaths, SpeakerCluster, SpeakerClusters,
 };
 use meethook_transcribe::{
-    EMBEDDING_MODEL, IDENTIFY_DISTANCE, SEGMENTATION_MODEL, TARGET_RATE, identify_clusters,
-    open_session,
+    EMBEDDING_MODEL, IDENTIFY_DISTANCE, LocalTurn, SEGMENTATION_MODEL, TARGET_RATE,
+    identify_clusters, open_session,
 };
 
 fn main() {
@@ -79,13 +97,27 @@ fn main() {
         elapsed.as_secs_f64()
     );
 
-    for cluster in &clustering.clusters {
-        let spoken: Vec<String> = turns
-            .iter()
-            .zip(&clustering.assignment)
-            .filter(|(_, assigned)| **assigned == Some(cluster.id))
-            .map(|(turn, _)| format!("{:.1}-{:.1}", turn.start_s, turn.end_s))
-            .collect();
+    // Turn indices per cluster, positional against `turns`. Computed once because every
+    // block below groups the same way, and two loops that each rebuilt this grouping could
+    // disagree about it.
+    let members: Vec<Vec<usize>> = clustering
+        .clusters
+        .iter()
+        .map(|cluster| {
+            clustering
+                .assignment
+                .iter()
+                .enumerate()
+                .filter(|(_, assigned)| **assigned == Some(cluster.id))
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .collect();
+    let span = |turn: usize| format!("{:.1}-{:.1}", turns[turn].start_s, turns[turn].end_s);
+
+    for (index, cluster) in clustering.clusters.iter().enumerate() {
+        let mine = &members[index];
+        let spoken: Vec<String> = mine.iter().map(|&turn| span(turn)).collect();
         println!(
             "\nspeaker {}: {:.1} s of speech over {} turns",
             cluster.id,
@@ -93,6 +125,30 @@ fn main() {
             spoken.len()
         );
         println!("  turns: {}", spoken.join(" "));
+
+        // How close this speaker came to being split in two. The max is the number that
+        // matters: `MERGE_DISTANCE` has headroom only insofar as it sits above this.
+        match spread(pairs_within(mine, &clustering.turn_embeddings)) {
+            Some(within) => {
+                println!(
+                    "  within speaker {}: {} pairs  min {:.3}  median {:.3}  max {:.3}",
+                    cluster.id, within.count, within.min, within.median, within.max
+                );
+                let (a, b) = within.furthest;
+                println!(
+                    "    furthest apart: {} vs {}  ({:.3})",
+                    span(a),
+                    span(b),
+                    within.max
+                );
+            }
+            None => println!(
+                "  within speaker {}: {} embedded turn, no pairs",
+                cluster.id,
+                mine.len()
+            ),
+        }
+
         for clip in &cluster.representatives {
             println!(
                 "  play:  {:>8.2} -> {:>8.2}  ({:.2} s)",
@@ -125,6 +181,67 @@ fn main() {
         }
     }
 
+    // Deliberately adjacent to the matrix above: the comparison between a mean-to-mean
+    // distance and the closest approach of the two clouds behind those means is the whole
+    // reason both are printed.
+    println!("\nturn-to-turn distance between speakers:");
+    if clustering.clusters.len() < 2 {
+        // Both degenerate shapes say so out loud rather than rendering as zero lines, which
+        // would be indistinguishable from the block being broken.
+        println!(
+            "  {} in this recording; no cluster pairs to compare",
+            match clustering.clusters.len() {
+                0 => "no speakers",
+                _ => "only one speaker",
+            }
+        );
+    }
+    for left in 0..clustering.clusters.len() {
+        for right in 0..left {
+            let cross = pairs_between(&members[left], &members[right], &clustering.turn_embeddings);
+            let Some(cross) = spread(cross) else {
+                println!(
+                    "  {} vs {}:  no pairs (one of them has no embedded turns)",
+                    clustering.clusters[right].id, clustering.clusters[left].id
+                );
+                continue;
+            };
+            let (a, b) = cross.closest;
+            println!(
+                "  {} vs {}:  {} pairs  min {:.3}  median {:.3}   closest: {} vs {}",
+                clustering.clusters[right].id,
+                clustering.clusters[left].id,
+                cross.count,
+                cross.min,
+                cross.median,
+                span(a),
+                span(b)
+            );
+        }
+    }
+
+    // The one block no threshold stands behind. Segmentation heard these two turns at once
+    // under different local speaker indices, so they are different people whatever the
+    // clustering decided -- and `agglomerate` refuses to merge such a pair for that reason,
+    // meaning these distances are the only different-speaker evidence here that is not
+    // conditional on a grouping a reader has to trust.
+    println!("\nknown-different speakers (heard in one window, different local speakers):");
+    match spread(pairs_heard_at_once(&turns, &clustering.turn_embeddings)) {
+        Some(known) => {
+            let (a, b) = known.closest;
+            println!(
+                "  {} pairs  min {:.3}  median {:.3}  max {:.3}   closest: {} vs {}",
+                known.count,
+                known.min,
+                known.median,
+                known.max,
+                span(a),
+                span(b)
+            );
+        }
+        None => println!("  none: no two speakers were ever heard in the same window"),
+    }
+
     print_enrolled_distances(&clustering.clusters);
 
     if write {
@@ -142,6 +259,119 @@ fn main() {
             .unwrap_or_else(|e| fail(&format!("{e}")));
         println!("\nwrote {}", paths.speaker_clusters_json().display());
     }
+}
+
+/// The shape of a set of turn-to-turn distances, and which pair sits at each end.
+struct Spread {
+    count: usize,
+    min: f32,
+    median: f32,
+    max: f32,
+    /// Turn indices of the pair at `min`, and of the pair at `max`. Printed as timings so
+    /// the reader can play them: a distribution nobody can check against the audio is a
+    /// number to believe rather than evidence.
+    closest: (usize, usize),
+    furthest: (usize, usize),
+}
+
+/// Summarizes distances between turn pairs, or `None` when there are no pairs at all.
+///
+/// `None` rather than zeroes, because a cluster holding one turn has no within-cluster
+/// distances and the min, median and max of an empty set do not exist. Callers print "no
+/// pairs"; a fabricated 0.000 would read as two identical turns.
+///
+/// The median of an even count is the mean of the two middle values.
+fn spread(pairs: Vec<(usize, usize, f32)>) -> Option<Spread> {
+    let mut pairs = pairs;
+    if pairs.is_empty() {
+        return None;
+    }
+    pairs.sort_by(|a, b| a.2.total_cmp(&b.2));
+
+    let count = pairs.len();
+    let median = if count % 2 == 1 {
+        pairs[count / 2].2
+    } else {
+        (pairs[count / 2 - 1].2 + pairs[count / 2].2) / 2.0
+    };
+    let (first, last) = (pairs[0], pairs[count - 1]);
+    Some(Spread {
+        count,
+        min: first.2,
+        median,
+        max: last.2,
+        closest: (first.0, first.1),
+        furthest: (last.0, last.1),
+    })
+}
+
+/// Cosine distance between two unit-length turn embeddings.
+///
+/// Raw, unlike the distance clustering merges on, which substitutes infinity for a pair
+/// segmentation heard at once. Within a cluster the difference cannot arise -- an infinite
+/// pair makes its groups' average infinite, so no cluster can hold one -- but between
+/// clusters and in the known-different block it is the entire point: infinity there would
+/// erase precisely the closest approaches being measured.
+fn distance(a: &[f32], b: &[f32]) -> f32 {
+    1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
+}
+
+/// Every unordered pair of turns within one cluster, with its distance.
+///
+/// Turns too short to embed carry no vector and take part in nothing; they are already
+/// reported as the "turns too short to embed" count on the first line.
+fn pairs_within(members: &[usize], embeddings: &[Option<Vec<f32>>]) -> Vec<(usize, usize, f32)> {
+    let mut pairs = Vec::new();
+    for (nth, &i) in members.iter().enumerate() {
+        for &j in &members[nth + 1..] {
+            if let (Some(a), Some(b)) = (&embeddings[i], &embeddings[j]) {
+                pairs.push((i, j, distance(a, b)));
+            }
+        }
+    }
+    pairs
+}
+
+/// Every turn of one cluster against every turn of another.
+fn pairs_between(
+    left: &[usize],
+    right: &[usize],
+    embeddings: &[Option<Vec<f32>>],
+) -> Vec<(usize, usize, f32)> {
+    let mut pairs = Vec::new();
+    for &i in left {
+        for &j in right {
+            if let (Some(a), Some(b)) = (&embeddings[i], &embeddings[j]) {
+                pairs.push((i, j, distance(a, b)));
+            }
+        }
+    }
+    pairs
+}
+
+/// Pairs of turns segmentation heard in one window under different local speaker indices.
+///
+/// Different people by construction: the model was asked who was speaking during a single
+/// ten-second window and answered with two of them. Nothing about voice embeddings or merge
+/// thresholds is assumed, which is what makes these distances worth more than the rest.
+fn pairs_heard_at_once(
+    turns: &[LocalTurn],
+    embeddings: &[Option<Vec<f32>>],
+) -> Vec<(usize, usize, f32)> {
+    let mut pairs = Vec::new();
+    for i in 0..turns.len() {
+        for j in 0..i {
+            if turns[i].window != turns[j].window
+                || turns[i].local_speaker == turns[j].local_speaker
+            {
+                continue;
+            }
+            if let (Some(a), Some(b)) = (&embeddings[i], &embeddings[j]) {
+                pairs.push((i, j, distance(a, b)));
+            }
+        }
+    }
+    pairs
 }
 
 /// Every cluster measured against every enrolled reference, accepted or not.

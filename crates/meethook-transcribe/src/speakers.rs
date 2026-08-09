@@ -7,8 +7,10 @@
 //! the whole meeting, so a person who speaks at minute 0 and again at minute 40 comes back
 //! as the same speaker.
 //!
-//! Everything below -- filterbanks, ONNX tensors, distance matrices -- is private. The
-//! caller gets [`cluster_speaker_turns`] and the clusters it returns.
+//! Filterbanks, ONNX tensors and the pairwise distance matrix stay private. What the caller
+//! gets is [`cluster_speaker_turns`], the clusters it returns, and -- so that a grouping can
+//! be checked rather than taken on trust -- the per-turn embeddings those clusters are means
+//! of. See [`Clustering::turn_embeddings`] for why that last one is handed back.
 
 use meethook_session::{MIN_REPRESENTATIVE_SECONDS, RepresentativeSegment, SpeakerCluster};
 use ort::session::Session;
@@ -61,6 +63,28 @@ pub struct Clustering {
     /// This is how the caller attributes recognised text to a speaker, which is why it is
     /// positional rather than a map -- there is no turn identity to key on.
     pub assignment: Vec<Option<u32>>,
+
+    /// Parallel to the turns handed in: each turn's unit-length voice embedding, `None` in
+    /// exactly the positions [`Clustering::assignment`] is `None`.
+    ///
+    /// Named for the turns rather than shortened to `embeddings`, because
+    /// [`SpeakerCluster::embedding`] is one field away and is a different vector: this is
+    /// the population, that is its normalized mean.
+    ///
+    /// Handed back because the mean is not enough to calibrate anything on. A distance
+    /// between two cluster references only ever describes groups that already survived
+    /// the merge threshold, so it can say how far apart the decisions were but not how close
+    /// the evidence came to going the other way -- how nearly one speaker split, or how
+    /// nearly two merged. Those are turn-to-turn questions, and answering them outside this
+    /// module is what keeps the answer honest: the diagnostic reads the same vectors
+    /// clustering grouped instead of re-deriving its own, which could quietly disagree.
+    ///
+    /// Production callers pay no inference and no arithmetic for this -- these vectors are
+    /// computed either way and were previously just dropped. The whole cost is that they
+    /// stay alive until the `Clustering` does, `4 * dimensions` bytes per embedded turn:
+    /// about 1 KB per turn, so ~2 MB for a two-hour meeting, against a speaker track for
+    /// that meeting already resident at ~460 MB.
+    pub turn_embeddings: Vec<Option<Vec<f32>>>,
 }
 
 impl Clustering {
@@ -147,9 +171,18 @@ pub fn cluster_speaker_turns(
         });
     }
 
+    // Scattered by `sources` exactly the way `assignment` is, so the two vectors cannot
+    // drift into disagreeing about which turns were embedded. `embeddings` is finished with
+    // by here, so this moves rather than copies.
+    let mut turn_embeddings = vec![None; turns.len()];
+    for (embedding, &index) in embeddings.into_iter().zip(&sources) {
+        turn_embeddings[index] = Some(embedding);
+    }
+
     Ok(Clustering {
         clusters,
         assignment,
+        turn_embeddings,
     })
 }
 
@@ -593,6 +626,34 @@ mod tests {
             "the same voice at 3 s and 34 s split into clusters {opening} and {closing}"
         );
 
+        for embedding in clustering.turn_embeddings.iter().flatten() {
+            assert_eq!(embedding.len(), 256);
+            let length: f32 = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((length - 1.0).abs() < 1e-5, "length {length}");
+        }
+
+        // The claim that makes the handed-back vectors worth calibrating on: they are the
+        // ones clustering actually grouped, not a plausible re-embedding. A refactor that
+        // recomputed them -- with different fbank settings, or without normalizing -- would
+        // still produce 256 unit-length floats and would fail only here.
+        for cluster in &clustering.clusters {
+            let mine: Vec<usize> = clustering
+                .assignment
+                .iter()
+                .enumerate()
+                .filter(|(_, assigned)| **assigned == Some(cluster.id))
+                .map(|(index, _)| index)
+                .collect();
+            let members: Vec<Vec<f32>> = mine
+                .iter()
+                .map(|&i| clustering.turn_embeddings[i].clone().expect("assigned"))
+                .collect();
+            let rebuilt = reference_embedding(&(0..members.len()).collect::<Vec<_>>(), &members);
+            for (a, b) in rebuilt.iter().zip(&cluster.embedding) {
+                assert!((a - b).abs() < 1e-5, "cluster {} drifted", cluster.id);
+            }
+        }
+
         for cluster in &clustering.clusters {
             assert_eq!(cluster.embedding.len(), 256);
             let length: f32 = cluster.embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -663,6 +724,17 @@ mod tests {
         assert_eq!(clustering.assignment, [Some(0), None]);
         assert_eq!(clustering.skipped(), 1);
         assert_eq!(clustering.clusters.len(), 1);
+
+        // The invariant `turn_embeddings` documents, and the one every caller zipping the
+        // two vectors together relies on: a vector exists in exactly the positions a cluster
+        // assignment does.
+        let embedded: Vec<bool> = clustering
+            .turn_embeddings
+            .iter()
+            .map(Option::is_some)
+            .collect();
+        let assigned: Vec<bool> = clustering.assignment.iter().map(Option::is_some).collect();
+        assert_eq!(embedded, assigned);
     }
 
     /// What `enroll` will read out of `speaker_clusters.json` to recover the "Unknown N"
