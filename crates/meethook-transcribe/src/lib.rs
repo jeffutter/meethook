@@ -16,6 +16,7 @@ mod asr;
 mod audio;
 mod diarize;
 mod fbank;
+mod identify;
 mod merge;
 mod onnx;
 mod segmentation;
@@ -29,6 +30,7 @@ pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
+pub use identify::{Identification, identify_clusters};
 pub use merge::merge;
 pub use onnx::{Loaded, open_session};
 pub use segmentation::{LocalTurn, segment_speaker_track};
@@ -36,8 +38,8 @@ pub use speakers::{Clustering, cluster_speaker_turns};
 
 use meethook_models::ModelSpec;
 use meethook_session::{
-    Classification, DiscoveredSession, Paths, SessionId, SessionMetadata, SpeakerClusters,
-    Transcript, discover_sessions,
+    Classification, DiscoveredSession, EnrolledSpeakers, Paths, SessionId, SessionMetadata,
+    SpeakerClusters, Transcript, discover_sessions,
 };
 
 /// The Whisper checkpoint this tool transcribes with.
@@ -221,10 +223,16 @@ pub struct BatchReport {
 ///
 /// A session with no `speaker.wav`, or an empty one, degrades to a mic-only transcript
 /// rather than failing. A recording with nothing on the far end is a normal recording.
+///
+/// `speakers` is the enrolled database, handed in already loaded rather than read from
+/// `paths` here. The read belongs to the batch -- one file, one read, however many sessions
+/// -- and passing the values keeps this function testable against a hand-built database with
+/// no filesystem in the way.
 pub fn transcribe_session(
     session: &DiscoveredSession,
     asr: &mut dyn SpeechToText,
     diarizer: &mut dyn Diarize,
+    speakers: &EnrolledSpeakers,
     progress: &mut dyn Write,
 ) -> Result<Transcript> {
     let metadata = session.load_metadata()?;
@@ -252,6 +260,11 @@ pub fn transcribe_session(
         (diarization, segments)
     };
 
+    // Names are decided here rather than inside `merge`, and are never written back into
+    // `speaker_clusters.json`: that file is what diarization honestly knows about the audio,
+    // and `enroll` reads it expecting to find no names in it.
+    let identified = identify::identify_clusters(&diarization.clusters, speakers);
+
     SpeakerClusters::new(session.id.clone(), diarization.clusters).write(&session.paths)?;
 
     let turns = merge::merge(
@@ -260,6 +273,7 @@ pub fn transcribe_session(
         speaker_segments,
         speaker_offset_seconds(&metadata)?,
         &diarization.turns,
+        &identified,
     );
 
     Ok(Transcript::new(session.id.clone(), turns))
@@ -340,11 +354,17 @@ pub fn run_batch(
         return Ok(report);
     }
 
+    // After the partition, so a batch with nothing to do reads nothing it does not need, and
+    // once for the batch rather than once per session: `enroll` never runs concurrently with
+    // `transcribe`, so re-reading between sessions would only make a batch's output depend on
+    // when each session happened to be reached.
+    let speakers = EnrolledSpeakers::read_or_empty(paths)?;
+
     let mut engines = open_engine().map_err(|source| Error::Engine { source })?;
 
     for session in work {
         writeln!(out, "{}  transcribing...", session.id)?;
-        match transcribe_and_write(session, &mut engines, out) {
+        match transcribe_and_write(session, &mut engines, &speakers, out) {
             Ok(turns) => {
                 writeln!(out, "{}  {turns} turn(s)", session.id)?;
                 report.transcribed += 1;
@@ -363,12 +383,14 @@ pub fn run_batch(
 fn transcribe_and_write(
     session: &DiscoveredSession,
     engines: &mut Engines,
+    speakers: &EnrolledSpeakers,
     progress: &mut dyn Write,
 ) -> Result<usize> {
     let transcript = transcribe_session(
         session,
         engines.asr.as_mut(),
         engines.diarizer.as_mut(),
+        speakers,
         progress,
     )?;
     transcript.write(&session.paths)?;
@@ -459,7 +481,9 @@ mod tests {
 
     use hound::{SampleFormat, WavSpec, WavWriter};
     use jiff::Timestamp;
-    use meethook_session::{SPEAKER_YOU, SessionPaths, SourceTrack, TrackSync};
+    use meethook_session::{
+        EnrolledSpeaker, SPEAKER_YOU, SessionPaths, SourceTrack, TrackSync, Turn,
+    };
 
     use super::*;
 
@@ -519,10 +543,18 @@ mod tests {
         }
     }
 
+    /// A distinct unit vector per cluster id, so a test can enroll one of these voices and
+    /// have it match that cluster and nobody else's.
+    fn voice(id: u32) -> Vec<f32> {
+        let mut embedding = vec![0.0f32; 4];
+        embedding[id as usize % 4] = 1.0;
+        embedding
+    }
+
     fn cluster(id: u32, seconds: f64) -> meethook_session::SpeakerCluster {
         meethook_session::SpeakerCluster {
             id,
-            embedding: vec![1.0, 0.0],
+            embedding: voice(id),
             speech_seconds: seconds,
             representatives: vec![meethook_session::RepresentativeSegment {
                 start: 0.0,
@@ -554,6 +586,31 @@ mod tests {
     /// Progress output no test is asserting on.
     fn quiet() -> std::io::Sink {
         std::io::sink()
+    }
+
+    /// Every install before anybody has run `enroll`, which is what all the tests that are
+    /// not about identification want.
+    fn nobody_enrolled() -> EnrolledSpeakers {
+        EnrolledSpeakers::new(Vec::new())
+    }
+
+    /// A database naming each person after the cluster whose voice they were enrolled from,
+    /// so `enrolled(&[("Alice", 0)])` is "Alice is cluster 0".
+    fn enrolled(people: &[(&str, u32)]) -> EnrolledSpeakers {
+        EnrolledSpeakers::new(
+            people
+                .iter()
+                .map(|&(name, from_cluster)| EnrolledSpeaker {
+                    name: name.to_string(),
+                    embedding: voice(from_cluster),
+                })
+                .collect(),
+        )
+    }
+
+    fn transcript_of(paths: &Paths, id: &str) -> Transcript {
+        let session = paths.session(&SessionId::parse(id).unwrap());
+        Transcript::read(&session.transcript_json()).unwrap()
     }
 
     fn segment(start: f64, end: f64, text: &str) -> AsrSegment {
@@ -701,7 +758,13 @@ mod tests {
     /// Transcribes one session with nobody on the far end: the shape every test that is
     /// about the microphone side wants.
     fn mic_only(session: &DiscoveredSession, asr: &mut FakeAsr) -> Result<Transcript> {
-        transcribe_session(session, asr, &mut FakeDiarizer::default(), &mut quiet())
+        transcribe_session(
+            session,
+            asr,
+            &mut FakeDiarizer::default(),
+            &nobody_enrolled(),
+            &mut quiet(),
+        )
     }
 
     #[test]
@@ -841,8 +904,14 @@ mod tests {
         let paths = Paths::new(root.path());
         let (session, mut asr, mut diarizer) = two_party(&paths, "20260809-052600");
 
-        let transcript =
-            transcribe_session(&session, &mut asr, &mut diarizer, &mut quiet()).unwrap();
+        let transcript = transcribe_session(
+            &session,
+            &mut asr,
+            &mut diarizer,
+            &nobody_enrolled(),
+            &mut quiet(),
+        )
+        .unwrap();
 
         let said: Vec<(&str, &str)> = transcript
             .turns
@@ -903,7 +972,14 @@ mod tests {
         let paths = Paths::new(root.path());
         let (session, mut asr, mut diarizer) = two_party(&paths, "20260809-052600");
 
-        transcribe_session(&session, &mut asr, &mut diarizer, &mut quiet()).unwrap();
+        transcribe_session(
+            &session,
+            &mut asr,
+            &mut diarizer,
+            &nobody_enrolled(),
+            &mut quiet(),
+        )
+        .unwrap();
 
         let stored =
             meethook_session::SpeakerClusters::read(&session.paths.speaker_clusters_json())
@@ -935,15 +1011,20 @@ mod tests {
     /// Re-running must produce the same transcript, byte for byte. Labels that moved between
     /// runs would mean "Unknown 2" is not a thing a user can act on -- and `--force` exists
     /// precisely so a transcript can be regenerated.
+    ///
+    /// Run with one speaker enrolled as well as with none, because substituting a name is a
+    /// new way for a rerun to stop being byte-identical: a tie between two references, or a
+    /// number handed out in a different order, would show up here and nowhere else.
     #[test]
     fn re_transcribing_the_same_session_produces_an_identical_transcript() {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path());
 
-        let transcribe = |id: &str| {
+        let transcribe = |id: &str, speakers: &EnrolledSpeakers| {
             let (session, mut asr, mut diarizer) = two_party(&paths, id);
             let transcript =
-                transcribe_session(&session, &mut asr, &mut diarizer, &mut quiet()).unwrap();
+                transcribe_session(&session, &mut asr, &mut diarizer, speakers, &mut quiet())
+                    .unwrap();
             transcript.write(&session.paths).unwrap();
             (
                 std::fs::read(session.paths.transcript_json()).unwrap(),
@@ -953,9 +1034,158 @@ mod tests {
 
         // Compared as bytes rather than as parsed turns, because what a user diffs is the
         // file: a re-ordered tie or a renumbered label would show up here and nowhere else.
-        let first = transcribe("20260809-052600");
-        let second = transcribe("20260809-052600");
-        assert_eq!(first, second);
+        for speakers in [nobody_enrolled(), enrolled(&[("Alice", 0)])] {
+            let first = transcribe("20260809-052600", &speakers);
+            let second = transcribe("20260809-052600", &speakers);
+            assert_eq!(first, second);
+        }
+    }
+
+    /// Acceptance criteria #1 and #5, at the level a user meets them: a hand-written
+    /// `speakers.json` turns "Unknown 1" into a name, the similarity that decided it lands on
+    /// those turns, and nothing that makes no identity claim carries a number.
+    ///
+    /// The vacated "Unknown 1" is the visible half of numbering over every voice and
+    /// substituting afterwards: the second speaker stays "Unknown 2" rather than being
+    /// promoted, so naming Alice does not silently relabel the person nobody has named.
+    #[test]
+    fn an_enrolled_speaker_is_named_in_the_transcript_with_the_similarity_that_matched_them() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let (session, mut asr, mut diarizer) = two_party(&paths, "20260809-052600");
+
+        let transcript = transcribe_session(
+            &session,
+            &mut asr,
+            &mut diarizer,
+            &enrolled(&[("Alice", 0)]),
+            &mut quiet(),
+        )
+        .unwrap();
+
+        let said: Vec<(&str, &str, Option<f32>)> = transcript
+            .turns
+            .iter()
+            .map(|t| (t.speaker.as_str(), t.text.as_str(), t.speaker_id_confidence))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("Alice", "hi there", Some(1.0)),
+                ("You", "morning", None),
+                ("Unknown 2", "and from me", None),
+                ("You", "sounds good", None),
+                ("Alice", "let us start", Some(1.0)),
+            ]
+        );
+    }
+
+    /// `speaker_clusters.json` is what diarization honestly knows about the audio, and
+    /// `enroll` reads it back expecting to find no names in it -- so identification must not
+    /// leak into the file even when it succeeded.
+    #[test]
+    fn naming_a_speaker_leaves_the_clusters_file_anonymous() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let (session, mut asr, mut diarizer) = two_party(&paths, "20260809-052600");
+
+        transcribe_session(
+            &session,
+            &mut asr,
+            &mut diarizer,
+            &enrolled(&[("Alice", 0)]),
+            &mut quiet(),
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(session.paths.speaker_clusters_json()).unwrap();
+        assert!(!raw.contains("Alice"), "{raw}");
+        let stored =
+            meethook_session::SpeakerClusters::read(&session.paths.speaker_clusters_json())
+                .unwrap();
+        assert_eq!(
+            stored.clusters.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(stored.clusters[0].embedding, voice(0));
+    }
+
+    /// Acceptance criterion #6, at the level a first-run user meets it: a fresh install has no
+    /// `speakers.json` at all, and that has to be an ordinary all-Unknown transcript rather
+    /// than a failed batch.
+    #[test]
+    fn a_first_run_with_no_speakers_file_transcribes_everyone_as_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600", 0);
+        assert!(!paths.speakers_json().exists());
+
+        let (report, _, output) = run(&paths, &[], false);
+
+        assert_eq!(report.failed, 0, "{output}");
+        assert_eq!(report.transcribed, 1, "{output}");
+        let transcript = transcript_of(&paths, "20260809-052600");
+        assert!(
+            transcript.turns.iter().any(|t| t.speaker == "Unknown 1"),
+            "{:?}",
+            transcript.turns
+        );
+        assert!(
+            transcript
+                .turns
+                .iter()
+                .all(|t| t.speaker_id_confidence.is_none()),
+            "{:?}",
+            transcript.turns
+        );
+    }
+
+    /// The ticket's own manual check, mechanized: a `speakers.json` written by hand at the
+    /// root, an ordinary batch over an ordinary session, and the cluster comes back named.
+    /// This is the only test that proves `run_batch` reads the file at all.
+    #[test]
+    fn a_batch_reads_speakers_json_from_the_root_and_names_the_matching_cluster() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600", 0);
+        enrolled(&[("Alice", 0)]).write(&paths).unwrap();
+
+        let (report, _, output) = run(&paths, &[], false);
+
+        assert_eq!(report.transcribed, 1, "{output}");
+        let transcript = transcript_of(&paths, "20260809-052600");
+        let alice: Vec<&Turn> = transcript
+            .turns
+            .iter()
+            .filter(|t| t.speaker == "Alice")
+            .collect();
+        assert_eq!(alice.len(), 1, "{:?}", transcript.turns);
+        assert_eq!(alice[0].speaker_id_confidence, Some(1.0));
+    }
+
+    /// A database that exists and does not parse is not the first-run case and must not be
+    /// silently downgraded into one: ten enrolled people quietly coming back as ten Unknowns
+    /// is the failure worth interrupting a batch for. The message has to name the file, or the
+    /// user has no way to find what to fix.
+    #[test]
+    fn a_malformed_speakers_file_fails_the_batch_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600", 0);
+        std::fs::write(paths.speakers_json(), b"{ not json at all").unwrap();
+
+        let mut out = Vec::new();
+        let error =
+            run_batch(&paths, &[], false, &mut || Ok(fake_engines()), &mut out).unwrap_err();
+
+        assert!(error.to_string().contains("speakers.json"), "{error}");
+        assert!(
+            !paths
+                .session(&SessionId::parse("20260809-052600").unwrap())
+                .transcript_json()
+                .exists(),
+            "a batch that could not read the database must not write half-named transcripts"
+        );
     }
 
     /// Acceptance criterion #1. The derived track appears; the recording it was derived from
@@ -1012,7 +1242,14 @@ mod tests {
         let mut asr = FakeAsr::default();
         let mut diarizer = FakeDiarizer::default();
         let mut progress = Vec::new();
-        transcribe_session(&session, &mut asr, &mut diarizer, &mut progress).unwrap();
+        transcribe_session(
+            &session,
+            &mut asr,
+            &mut diarizer,
+            &nobody_enrolled(),
+            &mut progress,
+        )
+        .unwrap();
 
         let raw = audio::read_track_16k_mono(&session.paths.mic_wav()).unwrap();
         assert_eq!(

@@ -61,9 +61,14 @@ pub struct Turn {
     pub end: f64,
     pub text: String,
     pub source_track: SourceTrack,
-    /// How confident speaker identification was, or `null` where the question does not
-    /// arise. Mic-track turns are always `null` -- the speaker there is known, not inferred,
-    /// so reporting a confidence would be inventing one.
+    /// How confident the claim that `speaker` names the right *person* is: the cosine
+    /// similarity between this voice and that person's enrolled reference, in `[-1, 1]` and
+    /// in practice near 1.
+    ///
+    /// `null` wherever no such claim is being made, which is every turn that is not a matched
+    /// enrolled speaker: mic-track turns, where the speaker is known by construction rather
+    /// than inferred, and "Unknown N" turns, where the label names nobody. A number on either
+    /// would be a number about a different question.
     ///
     /// No `skip_serializing_if`: the key must be present and null rather than absent, so a
     /// consumer can tell "not applicable" from "written by an older tool".
