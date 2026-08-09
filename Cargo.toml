@@ -48,6 +48,29 @@ realfft = "3.5"
 # true; see the assertion in meethook-transcribe::asr that keeps that honest.
 whisper-rs = { version = "0.16", default-features = false, features = ["metal"] }
 
+# ONNX Runtime bindings, for diarization and speaker embeddings.
+#
+# Pinned exactly, not with a caret. This is a pre-release whose surface has already moved
+# under us once: `load-dynamic` and `ORT_DYLIB_PATH` -- which the original design for this
+# slice was written against -- were deleted after rc.9. A caret requirement invites a
+# routine `cargo update` to do that again.
+#
+# `pkg-config` is how the runtime is found: `ort-sys`'s build script probes for the module
+# named `libonnxruntime` before anything else and returns immediately on a hit, so the
+# flake's onnxruntime is what gets linked and nothing is downloaded. `download-binaries` is
+# not a default feature, so a missed probe surfaces as a link error rather than as a
+# silently different runtime.
+#
+# `api-27` is the ceiling, not an arbitrary choice: `ort-sys` rejects a probed library whose
+# minor version is below the requested API level, and the flake's runtime is 1.27. Asking
+# for `api-28` here would fail the probe and fall through to the download path.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+  "std",
+  "coreml",
+  "pkg-config",
+  "api-27",
+] }
+
 # WebRTC AEC3, for the echo-cancellation pre-pass. The tilde requirement is what upstream
 # recommends: the crate's major version tracks the PulseAudio-maintained APM major version,
 # so a minor bump is allowed to break the API. `bundled` is deliberately off -- it would

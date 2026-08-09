@@ -11,6 +11,9 @@ meethook-models = { workspace = true }
 meethook-session = { workspace = true }
 
 hound = { workspace = true }
+# A normal dependency, not a dev one: the diarization and speaker-embedding graphs run on
+# the real transcribe path.
+ort = { workspace = true }
 realfft = { workspace = true }
 rubato = { workspace = true }
 thiserror = { workspace = true }

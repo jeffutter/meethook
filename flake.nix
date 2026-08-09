@@ -12,13 +12,11 @@
   # devShell-only on purpose: meethook is a personal, non-distributed tool, so there is
   # no buildRustPackage/crane package output to maintain.
   #
-  # Native inputs are added by the slice that actually needs them. Deliberately absent:
-  # onnxruntime -- nothing links it yet, and carrying it speculatively makes the shell
-  # slower to build for no benefit.
+  # Native inputs are added by the slice that actually needs them, never speculatively.
   #
-  # Model weights are deliberately absent too, and not merely unadded: they are fetched at
+  # Model weights are deliberately absent, and not merely unadded: they are fetched at
   # runtime into ~/meethook/models/ and verified against sha256 hashes embedded in source,
-  # so no ggml checkpoint is ever part of this closure.
+  # so no checkpoint -- ggml or ONNX -- is ever part of this closure.
   outputs = { self, nixpkgs, rust-overlay }:
     let
       # Apple Silicon only. Cross-platform support is explicitly out of scope, so the
@@ -49,7 +47,13 @@
         # against dynamically; the `webrtc-audio-processing` crate's `bundled` feature,
         # which would build the vendored C++ instead, is off because it does not
         # cross-compile on Apple (tonarino/webrtc-audio-processing#102).
-        buildInputs = [ pkgs.apple-sdk_26 pkgs.webrtc-audio-processing ];
+        #
+        # onnxruntime runs the diarization and speaker-embedding graphs. This build is
+        # configured with onnxruntime_USE_COREML, which is what makes the CoreML execution
+        # provider registrable; `ort-sys` finds it by probing pkg-config for the module
+        # named `libonnxruntime`, which is exactly what the dev output's .pc file is called,
+        # so nothing is ever downloaded at build time.
+        buildInputs = [ pkgs.apple-sdk_26 pkgs.onnxruntime pkgs.webrtc-audio-processing ];
 
         # whisper-rs-sys compiles its own vendored whisper.cpp with the `cmake` crate.
         # pkgs.whisper-cpp is deliberately *not* here: linking a second, separately built

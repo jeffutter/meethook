@@ -12,6 +12,7 @@ mod aec;
 mod align;
 mod asr;
 mod audio;
+mod onnx;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ pub use aec::{Cleaned, Cleaning, PassThrough, cancel_bleed};
 pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
 pub use audio::TARGET_RATE;
+pub use onnx::{Loaded, open_session};
 
 use meethook_models::ModelSpec;
 use meethook_session::{
@@ -47,6 +49,48 @@ pub const WHISPER_MODEL: ModelSpec = ModelSpec {
           5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin",
     sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
     size_bytes: 1_624_555_275,
+};
+
+/// The speaker-segmentation graph diarization runs over the speaker track.
+///
+/// pyannote segmentation 3.0, exported to ONNX. It consumes a fixed-length window of raw
+/// audio and emits, per frame, a distribution over the *powerset* of up to three concurrent
+/// speakers -- which is why the output's last dimension is 7 (silence, three singles, three
+/// pairs) rather than a speaker count.
+///
+/// Graph contract, asserted in [`onnx`]'s smoke test:
+/// input `input_values` f32 `[batch_size, num_channels, num_samples]`;
+/// output `logits` f32 `[batch_size, num_frames, 7]`.
+///
+/// The file name is the repository's, not the repository's `model.onnx`: the models
+/// directory is flat and shared, so a generic name would collide with the next ONNX model
+/// added.
+///
+/// Like [`WHISPER_MODEL`], the URL pins an immutable revision and the hash and size come
+/// from the git-LFS pointer Hugging Face serves at the `raw/` path, so bumping the revision
+/// does not require downloading the weights to re-derive them.
+pub const SEGMENTATION_MODEL: ModelSpec = ModelSpec {
+    file_name: "pyannote-segmentation-3.0.onnx",
+    url: "https://huggingface.co/onnx-community/pyannote-segmentation-3.0/resolve/\
+          733a93b6473d019a773298e08cefa686894b1854/onnx/model.onnx",
+    sha256: "057ee564753071c0b09b5b611648b50ac188d50846bff5f01e9f7bbf1591ea25",
+    size_bytes: 5_986_908,
+};
+
+/// The speaker-embedding graph that turns a segment of speech into a voice fingerprint.
+///
+/// WeSpeaker's VoxCeleb ResNet34-LM. It takes fbank features rather than raw audio -- 80
+/// mel bins per frame -- and returns one 256-dimensional embedding per utterance, which is
+/// what clustering and enrollment compare.
+///
+/// Graph contract, asserted in [`onnx`]'s smoke test:
+/// input `feats` f32 `[B, T, 80]`; output `embs` f32 `[B, 256]`.
+pub const EMBEDDING_MODEL: ModelSpec = ModelSpec {
+    file_name: "wespeaker-voxceleb-resnet34-LM.onnx",
+    url: "https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/\
+          f0c48c298fd835726c27956a5d617bad7115627e/voxceleb_resnet34_LM.onnx",
+    sha256: "7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068",
+    size_bytes: 26_530_309,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +124,13 @@ pub enum Error {
         session: SessionId,
         numer: u32,
         denom: u32,
+    },
+
+    #[error("could not load the ONNX model at {path}: {source}")]
+    Onnx {
+        path: PathBuf,
+        #[source]
+        source: Box<ort::Error>,
     },
 
     #[error("could not load the speech recognition model: {source}")]
