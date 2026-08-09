@@ -8,4 +8,23 @@ __pycache__
 # Recorded and generated audio under scratch/. The scripts that produce and
 # consume it are tracked; the waveforms themselves are large, regenerable
 # (`make_click_track.py`) or machine-specific captures.
+#
+# Corpus work writes outside the repository entirely, so nothing below should
+# ever match. It is here so that a stray `curl` into `scratch/` is a no-op
+# rather than a licensing incident: the rule is "no corpus audio and no corpus
+# archive in this repository", and a rule only enforced by care is a habit.
 scratch/**/*.wav
+scratch/**/*.flac
+scratch/**/*.mp3
+scratch/**/*.m4a
+scratch/**/*.ogg
+scratch/**/*.oga
+scratch/**/*.opus
+scratch/**/*.aif
+scratch/**/*.aiff
+scratch/**/*.au
+scratch/**/*.caf
+scratch/**/*.tar
+scratch/**/*.tar.gz
+scratch/**/*.tgz
+scratch/**/*.zip
