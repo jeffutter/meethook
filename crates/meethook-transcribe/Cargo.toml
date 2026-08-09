@@ -1,0 +1,25 @@
+[package]
+name = "meethook-transcribe"
+version = "0.1.0"
+description = "Whisper ASR over a recorded meethook session's microphone track"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+meethook-models = { workspace = true }
+meethook-session = { workspace = true }
+
+hound = { workspace = true }
+rubato = { workspace = true }
+thiserror = { workspace = true }
+
+# `metal` (not `coreml`): Metal alone is fast enough for batch, non-real-time use, and
+# Core ML would need a one-time Python/coremltools conversion step this project exists to
+# avoid. `default-features = false` is stated rather than implied -- whisper-rs's default
+# feature set is empty today, and this keeps it that way if that ever changes.
+whisper-rs = { workspace = true }
+
+[dev-dependencies]
+jiff = { workspace = true }
+tempfile = { workspace = true }

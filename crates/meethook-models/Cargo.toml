@@ -1,0 +1,15 @@
+[package]
+name = "meethook-models"
+version = "0.1.0"
+description = "Lazy, hash-verified acquisition of model weights that are deliberately outside the Nix closure"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

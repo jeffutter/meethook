@@ -8,8 +8,8 @@ use std::path::Path;
 
 use jiff::Timestamp;
 use meethook_session::{
-    Classification, Paths, SCHEMA_VERSION, SessionId, SessionMetadata, SessionPaths, TrackSync,
-    create_session_dir, discover_sessions, write_atomic,
+    Classification, Paths, SESSION_SCHEMA_VERSION, SessionId, SessionMetadata, SessionPaths,
+    TrackSync, create_session_dir, discover_sessions, write_atomic,
 };
 use tempfile::TempDir;
 
@@ -103,7 +103,7 @@ fn metadata_round_trips_with_raw_mach_ticks() {
     let decoded: SessionMetadata = serde_json::from_str(&json).unwrap();
 
     assert_eq!(decoded, metadata);
-    assert_eq!(decoded.schema_version, SCHEMA_VERSION);
+    assert_eq!(decoded.schema_version, SESSION_SCHEMA_VERSION);
     assert_eq!(decoded.session_id.as_str(), "20260809-052607");
     assert_eq!(decoded.start_time.to_string(), "2026-08-09T05:26:00Z");
 

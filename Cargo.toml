@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/meethook", "crates/meethook-record", "crates/meethook-session"]
+members = [
+  "crates/meethook",
+  "crates/meethook-models",
+  "crates/meethook-record",
+  "crates/meethook-session",
+  "crates/meethook-transcribe",
+]
 
 [workspace.package]
 edition = "2024"
@@ -8,8 +14,10 @@ rust-version = "1.85"
 publish = false
 
 [workspace.dependencies]
+meethook-models = { path = "crates/meethook-models" }
 meethook-record = { path = "crates/meethook-record" }
 meethook-session = { path = "crates/meethook-session" }
+meethook-transcribe = { path = "crates/meethook-transcribe" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -19,8 +27,20 @@ jiff = "0.2"
 mach2 = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
+# Blocking and rustls-backed: one plain GET per model file wants neither an async runtime
+# nor a native OpenSSL dependency in the flake.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# The classic (pre-1.0) rubato API. 1.0+ routes all I/O through the `audioadapter` traits,
+# which buy nothing for one fixed-ratio mono conversion.
+rubato = "0.16"
+
+# whisper.cpp bindings. `metal` pulls in `_gpu`, which is what makes `use_gpu` default to
+# true; see the assertion in meethook-transcribe::asr that keeps that honest.
+whisper-rs = { version = "0.16", default-features = false, features = ["metal"] }
 
 # Apple framework bindings. Deliberately one binding family (objc2) for every framework
 # this slice touches, so there is one `Retained<T>`, one `NSObject`, and no duplicate

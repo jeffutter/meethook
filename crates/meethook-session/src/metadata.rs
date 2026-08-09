@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Result, SessionId, write_atomic};
 
 /// Bumped whenever `session.json`'s shape changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// `transcript.json` carries its own version; see [`crate::TRANSCRIPT_SCHEMA_VERSION`].
+pub const SESSION_SCHEMA_VERSION: u32 = 1;
 
 /// One track's first-sample host timestamp, in the form the hardware reported it.
 ///
@@ -52,7 +54,7 @@ impl SessionMetadata {
     ) -> Self {
         SessionMetadata {
             session_id,
-            schema_version: SCHEMA_VERSION,
+            schema_version: SESSION_SCHEMA_VERSION,
             start_time,
             mic,
             speaker,

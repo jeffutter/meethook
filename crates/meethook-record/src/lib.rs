@@ -226,10 +226,12 @@ impl RunningSession {
             track: "mic",
             dir: paths.dir().to_path_buf(),
         })?;
-        let speaker_ticks = speaker_summary.first_host_ticks().ok_or(Error::SilentTrack {
-            track: "speaker",
-            dir: paths.dir().to_path_buf(),
-        })?;
+        let speaker_ticks = speaker_summary
+            .first_host_ticks()
+            .ok_or(Error::SilentTrack {
+                track: "speaker",
+                dir: paths.dir().to_path_buf(),
+            })?;
 
         report_first_buffer_timing(&mic_summary, &speaker_summary);
 

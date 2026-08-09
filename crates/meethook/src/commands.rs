@@ -1,14 +1,17 @@
 //! Subcommand bodies.
 //!
-//! `enroll` is a stub in this slice; `record` captures for real, and `transcribe` already
-//! does the real discovery work, which is what makes the session contract observable from
-//! the CLI rather than only from tests.
+//! `enroll` is a stub in this slice; `record` and `transcribe` do the real work. Both are
+//! thin: the rules they enforce live in `meethook-record` and `meethook-transcribe`, where
+//! they can be tested without a terminal.
 
+use std::io::{self, Write};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
+use meethook_models::ensure_model;
 use meethook_record::{Recorder, preflight};
-use meethook_session::{Paths, SessionId, discover_sessions};
+use meethook_session::{Paths, SessionId};
+use meethook_transcribe::{SpeechToText, WHISPER_MODEL, WhisperEngine, run_batch};
 
 /// Records one session, from launch until the process is interrupted.
 ///
@@ -56,47 +59,80 @@ pub fn record(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// Lists discovered sessions and their classification.
+/// Transcribes recorded sessions.
 ///
-/// Transcription itself lands in a later slice; the discovery result this prints is the
-/// same value that slice will consume, so the listing is a temporary presentation of
-/// permanent code, not throwaway scaffolding.
+/// Fully non-interactive, deliberately: this is meant to be aimed at a directory of
+/// meetings and left alone. The model is acquired lazily through the factory below, so a
+/// run that turns out to have nothing to do never pays for a download.
 pub fn transcribe(paths: &Paths, session_ids: &[String], force: bool) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
-    let discovered = discover_sessions(paths)?;
 
-    if force {
-        println!("--force accepted; re-transcription lands with transcription itself.");
-    }
-
-    let selected: Vec<_> = if requested.is_empty() {
-        discovered.iter().collect()
-    } else {
-        discovered
-            .iter()
-            .filter(|session| requested.contains(&session.id))
-            .collect()
+    let models_dir = paths.models_dir();
+    let mut open_engine = || -> std::result::Result<
+        Box<dyn SpeechToText>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let mut report = DownloadProgress::default();
+        let model = ensure_model(&models_dir, &WHISPER_MODEL, &mut |done, total| {
+            report.update(done, total)
+        })?;
+        Ok(Box::new(WhisperEngine::load(&model)?))
     };
 
-    // An id the user asked for that is not on disk is worth naming individually; silently
-    // transcribing three of four requested sessions would look like success.
-    for id in &requested {
-        if !discovered.iter().any(|session| &session.id == id) {
-            println!("{id}  not found");
-        }
-    }
+    let stdout = io::stdout();
+    let report = run_batch(
+        paths,
+        &requested,
+        force,
+        &mut open_engine,
+        &mut stdout.lock(),
+    )?;
 
-    if selected.is_empty() && requested.is_empty() {
-        println!("No sessions found in {}", paths.sessions_dir().display());
-        return Ok(());
+    // Skips -- including orphans -- are normal and stay at exit 0; a session that genuinely
+    // failed is what makes the run unsuccessful.
+    if report.failed > 0 {
+        bail!(
+            "{} of {} session(s) failed to transcribe",
+            report.failed,
+            report.failed + report.transcribed
+        );
     }
-
-    for session in selected {
-        println!("{}  {}", session.id, session.classification);
-    }
-
-    println!("meethook transcribe: transcription is not implemented in this slice.");
     Ok(())
+}
+
+/// Prints download progress on stderr, one line, rewritten in place.
+///
+/// stderr rather than stdout so the batch's own output stays a clean, greppable record of
+/// what happened to each session. Throttled to whole percent because a 1.6 GB download at a
+/// megabyte a chunk would otherwise emit sixteen hundred lines.
+#[derive(Default)]
+struct DownloadProgress {
+    last_percent: u64,
+    started: bool,
+}
+
+impl DownloadProgress {
+    fn update(&mut self, done: u64, total: u64) {
+        if !self.started {
+            self.started = true;
+            eprintln!(
+                "Fetching {} ({:.1} GB, one time)",
+                WHISPER_MODEL.file_name,
+                total as f64 / 1e9
+            );
+        }
+        let percent = (done * 100).checked_div(total).unwrap_or(0);
+        if percent == self.last_percent && done < total {
+            return;
+        }
+        self.last_percent = percent;
+        let mut stderr = io::stderr();
+        let _ = write!(stderr, "\r  {percent}%");
+        if done >= total {
+            let _ = writeln!(stderr);
+        }
+        let _ = stderr.flush();
+    }
 }
 
 pub fn enroll(_paths: &Paths, session_ids: &[String]) -> Result<()> {

@@ -11,8 +11,10 @@ name = "meethook"
 path = "src/main.rs"
 
 [dependencies]
+meethook-models = { workspace = true }
 meethook-record = { workspace = true }
 meethook-session = { workspace = true }
+meethook-transcribe = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }
