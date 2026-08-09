@@ -38,6 +38,12 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # which buy nothing for one fixed-ratio mono conversion.
 rubato = "0.16"
 
+# Real-input FFT, for the GCC-PHAT delay estimate in meethook-transcribe::align. It wraps
+# rustfft, which rubato already pulls in, so this adds a thin layer rather than a second FFT
+# implementation -- and a real-input transform is half the work of pretending audio is
+# complex.
+realfft = "3.5"
+
 # whisper.cpp bindings. `metal` pulls in `_gpu`, which is what makes `use_gpu` default to
 # true; see the assertion in meethook-transcribe::asr that keeps that honest.
 whisper-rs = { version = "0.16", default-features = false, features = ["metal"] }

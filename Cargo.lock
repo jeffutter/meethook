@@ -603,6 +603,7 @@ dependencies = [
  "jiff",
  "meethook-models",
  "meethook-session",
+ "realfft",
  "rubato",
  "tempfile",
  "thiserror",

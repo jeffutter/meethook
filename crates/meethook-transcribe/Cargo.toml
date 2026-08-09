@@ -11,6 +11,7 @@ meethook-models = { workspace = true }
 meethook-session = { workspace = true }
 
 hound = { workspace = true }
+realfft = { workspace = true }
 rubato = { workspace = true }
 thiserror = { workspace = true }
 
