@@ -334,6 +334,10 @@ impl AudioOutput {
     ///
     /// `sample_buffer` must be a live audio `CMSampleBuffer`.
     unsafe fn handle_audio(&self, sample_buffer: &CMSampleBuffer) {
+        // Read first, before any work, so it measures when this callback arrived rather
+        // than how long it took.
+        let delivered_ticks = clock::now_ticks();
+
         // SAFETY: plain accessors on a live sample buffer.
         let frames = unsafe { sample_buffer.num_samples() } as usize;
         if frames == 0 {
@@ -395,6 +399,6 @@ impl AudioOutput {
         let channel_ptrs = [data];
         // SAFETY: `data` is valid for `available` f32s, and `usable * channels <= available`.
         let mono = unsafe { crate::track::channel_zero(channel_ptrs.as_ptr(), usable, channels) };
-        self.ivars().sink.push(host_ticks, mono);
+        self.ivars().sink.push(host_ticks, delivered_ticks, mono);
     }
 }

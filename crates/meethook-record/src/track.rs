@@ -29,19 +29,151 @@ use crate::{Error, Result};
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
 enum Message {
-    Samples(Vec<f32>),
+    Samples {
+        host_ticks: u64,
+        delivered_ticks: u64,
+        samples: Vec<f32>,
+    },
     Stop,
+}
+
+/// Per-buffer timing for a whole track, accumulated on the writer thread.
+///
+/// Exists to answer one question the stored first-buffer timestamp cannot answer about
+/// itself: *is it typical?* Delivery settles into a steady rhythm once a stream is running,
+/// so the gap between an API's timestamp and the buffer's arrival converges to a constant.
+/// A first-buffer gap that sits on that constant means the stored timestamp describes its
+/// samples the same way every later timestamp does. A first-buffer gap that is an outlier
+/// means the one value written to `session.json` is the one value the API got wrong.
+///
+/// Gated behind `MEETHOOK_TIMING_DEBUG`, checked once when the track is created rather than
+/// per buffer, so an unset variable costs a single `bool` test on the writer thread.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimingProfile {
+    first_gap_ticks: i64,
+    /// Ascending, so percentiles are a plain index.
+    sorted_gaps: Vec<i64>,
+    /// The furthest any buffer's timestamp strayed from the straight line drawn through the
+    /// first timestamp at the track's nominal sample rate. Large values mean the timestamps
+    /// and the sample stream disagree about how much time has passed -- which would corrupt
+    /// alignment no matter how accurate the first timestamp was.
+    max_drift_ticks: i64,
+}
+
+impl TimingProfile {
+    pub fn buffers(&self) -> usize {
+        self.sorted_gaps.len()
+    }
+
+    /// The gap belonging to the buffer whose timestamp is stored in `session.json`.
+    pub fn first_gap_ticks(&self) -> i64 {
+        self.first_gap_ticks
+    }
+
+    /// The gap a settled stream converges to. Median rather than mean because a single
+    /// scheduling stall would drag a mean far more than it distorts the typical case.
+    pub fn median_gap_ticks(&self) -> i64 {
+        self.sorted_gaps
+            .get(self.sorted_gaps.len() / 2)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn min_gap_ticks(&self) -> i64 {
+        self.sorted_gaps.first().copied().unwrap_or(0)
+    }
+
+    pub fn max_gap_ticks(&self) -> i64 {
+        self.sorted_gaps.last().copied().unwrap_or(0)
+    }
+
+    pub fn max_drift_ticks(&self) -> i64 {
+        self.max_drift_ticks
+    }
+}
+
+/// Accumulates [`TimingProfile`] as buffers arrive.
+struct TimingAccumulator {
+    ticks_per_frame: f64,
+    first_host_ticks: Option<u64>,
+    frames_before: u64,
+    gaps: Vec<i64>,
+    first_gap_ticks: i64,
+    max_drift_ticks: i64,
+}
+
+impl TimingAccumulator {
+    fn new(sample_rate: u32) -> TimingAccumulator {
+        let (numer, denom) = crate::clock::timebase();
+        // ticks/second = 1e9 * denom / numer, so ticks/frame divides that by the rate.
+        let ticks_per_second = 1e9 * f64::from(denom) / f64::from(numer);
+        TimingAccumulator {
+            ticks_per_frame: ticks_per_second / f64::from(sample_rate.max(1)),
+            first_host_ticks: None,
+            frames_before: 0,
+            gaps: Vec::new(),
+            first_gap_ticks: 0,
+            max_drift_ticks: 0,
+        }
+    }
+
+    fn observe(&mut self, host_ticks: u64, delivered_ticks: u64, frames: u64) {
+        // Signed throughout: a timestamp later than its own delivery is a distinct and much
+        // stranger fault than one earlier, and must not wrap silently through `u64`.
+        let gap = delivered_ticks as i64 - host_ticks as i64;
+        let first = *self.first_host_ticks.get_or_insert_with(|| {
+            self.first_gap_ticks = gap;
+            host_ticks
+        });
+        self.gaps.push(gap);
+
+        let expected = first as f64 + self.frames_before as f64 * self.ticks_per_frame;
+        let drift = (host_ticks as f64 - expected) as i64;
+        if drift.abs() > self.max_drift_ticks.abs() {
+            self.max_drift_ticks = drift;
+        }
+        self.frames_before += frames;
+    }
+
+    fn finish(mut self) -> TimingProfile {
+        self.gaps.sort_unstable();
+        TimingProfile {
+            first_gap_ticks: self.first_gap_ticks,
+            sorted_gaps: self.gaps,
+            max_drift_ticks: self.max_drift_ticks,
+        }
+    }
+}
+
+/// Everything known about the buffer whose timestamp becomes the track's stored
+/// `host_ticks`.
+///
+/// `delivered_ticks` exists to make the capture API's timestamp *falsifiable*. A stored
+/// timestamp on its own cannot be checked against anything; paired with the moment the
+/// buffer actually reached us, the gap between them reveals what the API means by "when":
+/// a gap of roughly one buffer duration means the timestamp refers to the buffer's first
+/// sample, a gap near zero means it refers to delivery, and a gap materially larger than a
+/// buffer means there is latency the timestamp is not accounting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstBuffer {
+    pub host_ticks: u64,
+    pub delivered_ticks: u64,
+    pub frames: u32,
 }
 
 /// A cheap, cloneable handle for a capture callback to push samples through.
 #[derive(Clone)]
 pub struct TrackSink {
     tx: Sender<Message>,
-    first: Arc<OnceLock<u64>>,
+    first: Arc<OnceLock<FirstBuffer>>,
 }
 
 impl TrackSink {
-    /// Records `host_ticks` if this is the track's first buffer, then queues `mono`.
+    /// Records the first buffer's timing if this is the track's first buffer, then queues
+    /// `mono`.
+    ///
+    /// `delivered_ticks` should be read at the very top of the capture callback, before any
+    /// sample copying, so it measures the callback's arrival rather than its duration.
     ///
     /// Returns immediately and performs no I/O or allocation beyond taking ownership of a
     /// buffer the caller already allocated.
@@ -49,22 +181,38 @@ impl TrackSink {
     /// A closed channel is ignored: the writer thread has already stopped or failed, and
     /// [`TrackWriter::finish`] is where that gets reported. There is nothing useful a
     /// real-time callback could do about it.
-    pub fn push(&self, host_ticks: u64, mono: Vec<f32>) {
-        let _ = self.first.set(host_ticks);
-        let _ = self.tx.send(Message::Samples(mono));
+    pub fn push(&self, host_ticks: u64, delivered_ticks: u64, mono: Vec<f32>) {
+        // Mono, so one sample is one frame.
+        let _ = self.first.set(FirstBuffer {
+            host_ticks,
+            delivered_ticks,
+            frames: mono.len() as u32,
+        });
+        let _ = self.tx.send(Message::Samples {
+            host_ticks,
+            delivered_ticks,
+            samples: mono,
+        });
     }
 }
 
 /// What a finished track turned out to contain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrackSummary {
     pub sample_rate: u32,
     pub frames: u64,
     /// `None` means the track never received a single buffer.
-    pub first_host_ticks: Option<u64>,
+    pub first_buffer: Option<FirstBuffer>,
+    /// `None` unless `MEETHOOK_TIMING_DEBUG` was set for this run.
+    pub timing: Option<TimingProfile>,
 }
 
 impl TrackSummary {
+    /// The timestamp that becomes this track's `host_ticks` in `session.json`.
+    pub fn first_host_ticks(&self) -> Option<u64> {
+        self.first_buffer.map(|b| b.host_ticks)
+    }
+
     pub fn seconds(&self) -> f64 {
         if self.sample_rate == 0 {
             return 0.0;
@@ -78,7 +226,7 @@ pub struct TrackWriter {
     path: PathBuf,
     sample_rate: u32,
     sink: TrackSink,
-    handle: JoinHandle<Result<u64>>,
+    handle: JoinHandle<Result<(u64, Option<TimingProfile>)>>,
 }
 
 impl TrackWriter {
@@ -107,17 +255,26 @@ impl TrackWriter {
 
         let (tx, rx) = mpsc::channel::<Message>();
         let thread_path = path.to_path_buf();
+        // Read once here rather than per buffer: the diagnostic must not put an environment
+        // lookup anywhere near the write loop.
+        let timing = std::env::var_os("MEETHOOK_TIMING_DEBUG").map(|_| ());
 
         let handle = thread::Builder::new()
             .name("meethook-wav".to_owned())
             .spawn(move || {
                 let mut frames: u64 = 0;
                 let mut last_checkpoint = Instant::now();
+                let mut timing = timing.map(|()| TimingAccumulator::new(sample_rate));
 
                 // `Stop` rather than sender-disconnect, because a capture callback may still
                 // be holding a `TrackSink` clone when `finish` runs; waiting for every clone
                 // to drop would hang.
-                while let Ok(Message::Samples(samples)) = rx.recv() {
+                while let Ok(Message::Samples {
+                    host_ticks,
+                    delivered_ticks,
+                    samples,
+                }) = rx.recv()
+                {
                     for sample in &samples {
                         writer
                             .write_sample(*sample)
@@ -126,6 +283,10 @@ impl TrackWriter {
                     // Mono means every sample is a complete frame, so a checkpoint can never
                     // land mid-frame.
                     frames += samples.len() as u64;
+
+                    if let Some(timing) = timing.as_mut() {
+                        timing.observe(host_ticks, delivered_ticks, samples.len() as u64);
+                    }
 
                     if last_checkpoint.elapsed() >= checkpoint {
                         writer.flush().map_err(|e| Error::wav(&thread_path, e))?;
@@ -136,7 +297,7 @@ impl TrackWriter {
                 writer
                     .finalize()
                     .map_err(|e| Error::wav(&thread_path, e))
-                    .map(|()| frames)
+                    .map(|()| (frames, timing.map(TimingAccumulator::finish)))
             })
             .map_err(|e| Error::io(path, e))?;
 
@@ -172,7 +333,7 @@ impl TrackWriter {
         let _ = sink.tx.send(Message::Stop);
         drop(sink);
 
-        let frames = match handle.join() {
+        let (frames, timing) = match handle.join() {
             Ok(result) => result?,
             Err(_) => return Err(Error::WriterPanic { path }),
         };
@@ -182,7 +343,8 @@ impl TrackWriter {
             frames,
             // Read after the join, so any callback still in flight when `stop` was called
             // has already had its chance to set it.
-            first_host_ticks: first.get().copied(),
+            first_buffer: first.get().copied(),
+            timing,
         })
     }
 }
@@ -246,14 +408,14 @@ mod tests {
 
         let first: Vec<f32> = vec![0.0, 0.25, -0.5, 1.0];
         let second: Vec<f32> = vec![-1.0, 0.125];
-        sink.push(1_000, first.clone());
-        sink.push(2_000, second.clone());
+        sink.push(1_000, 1_500, first.clone());
+        sink.push(2_000, 2_500, second.clone());
 
         let summary = writer.finish().unwrap();
         assert_eq!(summary.frames, 6);
         assert_eq!(summary.sample_rate, 44_100);
         // The *first* buffer's ticks, not the last.
-        assert_eq!(summary.first_host_ticks, Some(1_000));
+        assert_eq!(summary.first_host_ticks(), Some(1_000));
 
         let mut reader = hound::WavReader::open(&path).unwrap();
         let spec = reader.spec();
@@ -278,7 +440,7 @@ mod tests {
 
         let summary = writer.finish().unwrap();
         assert_eq!(summary.frames, 0);
-        assert_eq!(summary.first_host_ticks, None);
+        assert_eq!(summary.first_host_ticks(), None);
 
         let reader = hound::WavReader::open(&path).unwrap();
         assert_eq!(reader.duration(), 0);
@@ -294,7 +456,7 @@ mod tests {
         // interval takes, just without a 5-second test.
         let writer =
             TrackWriter::create_with_checkpoint(&path, 16_000, Duration::from_secs(0)).unwrap();
-        writer.sink().push(7, vec![0.5; 128]);
+        writer.sink().push(7, 9, vec![0.5; 128]);
 
         // Poll rather than sleep-and-hope: the writer thread is asynchronous by design.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -340,7 +502,12 @@ mod tests {
         let summary = TrackSummary {
             sample_rate: 48_000,
             frames: 24_000,
-            first_host_ticks: Some(1),
+            timing: None,
+            first_buffer: Some(FirstBuffer {
+                host_ticks: 1,
+                delivered_ticks: 2,
+                frames: 24_000,
+            }),
         };
         assert!((summary.seconds() - 0.5).abs() < f64::EPSILON);
     }

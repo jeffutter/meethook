@@ -21,6 +21,7 @@
 //! offset arithmetic is `transcribe`'s job.
 
 mod clock;
+mod latency;
 mod mic;
 mod preflight;
 mod speaker;
@@ -214,6 +215,10 @@ impl RunningSession {
             speaker,
         } = self;
 
+        // Read before the stop consumes the capture: an idle engine reports 0 rather than
+        // the hardware's figure.
+        let mic_presentation_latency = mic.presentation_latency();
+
         // Stop both before inspecting either result: returning early on a mic failure would
         // leave the speaker WAV unfinalized, which is a worse outcome than a late error.
         let mic_stop = mic.stop();
@@ -222,14 +227,16 @@ impl RunningSession {
         let mic_summary = mic_stop?;
         let speaker_summary = speaker_stop?;
 
-        let mic_ticks = mic_summary.first_host_ticks.ok_or(Error::SilentTrack {
+        let mic_ticks = mic_summary.first_host_ticks().ok_or(Error::SilentTrack {
             track: "mic",
             dir: paths.dir().to_path_buf(),
         })?;
-        let speaker_ticks = speaker_summary.first_host_ticks.ok_or(Error::SilentTrack {
+        let speaker_ticks = speaker_summary.first_host_ticks().ok_or(Error::SilentTrack {
             track: "speaker",
             dir: paths.dir().to_path_buf(),
         })?;
+
+        report_first_buffer_timing(&mic_summary, &speaker_summary, mic_presentation_latency);
 
         let metadata = SessionMetadata::new(
             id.clone(),
@@ -247,6 +254,124 @@ impl RunningSession {
             speaker: speaker_summary,
         })
     }
+}
+
+/// Prints how far each capture API's own timestamp sits from the moment its buffer was
+/// actually delivered. Gated behind `MEETHOOK_TIMING_DEBUG`.
+///
+/// This exists because a stored timestamp is otherwise unfalsifiable: `session.json` says
+/// the two tracks start N ms apart, and nothing in the recording can confirm or refute it.
+/// A live click test showed the stored offset is wrong by at least 13 ms -- the mic appears
+/// to hear a sound before the speaker emitted it -- but not *which* of the two timestamps
+/// is at fault, since both APIs are asked the same question and only one can be lying.
+///
+/// The first buffer's gap alone cannot say this, because it cannot separate "the timestamp
+/// is early" from "delivery was late" -- and the first buffer of a stream is exactly where
+/// startup delay is worst. The **median** gap over the whole session is the reference that
+/// makes it decidable: once a stream is running, delivery is paced by the buffer clock, so
+/// the gap converges. Read `first - median`:
+///
+/// - `~= 0` means the stored timestamp describes its samples exactly the way every later
+///   timestamp does; the recorder's arithmetic is sound and any residual sync error is
+///   physical, not computed.
+/// - Materially negative means the stored timestamp is *earlier* than that track's own
+///   steady-state relationship to its samples, so `session.json` starts that track too
+///   early.
+///
+/// `max drift` is a separate check: how far any buffer's timestamp strayed from the straight
+/// line through the first timestamp at the track's nominal rate. A track whose timestamps
+/// disagree with its own sample count has lost or gained audio, which corrupts alignment
+/// however good the first timestamp was.
+fn report_first_buffer_timing(
+    mic: &track::TrackSummary,
+    speaker: &track::TrackSummary,
+    mic_presentation_latency: f64,
+) {
+    if std::env::var_os("MEETHOOK_TIMING_DEBUG").is_none() {
+        return;
+    }
+
+    eprintln!("\n[timing] diagnostics (MEETHOOK_TIMING_DEBUG)");
+    for (label, summary) in [("mic", mic), ("speaker", speaker)] {
+        let Some(b) = summary.first_buffer else {
+            eprintln!("  {label:<8} no buffers received");
+            continue;
+        };
+        // Signed: a timestamp *after* delivery would be a distinct and much stranger bug
+        // than one before it, and must not silently wrap through u64.
+        let first_gap = clock::ticks_to_millis(b.delivered_ticks as i64 - b.host_ticks as i64);
+        let buffer_ms = f64::from(b.frames) / f64::from(summary.sample_rate) * 1000.0;
+        eprintln!(
+            "  {label:<8} buffer={} frames ({buffer_ms:.3} ms)   first gap={first_gap:+.3} ms \
+             ({:.2} buffers)",
+            b.frames,
+            first_gap / buffer_ms,
+        );
+
+        let Some(t) = summary.timing.as_ref() else {
+            continue;
+        };
+        let median = clock::ticks_to_millis(t.median_gap_ticks());
+        let excess = first_gap - median;
+        eprintln!(
+            "  {:<8} {} buffers   gap median={median:+.3} min={:+.3} max={:+.3} ms   \
+             max drift={:+.3} ms",
+            "",
+            t.buffers(),
+            clock::ticks_to_millis(t.min_gap_ticks()),
+            clock::ticks_to_millis(t.max_gap_ticks()),
+            clock::ticks_to_millis(t.max_drift_ticks()),
+        );
+        eprintln!(
+            "  {:<8} first - median = {excess:+.3} ms ({:.2} buffers){}",
+            "",
+            excess / buffer_ms,
+            if excess.abs() > buffer_ms {
+                "   <- OUTLIER: the stored timestamp is not typical of this track"
+            } else {
+                ""
+            },
+        );
+    }
+
+    if let (Some(m), Some(s)) = (mic.first_buffer, speaker.first_buffer) {
+        let stored = clock::ticks_to_millis(m.host_ticks as i64 - s.host_ticks as i64);
+        eprintln!(
+            "  stored offset (mic - speaker)    {stored:+.3} ms   <- what session.json records"
+        );
+        // Deliberately no "corrected" offset is printed here. A first-vs-median excess is
+        // tempting to subtract, but `max drift` above measures the first timestamp against
+        // every later one in the same stream: when drift is ~0, the first timestamp is
+        // already on the same line as the rest, and the excess is startup *delivery* -- the
+        // pipeline is not yet full -- rather than a timestamp fault. Subtracting it would be
+        // a calibration constant dressed up as a measurement.
+    }
+
+    // The hardware's own account of the delays each timestamp may or may not already
+    // include. A path total close to the click test's constant residual identifies which
+    // API is compensating and which is not -- the difference between a principled,
+    // device-adaptive correction and a constant that only fits this Mac.
+    eprintln!(
+        "  AVAudioEngine input presentationLatency  {:.3} ms",
+        mic_presentation_latency * 1000.0
+    );
+    for (label, input, rate) in [
+        ("input ", true, mic.sample_rate),
+        ("output", false, speaker.sample_rate),
+    ] {
+        match latency::default_path(input) {
+            Some(p) => eprintln!(
+                "  CoreAudio default {label}  device={} stream={} safety={} frames  \
+                 total={:.3} ms @ {rate} Hz",
+                p.device_frames,
+                p.stream_frames,
+                p.safety_offset_frames,
+                p.total_millis(rate),
+            ),
+            None => eprintln!("  CoreAudio default {label}  no device / not reported"),
+        }
+    }
+    eprintln!();
 }
 
 /// A completed, on-disk session.

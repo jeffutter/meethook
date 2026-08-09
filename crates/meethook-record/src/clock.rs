@@ -40,6 +40,26 @@ pub fn timebase() -> (u32, u32) {
     })
 }
 
+/// The host clock right now, in the same units as every stored `host_ticks`.
+///
+/// Used to record *when a buffer was delivered*, against which a capture API's own notion
+/// of "when these samples happened" can be compared. Cheap enough for a capture callback:
+/// `mach_absolute_time` is a vDSO-style read of the timebase register, with no syscall,
+/// no lock, and no allocation.
+pub fn now_ticks() -> u64 {
+    // SAFETY: `mach_absolute_time` takes no arguments and has no preconditions.
+    unsafe { mach2::mach_time::mach_absolute_time() }
+}
+
+/// Converts a tick count into milliseconds through the machine's timebase.
+///
+/// Diagnostics only. The session contract deliberately stores raw ticks, so nothing on the
+/// recording path may depend on this.
+pub fn ticks_to_millis(ticks: i64) -> f64 {
+    let (numer, denom) = timebase();
+    ticks as f64 * f64::from(numer) / f64::from(denom) / 1e6
+}
+
 /// Converts a Core Media host time into the units of `mach_absolute_time`.
 ///
 /// `SCStream` hands out presentation timestamps on the host time clock, but with a

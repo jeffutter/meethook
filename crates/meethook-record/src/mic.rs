@@ -1,10 +1,18 @@
 //! Microphone capture via a dedicated `AVAudioEngine` input tap.
 //!
 //! This is a completely separate engine from the ScreenCaptureKit stream in `speaker.rs`,
-//! and that separation is the design, not an accident. It keeps the speaker track usable as
-//! an independent reference signal for echo cancellation later, and it avoids ScreenCapture
-//! Kit's unified microphone output, which is a known source of corrupted recordings when
-//! combined with capture.
+//! and that separation is the design, not an accident. The reason is native-format capture:
+//! `SCStreamConfiguration` fixes the audio format for the whole stream, so pulling the mic
+//! through macOS 15's unified `SCStream` microphone output would deliver it resampled to the
+//! stream's rate -- a 44.1 kHz USB mic silently converted to 48 kHz -- which is precisely the
+//! lossy transform this recorder exists to avoid. Keeping our own engine also means an
+//! unusable device format is visible here, before a session directory exists.
+//!
+//! Not the reason: the widely-cited report of corrupted output from `captureMicrophone`
+//! describes an `AVAssetWriter` container error, and this recorder muxes nothing. Nor is it
+//! echo cancellation -- SCK delivers microphone audio as its own output type rather than
+//! mixed into system audio, so the unified API would leave the speaker track intact as an
+//! independent reference signal.
 //!
 //! The tap writes whatever the device reports -- its own sample rate, its own float32
 //! samples -- with no conversion. `transcribe` owns all rate handling.
@@ -93,6 +101,10 @@ impl InputDevice {
 
         let tap = RcBlock::new(
             move |buffer: NonNull<AVAudioPCMBuffer>, when: NonNull<AVAudioTime>| {
+                // Read first, before any work, so it measures when this callback arrived
+                // rather than how long it took.
+                let delivered_ticks = crate::clock::now_ticks();
+
                 // SAFETY: AVAudioEngine passes live objects that outlive the callback.
                 let buffer = unsafe { buffer.as_ref() };
                 let when = unsafe { when.as_ref() };
@@ -124,7 +136,7 @@ impl InputDevice {
                         stride,
                     )
                 };
-                sink.push(host_ticks, mono);
+                sink.push(host_ticks, delivered_ticks, mono);
             },
         );
 
@@ -149,6 +161,10 @@ impl InputDevice {
             return Err(Error::AudioEngine(e.localizedDescription().to_string()));
         }
 
+        // SAFETY: a plain property read on the live input node. Read after `start`, because
+        // before the engine runs the node reports 0 rather than the hardware's figure.
+        let presentation_latency = unsafe { input.presentationLatency() };
+
         Ok(MicCapture {
             engine,
             input,
@@ -156,6 +172,7 @@ impl InputDevice {
             writer,
             sample_rate,
             channels,
+            presentation_latency,
         })
     }
 }
@@ -171,6 +188,9 @@ pub struct MicCapture {
     writer: TrackWriter,
     sample_rate: u32,
     channels: u32,
+    /// Seconds of hardware latency AVAudioEngine reports for this input, captured at start.
+    /// Diagnostic only; see [`crate::latency`].
+    presentation_latency: f64,
 }
 
 impl MicCapture {
@@ -180,6 +200,11 @@ impl MicCapture {
 
     pub fn channels(&self) -> u32 {
         self.channels
+    }
+
+    /// What AVAudioEngine says this input's hardware latency is, in seconds.
+    pub fn presentation_latency(&self) -> f64 {
+        self.presentation_latency
     }
 
     /// Stops the engine and finalizes the WAV.
