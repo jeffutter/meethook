@@ -71,7 +71,7 @@ impl WhisperEngine {
     /// The GPU decision is taken here rather than at CLI entry because this is the exact call
     /// that crashes without a device, and because the CLI opens engines lazily -- a check at
     /// entry would fail a run that had nothing to transcribe, on a machine it was never going
-    /// to touch. See [`crate::gpu`] for why a missing device is an error rather than a silent
+    /// to touch. See the `gpu` module for why a missing device is an error rather than a silent
     /// CPU fallback.
     pub fn load(model_path: &Path) -> Result<WhisperEngine> {
         static HOOKS: Once = Once::new();

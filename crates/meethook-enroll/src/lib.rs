@@ -80,8 +80,8 @@ pub struct UnknownVoice<'a> {
     /// from someone who coughed once.
     pub speech_seconds: f64,
 
-    /// Up to [`SNIPPETS`] of what this voice said, whitespace-trimmed and cut to
-    /// [`SNIPPET_CHARS`] characters. Empty if the recogniser heard nothing over it.
+    /// Up to `SNIPPETS` of what this voice said, whitespace-trimmed and cut to
+    /// `SNIPPET_CHARS` characters. Empty if the recogniser heard nothing over it.
     pub snippets: Vec<&'a str>,
 
     /// The longest representative clip: 16 kHz mono, the same rate everything else in

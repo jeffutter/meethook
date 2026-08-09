@@ -89,7 +89,7 @@ pub enum Cleaning {
     Cancelled {
         /// How much later the mic track heard the far end than the speaker track recorded it,
         /// in samples. This is the measurement, not the shift: the reference is actually laid
-        /// down [`RENDER_HEADROOM`] samples ahead of it.
+        /// down `RENDER_HEADROOM` samples ahead of it.
         lag_samples: i64,
         /// How far the windows the lag was measured over disagreed. A wide spread on an
         /// accepted measurement means the delay drifted or the correlation was marginal.

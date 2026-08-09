@@ -133,7 +133,7 @@ impl Error {
 
 /// A configured, not-yet-running recorder.
 ///
-/// Construction demands an [`Authorized`] token, which only [`preflight`] can produce.
+/// Construction demands an [`Authorized`] token, which only [`preflight()`] can produce.
 /// That is what keeps "permissions are checked before anything is written to disk" a
 /// property of the type system rather than a convention a later edit can quietly break.
 ///

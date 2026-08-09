@@ -1,0 +1,70 @@
+# Git hooks for meethook. Entering the devShell runs `lefthook install`, so a fresh
+# clone is gated without a manual setup step.
+#
+# Every command here resolves `cargo`/`rustfmt`/`lefthook` from the devShell PATH. A
+# commit made from a shell where direnv is not active fails with command-not-found
+# rather than a lint error; that is accepted for this repo, which ships a committed
+# .envrc.
+#
+# backlog/config.yml keeps bypassGitHooks: true on purpose. `backlog task edit` auto-
+# commits task metadata on nearly every invocation, so running the Rust gates would add
+# minutes of latency to each CLI call and would fail outright whenever the working tree
+# is mid-edit. Those commits touch markdown only, so they have nothing for these gates
+# to check.
+
+pre-commit:
+  # rustfmt has to succeed, and restage, before clippy is worth running at all.
+  # `piped` only makes the commands sequential; lefthook still orders them by name
+  # unless `priority` says otherwise, so every command below is numbered.
+  piped: true
+  commands:
+    fmt:
+      priority: 1
+      glob: "*.rs"
+      # Bare rustfmt, not `cargo fmt`: `cargo fmt` formats whole crates no matter which
+      # paths it is handed, which would defeat pairing {staged_files} with stage_fixed.
+      # It also means Cargo.toml is not read, so the edition is spelled out here and
+      # must track `edition` in the workspace package table.
+      run: rustfmt --edition 2024 {staged_files}
+      stage_fixed: true
+    clippy:
+      priority: 2
+      # The glob is what keeps a markdown- or nix-only commit from paying for a clippy
+      # run. Note that clippy necessarily lints the working tree, not the staged
+      # snapshot: a partially staged file is checked in full. Accepted.
+      glob: "*.rs"
+      run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+
+pre-push:
+  # Cheapest gate first, and stop at the first failure, so a formatting slip does not
+  # cost a full test-and-doc build. `priority` is what fixes that order: `piped` alone
+  # would still run these by name, i.e. audit first and test last.
+  piped: true
+  commands:
+    fmt:
+      priority: 1
+      run: cargo fmt --all --check
+    clippy:
+      priority: 2
+      run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+    test:
+      priority: 3
+      run: cargo test --all-features --workspace
+    doc:
+      priority: 4
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+      run: cargo doc --no-deps --document-private-items --all-features --workspace
+    audit:
+      priority: 5
+      # Default DB location ($CARGO_HOME/advisory-db, fetched on each run) is deliberate.
+      # It does not work from an agent sandbox -- $CARGO_HOME is read-only there and the
+      # TLS interception breaks cargo-audit's fetch -- but a real `git push`, which is
+      # what actually fires this hook, runs outside that sandbox, as does any human
+      # shell. Pinning --db into ./target would not fix the sandbox case either (the
+      # fetch still fails) and would cost a per-repo copy of the advisory DB.
+      #
+      # So this step is kept rather than dropped, and a sandboxed run that wants the
+      # other four gates asks for that explicitly: LEFTHOOK_EXCLUDE=audit lefthook run
+      # pre-push.
+      run: cargo audit

@@ -77,7 +77,7 @@ pub const WHISPER_MODEL: ModelSpec = ModelSpec {
 /// speakers -- which is why the output's last dimension is 7 (silence, three singles, three
 /// pairs) rather than a speaker count.
 ///
-/// Graph contract, asserted in [`onnx`]'s smoke test:
+/// Graph contract, asserted in the `onnx` module's smoke test:
 /// input `input_values` f32 `[batch_size, num_channels, num_samples]`;
 /// output `logits` f32 `[batch_size, num_frames, 7]`.
 ///
@@ -102,7 +102,7 @@ pub const SEGMENTATION_MODEL: ModelSpec = ModelSpec {
 /// mel bins per frame -- and returns one 256-dimensional embedding per utterance, which is
 /// what clustering and enrollment compare.
 ///
-/// Graph contract, asserted in [`onnx`]'s smoke test:
+/// Graph contract, asserted in the `onnx` module's smoke test:
 /// input `feats` f32 `[B, T, 80]`; output `embs` f32 `[B, 256]`.
 pub const EMBEDDING_MODEL: ModelSpec = ModelSpec {
     file_name: "wespeaker-voxceleb-resnet34-LM.onnx",

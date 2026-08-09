@@ -48,7 +48,7 @@ use crate::{Error, Result};
 
 /// Silence spliced between two consecutive source files, in seconds.
 ///
-/// Written against [`MAX_GAP_IN_TURN_S`] rather than as a loose number, because the only
+/// Written against `MAX_GAP_IN_TURN_S` rather than as a loose number, because the only
 /// thing that matters about it is that it is comfortably the larger of the two: a shorter
 /// gap lets segmentation join the last turn of one file to the first turn of the next, and
 /// two different people merged into one turn produce an embedding of neither.
@@ -56,7 +56,7 @@ pub const SPLICE_GAP_S: f64 = MAX_GAP_IN_TURN_S * 2.0;
 
 /// How much digital silence `mic.wav` gets when the caller supplies no local track.
 ///
-/// One second rather than zero: below [`crate::asr`]'s minimum, whisper.cpp pads the buffer
+/// One second rather than zero: below the `asr` module's minimum, whisper.cpp pads the buffer
 /// itself, and a track that exists is the difference between a session `transcribe` reads and
 /// one it refuses. A silent mic against a real speaker track makes the echo-cancellation
 /// pre-pass find no measurable lag and write `mic.cleaned.wav` as a pass-through, which is

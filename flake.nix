@@ -64,7 +64,14 @@
         # which is how webrtc-audio-processing-sys finds the library at all.
         nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
 
-        packages = [ rustToolchain ];
+        # Developer tooling, not build inputs: neither is linked against nor invoked by
+        # any crate's build script, so `packages` is the right list for both.
+        #
+        # lefthook runs the gates in lefthook.yml; the shellHook below installs its git
+        # hooks, so entering the shell is the only setup step a fresh clone needs.
+        #
+        # cargo-audit backs the pre-push advisory scan.
+        packages = [ rustToolchain pkgs.lefthook pkgs.cargo-audit ];
 
         env = {
           # bindgen (via whisper-rs-sys) loads libclang at build time rather than linking
@@ -82,6 +89,11 @@
           # bindgen invokes libclang directly, outside the cc wrapper that would otherwise
           # supply the SDK, so the system headers have to be pointed at by hand.
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDKROOT"
+
+          # Rewrites .git/hooks/{pre-commit,pre-push} from lefthook.yml. It is idempotent,
+          # so it is unguarded and safe on every direnv reload; only its chatter is
+          # dropped, never its errors.
+          lefthook install > /dev/null
 
           echo "meethook devShell: $(rustc --version)"
         '';
