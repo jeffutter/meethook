@@ -343,6 +343,25 @@ impl AudioOutput {
         if frames == 0 {
             return;
         }
+        // This timestamp is internally consistent -- it stays linear in this stream's own
+        // sample count to under 0.1 ms over 35 s -- but it is NOT the moment the sound
+        // reached the air, and the gap is not recoverable from any API. Measured by click
+        // test across built-in, USB and Bluetooth outputs:
+        //
+        // - It runs ~16 ms ahead of the mic's timeline by a fixed amount that originates
+        //   inside ScreenCaptureKit. Driving the display between 72 Hz and 30 Hz moved it
+        //   0.63 ms against a predicted 19.44 ms, so it is not the video frame clock.
+        // - It excludes output latency entirely: swapping the output device moved the click
+        //   residual by 423 ms while this timestamp's behaviour was unchanged.
+        // - CoreAudio cannot supply that missing term. A probe reading device latency,
+        //   stream latency and safety offset reported 186.688 ms for a Bluetooth path
+        //   measured at ~426 ms. `AVAudioIONode.presentationLatency` is no better: it tracks
+        //   the OUTPUT device (1.542 ms on USB, 203.197 ms on Bluetooth, same USB mic).
+        //
+        // So do not "correct" this with a constant. Doing so would fix ~16 ms of an error
+        // that reached 410 ms while making `session.json` look authoritative. Acoustic
+        // alignment has to be measured from the signals, which the AEC stage does anyway.
+        // The CoreAudio probe was written, used to establish the above, and then removed.
         let host_ticks =
             clock::cmtime_to_host_ticks(unsafe { sample_buffer.presentation_time_stamp() });
 

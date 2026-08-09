@@ -21,7 +21,6 @@
 //! offset arithmetic is `transcribe`'s job.
 
 mod clock;
-mod latency;
 mod mic;
 mod preflight;
 mod speaker;
@@ -215,10 +214,6 @@ impl RunningSession {
             speaker,
         } = self;
 
-        // Read before the stop consumes the capture: an idle engine reports 0 rather than
-        // the hardware's figure.
-        let mic_presentation_latency = mic.presentation_latency();
-
         // Stop both before inspecting either result: returning early on a mic failure would
         // leave the speaker WAV unfinalized, which is a worse outcome than a late error.
         let mic_stop = mic.stop();
@@ -236,7 +231,7 @@ impl RunningSession {
             dir: paths.dir().to_path_buf(),
         })?;
 
-        report_first_buffer_timing(&mic_summary, &speaker_summary, mic_presentation_latency);
+        report_first_buffer_timing(&mic_summary, &speaker_summary);
 
         let metadata = SessionMetadata::new(
             id.clone(),
@@ -282,11 +277,7 @@ impl RunningSession {
 /// line through the first timestamp at the track's nominal rate. A track whose timestamps
 /// disagree with its own sample count has lost or gained audio, which corrupts alignment
 /// however good the first timestamp was.
-fn report_first_buffer_timing(
-    mic: &track::TrackSummary,
-    speaker: &track::TrackSummary,
-    mic_presentation_latency: f64,
-) {
+fn report_first_buffer_timing(mic: &track::TrackSummary, speaker: &track::TrackSummary) {
     if std::env::var_os("MEETHOOK_TIMING_DEBUG").is_none() {
         return;
     }
@@ -347,30 +338,9 @@ fn report_first_buffer_timing(
         // a calibration constant dressed up as a measurement.
     }
 
-    // The hardware's own account of the delays each timestamp may or may not already
-    // include. A path total close to the click test's constant residual identifies which
-    // API is compensating and which is not -- the difference between a principled,
-    // device-adaptive correction and a constant that only fits this Mac.
-    eprintln!(
-        "  AVAudioEngine input presentationLatency  {:.3} ms",
-        mic_presentation_latency * 1000.0
-    );
-    for (label, input, rate) in [
-        ("input ", true, mic.sample_rate),
-        ("output", false, speaker.sample_rate),
-    ] {
-        match latency::default_path(input) {
-            Some(p) => eprintln!(
-                "  CoreAudio default {label}  device={} stream={} safety={} frames  \
-                 total={:.3} ms @ {rate} Hz",
-                p.device_frames,
-                p.stream_frames,
-                p.safety_offset_frames,
-                p.total_millis(rate),
-            ),
-            None => eprintln!("  CoreAudio default {label}  no device / not reported"),
-        }
-    }
+    // Nor is any hardware latency printed. That probe existed and was removed: CoreAudio's
+    // figures proved unusable for this purpose (see `speaker.rs`), and a number on screen
+    // that nobody should subtract is worse than no number at all.
     eprintln!();
 }
 

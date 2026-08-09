@@ -161,10 +161,6 @@ impl InputDevice {
             return Err(Error::AudioEngine(e.localizedDescription().to_string()));
         }
 
-        // SAFETY: a plain property read on the live input node. Read after `start`, because
-        // before the engine runs the node reports 0 rather than the hardware's figure.
-        let presentation_latency = unsafe { input.presentationLatency() };
-
         Ok(MicCapture {
             engine,
             input,
@@ -172,7 +168,6 @@ impl InputDevice {
             writer,
             sample_rate,
             channels,
-            presentation_latency,
         })
     }
 }
@@ -188,9 +183,6 @@ pub struct MicCapture {
     writer: TrackWriter,
     sample_rate: u32,
     channels: u32,
-    /// Seconds of hardware latency AVAudioEngine reports for this input, captured at start.
-    /// Diagnostic only; see [`crate::latency`].
-    presentation_latency: f64,
 }
 
 impl MicCapture {
@@ -200,11 +192,6 @@ impl MicCapture {
 
     pub fn channels(&self) -> u32 {
         self.channels
-    }
-
-    /// What AVAudioEngine says this input's hardware latency is, in seconds.
-    pub fn presentation_latency(&self) -> f64 {
-        self.presentation_latency
     }
 
     /// Stops the engine and finalizes the WAV.
