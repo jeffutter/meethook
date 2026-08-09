@@ -3,7 +3,7 @@ id: doc-005
 title: 'Meethook v1 spec: local meeting recorder + transcriber'
 type: specification
 created_date: '2026-08-09 05:06'
-updated_date: '2026-08-09 13:27'
+updated_date: '2026-08-09 14:31'
 ---
 ## Problem Statement
 
@@ -109,8 +109,8 @@ Everything — ASR, diarization, speaker-ID, echo cancellation — runs in-proce
 - A separate command from `transcribe`, kept non-interactive-safe by design — `transcribe`'s batch nature means no interactive prompts live inside it at all; `enroll` is the only interactive surface in the whole system.
 - With no arguments, `enroll` scans all sessions with unresolved "Unknown" clusters as a work queue (an explicit session id, or ids, can optionally scope it to fewer sessions).
 - For each unresolved cluster: shows transcript text snippets and auto-plays the longest representative audio segment via `afplay` (the system binary already present on macOS — chosen over adding a new in-process Rust audio-playback crate, since this path isn't latency-sensitive), then prompts for a name or skip.
-- On naming: appends/updates the reference embedding in `~/meethook/speakers.json`, and rewrites that session's `transcript.json` and `transcript.md` in place with the new name — so the very session that surfaced the unknown speaker benefits immediately, not just future sessions.
-- Scope for v1 is first-time naming + matching only; rename/remove/re-enrollment-to-correct-drift is deferred (tracked in Not-yet-specified below). Multi-session `enroll` runs treat each session's unknown clusters independently — no cross-session deduplication of "this looks like the same unnamed person across two sessions."
+- On naming: appends/updates the reference embedding in `~/meethook/speakers.json`, and rewrites that session's `transcript.json` and `transcript.md` in place with the new name — so the very session that surfaced the unknown speaker benefits immediately, not just future sessions. A rewrite is defined as whatever `transcribe --force` would now produce, which is also applied to any *other* session the run reads: a transcript written before its speaker was enrolled would otherwise keep its `Unknown N` labels for good, since a session with nothing left to ask about is passed over on every later run. Files that already agree are left untouched, so a run that names nobody writes nothing.
+- Scope for v1 is first-time naming + matching only; rename/remove/re-enrollment-to-correct-drift is deferred (tracked in Not-yet-specified below). Multi-session `enroll` runs treat each session's *unknown* clusters independently — no cross-session deduplication of "this looks like the same unnamed person across two sessions." Once a person is named, though, later sessions in the same run identify them normally rather than asking again: the deduplication is enrollment itself.
 
 **Nix flake structure**
 - `devShell`-only flake — no `buildRustPackage`/`crane` flake packages, since this is a personal, non-distributed tool.
@@ -119,7 +119,7 @@ Everything — ASR, diarization, speaker-ID, echo cancellation — runs in-proce
 - ASR native deps: whisper-rs with the `metal` feature only.
 - Diarization/embedding native deps: nixpkgs' `onnxruntime` (built with the CoreML execution provider on Darwin by default) as a devShell build input, using `ort`'s `pkg-config` feature — `ort-sys` probes for the module named `libonnxruntime`, which is exactly what `onnxruntime.dev` ships, so the flake's copy is what gets linked. This sidesteps `ort`'s `download-binaries` path, which is not a default feature, so a missed probe surfaces as a link error rather than as a silently different runtime. (The `load-dynamic` feature and `ORT_DYLIB_PATH` env var this bullet originally named were deleted from `ort` after `2.0.0-rc.9` and no longer exist; `ORT_LIB_LOCATION` plus `ORT_PREFER_DYNAMIC_LINK` is the fallback if the probe ever needs overriding.)
 - AEC native deps: nixpkgs' `webrtc-audio-processing` (v2.1) plus `pkg-config` as devShell build inputs, matching the crate's default dynamic-link expectation.
-- Model weights are not part of the Nix closure: they're lazily fetched on first need (by `transcribe`/`enroll`) into `~/meethook/models/`, sha256-verified against hashes embedded in source, with an optional `HF_TOKEN` env var sent as a bandwidth-only bearer header (no gating logic is needed — every chosen model source is already publicly, ungated available).
+- Model weights are not part of the Nix closure: they're lazily fetched on first need (by `transcribe`; `enroll` needs no models, since it reuses the embeddings `transcribe` left in `speaker_clusters.json`) into `~/meethook/models/`, sha256-verified against hashes embedded in source, with an optional `HF_TOKEN` env var sent as a bandwidth-only bearer header (no gating logic is needed — every chosen model source is already publicly, ungated available).
 
 ## Testing Decisions
 
