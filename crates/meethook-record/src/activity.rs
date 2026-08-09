@@ -125,6 +125,16 @@ impl MicActivityWatcher {
         Ok((watcher, active))
     }
 
+    /// The predicate as of the last recomputation: is some other process capturing *now*?
+    ///
+    /// A level, not an edge -- the same value [`MicActivityWatcher::start`] returns. The
+    /// record loop needs it because a failed `Recorder::start` has to be retried while the
+    /// call is still up: the level is already true, so no further [`Activity::Started`] can
+    /// arrive until this call ends and a different one begins.
+    pub fn is_active(&self) -> bool {
+        self.lock().active
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         // A panic inside a listener block would otherwise poison the watcher permanently,
         // turning a one-off fault into a recorder that silently never triggers again.
@@ -222,7 +232,23 @@ impl State {
         )?;
         self.system.push(process_list);
 
-        self.attach_device_listener()?;
+        // A missing input device is not fatal here. The device listener is only a wake-up
+        // trigger -- the predicate is computed from process objects and does not read it --
+        // and `notified` already treats a device that goes away as a normal state to keep
+        // watching from. Launching meethook before the USB mic is plugged in should not end
+        // differently from unplugging it afterwards: the `DefaultInputDevice` notification
+        // attaches the listener as soon as a device appears.
+        //
+        // `Error::CoreAudio` stays fatal by contrast: a listener the HAL *refuses* means no
+        // trigger at all, and a recorder that silently never fires is this command's worst
+        // outcome.
+        match self.attach_device_listener() {
+            Ok(()) => {}
+            Err(e @ Error::NoInputDevice) => {
+                eprintln!("Warning: {e}. Watching anyway; a device selected later is picked up.");
+            }
+            Err(e) => return Err(e),
+        }
         self.sync_process_listeners();
 
         self.active = self.someone_else_is_capturing();

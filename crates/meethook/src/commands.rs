@@ -10,16 +10,39 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use meethook_models::ensure_model;
-use meethook_record::{Activity, MicActivityWatcher, Recorder, preflight};
+use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
 use meethook_session::{Paths, SessionId};
 use meethook_transcribe::{SpeechToText, WHISPER_MODEL, WhisperEngine, run_batch};
 
-/// How long microphone activity must stay stopped before a session is finalized.
+/// The three waits the record loop's behaviour depends on.
 ///
-/// Asymmetric with the start side, which has no debounce at all, on purpose: three seconds
-/// of extra tail audio is harmless, while a premature finalize loses the end of a meeting
-/// and a late start loses its opening.
-const STOP_GRACE: Duration = Duration::from_secs(3);
+/// Gathered into one value so the sequencing can be exercised at millisecond scale. The live
+/// figures would make the loop's tests take half a minute, and a slow test is one nobody
+/// runs.
+#[derive(Debug, Clone, Copy)]
+struct Timing {
+    /// How long microphone activity must stay stopped before a session is finalized.
+    ///
+    /// Asymmetric with the start side, which has no debounce at all, on purpose: three
+    /// seconds of extra tail audio is harmless, while a premature finalize loses the end of
+    /// a meeting and a late start loses its opening.
+    grace: Duration,
+    /// How long to wait between attempts at a session start that failed.
+    retry: Duration,
+    /// How many attempts one call gets before it is abandoned.
+    ///
+    /// Bounded because the failure may be permanent -- a revoked permission, a display that
+    /// has gone away -- and an unbounded retry would spin for the length of the meeting.
+    attempts: u32,
+}
+
+impl Timing {
+    const LIVE: Timing = Timing {
+        grace: Duration::from_secs(3),
+        retry: Duration::from_secs(2),
+        attempts: 5,
+    };
+}
 
 /// Anything the record loop waits on.
 ///
@@ -31,66 +54,33 @@ enum Event {
     Interrupt,
 }
 
-/// Records every call until the process is interrupted.
+/// What the record loop needs from a capture backend.
 ///
-/// Permissions are checked first and separately, so a missing TCC grant costs the user an
-/// error message rather than a silently unrecorded meeting.
-///
-/// The loop is deliberately forgiving of a failed session: a two-second false start that
-/// produces a silent track prints an error and goes back to watching. Ending a day of
-/// recording over one bad session would be a far worse failure than the session itself.
-pub fn record(paths: &Paths) -> Result<()> {
-    let authorized = preflight()?;
-    let recorder = Recorder::new(authorized)?;
-    let debug = std::env::var_os("MEETHOOK_ACTIVITY_DEBUG").is_some();
+/// The loop's whole responsibility is sequencing -- when to open a session, when to hold on
+/// through a blip, when to finalize, when to give up -- and none of that needs a microphone
+/// to decide. This two-method seam is what makes it decidable in `cargo test`: the live
+/// implementation drives a [`Recorder`], and the test one records the order it was called
+/// in. Everything either of them knows about audio stays on their side of it.
+trait Capture {
+    /// Begins a session and announces it.
+    fn start(&mut self) -> Result<()>;
+    /// Finalizes the current session and reports what it produced.
+    fn finish(&mut self) -> Result<()>;
+}
 
-    let (tx, rx) = mpsc::channel::<Event>();
+/// The live backend: one session at a time, plus the user-facing report of it.
+struct SessionCapture<'a> {
+    recorder: &'a Recorder,
+    paths: &'a Paths,
+    debug: bool,
+    running: Option<RunningSession>,
+}
 
-    // `ctrlc` runs its handler on a thread of its own rather than in signal context, so the
-    // finalize path below is free to allocate and do I/O. The handler itself only signals.
-    let interrupt_tx = tx.clone();
-    ctrlc::set_handler(move || {
-        let _ = interrupt_tx.send(Event::Interrupt);
-    })
-    .context("could not install the interrupt handler")?;
-
-    let activity_tx = tx.clone();
-    // Bound to the whole function: dropping the watcher removes its listeners, and a
-    // recorder that has stopped watching is the failure this command exists to prevent.
-    let (_watcher, mut already_active) = MicActivityWatcher::start(move |activity| {
-        let _ = activity_tx.send(match activity {
-            Activity::Started => Event::Started,
-            Activity::Stopped => Event::Stopped,
-        });
-    })?;
-
-    println!("Watching the default microphone. Press Ctrl-C to stop.");
-    if already_active {
-        println!("A microphone is already in use; recording immediately.");
-    }
-
-    loop {
-        // Idle. The already-active case skips the wait rather than holding out for an edge
-        // that happened before this process started.
-        if !already_active {
-            match rx.recv() {
-                Ok(Event::Started) => {}
-                Ok(Event::Stopped) => continue,
-                Ok(Event::Interrupt) | Err(_) => break,
-            }
-        }
-        already_active = false;
-
+impl Capture for SessionCapture<'_> {
+    fn start(&mut self) -> Result<()> {
         let started_at = Instant::now();
-        let session = match recorder.start(paths, &jiff::Zoned::now()) {
-            Ok(session) => session,
-            Err(e) => {
-                eprintln!("Could not start recording: {e}");
-                println!("Watching the default microphone. Press Ctrl-C to stop.");
-                continue;
-            }
-        };
-        if debug {
+        let session = self.recorder.start(self.paths, &jiff::Zoned::now())?;
+        if self.debug {
             // This latency sits directly on the "no debounce, a late start loses the
             // opening" path, so it is worth being able to see rather than assume.
             eprintln!(
@@ -111,9 +101,125 @@ pub fn record(paths: &Paths) -> Result<()> {
         println!("  speaker   {} Hz", session.speaker_sample_rate());
         println!("Recording... press Ctrl-C to stop.");
 
+        self.running = Some(session);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        // Nothing running is not an error. The loop only finishes a start it saw succeed, so
+        // defining the case away here is cheaper than a branch that can only ever be wrong.
+        let Some(session) = self.running.take() else {
+            return Ok(());
+        };
+        let recording = session.finish()?;
+        println!(
+            "Recorded {} ({:.1}s mic, {:.1}s speaker) to {}",
+            recording.id,
+            recording.mic.seconds(),
+            recording.speaker.seconds(),
+            recording.paths.dir().display()
+        );
+        Ok(())
+    }
+}
+
+/// Records every call until the process is interrupted.
+///
+/// Permissions are checked first and separately, so a missing TCC grant costs the user an
+/// error message rather than a silently unrecorded meeting.
+///
+/// The loop is deliberately forgiving of a failed session: a two-second false start that
+/// produces a silent track prints an error and goes back to watching. Ending a day of
+/// recording over one bad session would be a far worse failure than the session itself.
+///
+/// Everything past the setup lives in [`record_loop`], which is where the sequencing is and
+/// where it can be tested without a microphone.
+pub fn record(paths: &Paths) -> Result<()> {
+    let authorized = preflight()?;
+    let recorder = Recorder::new(authorized)?;
+    let debug = std::env::var_os("MEETHOOK_ACTIVITY_DEBUG").is_some();
+
+    let (tx, rx) = mpsc::channel::<Event>();
+
+    // `ctrlc` runs its handler on a thread of its own rather than in signal context, so the
+    // finalize path below is free to allocate and do I/O. The handler itself only signals.
+    let interrupt_tx = tx.clone();
+    ctrlc::set_handler(move || {
+        let _ = interrupt_tx.send(Event::Interrupt);
+    })
+    .context("could not install the interrupt handler")?;
+
+    let activity_tx = tx.clone();
+    // Bound to the whole function: dropping the watcher removes its listeners, and a
+    // recorder that has stopped watching is the failure this command exists to prevent.
+    let (watcher, already_active) = MicActivityWatcher::start(move |activity| {
+        let _ = activity_tx.send(match activity {
+            Activity::Started => Event::Started,
+            Activity::Stopped => Event::Stopped,
+        });
+    })?;
+
+    announce_watching();
+    if already_active {
+        println!("A microphone is already in use; recording immediately.");
+    }
+
+    let mut capture = SessionCapture {
+        recorder: &recorder,
+        paths,
+        debug,
+        running: None,
+    };
+    record_loop(
+        &rx,
+        &mut capture,
+        &|| watcher.is_active(),
+        already_active,
+        Timing::LIVE,
+    );
+
+    Ok(())
+}
+
+fn announce_watching() {
+    println!("Watching the default microphone. Press Ctrl-C to stop.");
+}
+
+/// Sequences one session per detected call until the process is interrupted.
+///
+/// `is_active` reports the activity *level* rather than an edge; see [`begin`] for the one
+/// place that needs it. `already_active` skips the first idle wait, because a call that was
+/// already in progress when this process started will not produce a start edge.
+fn record_loop(
+    rx: &Receiver<Event>,
+    capture: &mut dyn Capture,
+    is_active: &dyn Fn() -> bool,
+    already_active: bool,
+    timing: Timing,
+) {
+    let mut already_active = already_active;
+    loop {
+        if !already_active {
+            match rx.recv() {
+                Ok(Event::Started) => {}
+                Ok(Event::Stopped) => continue,
+                Ok(Event::Interrupt) | Err(_) => break,
+            }
+        }
+        already_active = false;
+
+        match begin(rx, capture, is_active, timing) {
+            Begin::Recording => {}
+            Begin::Abandoned => {
+                announce_watching();
+                continue;
+            }
+            Begin::Interrupted => break,
+        }
+
         let interrupted = loop {
             match rx.recv() {
-                Ok(Event::Stopped) => match await_end(&rx, STOP_GRACE) {
+                Ok(Event::Stopped) => match await_end(rx, timing.grace) {
                     Outcome::CallEnded => break false,
                     Outcome::Interrupted => break true,
                     Outcome::Continue => {}
@@ -126,24 +232,83 @@ pub fn record(paths: &Paths) -> Result<()> {
         };
         println!("Stopping...");
 
-        match session.finish() {
-            Ok(recording) => println!(
-                "Recorded {} ({:.1}s mic, {:.1}s speaker) to {}",
-                recording.id,
-                recording.mic.seconds(),
-                recording.speaker.seconds(),
-                recording.paths.dir().display()
-            ),
-            Err(e) => eprintln!("This session did not produce a usable recording: {e}"),
+        if let Err(e) = capture.finish() {
+            eprintln!("This session did not produce a usable recording: {e}");
         }
 
         if interrupted {
             break;
         }
-        println!("Watching the default microphone. Press Ctrl-C to stop.");
+        announce_watching();
+    }
+}
+
+/// How the attempt to open a session for the call that just started resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Begin {
+    /// A session is live and must be finalized.
+    Recording,
+    /// No session was opened: go back to watching.
+    Abandoned,
+    /// Ctrl-C arrived before a session existed: exit.
+    Interrupted,
+}
+
+/// Opens a session, retrying for as long as the call is still up.
+///
+/// The retry is driven by the *level*, not by edges, and that is the whole point. Capture
+/// can fail transiently -- a ScreenCaptureKit timeout, an input device caught mid-swap --
+/// and returning to the idle wait after one failure would cost the entire meeting: the
+/// microphone is still in use, so no further start edge can arrive until this call ends and
+/// a different one begins. One timeout two seconds into a 45-minute meeting would leave
+/// meethook watching an active microphone in silence for the rest of it.
+///
+/// Bounded, because a permanent failure should cost this call rather than the day, and the
+/// loop stays responsive to Ctrl-C and to the call ending throughout.
+fn begin(
+    rx: &Receiver<Event>,
+    capture: &mut dyn Capture,
+    is_active: &dyn Fn() -> bool,
+    timing: Timing,
+) -> Begin {
+    for attempt in 1..=timing.attempts {
+        match capture.start() {
+            Ok(()) => return Begin::Recording,
+            // Only the first failure is printed in full, and only the give-up line follows
+            // it: five copies of one message is noise to read past rather than information.
+            Err(e) if attempt == 1 => eprintln!("Could not start recording: {e:#}"),
+            Err(_) => {}
+        }
+
+        // Waiting on the channel rather than sleeping: the two things that should abandon
+        // the retry both arrive here, and a sleep would delay both by up to the retry
+        // interval.
+        match rx.recv_timeout(timing.retry) {
+            // The call ended while we were failing; there is nothing left to record.
+            Ok(Event::Stopped) => return Begin::Abandoned,
+            Ok(Event::Interrupt) => return Begin::Interrupted,
+            // Cannot normally arrive, since the level was already true. Retrying at once is
+            // the reading that loses the least if it does.
+            Ok(Event::Started) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                // The stop edge can also be missed outright -- the watcher recomputes from
+                // the world rather than from our expectations -- so the level is checked
+                // directly rather than inferred from the absence of a message.
+                if !is_active() {
+                    return Begin::Abandoned;
+                }
+            }
+            // Every sender is gone, so no edge can arrive again. Nothing is recording, so
+            // unlike the grace period there is nothing here worth finalizing.
+            Err(RecvTimeoutError::Disconnected) => return Begin::Interrupted,
+        }
     }
 
-    Ok(())
+    eprintln!(
+        "Giving up on this call after {} attempts; still watching.",
+        timing.attempts
+    );
+    Begin::Abandoned
 }
 
 /// What the grace period after a stop edge resolved to.
@@ -277,18 +442,20 @@ fn parse_session_ids(raw: &[String]) -> Result<Vec<SessionId>> {
     Ok(ids)
 }
 
-/// The grace-period state machine, exercised without a microphone.
+/// The record loop's sequencing, exercised without a microphone.
 ///
-/// This is where "a blip does not split a session" and "a mute does not end one" are
-/// decidable in an automated test: both reduce to activity resuming inside the grace
-/// window, and both must leave the session running.
+/// This is where "a blip does not split a session", "a mute does not end one", "two calls
+/// produce two sessions" and "Ctrl-C finalizes before it exits" are decidable in an
+/// automated test. What is *not* decidable here is whether the trigger fires at all against
+/// real hardware -- these tests feed the loop the edges a working watcher would produce, and
+/// prove only what it does with them.
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{Event, Outcome, await_end};
+    use super::{Capture, Event, Outcome, Timing, await_end, record_loop};
 
     /// Long enough that scheduling noise cannot be mistaken for a timeout, short enough
     /// that the suite stays fast.
@@ -367,5 +534,190 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Event>();
         drop(tx);
         assert_eq!(await_end(&rx, GRACE), Outcome::CallEnded);
+    }
+
+    /// Timing for the whole-loop tests below.
+    ///
+    /// `SETTLE` is what separates one call from the next: comfortably longer than `grace`,
+    /// so a gap the loop is meant to read as "the call ended" cannot be mistaken for
+    /// scheduling noise. `BLIP` is the opposite -- short enough that it must land inside the
+    /// grace window.
+    const LOOP_TIMING: Timing = Timing {
+        grace: Duration::from_millis(120),
+        retry: Duration::from_millis(30),
+        attempts: 3,
+    };
+    const SETTLE: Duration = Duration::from_millis(400);
+    const BLIP: Duration = Duration::from_millis(20);
+
+    /// A [`Capture`] that records the order it was called in.
+    ///
+    /// `start` is logged whether or not it succeeds, so the retry tests can count attempts
+    /// as well as sessions.
+    #[derive(Default)]
+    struct FakeCapture {
+        calls: Vec<&'static str>,
+        /// How many of the next starts should fail.
+        failing_starts: u32,
+    }
+
+    impl Capture for FakeCapture {
+        fn start(&mut self) -> super::Result<()> {
+            self.calls.push("start");
+            if self.failing_starts > 0 {
+                self.failing_starts -= 1;
+                anyhow::bail!("deliberate start failure");
+            }
+            Ok(())
+        }
+
+        fn finish(&mut self) -> super::Result<()> {
+            self.calls.push("finish");
+            Ok(())
+        }
+    }
+
+    /// Plays a script of events into a channel from its own thread.
+    ///
+    /// A script rather than pre-queued messages, because the loop's decisions are made of
+    /// *gaps*: a stop followed immediately by a queued start is a blip, and the same pair
+    /// separated by the grace period is two calls. Sending them all up front would collapse
+    /// every one of those distinctions.
+    ///
+    /// The returned `Sender` is kept alive by the caller on purpose: in the real loop the
+    /// original sender lives for the whole run, and a disconnect means something quite
+    /// different from "the script is finished".
+    fn script(events: Vec<(Duration, Event)>) -> (mpsc::Sender<Event>, mpsc::Receiver<Event>) {
+        let (tx, rx) = mpsc::channel::<Event>();
+        let feeder = tx.clone();
+        thread::spawn(move || {
+            for (delay, event) in events {
+                thread::sleep(delay);
+                if feeder.send(event).is_err() {
+                    return;
+                }
+            }
+        });
+        (tx, rx)
+    }
+
+    /// Two consecutive calls in one process lifetime are two separate sessions.
+    #[test]
+    fn two_calls_produce_two_sessions() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::Stopped),
+            (SETTLE, Event::Started),
+            (BLIP, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish", "start", "finish"]);
+    }
+
+    /// A device-state blip shorter than the grace period is one session, not two -- the same
+    /// shape a mute toggle would take if it produced edges at all.
+    #[test]
+    fn a_blip_inside_the_grace_period_does_not_split_the_session() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::Stopped),
+            (BLIP, Event::Started),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+    }
+
+    /// Ctrl-C mid-recording finalizes before it exits. The alternative is a truncated WAV
+    /// with no header and no `session.json`, which is unrecoverable audio.
+    #[test]
+    fn an_interrupt_while_recording_finalizes_first() {
+        let (_tx, rx) = script(vec![(BLIP, Event::Started), (BLIP, Event::Interrupt)]);
+
+        let mut capture = FakeCapture::default();
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+    }
+
+    /// A call already in progress at startup is recorded without waiting for an edge that
+    /// has already happened.
+    #[test]
+    fn an_already_active_microphone_records_without_a_start_edge() {
+        let (_tx, rx) = script(vec![(BLIP, Event::Stopped), (SETTLE, Event::Interrupt)]);
+
+        let mut capture = FakeCapture::default();
+        record_loop(&rx, &mut capture, &|| true, true, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+    }
+
+    /// The defect this retry exists for: a transient start failure must not cost the whole
+    /// meeting. No second start edge can arrive while the call is still up, so a loop that
+    /// went back to waiting for one would watch an active microphone in silence.
+    #[test]
+    fn a_transient_start_failure_still_records_the_call() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            failing_starts: 1,
+            ..FakeCapture::default()
+        };
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "start", "finish"]);
+    }
+
+    /// A start that keeps failing costs this call and nothing more: the retry is bounded,
+    /// and the loop is still watching when the next call arrives.
+    #[test]
+    fn a_permanent_start_failure_gives_up_without_ending_the_loop() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (SETTLE, Event::Stopped),
+            (BLIP, Event::Started),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            failing_starts: LOOP_TIMING.attempts,
+            ..FakeCapture::default()
+        };
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        let attempts = LOOP_TIMING.attempts as usize;
+        assert_eq!(capture.calls.len(), attempts + 2, "{:?}", capture.calls);
+        assert!(capture.calls[..attempts].iter().all(|c| *c == "start"));
+        assert_eq!(capture.calls[attempts..], ["start", "finish"]);
+    }
+
+    /// A call that ends while the start is still failing stops the retry, without waiting
+    /// for the remaining attempts and without opening a session for a call that is over.
+    #[test]
+    fn a_start_failure_stops_retrying_once_the_microphone_goes_idle() {
+        let (_tx, rx) = script(vec![(BLIP, Event::Started), (SETTLE, Event::Interrupt)]);
+
+        let mut capture = FakeCapture {
+            failing_starts: LOOP_TIMING.attempts,
+            ..FakeCapture::default()
+        };
+        // The level is false by the time the first retry is due: the stop edge was missed
+        // outright, which is exactly the case the level check is there to cover.
+        record_loop(&rx, &mut capture, &|| false, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start"]);
     }
 }
