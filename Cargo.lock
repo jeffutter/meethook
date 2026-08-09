@@ -631,6 +631,8 @@ dependencies = [
  "ort",
  "realfft",
  "rubato",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "webrtc-audio-processing",

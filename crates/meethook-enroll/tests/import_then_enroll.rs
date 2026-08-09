@@ -227,6 +227,18 @@ fn a_session_built_from_a_wav_file_transcribes_enrolls_and_stores_that_audio() {
         );
     }
 
+    // The other half of the same claim, and the one the trial-list runner rests on: the stored
+    // reference is element for element *one cluster's* embedding, copied rather than averaged
+    // or renormalized on the way through. `speaker-trials` takes an item's dominant cluster as
+    // that item's voice for exactly this reason -- if enrollment did anything else to the
+    // vector, the distances it measures would not be the distances identification decides on.
+    let clusters = SpeakerClusters::read(&paths.session(&session).speaker_clusters_json()).unwrap();
+    assert_eq!(clusters.clusters.len(), 1);
+    assert_eq!(
+        stored.speakers[0].embedding, clusters.clusters[0].embedding,
+        "enroll must store the cluster's own embedding, unmodified"
+    );
+
     // And the transcript is rewritten in that name, which is what a reader sees.
     let transcript = Transcript::read(&paths.session(&session).transcript_json()).unwrap();
     assert!(

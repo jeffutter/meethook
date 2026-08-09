@@ -24,6 +24,7 @@ mod merge;
 mod onnx;
 mod segmentation;
 mod speakers;
+mod trials;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -41,6 +42,7 @@ pub use merge::merge;
 pub use onnx::{Loaded, open_session};
 pub use segmentation::{LocalTurn, segment_speaker_track};
 pub use speakers::{Clustering, cluster_speaker_turns};
+pub use trials::{EqualError, Spread, Trial, TrialReport, ZeroFalseAccept, score_trials};
 
 use meethook_models::ModelSpec;
 use meethook_session::{

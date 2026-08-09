@@ -36,4 +36,14 @@ whisper-rs = { workspace = true }
 webrtc-audio-processing = { workspace = true }
 
 [dev-dependencies]
+# The `speaker-trials` example's `--embeddings` cache, and nothing else. The examples here
+# otherwise take no dependency the library does not, so that a diagnostic can never be the
+# reason a build breaks -- these two are the stated exception rather than a drift away from
+# that rule. A dev-dependency cannot affect the library build at all, and both crates are
+# already in this workspace's graph (meethook-session depends on them directly), so this adds
+# no crate to compile and nothing to download. The alternative -- a bespoke TSV to dodge the
+# dependency -- would put a hand-rolled float parser on the path of every number that tool
+# exists to produce.
+serde = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }

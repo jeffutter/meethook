@@ -276,30 +276,29 @@ struct Spread {
 
 /// Summarizes distances between turn pairs, or `None` when there are no pairs at all.
 ///
-/// `None` rather than zeroes, because a cluster holding one turn has no within-cluster
-/// distances and the min, median and max of an empty set do not exist. Callers print "no
-/// pairs"; a fabricated 0.000 would read as two identical turns.
+/// The arithmetic -- and with it the conventions that matter, that the median of an even count
+/// is the mean of the two middle values and that an empty population is `None` rather than
+/// zeroes or NaN -- belongs to [`meethook_transcribe::Spread`], which states and tests them in
+/// one place. `None` here still means what it always did: a cluster holding one turn has no
+/// within-cluster distances, callers print "no pairs", and a fabricated 0.000 would read as two
+/// identical turns.
 ///
-/// The median of an even count is the mean of the two middle values.
+/// What stays local is the pair of turn indices at each end, which a summary of bare numbers
+/// cannot carry and should not try to: they are what turns a distance into a clip somebody can
+/// play.
 fn spread(pairs: Vec<(usize, usize, f32)>) -> Option<Spread> {
     let mut pairs = pairs;
-    if pairs.is_empty() {
-        return None;
-    }
     pairs.sort_by(|a, b| a.2.total_cmp(&b.2));
 
-    let count = pairs.len();
-    let median = if count % 2 == 1 {
-        pairs[count / 2].2
-    } else {
-        (pairs[count / 2 - 1].2 + pairs[count / 2].2) / 2.0
-    };
-    let (first, last) = (pairs[0], pairs[count - 1]);
+    let distances: Vec<f32> = pairs.iter().map(|pair| pair.2).collect();
+    let summary = meethook_transcribe::Spread::of(&distances)?;
+
+    let (first, last) = (pairs[0], pairs[pairs.len() - 1]);
     Some(Spread {
-        count,
-        min: first.2,
-        median,
-        max: last.2,
+        count: summary.count,
+        min: summary.min,
+        median: summary.median,
+        max: summary.max,
         closest: (first.0, first.1),
         furthest: (last.0, last.1),
     })
