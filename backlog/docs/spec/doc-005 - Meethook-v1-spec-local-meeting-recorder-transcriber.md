@@ -3,7 +3,7 @@ id: doc-005
 title: 'Meethook v1 spec: local meeting recorder + transcriber'
 type: specification
 created_date: '2026-08-09 05:06'
-updated_date: '2026-08-09 13:07'
+updated_date: '2026-08-09 13:27'
 ---
 ## Problem Statement
 
@@ -102,7 +102,7 @@ Everything — ASR, diarization, speaker-ID, echo cancellation — runs in-proce
 - All turns (mic + speaker track) are merged by strict chronological sort on start time; there is no explicit cross-talk/overlap handling.
 - Mic-track turns are always labeled "You"; unmatched speaker-track clusters get stable per-session numbering ("Unknown 1", "Unknown 2", …) rather than one collapsed "Unknown" bucket.
 - Two output files, both written by `transcribe`: `transcript.json` (canonical) and `transcript.md` (derived, human-readable rendering — one line per turn, e.g. `**[00:12] You:** text`).
-- `transcript.json` schema: `{schema_version, session_id, turns: [{speaker, start, end, text, source_track, speaker_id_confidence}]}`. Timestamps are seconds-from-session-start. `speaker_id_confidence` is null for mic-track turns. `source_track` is kept as an explicit field even though it's currently derivable from `speaker == "You"`, so that assumption isn't silently baked into every consumer of the JSON.
+- `transcript.json` schema: `{schema_version, session_id, turns: [{speaker, start, end, text, source_track, speaker_id_confidence}]}`. Timestamps are seconds-from-session-start. `speaker_id_confidence` is the cosine similarity that matched a turn's speaker to their enrolled reference, and is null wherever no identity claim is being made: mic-track turns (the speaker is known by construction) and `Unknown N` turns (the label names nobody). `source_track` is kept as an explicit field even though it's currently derivable from `speaker == "You"`, so that assumption isn't silently baked into every consumer of the JSON.
 - WebVTT/SRT export is explicitly deferred (easy future JSON-to-VTT conversion using WebVTT's `<v Speaker>` voice tags) — no playback-sync use case exists in v1.
 
 **Speaker enrollment workflow (`meethook enroll`)**
