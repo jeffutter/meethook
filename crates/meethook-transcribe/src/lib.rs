@@ -16,6 +16,7 @@ mod asr;
 mod audio;
 mod diarize;
 mod fbank;
+mod gpu;
 mod identify;
 mod merge;
 mod onnx;
@@ -30,6 +31,7 @@ pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
+pub use gpu::NoMetalDevice;
 pub use identify::{Identification, identify_clusters};
 pub use merge::merge;
 pub use onnx::{Loaded, open_session};
@@ -111,6 +113,12 @@ pub enum Error {
     #[error(transparent)]
     Session(#[from] meethook_session::Error),
 
+    /// `transparent` rather than `"{0}"`, matching `meethook_record::Error::Permissions`:
+    /// the latter makes `anyhow` print this long, multi-line message twice -- once as the
+    /// error and once as its own cause.
+    #[error(transparent)]
+    NoMetalDevice(#[from] NoMetalDevice),
+
     #[error("could not read {path} as audio: {source}")]
     Wav {
         path: PathBuf,
@@ -157,7 +165,11 @@ pub enum Error {
         source: Box<ort::Error>,
     },
 
-    #[error("could not load the speech recognition model: {source}")]
+    /// No `{source}` in the message even though one is attached: `anyhow` already prints the
+    /// cause under "Caused by", and interpolating it here as well prints it twice. Harmless
+    /// for a one-line ort failure, unreadable for the several-line [`NoMetalDevice`] one that
+    /// also arrives through here.
+    #[error("could not load the speech recognition model")]
     Engine {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,

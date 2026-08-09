@@ -6,6 +6,7 @@ use std::sync::Once;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::audio::TARGET_RATE;
+use crate::gpu;
 use crate::{Error, Result};
 
 /// One stretch of recognized speech, timed from the start of the audio that was handed to
@@ -56,6 +57,7 @@ const BLANK_AUDIO: &str = "[BLANK_AUDIO]";
 pub struct WhisperEngine {
     context: WhisperContext,
     threads: i32,
+    accelerated: bool,
 }
 
 impl WhisperEngine {
@@ -65,17 +67,29 @@ impl WhisperEngine {
     /// `WhisperContextParameters::use_gpu` default to true. That default is asserted rather
     /// than set: if the feature is ever dropped, this fails loudly at startup instead of
     /// quietly transcribing on the CPU at a fraction of the speed.
+    ///
+    /// The GPU decision is taken here rather than at CLI entry because this is the exact call
+    /// that crashes without a device, and because the CLI opens engines lazily -- a check at
+    /// entry would fail a run that had nothing to transcribe, on a machine it was never going
+    /// to touch. See [`crate::gpu`] for why a missing device is an error rather than a silent
+    /// CPU fallback.
     pub fn load(model_path: &Path) -> Result<WhisperEngine> {
         static HOOKS: Once = Once::new();
         // Without this, ggml and whisper.cpp write their own progress and load messages
         // straight to stderr, interleaved with the CLI's output.
         HOOKS.call_once(whisper_rs::install_logging_hooks);
 
-        let params = WhisperContextParameters::default();
+        let mut params = WhisperContextParameters::default();
         assert!(
             params.use_gpu,
             "whisper-rs was built without a GPU backend; the `metal` feature is required"
         );
+        // Must happen before `new_with_params`. Loading with `use_gpu` still set on a process
+        // that cannot reach a device gets as far as ggml's Metal allocator, which does not
+        // null-check a failed allocation and dies with SIGSEGV -- not something a `?` further
+        // down could have caught.
+        let accelerated = gpu::use_gpu()?;
+        params.use_gpu(accelerated);
 
         let context =
             WhisperContext::new_with_params(model_path, params).map_err(|e| Error::Asr {
@@ -87,7 +101,20 @@ impl WhisperEngine {
             .unwrap_or(4)
             .min(MAX_THREADS) as i32;
 
-        Ok(WhisperEngine { context, threads })
+        Ok(WhisperEngine {
+            context,
+            threads,
+            accelerated,
+        })
+    }
+
+    /// False when recognition is running on the CPU because `MEETHOOK_CPU` asked it to.
+    ///
+    /// Mirrors [`crate::OnnxDiarizer::accelerated`], for the same reason and with the same
+    /// rule: a CPU run is correct and many times slower, and reporting is the caller's job,
+    /// so loading prints on no path at all.
+    pub fn accelerated(&self) -> bool {
+        self.accelerated
     }
 }
 

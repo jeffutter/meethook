@@ -96,4 +96,10 @@ objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
 objc2-core-media = "0.3"
 objc2-foundation = "0.3"
+# Only for `MTLCreateSystemDefaultDevice`, the pre-flight probe in meethook-transcribe::gpu.
+# `default-features = false` is load-bearing: the default feature set is an enormous list
+# covering all of Metal. `MTLDevice` alone is exactly what objc2-core-graphics already
+# depends on -- same version, same single feature -- and that is already in the tree via
+# meethook-record, so this line adds no crates and no extra compilation.
+objc2-metal = { version = "0.3", default-features = false, features = ["MTLDevice"] }
 objc2-screen-capture-kit = "0.3"

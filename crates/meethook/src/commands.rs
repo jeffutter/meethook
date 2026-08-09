@@ -379,8 +379,18 @@ pub fn transcribe(paths: &Paths, session_ids: &[String], force: bool) -> Result<
                 eprintln!("Note: CoreML declined these graphs; diarization is running on CPU.");
             }
 
+            let asr = WhisperEngine::load(&whisper)?;
+            if !asr.accelerated() {
+                // Only reachable via MEETHOOK_CPU, so this confirms an explicit choice rather
+                // than reporting a surprise -- and says out loud what that choice costs.
+                eprintln!(
+                    "Note: MEETHOOK_CPU is set; speech recognition is running on the CPU and \
+                     will be much slower."
+                );
+            }
+
             Ok(Engines {
-                asr: Box::new(WhisperEngine::load(&whisper)?),
+                asr: Box::new(asr),
                 diarizer: Box::new(diarizer),
             })
         };

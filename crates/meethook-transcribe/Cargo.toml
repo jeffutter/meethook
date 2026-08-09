@@ -11,6 +11,9 @@ meethook-models = { workspace = true }
 meethook-session = { workspace = true }
 
 hound = { workspace = true }
+# Solely for `MTLCreateSystemDefaultDevice`, the pre-flight device probe in `gpu`, without
+# which whisper.cpp's Metal path segfaults instead of failing.
+objc2-metal = { workspace = true }
 # A normal dependency, not a dev one: the diarization and speaker-embedding graphs run on
 # the real transcribe path.
 ort = { workspace = true }

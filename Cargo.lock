@@ -627,6 +627,7 @@ dependencies = [
  "jiff",
  "meethook-models",
  "meethook-session",
+ "objc2-metal",
  "ort",
  "realfft",
  "rubato",
