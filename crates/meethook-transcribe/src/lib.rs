@@ -13,6 +13,7 @@ mod align;
 mod asr;
 mod audio;
 mod onnx;
+mod segmentation;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,8 +21,9 @@ use std::path::PathBuf;
 pub use aec::{Cleaned, Cleaning, PassThrough, cancel_bleed};
 pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
-pub use audio::TARGET_RATE;
+pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use onnx::{Loaded, open_session};
+pub use segmentation::{LocalTurn, segment_speaker_track};
 
 use meethook_models::ModelSpec;
 use meethook_session::{
@@ -125,6 +127,12 @@ pub enum Error {
         numer: u32,
         denom: u32,
     },
+
+    /// Everything that can go wrong once the segmentation graph is already loaded:
+    /// inference itself, and an output that does not match the shape the decoder reads.
+    /// Loading is [`Error::Onnx`].
+    #[error("speaker segmentation failed: {0}")]
+    Segmentation(String),
 
     #[error("could not load the ONNX model at {path}: {source}")]
     Onnx {
