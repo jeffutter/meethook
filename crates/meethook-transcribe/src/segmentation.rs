@@ -94,7 +94,7 @@ const POWERSET: [&[usize]; 7] = [
 /// Turns shorter than this are *not* dropped. Deciding that a 30 ms fleck is too short to
 /// be worth a voice fingerprint is a judgement about embeddings, and it belongs to the code
 /// that computes them, not to the code that reports what the model said.
-const MAX_GAP_IN_TURN_S: f64 = 0.25;
+pub(crate) const MAX_GAP_IN_TURN_S: f64 = 0.25;
 
 /// Runs the segmentation model across a whole track and returns its speech turns.
 ///

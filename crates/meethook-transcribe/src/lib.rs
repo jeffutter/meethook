@@ -18,6 +18,7 @@ mod diarize;
 mod fbank;
 mod gpu;
 mod identify;
+mod import;
 mod levels;
 mod merge;
 mod onnx;
@@ -34,6 +35,7 @@ pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
 pub use gpu::NoMetalDevice;
 pub use identify::{IDENTIFY_DISTANCE, Identification, identify_clusters};
+pub use import::{BuiltSession, ImportedSource, MIC_SILENCE_S, SPLICE_GAP_S, build_session};
 pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
 pub use merge::merge;
 pub use onnx::{Loaded, open_session};
@@ -130,6 +132,13 @@ pub enum Error {
 
     #[error("{path} is not a track this tool can read: {detail}")]
     UnsupportedAudio { path: PathBuf, detail: String },
+
+    /// Audio that cannot produce a turn, a cluster or an embedding: a wav whose data chunk
+    /// holds nothing, or no source files at all. Raised by [`build_session`] rather than
+    /// tolerated, because a session assembled from it would be indistinguishable from a
+    /// successful recording in which nobody spoke.
+    #[error("cannot build a session: {detail}")]
+    NoAudio { detail: String },
 
     #[error("resampling failed: {0}")]
     Resample(String),
@@ -432,7 +441,7 @@ fn clean_mic_track(
 
     let cleaned = aec::cancel_bleed(&mic, speaker, mic_minus_speaker_s);
     writeln!(progress, "{}  {}", session.id, cleaned.cleaning)?;
-    aec::write_cleaned_track(&session.paths.mic_cleaned_wav(), &cleaned.audio)?;
+    audio::write_track_16k_mono(&session.paths.mic_cleaned_wav(), &cleaned.audio)?;
 
     Ok(cleaned.audio)
 }
@@ -736,8 +745,8 @@ mod tests {
         let id = SessionId::parse(id).unwrap();
         let session_paths = paths.session(&id);
         std::fs::create_dir_all(session_paths.dir()).unwrap();
-        aec::write_cleaned_track(&session_paths.mic_wav(), &mic).unwrap();
-        aec::write_cleaned_track(&session_paths.speaker_wav(), &speaker).unwrap();
+        audio::write_track_16k_mono(&session_paths.mic_wav(), &mic).unwrap();
+        audio::write_track_16k_mono(&session_paths.speaker_wav(), &speaker).unwrap();
         metadata(&id, 900_000_000_000, 900_000_000_000)
             .write(&session_paths.session_json())
             .unwrap();

@@ -31,13 +31,10 @@
 //! timestamp. Shifting the mic to meet the reference would silently skew every timestamp in
 //! the transcript, so the measured lag is applied to the reference instead.
 
-use meethook_session::write_atomic_with;
-use std::path::Path;
 use webrtc_audio_processing::{Config, Processor, config::EchoCanceller};
 
 use crate::align::{self, Alignment, NotMeasurable};
 use crate::audio::TARGET_RATE;
-use crate::{Error, Result};
 
 /// AEC3's frame size is fixed at 10 ms, and feeding it any other length is a panic rather
 /// than an error, so the 16 kHz frame size is pinned here rather than left to be discovered
@@ -196,32 +193,6 @@ pub fn cancel_bleed(mic_16k: &[f32], speaker_16k: &[f32], metadata_offset_s: f64
             erle_db,
         },
     }
-}
-
-/// Writes 16 kHz mono float audio to `path`, all or nothing.
-///
-/// Atomic for the same reason `session.json` is: a half-written cleaned track that ASR then
-/// reads is a corrupt transcript that looks like a model failure.
-pub fn write_cleaned_track(path: &Path, audio: &[f32]) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: TARGET_RATE,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-
-    write_atomic_with(path, |file| {
-        // Buffered: hound writes each sample straight through, and an hour of audio is 57
-        // million of them.
-        let mut writer = hound::WavWriter::new(std::io::BufWriter::new(file), spec)
-            .map_err(|e| Error::wav(path, e))?;
-        for sample in audio {
-            writer
-                .write_sample(*sample)
-                .map_err(|e| Error::wav(path, e))?;
-        }
-        writer.finalize().map_err(|e| Error::wav(path, e))
-    })
 }
 
 /// The mic track unchanged, with the reason recorded.
@@ -692,19 +663,5 @@ mod tests {
         // Shifted clean off either end.
         assert_eq!(shift_reference(&speaker, 99, 4), vec![0.0; 4]);
         assert_eq!(shift_reference(&speaker, -99, 4), vec![0.0; 4]);
-    }
-
-    #[test]
-    fn a_cleaned_track_round_trips_through_the_wav_writer_at_16_khz() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mic.cleaned.wav");
-        let audio = voice_band(5, RATE + 37);
-
-        write_cleaned_track(&path, &audio).unwrap();
-
-        let reader = hound::WavReader::open(&path).unwrap();
-        assert_eq!(reader.spec().sample_rate, TARGET_RATE);
-        assert_eq!(reader.spec().channels, 1);
-        assert_eq!(crate::audio::read_track_16k_mono(&path).unwrap(), audio);
     }
 }

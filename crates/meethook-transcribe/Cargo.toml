@@ -11,6 +11,10 @@ meethook-models = { workspace = true }
 meethook-session = { workspace = true }
 
 hound = { workspace = true }
+# For the session directories `import` builds: `create_session_dir` takes a `Zoned` and
+# `SessionMetadata` a `Timestamp`. A normal dependency rather than a dev one since that path
+# is compiled into the library.
+jiff = { workspace = true }
 # Solely for `MTLCreateSystemDefaultDevice`, the pre-flight device probe in `gpu`, without
 # which whisper.cpp's Metal path segfaults instead of failing.
 objc2-metal = { workspace = true }
@@ -32,5 +36,4 @@ whisper-rs = { workspace = true }
 webrtc-audio-processing = { workspace = true }
 
 [dev-dependencies]
-jiff = { workspace = true }
 tempfile = { workspace = true }

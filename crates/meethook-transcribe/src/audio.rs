@@ -7,13 +7,25 @@
 
 use std::path::Path;
 
-use hound::{SampleFormat, WavReader};
+use hound::{SampleFormat, WavReader, WavSpec};
+use meethook_session::write_atomic_with;
 use rubato::{FftFixedIn, Resampler};
 
 use crate::{Error, Result};
 
 /// The sample rate whisper.cpp requires. Not configurable: it is a property of the model.
 pub const TARGET_RATE: u32 = 16_000;
+
+/// The header on every track meethook writes for itself.
+///
+/// One spelling, because a track written at a different rate or width than
+/// [`read_track_16k_mono`] insists on would be rejected by the very next thing to open it.
+const TRACK_SPEC: WavSpec = WavSpec {
+    channels: 1,
+    sample_rate: TARGET_RATE,
+    bits_per_sample: 32,
+    sample_format: SampleFormat::Float,
+};
 
 /// Input frames handed to the resampler at a time.
 ///
@@ -56,63 +68,143 @@ pub fn read_track_16k_mono(path: &Path) -> Result<Vec<f32>> {
         return Ok(samples);
     }
 
-    resample_to_target(reader, path, spec.sample_rate, frames)
+    let mut resample = Resample::new(spec.sample_rate, frames)?;
+    for sample in reader.into_samples::<f32>() {
+        resample.push(sample.map_err(|e| Error::wav(path, e))?)?;
+    }
+    resample.finish()
 }
 
-fn resample_to_target(
-    reader: WavReader<std::io::BufReader<std::fs::File>>,
-    path: &Path,
-    source_rate: u32,
-    frames: usize,
-) -> Result<Vec<f32>> {
-    let mut resampler = FftFixedIn::<f32>::new(
-        source_rate as usize,
-        TARGET_RATE as usize,
-        CHUNK_FRAMES,
-        SUB_CHUNKS,
-        1,
-    )
-    .map_err(|e| Error::Resample(e.to_string()))?;
+/// Converts audio already held in memory to [`TARGET_RATE`].
+///
+/// The in-memory twin of the loop in [`read_track_16k_mono`], for callers whose samples did
+/// not come from a file this crate is willing to open -- see [`crate::import`]. Both go
+/// through [`Resample`], so the filter length and the delay compensation are decided once.
+pub(crate) fn resample_to_target(samples: &[f32], source_rate: u32) -> Result<Vec<f32>> {
+    if source_rate == TARGET_RATE {
+        return Ok(samples.to_vec());
+    }
 
-    // The filter is linear-phase, so its output lags its input by a known, constant number
-    // of frames. Dropping exactly that many leading output frames keeps the resampled track
-    // aligned with the original rather than uniformly late.
-    let delay = resampler.output_delay();
-    let expected = (frames as u128 * u128::from(TARGET_RATE) / u128::from(source_rate)) as usize;
+    let mut resample = Resample::new(source_rate, samples.len())?;
+    for sample in samples {
+        resample.push(*sample)?;
+    }
+    resample.finish()
+}
 
-    let mut out: Vec<f32> = Vec::with_capacity(expected + delay + CHUNK_FRAMES);
-    let mut chunk: Vec<f32> = Vec::with_capacity(CHUNK_FRAMES);
-
-    for sample in reader.into_samples::<f32>() {
-        chunk.push(sample.map_err(|e| Error::wav(path, e))?);
-        if chunk.len() == CHUNK_FRAMES {
-            let produced = resampler
-                .process(&[&chunk], None)
-                .map_err(|e| Error::Resample(e.to_string()))?;
-            out.extend_from_slice(&produced[0]);
-            chunk.clear();
+/// Writes a track in the one format everything downstream reads: 16 kHz mono float,
+/// atomically.
+///
+/// Atomic because every one of these files is something another command classifies a session
+/// by; a reader must see a whole track or no file, never a truncated one.
+pub(crate) fn write_track_16k_mono(path: &Path, audio: &[f32]) -> Result<()> {
+    write_atomic_with(path, |file| {
+        // Buffered: hound writes each sample straight through, and an hour of audio is 57
+        // million of them.
+        let mut writer = hound::WavWriter::new(std::io::BufWriter::new(file), TRACK_SPEC)
+            .map_err(|e| Error::wav(path, e))?;
+        for sample in audio {
+            writer
+                .write_sample(*sample)
+                .map_err(|e| Error::wav(path, e))?;
         }
+        writer.finalize().map_err(|e| Error::wav(path, e))
+    })
+}
+
+/// A fixed-ratio conversion to [`TARGET_RATE`], fed one sample at a time.
+///
+/// Push-shaped rather than slice-shaped because the caller that matters is reading a file:
+/// holding an hour of 48 kHz audio *and* its 16 kHz result at once costs ~900 MB, which is
+/// the whole reason the read loop above is streaming.
+struct Resample {
+    resampler: FftFixedIn<f32>,
+    /// Input frames still waiting for a full [`CHUNK_FRAMES`] to hand the resampler.
+    chunk: Vec<f32>,
+    out: Vec<f32>,
+    /// Leading output frames belonging to the filter's own group delay.
+    delay: usize,
+    /// How many output frames the conversion should yield once that delay is dropped.
+    expected: usize,
+    pushed: usize,
+}
+
+impl Resample {
+    /// `frames` is the input length, used to size the output exactly. It is a promise about
+    /// how much will be pushed, not a limit: pushing fewer simply yields a shorter track.
+    fn new(source_rate: u32, frames: usize) -> Result<Self> {
+        // Checked here rather than left to rubato, both because a rate of zero would divide
+        // by zero below and because "a header claiming 0 Hz" is a diagnosis, where a
+        // resampler-internal message would not be.
+        if source_rate == 0 {
+            return Err(Error::Resample(
+                "the file's header reports a sample rate of 0".to_string(),
+            ));
+        }
+
+        let resampler = FftFixedIn::<f32>::new(
+            source_rate as usize,
+            TARGET_RATE as usize,
+            CHUNK_FRAMES,
+            SUB_CHUNKS,
+            1,
+        )
+        .map_err(|e| Error::Resample(e.to_string()))?;
+
+        // The filter is linear-phase, so its output lags its input by a known, constant
+        // number of frames. Dropping exactly that many leading output frames keeps the
+        // resampled track aligned with the original rather than uniformly late.
+        let delay = resampler.output_delay();
+        let expected =
+            (frames as u128 * u128::from(TARGET_RATE) / u128::from(source_rate)) as usize;
+
+        Ok(Resample {
+            resampler,
+            chunk: Vec::with_capacity(CHUNK_FRAMES),
+            out: Vec::with_capacity(expected + delay + CHUNK_FRAMES),
+            delay,
+            expected,
+            pushed: 0,
+        })
     }
 
-    if !chunk.is_empty() {
-        let produced = resampler
-            .process_partial(Some(&[&chunk]), None)
-            .map_err(|e| Error::Resample(e.to_string()))?;
-        out.extend_from_slice(&produced[0]);
+    fn push(&mut self, sample: f32) -> Result<()> {
+        self.pushed += 1;
+        self.chunk.push(sample);
+        if self.chunk.len() == CHUNK_FRAMES {
+            let produced = self
+                .resampler
+                .process(&[&self.chunk], None)
+                .map_err(|e| Error::Resample(e.to_string()))?;
+            self.out.extend_from_slice(&produced[0]);
+            self.chunk.clear();
+        }
+        Ok(())
     }
 
-    // One flush of silence pushes the samples still inside the filter out, so the last
-    // fraction of a second of speech is not lost to the resampler's own latency.
-    if frames > 0 {
-        let flushed = resampler
-            .process_partial::<Vec<f32>>(None, None)
-            .map_err(|e| Error::Resample(e.to_string()))?;
-        out.extend_from_slice(&flushed[0]);
-    }
+    fn finish(mut self) -> Result<Vec<f32>> {
+        if !self.chunk.is_empty() {
+            let produced = self
+                .resampler
+                .process_partial(Some(&[&self.chunk]), None)
+                .map_err(|e| Error::Resample(e.to_string()))?;
+            self.out.extend_from_slice(&produced[0]);
+        }
 
-    out.drain(..delay.min(out.len()));
-    out.truncate(expected);
-    Ok(out)
+        // One flush of silence pushes the samples still inside the filter out, so the last
+        // fraction of a second of speech is not lost to the resampler's own latency.
+        if self.pushed > 0 {
+            let flushed = self
+                .resampler
+                .process_partial::<Vec<f32>>(None, None)
+                .map_err(|e| Error::Resample(e.to_string()))?;
+            self.out.extend_from_slice(&flushed[0]);
+        }
+
+        self.out.drain(..self.delay.min(self.out.len()));
+        self.out.truncate(self.expected);
+        Ok(self.out)
+    }
 }
 
 #[cfg(test)]
@@ -221,5 +313,39 @@ mod tests {
         let err = read_track_16k_mono(&path).unwrap_err().to_string();
         assert!(err.contains("2 channel(s)"), "{err}");
         assert!(err.contains("16-bit"), "{err}");
+    }
+
+    /// The writer and the reader agree, which is the only thing [`TRACK_SPEC`] exists to
+    /// guarantee: every track this crate writes is one the strict reader will open again.
+    #[test]
+    fn a_written_track_reads_back_sample_for_sample_through_the_strict_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mic.cleaned.wav");
+        let samples = tone(16_000, 0.5, 440.0);
+
+        write_track_16k_mono(&path, &samples).unwrap();
+
+        assert_eq!(read_track_16k_mono(&path).unwrap(), samples);
+    }
+
+    /// The in-memory conversion is the file one, so audio imported from a foreign wav is the
+    /// same audio it would have been had the recorder captured it at that rate.
+    #[test]
+    fn resampling_in_memory_agrees_with_resampling_from_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mic.wav");
+        let samples = tone(48_000, 1.0, 440.0);
+        write_wav(&path, 48_000, &samples);
+
+        assert_eq!(
+            resample_to_target(&samples, 48_000).unwrap(),
+            read_track_16k_mono(&path).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_header_claiming_no_sample_rate_is_refused_rather_than_divided_by() {
+        let err = resample_to_target(&[0.1; 64], 0).unwrap_err().to_string();
+        assert!(err.contains("sample rate of 0"), "{err}");
     }
 }
