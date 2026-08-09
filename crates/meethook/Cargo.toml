@@ -11,8 +11,10 @@ name = "meethook"
 path = "src/main.rs"
 
 [dependencies]
+meethook-record = { workspace = true }
 meethook-session = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }
+ctrlc = { workspace = true }
 jiff = { workspace = true }

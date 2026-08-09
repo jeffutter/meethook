@@ -1,14 +1,58 @@
 //! Subcommand bodies.
 //!
-//! `record` and `enroll` are stubs in this slice; `transcribe` already does the real
-//! discovery work, which is what makes the session contract observable from the CLI rather
-//! than only from tests.
+//! `enroll` is a stub in this slice; `record` captures for real, and `transcribe` already
+//! does the real discovery work, which is what makes the session contract observable from
+//! the CLI rather than only from tests.
 
-use anyhow::{Result, bail};
+use std::sync::mpsc;
+
+use anyhow::{Context, Result, bail};
+use meethook_record::{Recorder, preflight};
 use meethook_session::{Paths, SessionId, discover_sessions};
 
-pub fn record(_paths: &Paths) -> Result<()> {
-    println!("meethook record: not implemented in this slice.");
+/// Records one session, from launch until the process is interrupted.
+///
+/// Permissions are checked first and separately, so a missing TCC grant costs the user an
+/// error message rather than a silently unrecorded meeting.
+pub fn record(paths: &Paths) -> Result<()> {
+    let authorized = preflight()?;
+    let recorder = Recorder::new(authorized)?;
+
+    // `ctrlc` runs its handler on a thread of its own rather than in signal context, so the
+    // finalize path below is free to allocate and do I/O. The handler itself only signals.
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    ctrlc::set_handler(move || {
+        let _ = stop_tx.send(());
+    })
+    .context("could not install the interrupt handler")?;
+
+    let session = recorder.start(paths, &jiff::Zoned::now())?;
+
+    // Printing both rates proves both engines actually came up; a user who sees only one
+    // line knows something is wrong before the meeting rather than after it.
+    println!("Session {}", session.id());
+    println!("  {}", session.paths().dir().display());
+    println!(
+        "  mic       {} Hz, {} channel(s) reported by the input device",
+        session.mic_sample_rate(),
+        session.mic_channels()
+    );
+    println!("  speaker   {} Hz", session.speaker_sample_rate());
+    println!("Recording... press Ctrl-C to stop.");
+
+    // A dropped sender would mean the handler is gone, which should not happen; treating it
+    // as a stop is the safe interpretation either way.
+    let _ = stop_rx.recv();
+    println!("Stopping...");
+
+    let recording = session.finish()?;
+    println!(
+        "Recorded {} ({:.1}s mic, {:.1}s speaker) to {}",
+        recording.id,
+        recording.mic.seconds(),
+        recording.speaker.seconds(),
+        recording.paths.dir().display()
+    );
     Ok(())
 }
 
