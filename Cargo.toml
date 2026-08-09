@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "crates/meethook",
+  "crates/meethook-enroll",
   "crates/meethook-models",
   "crates/meethook-record",
   "crates/meethook-session",
@@ -14,6 +15,7 @@ rust-version = "1.85"
 publish = false
 
 [workspace.dependencies]
+meethook-enroll = { path = "crates/meethook-enroll" }
 meethook-models = { path = "crates/meethook-models" }
 meethook-record = { path = "crates/meethook-record" }
 meethook-session = { path = "crates/meethook-session" }

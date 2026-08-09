@@ -553,10 +553,23 @@ dependencies = [
  "clap",
  "ctrlc",
  "jiff",
+ "meethook-enroll",
  "meethook-models",
  "meethook-record",
  "meethook-session",
  "meethook-transcribe",
+ "tempfile",
+]
+
+[[package]]
+name = "meethook-enroll"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "meethook-session",
+ "meethook-transcribe",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

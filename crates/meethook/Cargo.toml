@@ -11,6 +11,7 @@ name = "meethook"
 path = "src/main.rs"
 
 [dependencies]
+meethook-enroll = { workspace = true }
 meethook-models = { workspace = true }
 meethook-record = { workspace = true }
 meethook-session = { workspace = true }
@@ -20,3 +21,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 ctrlc = { workspace = true }
 jiff = { workspace = true }
+# For the scratch directory `enroll` extracts clips into: `afplay` cannot seek, so playing
+# part of a recording means writing that part out first.
+tempfile = { workspace = true }

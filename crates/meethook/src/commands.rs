@@ -1,15 +1,18 @@
 //! Subcommand bodies.
 //!
-//! `enroll` is a stub in this slice; `record` and `transcribe` do the real work. Both are
-//! thin: the rules they enforce live in `meethook-record` and `meethook-transcribe`, where
-//! they can be tested without a terminal.
+//! All three are thin: the rules they enforce live in `meethook-record`,
+//! `meethook-transcribe` and `meethook-enroll`, where they can be tested without a terminal.
+//! What is left here is the terminal itself -- printing, prompting, and playing audio --
+//! which is exactly the part no test can decide.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use meethook_enroll::{Answer, Interviewer, UnknownVoice, run_enroll, write_clip};
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
 use meethook_session::{Paths, SessionId};
@@ -460,10 +463,108 @@ impl DownloadProgress {
     }
 }
 
-pub fn enroll(_paths: &Paths, session_ids: &[String]) -> Result<()> {
-    parse_session_ids(session_ids)?;
-    println!("meethook enroll: not implemented in this slice.");
+pub fn enroll(paths: &Paths, session_ids: &[String]) -> Result<()> {
+    let requested = parse_session_ids(session_ids)?;
+    let mut terminal = Terminal::default();
+    let report = run_enroll(paths, &requested, &mut terminal, &mut io::stdout())?;
+
+    println!(
+        "\n{} named, {} skipped, {} session(s) passed over",
+        report.named, report.skipped, report.passed_over
+    );
+    // Skips and pass-overs are ordinary; a session that could not be read is what makes the
+    // run unsuccessful, exactly as in `transcribe`.
+    if report.failed > 0 {
+        bail!("{} session(s) could not be enrolled", report.failed);
+    }
     Ok(())
+}
+
+/// The interactive half of `enroll`: what a prompt looks like, and how a clip gets played.
+///
+/// Everything about *which* voice is asked about, and what an answer writes, is on the other
+/// side of the `Interviewer` seam in `meethook-enroll`. What is left here needs a person in
+/// front of it, so none of it is tested; keeping it this small is what makes that acceptable.
+#[derive(Default)]
+struct Terminal {
+    /// Where clips are written for the player, created on first use and removed when the run
+    /// ends. `afplay` has no start offset, so playing part of a recording means handing it a
+    /// file that contains only that part.
+    clips: Option<tempfile::TempDir>,
+}
+
+impl Terminal {
+    /// Plays a clip and waits for it to finish, reporting anything that stopped it.
+    ///
+    /// Never fatal. A missing `afplay`, a full temp directory, a truncated `speaker.wav` --
+    /// none of them are a reason to stop asking, because the snippets above the prompt are
+    /// often enough to recognise somebody on their own.
+    fn play(&mut self, clip: &[f32]) {
+        if clip.is_empty() {
+            println!("    (no audio for this voice)");
+            return;
+        }
+
+        let played = || -> Result<()> {
+            let dir = match &self.clips {
+                Some(dir) => dir,
+                None => self.clips.insert(tempfile::tempdir()?),
+            };
+            let path = dir.path().join("clip.wav");
+            write_clip(&path, clip)?;
+            let status = Command::new("afplay").arg(&path).status()?;
+            if !status.success() {
+                bail!("afplay exited with {status}");
+            }
+            Ok(())
+        }();
+        if let Err(e) = played {
+            println!("    (could not play the clip: {e})");
+        }
+    }
+}
+
+impl Interviewer for Terminal {
+    fn identify(&mut self, voice: &UnknownVoice<'_>) -> Answer {
+        println!(
+            "\n{}  {} -- {} of speech",
+            voice.session,
+            voice.label,
+            speech(voice.speech_seconds)
+        );
+        if voice.snippets.is_empty() {
+            println!("    (nothing was transcribed for this voice)");
+        }
+        for snippet in &voice.snippets {
+            println!("    \"{snippet}\"");
+        }
+        self.play(voice.clip);
+
+        print!("Who is this? (name, Enter to skip, Ctrl-D to stop) ");
+        // Without this the question sits in the buffer behind the answer.
+        if io::stdout().flush().is_err() {
+            return Answer::Quit;
+        }
+
+        // End of input is somebody stopping, not a failure: every name accepted so far is
+        // already on disk, and so is the transcript it changed. Ctrl-C, which kills the
+        // process outright rather than arriving here, is safe for the same reason.
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => Answer::Quit,
+            Ok(_) if line.trim().is_empty() => Answer::Skip,
+            Ok(_) => Answer::Named(line.trim().to_string()),
+        }
+    }
+}
+
+/// How much this voice said, in the units a person would say it in.
+fn speech(seconds: f64) -> String {
+    let seconds = seconds.round() as u64;
+    match seconds / 60 {
+        0 => format!("{seconds}s"),
+        minutes => format!("{minutes}m {:02}s", seconds % 60),
+    }
 }
 
 /// Validates positional ids before any filesystem work, so a typo fails immediately with a

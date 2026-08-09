@@ -1,0 +1,23 @@
+[package]
+name = "meethook-enroll"
+version = "0.1.0"
+description = "Naming the voices transcription could not identify, and rewriting their transcripts"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+meethook-session = { workspace = true }
+
+# For `identify_clusters` and `read_track_16k_mono` only. A heavy-looking dependency for a
+# dot product and a resample, and still the right one: duplicating the matcher would
+# duplicate its threshold too, and `enroll` and `transcribe` disagreeing about who counts as
+# unresolved is exactly the drift the shared `unknown_labels` rule exists to prevent. The
+# binary already links both crates, so nothing gets bigger.
+meethook-transcribe = { workspace = true }
+
+hound = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
