@@ -2,3 +2,10 @@
 result
 result-*
 .direnv
+__pycache__
+.claude/settings.local.json
+
+# Recorded and generated audio under scratch/. The scripts that produce and
+# consume it are tracked; the waveforms themselves are large, regenerable
+# (`make_click_track.py`) or machine-specific captures.
+scratch/**/*.wav
