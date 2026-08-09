@@ -3,5 +3,152 @@ id: doc-005
 title: 'Meethook v1 spec: local meeting recorder + transcriber'
 type: specification
 created_date: '2026-08-09 05:06'
+updated_date: '2026-08-09 05:06'
 ---
+## Problem Statement
 
+The user regularly takes video calls (Zoom, Teams, Meet, etc.) and wants a reliable, fully local transcript of each one, with real participant names attached to what they said. Today that requires either a cloud transcription service (unacceptable for a personal tool — no network calls on meeting audio) or manually running and babysitting recording/transcription tools around every call. The user doesn't want to press a button to start recording (they forget, or it's disruptive mid-call), doesn't want a live/real-time transcript (accuracy and simplicity matter more than immediacy), and doesn't want a background daemon silently running all the time. They also don't reliably wear headphones, so any solution has to cope with the far-end call audio leaking into their own microphone.
+
+## Solution
+
+`meethook` is a macOS-only (Apple Silicon), personal-use, two-binary Rust tool, built and run entirely through a Nix flake:
+
+- **`meethook record`** runs in the foreground and watches the default microphone. The moment the mic goes active (a call starts, in any app), it automatically opens a new session and starts capturing microphone audio and system/speaker audio as two separate, time-synchronized WAV tracks. It automatically stops the session only when the mic is fully deactivated (the call actually ends) — muting mid-call does not stop it. It loops indefinitely across sessions until the user manually stops the process; there is no daemon.
+- **`meethook transcribe`** is run manually, whenever the user wants, against one or more past sessions found on disk. It cancels speaker-bleed out of the mic track using the synced speaker track as an acoustic-echo-cancellation reference, runs local ASR (Whisper) and diarization + speaker-identification (pyannote segmentation + WeSpeaker embeddings) against the speaker track, merges both tracks into one chronological, speaker-labeled transcript, and writes it to disk as JSON + Markdown.
+- **`meethook enroll`** is a separate, interactive command the user runs after transcribing, to name any speakers transcribe couldn't identify. Naming a speaker retroactively rewrites that session's transcript in place.
+
+Everything — ASR, diarization, speaker-ID, echo cancellation — runs in-process inside the Rust binaries, with model weights lazily fetched to `~/meethook/models/` on first use. No Python subprocess, no network calls at transcription time beyond that one-time model fetch, no cloud service.
+
+## User Stories
+
+1. As the user, I want recording to start automatically the moment I join a call, so that I never forget to record and never have to interrupt a call to press a button.
+2. As the user, I want recording to keep running while I'm muted mid-call, so that a normal mute/unmute during a meeting doesn't split or truncate my session.
+3. As the user, I want recording to stop automatically only once the call has actually ended, so that I don't have to remember to stop it either.
+4. As the user, I want `meethook record` to keep running across many calls in a day without me relaunching it, so that it behaves like a launch-once background tool without being an always-on daemon I have to trust silently.
+5. As the user, I want my own voice and the other participants' audio captured as separate tracks, so that diarizing the other participants isn't confused by my own voice, and so the raw mic audio is never lossily mixed.
+6. As the user, I want the two tracks to stay time-aligned, so that a merged transcript can be put in the correct chronological order across both tracks.
+7. As the user, I want a preflight check (and a clear error) if macOS hasn't granted mic/screen-recording permission, so that I find out immediately instead of getting a silently broken recording.
+8. As the user, I want to be able to transcribe a batch of past sessions at once, so that I can catch up on a backlog of recordings in one command rather than one at a time.
+9. As the user, I want re-running transcribe on an already-transcribed session to be a no-op by default, so that I don't accidentally waste time/CPU re-transcribing, but I want a `--force` escape hatch when I do want to redo one.
+10. As the user, I want a session that crashed mid-recording (no valid session metadata) to be skipped with a warning during transcription, rather than crashing the whole batch or silently producing a bad transcript.
+11. As the user, I want speaker-bleed from the call's speaker audio into my microphone to be removed before transcription, so that the other participants' words don't get duplicated into my own transcript lines, even when I'm not wearing headphones.
+12. As the user, I want the bleed-cancellation step to never touch my original mic recording, so that I still have the raw, unmodified audio if I ever need it.
+13. As the user, I want my own audio always labeled with my name/"You" rather than run through diarization, so that diarization effort is spent only on the participants who actually need to be told apart.
+14. As the user, I want the other participants' turns correctly attributed to the right diarized speaker most of the time, so that the transcript is genuinely useful without heavy manual correction.
+15. As the user, I want speakers meethook doesn't recognize yet to show up as clearly-numbered "Unknown" placeholders (not silently merged into one bucket), so that I can tell how many distinct unidentified people spoke.
+16. As the user, I want to enroll and name a recurring participant once, so that meethook recognizes them by voice in future recordings without me renaming them every time.
+17. As the user, I want to be able to hear a representative clip of an unidentified speaker while naming them, so that I can confidently recall who it was rather than guessing from a text snippet alone.
+18. As the user, I want naming a speaker to update the transcript of the very session where they were first flagged as unknown, so that the enrollment immediately pays off instead of only helping future recordings.
+19. As the user, I want the final transcript available as both a machine-readable JSON file and a readable Markdown file, so that I can either build tooling on top of it or just read it directly.
+20. As the user, I want each transcript turn timestamped and attributed to a track, so that I can trace any line back to when it was said and which audio stream it came from.
+21. As the user, I want the whole tool's dependencies — Rust toolchain, Apple frameworks, ASR/diarization runtimes, native libraries — managed by one Nix flake, so that I never have to manually install or version anything on my Mac to build or run it.
+22. As the user, I want model weights fetched lazily on first use rather than baked into the Nix closure, so that my Nix store doesn't balloon with multi-gigabyte model files I might not immediately need.
+23. As the user, I want the whole system to work without any Python installed, so that I don't have to maintain a second language runtime just for this personal tool.
+24. As the user, I want it explicitly out of scope for meethook to support any platform other than my own Mac, ship as a packaged/distributed app, transcribe in real time, or run as a background service — so that the design stays as simple as a personal tool needs to be.
+
+## Implementation Decisions
+
+**Binaries and process model**
+- Two independent binaries: `record` (foreground, long-running, loops across sessions until manually stopped — no daemon) and `transcribe` (manually invoked, batch, processes one or more past sessions from disk). `enroll` is a third, separate interactive command run after `transcribe`.
+- `record` and `transcribe` communicate only through the on-disk session directory contract below — no IPC, no shared process.
+
+**Mic-activity trigger (`record`)**
+- Event-driven via `AudioObjectAddPropertyListenerBlock` on `kAudioDevicePropertyDeviceIsRunningSomewhere` for the current default input device (not polling).
+- Also listens for `kAudioHardwarePropertyDefaultInputDevice` changes and re-attaches the `IsRunningSomewhere` listener to the new device when the default input changes (covers switching mics mid-session or between sessions).
+- Start: on `IsRunningSomewhere` → true, begin recording immediately, no debounce.
+- Stop: on `IsRunningSomewhere` → false, start a 2–3s grace-period timer before finalizing the stop; a `true` event before the timer fires cancels the timer and recording continues. This is a general hedge against any brief device-level blip, not specifically required for mute (mute produces no `IsRunningSomewhere` change at all — validated empirically: it stays `true` through mute/unmute toggles and only flips `false` when the call actually ends).
+- Bluetooth mics get no special-case handling in v1; the known Apple Bluetooth-misreport bug is an accepted, unverified risk for this project (the empirical validation used a USB mic, not Bluetooth).
+
+**Audio capture pipeline**
+- System/speaker audio: ScreenCaptureKit (`SCStream`), system-wide (not per-app scoped) in v1, via the `screencapturekit` crate falling back to `objc2-screen-capture-kit`.
+- Microphone audio: a fully separate `AVAudioEngine.inputNode` tap (via `objc2-avf-audio`), deliberately not macOS 15's unified `SCStream` microphone output, due to a known Apple Developer Forums bug (corrupted output when `captureMicrophone` is combined with recording).
+- Both tracks are written as native-format mono WAV files with no resampling in the recorder.
+- Time sync: each track's first delivered audio buffer's host/hardware timestamp (`CMSampleBuffer` presentation time for `SCStream`; `AVAudioTime`/host time for `AVAudioEngine`) is recorded as sync metadata; alignment math happens in `transcribe`, not `record`.
+- Permissions: an explicit TCC preflight check (screen-recording + mic authorization status) before capture starts, with an actionable CLI error pointing to System Settings if denied.
+
+**On-disk session format (the record/transcribe contract)**
+- `~/meethook/sessions/<YYYYMMDD-HHMMSS>/` (local-time id; numeric-suffix fallback on same-second collision), containing:
+  - `mic.wav`, `speaker.wav` — native-format mono, written continuously.
+  - `session.json` — written atomically (temp file + rename) on clean shutdown; its presence is the "valid/complete session" marker. Fields: `session_id`, `schema_version`, RFC3339 `start_time`, and per-track first-sample host timestamp as raw `mach_absolute_time` ticks plus `mach_timebase_info` numer/denom (kept in native tick form, not pre-converted to nanoseconds, so `transcribe` does the conversion with full precision).
+  - `transcript.json` — written atomically by `transcribe` on success; its presence is the "already transcribed" marker (skipped on rerun unless `--force`).
+- Sample rate/channels/bit-depth live only in the WAV headers, not duplicated into `session.json`.
+- A session directory with WAV files but no `session.json` (crash mid-recording) is treated as orphaned: skipped by `transcribe` with a warning, not an error.
+- `~/meethook/` also holds `speakers.json` (enrolled-speaker embedding DB) and `models/` (lazily fetched model weights) alongside `sessions/`.
+
+**Speaker-bleed mitigation**
+- Real reference-based acoustic echo cancellation (WebRTC AEC3-style), not headphones-as-mitigation and not naive ducking — the user's actual setup is external speaker + mic, not headphones.
+- The already-synced `speaker.wav` is the AEC far-end reference; `mic.wav` is the near-end signal. This works specifically because speaker audio is already a separate synced track — `AVAudioEngine`'s built-in `isVoiceProcessingEnabled` AEC was ruled out because its reference is scoped to audio the *same process* renders through its own paired output node, so it can't cancel bleed originating from another app's (Zoom/Meet/browser) speaker output.
+- Runs offline inside `transcribe`, before ASR (no real-time constraint). Produces a new derived `mic.cleaned.wav` alongside the untouched, original `mic.wav`. The "You" track's ASR input (per the merge design below) is `mic.cleaned.wav`.
+- AEC implementation: **tonarino's `webrtc-audio-processing` crate** (real WebRTC AEC3 C++ Audio Processing Module via FFI), dynamically linked against nixpkgs' `webrtc-audio-processing` v2.1 package (meson/pkg-config build, confirmed `aarch64-darwin` support) — not the crate's `bundled` C++-build feature, which has an open Apple cross-compilation issue. Fallback: the pure-Rust `aec3` crate (`RubyBit/aec3-rs`) if FFI/linking friction against the nixpkgs package proves worse than expected; it is young (9 months) and self-described work-in-progress, so its output should be spot-checked before trusting it as a silent swap-in. Rejected: `aec-rs` (`thewh1teagle/aec`, speexdsp MDF) — stale (15+ months), a 72-line unsafe FFI shim with no tests, wrapping an older/weaker algorithm than AEC3.
+- Headphone detection/warning is explicitly not built — the AEC approach makes it unnecessary; headphones remain a free bonus, not load-bearing for transcript quality.
+
+**ASR (speech-to-text)**
+- `whisper-rs` (Rust bindings to whisper.cpp) with the `metal` cargo feature; no Core ML encoder acceleration in v1 (Metal alone is comfortably fast for batch, non-real-time use, and Core ML would require a one-time Python/coremltools `.mlmodelc` conversion step this project wants to avoid).
+- Model: a ggml Whisper checkpoint (large-v3-turbo or distil-whisper for speed, or large-v3 if maximizing per-recording accuracy matters more than turnaround), fetched from `ggerganov/whisper.cpp`'s published, ungated weights.
+- Parakeet-family models (better WER/throughput on paper) are explicitly not used in v1: every current Rust-embeddable path on Apple Silicon (ONNX/`ort`'s CoreML EP, WebGPU EP, or the from-scratch Candle port) has a documented immaturity gap as of this evaluation. Revisit as a fast-follow if that tooling matures.
+
+**Diarization and speaker identification**
+- Diarization: `pyannote/segmentation-3.0`, via the ungated MIT `onnx-community` ONNX mirror, run through ONNX Runtime.
+- Speaker embeddings: a WeSpeaker ONNX embedding model (ECAPA-TDNN or ResNet34-LM variant) — pyannote's own newest embedding checkpoint currently fails ONNX export, so WeSpeaker is used instead, matching what existing Rust reference pipelines (e.g. `pyannote-rs`) already do.
+- Runtime: the `ort` crate (Rust ONNX Runtime bindings) with the CoreML execution-provider feature enabled, giving both models Apple Neural Engine/GPU acceleration through one runtime stack.
+- Enrollment/matching: mean + L2-normalized reference embedding per known speaker in `~/meethook/speakers.json`; each diarized cluster is matched via cosine similarity against all references with a single decision threshold (no separate "ambiguous" middle tier) — below threshold means unknown.
+- Only the speaker/system track is diarized. The mic track is never run through diarization or speaker-ID; it is hardcoded as "You" (there is only one local speaker).
+- `transcribe` also persists a new per-session `speaker_clusters.json` (reference embedding + representative segment references per cluster) so `enroll` doesn't need diarization re-run later.
+
+**Transcript merge and output format**
+- Merge unit is the ASR segment (not word-level) — Whisper's native segments from each track are used as-is, with no re-splitting.
+- Speaker-track segments get their speaker label via majority-time-overlap against diarization turns (chosen over diarize-then-chunk-ASR, which would need N separate Whisper invocations per meeting and lose Whisper's accuracy benefit from longer context). Diarize-then-chunk-ASR is a documented fallback to revisit if overlap-assignment proves unreliable in practice.
+- All turns (mic + speaker track) are merged by strict chronological sort on start time; there is no explicit cross-talk/overlap handling.
+- Mic-track turns are always labeled "You"; unmatched speaker-track clusters get stable per-session numbering ("Unknown 1", "Unknown 2", …) rather than one collapsed "Unknown" bucket.
+- Two output files, both written by `transcribe`: `transcript.json` (canonical) and `transcript.md` (derived, human-readable rendering — one line per turn, e.g. `**[00:12] You:** text`).
+- `transcript.json` schema: `{schema_version, session_id, turns: [{speaker, start, end, text, source_track, speaker_id_confidence}]}`. Timestamps are seconds-from-session-start. `speaker_id_confidence` is null for mic-track turns. `source_track` is kept as an explicit field even though it's currently derivable from `speaker == "You"`, so that assumption isn't silently baked into every consumer of the JSON.
+- WebVTT/SRT export is explicitly deferred (easy future JSON-to-VTT conversion using WebVTT's `<v Speaker>` voice tags) — no playback-sync use case exists in v1.
+
+**Speaker enrollment workflow (`meethook enroll`)**
+- A separate command from `transcribe`, kept non-interactive-safe by design — `transcribe`'s batch nature means no interactive prompts live inside it at all; `enroll` is the only interactive surface in the whole system.
+- With no arguments, `enroll` scans all sessions with unresolved "Unknown" clusters as a work queue (an explicit session id, or ids, can optionally scope it to fewer sessions).
+- For each unresolved cluster: shows transcript text snippets and auto-plays the longest representative audio segment via `afplay` (the system binary already present on macOS — chosen over adding a new in-process Rust audio-playback crate, since this path isn't latency-sensitive), then prompts for a name or skip.
+- On naming: appends/updates the reference embedding in `~/meethook/speakers.json`, and rewrites that session's `transcript.json` and `transcript.md` in place with the new name — so the very session that surfaced the unknown speaker benefits immediately, not just future sessions.
+- Scope for v1 is first-time naming + matching only; rename/remove/re-enrollment-to-correct-drift is deferred (tracked in Not-yet-specified below). Multi-session `enroll` runs treat each session's unknown clusters independently — no cross-session deduplication of "this looks like the same unnamed person across two sessions."
+
+**Nix flake structure**
+- `devShell`-only flake — no `buildRustPackage`/`crane` flake packages, since this is a personal, non-distributed tool.
+- `rust-overlay` tracks rolling stable, restricted to `aarch64-apple-darwin`.
+- Darwin frameworks (ScreenCaptureKit, CoreAudio, AudioToolbox, AVFoundation) via nixpkgs' unified `apple-sdk_26` as a devShell build input — no system-SDK fallback.
+- ASR native deps: whisper-rs with the `metal` feature only.
+- Diarization/embedding native deps: nixpkgs' `onnxruntime` (built with the CoreML execution provider on Darwin by default) as a devShell build input, using `ort`'s `load-dynamic` feature with `ORT_DYLIB_PATH` set in the shell hook — this sidesteps `ort`'s default behavior of downloading a prebuilt binary at build time.
+- AEC native deps: nixpkgs' `webrtc-audio-processing` (v2.1) plus `pkg-config` as devShell build inputs, matching the crate's default dynamic-link expectation.
+- Model weights are not part of the Nix closure: they're lazily fetched on first need (by `transcribe`/`enroll`) into `~/meethook/models/`, sha256-verified against hashes embedded in source, with an optional `HF_TOKEN` env var sent as a bandwidth-only bearer header (no gating logic is needed — every chosen model source is already publicly, ungated available).
+
+## Testing Decisions
+
+This is a new, greenfield personal project — there is no existing test suite or seam convention to follow yet, so testing decisions here are about what *kind* of test each module warrants, not an integration into prior art.
+
+- Prefer testing external, observable behavior over internals: given a fixed pair of `mic.wav`/`speaker.wav` fixtures (including a fixture recorded/synthesized with known bleed), the merge and labeling logic in `transcribe` should be tested against its `transcript.json` output shape and content — not against intermediate ASR/diarization data structures.
+- The on-disk session contract (`session.json`/`transcript.json` atomicity, the orphaned-session-skip behavior, the already-transcribed skip/`--force` behavior) is the highest-value seam to test directly, since it's the one contract both binaries and `enroll` all depend on and getting it wrong silently corrupts or loses sessions.
+- The transcript merge/labeling logic (segment-level merge, majority-overlap speaker attribution, chronological sort, "You"/"Unknown N" labeling) is pure, deterministic logic once ASR/diarization outputs are given — a strong candidate for unit tests against synthetic segment/turn fixtures, without needing real audio or real model inference in the test run.
+- AEC, ASR, and diarization/embedding correctness are governed by the underlying models/libraries (WebRTC AEC3, Whisper, pyannote+WeSpeaker) rather than by meethook's own code; meethook's tests should focus on correctly wiring inputs/outputs to those components (correct frame chunking for AEC, correct WAV/sample-rate handling, correct embedding/threshold plumbing), not on re-validating the models' own published accuracy.
+- No live macOS permission/Core Audio/ScreenCaptureKit integration tests are planned for v1 — those are hardware/OS-session-dependent and were already validated empirically during the design tickets (mute-vs-deactivate behavior, the `IsRunningSomewhere` listener). Revisit if regressions there prove costly to catch manually.
+
+## Out of Scope
+
+- Cross-platform (non-macOS) support.
+- Packaging, code signing, notarization, or distribution to other users — this is a personal tool only.
+- Real-time/live transcription.
+- An always-on background daemon/launchd-style service — v1 is a foreground terminal app the user watches and manually stops.
+- A downstream LLM summarization/search pipeline — explicitly future work; v1 only needs the transcript output format to not preclude it later.
+- vLLM (or any externally-hosted LLM runtime) as an inference runtime anywhere in this scope — reserved for a possible future summarization/search pipeline only.
+- Per-app system-audio scoping (an allowlist of known meeting-app bundle IDs, or an interactive app picker) — v1 captures system-wide; revisit only if that proves noisy in practice.
+- WebVTT/SRT transcript export.
+- Enrolled-speaker database versioning: renaming, removing, or re-enrolling a speaker to fix embedding drift over time.
+- Whisper Core ML encoder acceleration (Metal-only in v1).
+- Bluetooth-mic-specific `IsRunningSomewhere` misreport workarounds.
+- Cross-session deduplication of unnamed speakers during enrollment.
+- Headphone-usage detection or in-app warnings.
+
+## Further Notes
+
+- Full supporting research for the model/runtime/library choices above lives in four Backlog research docs: prior-art survey (`doc-001`), diarization/embedding evaluation (`doc-002`), ASR evaluation (`doc-003`), and AEC library evaluation (`doc-004`).
+- The full decision trail — one line per resolved question, each pointing at its ticket — lives in the wayfinder map `TASK-001`'s Implementation Notes; this document is the synthesized spec produced once that map's frontier was fully resolved.
+- A handful of items were deliberately left unspecified rather than forced into a decision now, because forcing them would have meant guessing without a signal to guess from: the final CLI command/flag surface and config file format (waits on nothing further — just hasn't been drafted yet); enrolled-speaker database versioning beyond first-time naming; per-app system-audio scoping; WebVTT/SRT export; and diarize-then-chunk-ASR as a fallback alignment strategy. None of these block building v1 from this spec; they're candidate fast-follows.
+- This spec assumes the reader has access to the four research docs and the wayfinder map for full rationale/alternatives-considered detail behind each decision; this document itself states the decisions, not the deliberation.
