@@ -20,4 +20,7 @@ hound = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# For the session timestamps the cross-command test's fixtures need; nothing in the crate
+# itself has an opinion about time.
+jiff = { workspace = true }
 tempfile = { workspace = true }

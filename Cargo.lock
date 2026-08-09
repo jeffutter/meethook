@@ -566,6 +566,7 @@ name = "meethook-enroll"
 version = "0.1.0"
 dependencies = [
  "hound",
+ "jiff",
  "meethook-session",
  "meethook-transcribe",
  "tempfile",
