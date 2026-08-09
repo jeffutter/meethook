@@ -3,7 +3,7 @@ id: doc-005
 title: 'Meethook v1 spec: local meeting recorder + transcriber'
 type: specification
 created_date: '2026-08-09 05:06'
-updated_date: '2026-08-09 08:36'
+updated_date: '2026-08-09 13:07'
 ---
 ## Problem Statement
 
@@ -117,7 +117,7 @@ Everything — ASR, diarization, speaker-ID, echo cancellation — runs in-proce
 - `rust-overlay` tracks rolling stable, restricted to `aarch64-apple-darwin`.
 - Darwin frameworks (ScreenCaptureKit, CoreAudio, AudioToolbox, AVFoundation) via nixpkgs' unified `apple-sdk_26` as a devShell build input — no system-SDK fallback.
 - ASR native deps: whisper-rs with the `metal` feature only.
-- Diarization/embedding native deps: nixpkgs' `onnxruntime` (built with the CoreML execution provider on Darwin by default) as a devShell build input, using `ort`'s `load-dynamic` feature with `ORT_DYLIB_PATH` set in the shell hook — this sidesteps `ort`'s default behavior of downloading a prebuilt binary at build time.
+- Diarization/embedding native deps: nixpkgs' `onnxruntime` (built with the CoreML execution provider on Darwin by default) as a devShell build input, using `ort`'s `pkg-config` feature — `ort-sys` probes for the module named `libonnxruntime`, which is exactly what `onnxruntime.dev` ships, so the flake's copy is what gets linked. This sidesteps `ort`'s `download-binaries` path, which is not a default feature, so a missed probe surfaces as a link error rather than as a silently different runtime. (The `load-dynamic` feature and `ORT_DYLIB_PATH` env var this bullet originally named were deleted from `ort` after `2.0.0-rc.9` and no longer exist; `ORT_LIB_LOCATION` plus `ORT_PREFER_DYNAMIC_LINK` is the fallback if the probe ever needs overriding.)
 - AEC native deps: nixpkgs' `webrtc-audio-processing` (v2.1) plus `pkg-config` as devShell build inputs, matching the crate's default dynamic-link expectation.
 - Model weights are not part of the Nix closure: they're lazily fetched on first need (by `transcribe`/`enroll`) into `~/meethook/models/`, sha256-verified against hashes embedded in source, with an optional `HF_TOKEN` env var sent as a bandwidth-only bearer header (no gating logic is needed — every chosen model source is already publicly, ungated available).
 
