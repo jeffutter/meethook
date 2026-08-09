@@ -24,11 +24,23 @@
 //! person sit at 0.5, or two people sit at 0.4, that is the number to move `MERGE_DISTANCE`
 //! against -- and it is far better to learn it here than from a transcript that quietly
 //! attributed one person's words to another.
+//!
+//! The enrolled-reference table at the end answers the other threshold's version of that
+//! question, `IDENTIFY_DISTANCE`. `transcript.json` records a similarity only for clusters
+//! that matched, so the single most useful measurement -- how far one person's stored
+//! reference sits from a *different* person's voice -- is invisible on every normal path
+//! precisely because it was rejected. Here every pair is printed, accepted or not, so the
+//! margin either side of the cut is readable rather than inferred.
 
 use std::path::PathBuf;
 
-use meethook_session::{SessionId, SessionPaths, SpeakerClusters};
-use meethook_transcribe::{EMBEDDING_MODEL, SEGMENTATION_MODEL, TARGET_RATE, open_session};
+use meethook_session::{
+    EnrolledSpeakers, Paths, SessionId, SessionPaths, SpeakerCluster, SpeakerClusters,
+};
+use meethook_transcribe::{
+    EMBEDDING_MODEL, IDENTIFY_DISTANCE, SEGMENTATION_MODEL, TARGET_RATE, identify_clusters,
+    open_session,
+};
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
@@ -113,6 +125,8 @@ fn main() {
         }
     }
 
+    print_enrolled_distances(&clustering.clusters);
+
     if write {
         let Some(dir) = session_dir else {
             fail("--write needs a session directory, not a bare wav file");
@@ -130,15 +144,97 @@ fn main() {
     }
 }
 
-fn load(file_name: &str) -> ort::session::Session {
-    let model = match std::env::var_os("MEETHOOK_ROOT") {
+/// Every cluster measured against every enrolled reference, accepted or not.
+///
+/// This is the number TASK-014 has to calibrate `IDENTIFY_DISTANCE` on, and it is not
+/// obtainable from anything else meethook writes: identification records a similarity only
+/// where it matched, so the rejections -- the half of the evidence that says how much room
+/// there is above the cut -- are exactly the half that gets dropped.
+///
+/// The accept/reject column comes from [`identify_clusters`] rather than from comparing each
+/// distance to the threshold here. Identification is argmax *then* threshold, so a reference
+/// that clears the cut while a nearer one wins is not a match, and a hand-rolled comparison
+/// would print it as one -- a diagnostic that disagrees with the decision it is diagnosing is
+/// worse than no diagnostic.
+fn print_enrolled_distances(clusters: &[SpeakerCluster]) {
+    let paths = Paths::new(meethook_root());
+    let enrolled =
+        EnrolledSpeakers::read_or_empty(&paths).unwrap_or_else(|e| fail(&format!("{e}")));
+
+    println!(
+        "\ncosine distance to enrolled references in {}",
+        paths.speakers_json().display()
+    );
+    println!("identification accepts a cluster's nearest reference below {IDENTIFY_DISTANCE:.3}");
+
+    // Both degenerate shapes say so out loud. A section that renders as nothing is
+    // indistinguishable from the feature being broken, and both of these are the *normal*
+    // state of a fresh install rather than a failure.
+    if enrolled.speakers.is_empty() {
+        println!("  no enrolled speakers yet; run `meethook enroll` on a session first");
+        return;
+    }
+    if clusters.is_empty() {
+        println!("  no clusters in this recording; nothing to compare against");
+        return;
+    }
+
+    let identified = identify_clusters(clusters, &enrolled);
+    for cluster in clusters {
+        let matched = identified.get(&cluster.id);
+        match matched {
+            Some(id) => println!("\n  speaker {} -> {}", cluster.id, id.name),
+            None => println!("\n  speaker {} -> unidentified", cluster.id),
+        }
+        for speaker in &enrolled.speakers {
+            // A reference of a different length came from a different embedding model, and
+            // `best_match` skips it for that reason. Printing a truncated `zip` of the two as
+            // a distance would invent evidence about an entry identification is ignoring.
+            if speaker.embedding.len() != cluster.embedding.len() {
+                println!(
+                    "    {:<20} not comparable ({} dims vs the cluster's {})",
+                    speaker.name,
+                    speaker.embedding.len(),
+                    cluster.embedding.len()
+                );
+                continue;
+            }
+
+            // Both sides are unit vectors by contract, so the dot product is the cosine --
+            // the same arithmetic `best_match` does, so the two cannot disagree.
+            let cosine: f32 = speaker
+                .embedding
+                .iter()
+                .zip(&cluster.embedding)
+                .map(|(a, b)| a * b)
+                .sum();
+            let accepted = matched.is_some_and(|id| id.name == speaker.name);
+            println!(
+                "    {:<20} {:>7.3}  {}",
+                speaker.name,
+                1.0 - cosine,
+                if accepted { "accepted" } else { "rejected" }
+            );
+        }
+    }
+}
+
+/// `--root`'s equivalent here: `$MEETHOOK_ROOT`, else `~/meethook`.
+///
+/// One resolution for the models this example runs and the `speakers.json` it reads against
+/// them, so a diagnostic can never report distances from one install's database to another
+/// install's embeddings.
+fn meethook_root() -> PathBuf {
+    match std::env::var_os("MEETHOOK_ROOT") {
         Some(root) => PathBuf::from(root),
         None => std::env::home_dir()
             .expect("could not determine the home directory; set MEETHOOK_ROOT")
             .join("meethook"),
     }
-    .join("models")
-    .join(file_name);
+}
+
+fn load(file_name: &str) -> ort::session::Session {
+    let model = meethook_root().join("models").join(file_name);
 
     let loaded = open_session(&model).unwrap_or_else(|e| {
         fail(&format!(

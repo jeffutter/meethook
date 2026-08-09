@@ -31,7 +31,15 @@ use meethook_session::{EnrolledSpeakers, SpeakerCluster};
 ///
 /// TASK-014 tracks measuring this against real cross-session recordings; it is an argued
 /// starting point, not a measured one.
-const IDENTIFY_DISTANCE: f32 = 0.45;
+///
+/// Public so that the measurement can name the cut it is measuring against: the
+/// `cluster-speaker-track` example prints every cluster-to-reference distance alongside this
+/// value, and a calibration constant a diagnostic has to hard-code a copy of is a constant
+/// that drifts out of agreement with the code it claims to describe. Exported for reading,
+/// not for deciding -- [`identify_clusters`] is argmax *then* threshold, so anything that
+/// compares against this on its own will call a reference that clears the cut but is not the
+/// closest a match, which it is not.
+pub const IDENTIFY_DISTANCE: f32 = 0.45;
 
 /// A cluster matched to an enrolled speaker.
 #[derive(Debug, Clone, PartialEq)]

@@ -32,7 +32,7 @@ pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
 pub use gpu::NoMetalDevice;
-pub use identify::{Identification, identify_clusters};
+pub use identify::{IDENTIFY_DISTANCE, Identification, identify_clusters};
 pub use merge::merge;
 pub use onnx::{Loaded, open_session};
 pub use segmentation::{LocalTurn, segment_speaker_track};
