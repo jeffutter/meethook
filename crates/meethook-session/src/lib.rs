@@ -27,6 +27,7 @@ mod discovery;
 mod id;
 mod metadata;
 mod paths;
+mod speaker_clusters;
 mod transcript;
 
 pub use atomic::{write_atomic, write_atomic_with};
@@ -34,6 +35,10 @@ pub use discovery::{Classification, DiscoveredSession, discover_sessions};
 pub use id::{SessionId, create_session_dir};
 pub use metadata::{SESSION_SCHEMA_VERSION, SessionMetadata, TrackSync};
 pub use paths::{Paths, SessionPaths};
+pub use speaker_clusters::{
+    MIN_REPRESENTATIVE_SECONDS, RepresentativeSegment, SPEAKER_CLUSTERS_SCHEMA_VERSION,
+    SpeakerCluster, SpeakerClusters,
+};
 pub use transcript::{
     SourceTrack, TRANSCRIPT_SCHEMA_VERSION, Transcript, Turn, YOU as SPEAKER_YOU,
 };

@@ -12,8 +12,10 @@ mod aec;
 mod align;
 mod asr;
 mod audio;
+mod fbank;
 mod onnx;
 mod segmentation;
+mod speakers;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -24,6 +26,7 @@ pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use onnx::{Loaded, open_session};
 pub use segmentation::{LocalTurn, segment_speaker_track};
+pub use speakers::{Clustering, cluster_speaker_turns};
 
 use meethook_models::ModelSpec;
 use meethook_session::{
@@ -133,6 +136,11 @@ pub enum Error {
     /// Loading is [`Error::Onnx`].
     #[error("speaker segmentation failed: {0}")]
     Segmentation(String),
+
+    /// The same, one graph later: inference through the embedding model, or an output that
+    /// is not the 256-dimensional vector clustering compares.
+    #[error("speaker embedding failed: {0}")]
+    Embedding(String),
 
     #[error("could not load the ONNX model at {path}: {source}")]
     Onnx {
