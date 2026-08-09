@@ -8,6 +8,7 @@
 //! 1.6 GB model in order to do nothing -- and they need to be testable against a fake
 //! recognizer rather than a real one.
 
+mod aec;
 mod asr;
 mod audio;
 

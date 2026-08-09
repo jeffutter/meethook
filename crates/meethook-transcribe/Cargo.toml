@@ -20,6 +20,10 @@ thiserror = { workspace = true }
 # feature set is empty today, and this keeps it that way if that ever changes.
 whisper-rs = { workspace = true }
 
+# AEC3 for the echo-cancellation pre-pass. A normal dependency, not a dev one: the pre-pass
+# is on the real transcribe path, not just in tests.
+webrtc-audio-processing = { workspace = true }
+
 [dev-dependencies]
 jiff = { workspace = true }
 tempfile = { workspace = true }

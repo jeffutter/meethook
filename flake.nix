@@ -13,8 +13,8 @@
   # no buildRustPackage/crane package output to maintain.
   #
   # Native inputs are added by the slice that actually needs them. Deliberately absent:
-  # onnxruntime and webrtc-audio-processing -- nothing links them yet, and carrying them
-  # speculatively makes the shell slower to build for no benefit.
+  # onnxruntime -- nothing links it yet, and carrying it speculatively makes the shell
+  # slower to build for no benefit.
   #
   # Model weights are deliberately absent too, and not merely unadded: they are fetched at
   # runtime into ~/meethook/models/ and verified against sha256 hashes embedded in source,
@@ -44,12 +44,21 @@
         # apple-sdk_26 belongs in buildInputs (not nativeBuildInputs): that is where it
         # sets SDKROOT for the shell, which is how the Darwin frameworks
         # (ScreenCaptureKit, CoreAudio, AudioToolbox, AVFoundation, Metal) become linkable.
-        buildInputs = [ pkgs.apple-sdk_26 ];
+        #
+        # webrtc-audio-processing is the AEC3 implementation the transcribe pre-pass links
+        # against dynamically; the `webrtc-audio-processing` crate's `bundled` feature,
+        # which would build the vendored C++ instead, is off because it does not
+        # cross-compile on Apple (tonarino/webrtc-audio-processing#102).
+        buildInputs = [ pkgs.apple-sdk_26 pkgs.webrtc-audio-processing ];
 
         # whisper-rs-sys compiles its own vendored whisper.cpp with the `cmake` crate.
         # pkgs.whisper-cpp is deliberately *not* here: linking a second, separately built
         # copy alongside the vendored one is a silent version skew waiting to happen.
-        nativeBuildInputs = [ pkgs.cmake ];
+        #
+        # pkg-config is a build-time tool, so it belongs here rather than in buildInputs:
+        # its setup hook is what puts each buildInput's dev output on PKG_CONFIG_PATH,
+        # which is how webrtc-audio-processing-sys finds the library at all.
+        nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
 
         packages = [ rustToolchain ];
 

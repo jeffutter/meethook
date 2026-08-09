@@ -42,6 +42,14 @@ rubato = "0.16"
 # true; see the assertion in meethook-transcribe::asr that keeps that honest.
 whisper-rs = { version = "0.16", default-features = false, features = ["metal"] }
 
+# WebRTC AEC3, for the echo-cancellation pre-pass. The tilde requirement is what upstream
+# recommends: the crate's major version tracks the PulseAudio-maintained APM major version,
+# so a minor bump is allowed to break the API. `bundled` is deliberately off -- it would
+# compile the vendored C++ here, which does not cross-compile on Apple
+# (tonarino/webrtc-audio-processing#102); instead the sys crate probes pkg-config and links
+# dynamically against the flake's `webrtc-audio-processing`.
+webrtc-audio-processing = "~2.1"
+
 # Apple framework bindings. Deliberately one binding family (objc2) for every framework
 # this slice touches, so there is one `Retained<T>`, one `NSObject`, and no duplicate
 # framework bindings in the tree. None of these have build scripts: they link via
