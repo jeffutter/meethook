@@ -3,7 +3,7 @@ id: doc-005
 title: 'Meethook v1 spec: local meeting recorder + transcriber'
 type: specification
 created_date: '2026-08-09 05:06'
-updated_date: '2026-08-09 05:06'
+updated_date: '2026-08-09 08:36'
 ---
 ## Problem Statement
 
@@ -60,10 +60,11 @@ Everything — ASR, diarization, speaker-ID, echo cancellation — runs in-proce
 - Bluetooth mics get no special-case handling in v1; the known Apple Bluetooth-misreport bug is an accepted, unverified risk for this project (the empirical validation used a USB mic, not Bluetooth).
 
 **Audio capture pipeline**
-- System/speaker audio: ScreenCaptureKit (`SCStream`), system-wide (not per-app scoped) in v1, via the `screencapturekit` crate falling back to `objc2-screen-capture-kit`.
-- Microphone audio: a fully separate `AVAudioEngine.inputNode` tap (via `objc2-avf-audio`), deliberately not macOS 15's unified `SCStream` microphone output, due to a known Apple Developer Forums bug (corrupted output when `captureMicrophone` is combined with recording).
+- System/speaker audio: ScreenCaptureKit (`SCStream`), system-wide (not per-app scoped) in v1, via `objc2-screen-capture-kit`. This reverses an earlier preference for the `screencapturekit` crate, whose build script shells out to `swift build`, `xcrun` and `xcode-select` and therefore cannot build inside the flake; staying within the objc2 binding family also avoids duplicate framework bindings. See TASK-003 decision D1.
+- Microphone audio: a fully separate `AVAudioEngine.inputNode` tap (via `objc2-avf-audio`), deliberately not macOS 15's unified `SCStream` microphone output. The load-bearing reason is native-format capture: `SCStreamConfiguration` fixes the audio format for the whole stream, so microphone buffers would arrive resampled to the configured rate — a Rode USB mic reporting 44100 Hz would be silently converted to 48000 Hz — which is precisely the lossy transform this pipeline forbids. The split also preserves the preflight's ability to detect an unusable device format before recording starts. The frequently-cited Apple Developer Forums report of corrupted output when `captureMicrophone` is combined with recording is a supporting note only, and a weak one: that thread describes an `AVAssetWriter` container error, since the two output types carry different `CMFormatDescription`s and require separate writer inputs. It cannot occur here, because the recorder writes two independent WAV files and muxes nothing.
 - Both tracks are written as native-format mono WAV files with no resampling in the recorder.
 - Time sync: each track's first delivered audio buffer's host/hardware timestamp (`CMSampleBuffer` presentation time for `SCStream`; `AVAudioTime`/host time for `AVAudioEngine`) is recorded as sync metadata; alignment math happens in `transcribe`, not `record`.
+- What time sync does *not* provide is acoustic alignment. Measured on real hardware, both APIs are internally honest — each stamps timestamps linear in its own sample count to under 0.1 ms over 35 s — but they disagree by a fixed ~16 ms originating inside ScreenCaptureKit's audio pipeline (tested against display refresh rates of 72 Hz and 30 Hz and shown *not* to be display-frame-clocked), and `SCStream` presentation timestamps omit output latency entirely. Output latency cannot be recovered from the OS either: CoreAudio under-reported a Bluetooth output path by roughly 240 ms (187 ms reported against ~426 ms measured). Correcting either term from device-reported constants would be unsound, and would mask an error an order of magnitude larger than the one it fixes. Acoustic alignment must therefore be measured from the signals themselves, which the AEC stage has to do regardless. See TASK-003.
 - Permissions: an explicit TCC preflight check (screen-recording + mic authorization status) before capture starts, with an actionable CLI error pointing to System Settings if denied.
 
 **On-disk session format (the record/transcribe contract)**
