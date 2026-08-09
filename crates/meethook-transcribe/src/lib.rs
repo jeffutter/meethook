@@ -1,7 +1,9 @@
 //! Turning recorded sessions into transcripts.
 //!
-//! This slice transcribes the microphone track only, so every turn is labelled `You`; the
-//! participants on the speaker track arrive with diarization in a later slice.
+//! Both captured tracks end up in one transcript. The microphone track is recognised and
+//! labelled `You` -- there is exactly one local speaker, so it is never diarized -- while the
+//! speaker track is diarized, recognised, and merged in chronologically with each
+//! participant turn attributed to a distinct voice.
 //!
 //! The batch rules live here rather than in the CLI because they are the part with teeth --
 //! never redo work silently, never let one bad session take down the rest, never fetch a
@@ -12,7 +14,9 @@ mod aec;
 mod align;
 mod asr;
 mod audio;
+mod diarize;
 mod fbank;
+mod merge;
 mod onnx;
 mod segmentation;
 mod speakers;
@@ -24,14 +28,16 @@ pub use aec::{Cleaned, Cleaning, PassThrough, cancel_bleed};
 pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
+pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
+pub use merge::merge;
 pub use onnx::{Loaded, open_session};
 pub use segmentation::{LocalTurn, segment_speaker_track};
 pub use speakers::{Clustering, cluster_speaker_turns};
 
 use meethook_models::ModelSpec;
 use meethook_session::{
-    Classification, DiscoveredSession, Paths, SPEAKER_YOU, SessionId, SessionMetadata, SourceTrack,
-    Transcript, Turn, discover_sessions,
+    Classification, DiscoveredSession, Paths, SessionId, SessionMetadata, SpeakerClusters,
+    Transcript, discover_sessions,
 };
 
 /// The Whisper checkpoint this tool transcribes with.
@@ -170,10 +176,21 @@ impl Error {
     }
 }
 
-/// Opens the recognizer. Boxed and fallible so the caller owns model acquisition, and so
-/// the batch can decide whether opening one is worth doing at all.
-pub type EngineFactory<'a> = dyn FnMut() -> std::result::Result<Box<dyn SpeechToText>, Box<dyn std::error::Error + Send + Sync>>
-    + 'a;
+/// Everything transcription needs a model for, opened together.
+///
+/// One value rather than two factories because the laziness has to be a single decision.
+/// Three separate "have we opened this yet" states would each need the same guard, and the
+/// invariant that matters -- a batch with nothing to do downloads nothing at all -- would
+/// then be three invariants, any one of which could quietly stop holding.
+pub struct Engines {
+    pub asr: Box<dyn SpeechToText>,
+    pub diarizer: Box<dyn Diarize>,
+}
+
+/// Opens both engines. Boxed and fallible so the caller owns model acquisition, and so the
+/// batch can decide whether opening them is worth doing at all.
+pub type EngineFactory<'a> =
+    dyn FnMut() -> std::result::Result<Engines, Box<dyn std::error::Error + Send + Sync>> + 'a;
 
 /// What a batch did, so the caller can pick an exit status without re-deriving it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -186,43 +203,64 @@ pub struct BatchReport {
 /// Transcribes one session, returning the transcript without writing it.
 ///
 /// Not writing the *transcript* is deliberate: the caller decides, which is what keeps skip
-/// and `--force` logic in one place instead of spread between here and there.
-/// `mic.cleaned.wav` is a different matter and is written here, because it is an input to
-/// the recognition that happens here rather than a result the caller chooses to keep.
+/// and `--force` logic in one place instead of spread between here and there. The two files
+/// that *are* written here -- `mic.cleaned.wav` and `speaker_clusters.json` -- are not
+/// results the caller chooses to keep but by-products of the work: one is the audio
+/// recognition actually ran on, the other is what spares `enroll` from re-running diarization
+/// over the whole meeting later. `speaker_clusters.json` lands before this returns, so a
+/// crash between here and the caller's write leaves clusters with no transcript -- which the
+/// next run simply overwrites -- rather than a transcript naming clusters nobody stored.
+///
+/// The speaker track is read once and used three times: as the echo canceller's reference,
+/// as diarization's input, and as the second recognition pass. A long meeting resampled
+/// three times over would cost seconds for nothing.
 ///
 /// `progress` receives one line about the echo-cancellation pre-pass. A user whose sessions
 /// quietly stopped being cleaned should be able to see that from normal output rather than
 /// from a mysteriously worse transcript.
+///
+/// A session with no `speaker.wav`, or an empty one, degrades to a mic-only transcript
+/// rather than failing. A recording with nothing on the far end is a normal recording.
 pub fn transcribe_session(
     session: &DiscoveredSession,
     asr: &mut dyn SpeechToText,
+    diarizer: &mut dyn Diarize,
     progress: &mut dyn Write,
 ) -> Result<Transcript> {
     let metadata = session.load_metadata()?;
-    let offset = mic_offset_seconds(&metadata)?;
 
-    let audio = clean_mic_track(session, mic_minus_speaker_seconds(&metadata)?, progress)?;
-    let segments = asr.transcribe(&audio)?;
+    // An unreadable or absent `speaker.wav` is not fatal here, unlike `mic.wav`: it is the
+    // far end of the call, and a call with no far end recorded is still a call.
+    let speaker_track =
+        audio::read_track_16k_mono(&session.paths.speaker_wav()).unwrap_or_default();
+    let mic_track = clean_mic_track(
+        session,
+        &speaker_track,
+        mic_minus_speaker_seconds(&metadata)?,
+        progress,
+    )?;
 
-    let mut turns: Vec<Turn> = segments
-        .into_iter()
-        .map(|segment| Turn {
-            speaker: SPEAKER_YOU.to_string(),
-            start: offset + segment.start_s,
-            end: offset + segment.end_s,
-            // Whisper's segmentation is used exactly as emitted: no re-splitting, no merging
-            // of neighbours. Any re-segmentation here would have to be undone by the slice
-            // that interleaves speaker-track turns.
-            text: segment.text,
-            source_track: SourceTrack::Mic,
-            // Known, not inferred: the mic track is this machine's user by construction.
-            speaker_id_confidence: None,
-        })
-        .collect();
+    let mic_segments = asr.transcribe(&mic_track)?;
 
-    // Sorted here so every later slice inherits the invariant rather than each one having to
-    // establish it when it merges in speaker-track turns.
-    turns.sort_by(|a, b| a.start.total_cmp(&b.start));
+    // Diarize before recognising the speaker track, so a diarization failure costs a
+    // Whisper pass over the meeting that would have been thrown away anyway.
+    let (diarization, speaker_segments) = if speaker_track.is_empty() {
+        (Diarization::default(), Vec::new())
+    } else {
+        let diarization = diarizer.diarize(&speaker_track)?;
+        let segments = asr.transcribe(&speaker_track)?;
+        (diarization, segments)
+    };
+
+    SpeakerClusters::new(session.id.clone(), diarization.clusters).write(&session.paths)?;
+
+    let turns = merge::merge(
+        mic_segments,
+        mic_offset_seconds(&metadata)?,
+        speaker_segments,
+        speaker_offset_seconds(&metadata)?,
+        &diarization.turns,
+    );
 
     Ok(Transcript::new(session.id.clone(), turns))
 }
@@ -302,11 +340,11 @@ pub fn run_batch(
         return Ok(report);
     }
 
-    let mut engine = open_engine().map_err(|source| Error::Engine { source })?;
+    let mut engines = open_engine().map_err(|source| Error::Engine { source })?;
 
     for session in work {
         writeln!(out, "{}  transcribing...", session.id)?;
-        match transcribe_and_write(session, engine.as_mut(), out) {
+        match transcribe_and_write(session, &mut engines, out) {
             Ok(turns) => {
                 writeln!(out, "{}  {turns} turn(s)", session.id)?;
                 report.transcribed += 1;
@@ -324,10 +362,15 @@ pub fn run_batch(
 
 fn transcribe_and_write(
     session: &DiscoveredSession,
-    asr: &mut dyn SpeechToText,
+    engines: &mut Engines,
     progress: &mut dyn Write,
 ) -> Result<usize> {
-    let transcript = transcribe_session(session, asr, progress)?;
+    let transcript = transcribe_session(
+        session,
+        engines.asr.as_mut(),
+        engines.diarizer.as_mut(),
+        progress,
+    )?;
     transcript.write(&session.paths)?;
     Ok(transcript.turns.len())
 }
@@ -340,18 +383,18 @@ fn transcribe_and_write(
 /// wrong, and it means `mic.wav` is never the thing being transcribed -- so nobody can
 /// accidentally re-point ASR at the uncleaned track.
 ///
-/// An unreadable or absent `speaker.wav` is not fatal here, unlike `mic.wav`. A session with
-/// no reference is a session with nothing to cancel, which is a normal recording, not a
-/// broken one.
+/// An empty `speaker` is not fatal here, unlike an unreadable `mic.wav`. A session with no
+/// reference is a session with nothing to cancel, which is a normal recording, not a broken
+/// one.
 fn clean_mic_track(
     session: &DiscoveredSession,
+    speaker: &[f32],
     mic_minus_speaker_s: f64,
     progress: &mut dyn Write,
 ) -> Result<Vec<f32>> {
     let mic = audio::read_track_16k_mono(&session.paths.mic_wav())?;
-    let speaker = audio::read_track_16k_mono(&session.paths.speaker_wav()).unwrap_or_default();
 
-    let cleaned = aec::cancel_bleed(&mic, &speaker, mic_minus_speaker_s);
+    let cleaned = aec::cancel_bleed(&mic, speaker, mic_minus_speaker_s);
     writeln!(progress, "{}  {}", session.id, cleaned.cleaning)?;
     aec::write_cleaned_track(&session.paths.mic_cleaned_wav(), &cleaned.audio)?;
 
@@ -367,6 +410,20 @@ fn clean_mic_track(
 /// speaker-track turns join the same timeline.
 fn mic_offset_seconds(metadata: &SessionMetadata) -> Result<f64> {
     Ok(mic_minus_speaker_seconds(metadata)?.max(0.0))
+}
+
+/// Seconds from session start to the speaker track's first sample: the mirror of
+/// [`mic_offset_seconds`], so exactly one of the two is non-zero for any session.
+///
+/// Both come from `session.json`'s recorded ticks, and deliberately *not* from
+/// [`align::measure_reference_lag`]. That measurement is the acoustic path -- how long after
+/// the system rendered a sample the microphone heard it come back out of a speaker in a room
+/// -- and it bundles output latency and air propagation, neither of which has anything to do
+/// with when the far end actually spoke. Applying it here would shift every participant turn
+/// late by up to a few hundred milliseconds. The tick delta is honest to well under the
+/// accuracy merge ordering needs.
+fn speaker_offset_seconds(metadata: &SessionMetadata) -> Result<f64> {
+    Ok((-mic_minus_speaker_seconds(metadata)?).max(0.0))
 }
 
 /// How much later the microphone track's first sample is than the speaker track's, negative
@@ -402,7 +459,7 @@ mod tests {
 
     use hound::{SampleFormat, WavSpec, WavWriter};
     use jiff::Timestamp;
-    use meethook_session::{SessionPaths, TrackSync};
+    use meethook_session::{SPEAKER_YOU, SessionPaths, SourceTrack, TrackSync};
 
     use super::*;
 
@@ -411,26 +468,87 @@ mod tests {
     const NUMER: u32 = 125;
     const DENOM: u32 = 3;
 
+    /// A recognizer that answers from a script and remembers what it was asked.
+    ///
+    /// One session means two calls -- the cleaned mic track, then the speaker track, in that
+    /// order -- so both sides of the fake are per-call. Recording every buffer rather than
+    /// only the last is what lets a test assert on *which* audio reached the recognizer,
+    /// which is the only version of "ASR reads the cleaned track" that a refactor cannot
+    /// quietly break.
     #[derive(Default)]
     struct FakeAsr {
-        segments: Vec<AsrSegment>,
-        /// Whatever audio the recognizer was handed, so a test can assert on *which* track
-        /// reached it rather than trusting that the right file was opened.
-        heard: Vec<f32>,
+        /// One canned response per call, in call order. Calls past the end answer nothing.
+        responses: Vec<Vec<AsrSegment>>,
+        heard: Vec<Vec<f32>>,
+    }
+
+    impl FakeAsr {
+        fn saying(mic: Vec<AsrSegment>, speaker: Vec<AsrSegment>) -> FakeAsr {
+            FakeAsr {
+                responses: vec![mic, speaker],
+                heard: Vec::new(),
+            }
+        }
     }
 
     impl SpeechToText for FakeAsr {
         fn transcribe(&mut self, audio: &[f32]) -> Result<Vec<AsrSegment>> {
-            self.heard = audio.to_vec();
-            Ok(self.segments.clone())
+            self.heard.push(audio.to_vec());
+            Ok(self
+                .responses
+                .get(self.heard.len() - 1)
+                .cloned()
+                .unwrap_or_default())
         }
     }
 
-    fn fake_engine() -> Box<dyn SpeechToText> {
-        Box::new(FakeAsr {
-            segments: vec![segment(0.0, 1.0, "hello")],
-            heard: Vec::new(),
-        })
+    /// Diarization without a model: whatever the test says was on the speaker track.
+    ///
+    /// Every buffer it was handed is kept, so "the mic track is never diarized" is
+    /// assertable against the samples themselves rather than trusted.
+    #[derive(Default)]
+    struct FakeDiarizer {
+        diarization: Diarization,
+        heard: Vec<Vec<f32>>,
+    }
+
+    impl Diarize for FakeDiarizer {
+        fn diarize(&mut self, speaker_16k_mono: &[f32]) -> Result<Diarization> {
+            self.heard.push(speaker_16k_mono.to_vec());
+            Ok(self.diarization.clone())
+        }
+    }
+
+    fn cluster(id: u32, seconds: f64) -> meethook_session::SpeakerCluster {
+        meethook_session::SpeakerCluster {
+            id,
+            embedding: vec![1.0, 0.0],
+            speech_seconds: seconds,
+            representatives: vec![meethook_session::RepresentativeSegment {
+                start: 0.0,
+                end: 2.0,
+            }],
+        }
+    }
+
+    fn fake_engines() -> Engines {
+        Engines {
+            asr: Box::new(FakeAsr::saying(
+                vec![segment(0.0, 1.0, "hello")],
+                vec![segment(0.0, 1.0, "hi")],
+            )),
+            diarizer: Box::new(FakeDiarizer {
+                diarization: Diarization {
+                    clusters: vec![cluster(0, 1.0)],
+                    turns: vec![SpeakerTurn {
+                        start_s: 0.0,
+                        end_s: 1.0,
+                        cluster: 0,
+                    }],
+                },
+                heard: Vec::new(),
+            }),
+        }
     }
 
     /// Progress output no test is asserting on.
@@ -563,7 +681,7 @@ mod tests {
         write_silence(&session_paths.mic_wav(), 0.25);
     }
 
-    /// Runs a batch against a single fake engine, reporting how many times the engine was
+    /// Runs a batch against a single set of fake engines, reporting how many times they were
     /// opened so "no work means no model" can be asserted.
     fn run(paths: &Paths, ids: &[&str], force: bool) -> (BatchReport, usize, String) {
         let requested: Vec<SessionId> =
@@ -573,11 +691,17 @@ mod tests {
         let report = {
             let mut factory = || {
                 opened += 1;
-                Ok(fake_engine())
+                Ok(fake_engines())
             };
             run_batch(paths, &requested, force, &mut factory, &mut out).unwrap()
         };
         (report, opened, String::from_utf8(out).unwrap())
+    }
+
+    /// Transcribes one session with nobody on the far end: the shape every test that is
+    /// about the microphone side wants.
+    fn mic_only(session: &DiscoveredSession, asr: &mut FakeAsr) -> Result<Transcript> {
+        transcribe_session(session, asr, &mut FakeDiarizer::default(), &mut quiet())
     }
 
     #[test]
@@ -600,17 +724,44 @@ mod tests {
         assert_eq!(offset, 0.0);
     }
 
+    /// The two offsets are mirrors: whichever track started second is the one that gets
+    /// pushed down the timeline, and exactly one of them is ever non-zero. A sign error here
+    /// would put every participant turn on the wrong side of the meeting.
+    #[test]
+    fn exactly_one_track_is_offset_and_it_is_the_one_that_started_second() {
+        let id = SessionId::parse("20260809-052600").unwrap();
+        let base = 900_000_000_000_000u64;
+        // 1_000_000 ticks at 125/3 ns per tick is 41.666... ms.
+        let expected = 0.041_666_666;
+
+        for (mic_ticks, speaker_ticks, mic_offset, speaker_offset) in [
+            (base + 1_000_000, base, expected, 0.0),
+            (base, base + 1_000_000, 0.0, expected),
+            (base, base, 0.0, 0.0),
+        ] {
+            let metadata = metadata(&id, mic_ticks, speaker_ticks);
+            let mic = mic_offset_seconds(&metadata).unwrap();
+            let speaker = speaker_offset_seconds(&metadata).unwrap();
+            assert!((mic - mic_offset).abs() < 1e-9, "mic offset was {mic} s");
+            assert!(
+                (speaker - speaker_offset).abs() < 1e-9,
+                "speaker offset was {speaker} s"
+            );
+            assert!(mic == 0.0 || speaker == 0.0, "both tracks were offset");
+        }
+    }
+
     #[test]
     fn every_turn_is_labelled_you_on_the_mic_track_with_no_confidence() {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path());
         let session = make_session(&paths, "20260809-052600", 1_000_000);
 
-        let mut asr = FakeAsr {
-            segments: vec![segment(2.0, 3.0, "second"), segment(0.5, 1.0, "first")],
-            ..FakeAsr::default()
-        };
-        let transcript = transcribe_session(&session, &mut asr, &mut quiet()).unwrap();
+        let mut asr = FakeAsr::saying(
+            vec![segment(2.0, 3.0, "second"), segment(0.5, 1.0, "first")],
+            Vec::new(),
+        );
+        let transcript = mic_only(&session, &mut asr).unwrap();
 
         assert_eq!(transcript.turns.len(), 2);
         // Sorted, and every timestamp shifted by the mic's 41.67 ms late start.
@@ -631,12 +782,180 @@ mod tests {
         let session = make_session(&paths, "20260809-052600", 0);
 
         let mut asr = FakeAsr::default();
-        let transcript = transcribe_session(&session, &mut asr, &mut quiet()).unwrap();
+        let transcript = mic_only(&session, &mut asr).unwrap();
         assert!(transcript.turns.is_empty());
 
         transcript.write(&session.paths).unwrap();
         assert!(session.paths.transcript_json().is_file());
         assert!(session.paths.transcript_md().is_file());
+    }
+
+    /// Two clusters and a diarized speaker track: the fixture the two-track tests below run
+    /// against, with the mic starting 41.67 ms after the speaker track so session time zero
+    /// is the *speaker* track's first sample.
+    fn two_party(paths: &Paths, id: &str) -> (DiscoveredSession, FakeAsr, FakeDiarizer) {
+        let session = make_session(paths, id, 1_000_000);
+        let asr = FakeAsr::saying(
+            vec![
+                segment(1.0, 2.0, "morning"),
+                segment(5.0, 6.0, "sounds good"),
+            ],
+            vec![
+                segment(0.0, 0.9, "hi there"),
+                segment(3.0, 4.0, "and from me"),
+                segment(7.0, 8.0, "let us start"),
+            ],
+        );
+        let diarizer = FakeDiarizer {
+            diarization: Diarization {
+                clusters: vec![cluster(0, 1.9), cluster(1, 1.0)],
+                turns: vec![
+                    SpeakerTurn {
+                        start_s: 0.0,
+                        end_s: 0.9,
+                        cluster: 0,
+                    },
+                    SpeakerTurn {
+                        start_s: 3.0,
+                        end_s: 4.0,
+                        cluster: 1,
+                    },
+                    SpeakerTurn {
+                        start_s: 7.0,
+                        end_s: 8.0,
+                        cluster: 0,
+                    },
+                ],
+            },
+            heard: Vec::new(),
+        };
+        (session, asr, diarizer)
+    }
+
+    /// Acceptance criteria #1, #2, #3 and #9, at the level a user meets them: one transcript
+    /// holding both tracks in order, the local speaker labelled "You" and never diarized,
+    /// and two participants told apart rather than pooled into one "Unknown".
+    #[test]
+    fn a_two_party_session_produces_one_chronological_transcript_of_both_tracks() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let (session, mut asr, mut diarizer) = two_party(&paths, "20260809-052600");
+
+        let transcript =
+            transcribe_session(&session, &mut asr, &mut diarizer, &mut quiet()).unwrap();
+
+        let said: Vec<(&str, &str)> = transcript
+            .turns
+            .iter()
+            .map(|turn| (turn.speaker.as_str(), turn.text.as_str()))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("Unknown 1", "hi there"),
+                ("You", "morning"),
+                ("Unknown 2", "and from me"),
+                ("You", "sounds good"),
+                ("Unknown 1", "let us start"),
+            ]
+        );
+        assert!(
+            transcript
+                .turns
+                .windows(2)
+                .all(|w| w[0].start <= w[1].start),
+            "{:?}",
+            transcript.turns
+        );
+
+        // "You" and the mic track are the same set of turns, in both directions.
+        for turn in &transcript.turns {
+            assert_eq!(
+                turn.speaker == SPEAKER_YOU,
+                turn.source_track == SourceTrack::Mic,
+                "{turn:?}"
+            );
+        }
+        // The other half of AC #2, and the one a label check cannot make: the microphone
+        // samples never reached diarization at all.
+        let speaker_track = audio::read_track_16k_mono(&session.paths.speaker_wav()).unwrap();
+        assert_eq!(
+            diarizer.heard,
+            [speaker_track],
+            "diarization must be run on the speaker track and on nothing else"
+        );
+
+        // AC #9: one line per turn, in transcript order.
+        let markdown = transcript.render_markdown();
+        assert_eq!(markdown.lines().count(), transcript.turns.len());
+        assert!(
+            markdown.starts_with("**[00:00] Unknown 1:** hi there\n"),
+            "{markdown}"
+        );
+    }
+
+    /// Acceptance criterion #5, and the reason this file is written here rather than by the
+    /// caller: `enroll` has to be able to name these speakers later without re-running
+    /// diarization over the whole meeting.
+    #[test]
+    fn a_transcribed_session_gets_a_clusters_file_enroll_can_work_from() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let (session, mut asr, mut diarizer) = two_party(&paths, "20260809-052600");
+
+        transcribe_session(&session, &mut asr, &mut diarizer, &mut quiet()).unwrap();
+
+        let stored =
+            meethook_session::SpeakerClusters::read(&session.paths.speaker_clusters_json())
+                .unwrap();
+        assert_eq!(stored.session_id, session.id);
+        assert_eq!(stored.clusters.len(), 2);
+        for cluster in &stored.clusters {
+            assert!(!cluster.embedding.is_empty(), "{cluster:?}");
+            assert!(!cluster.representatives.is_empty(), "{cluster:?}");
+        }
+    }
+
+    /// The file is written on every path, including the one where there was nobody to find.
+    /// One file with no branch downstream beats an absent file every consumer has to handle.
+    #[test]
+    fn a_session_with_no_participants_still_gets_an_empty_clusters_file() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600", 0);
+
+        mic_only(&session, &mut FakeAsr::default()).unwrap();
+
+        let stored =
+            meethook_session::SpeakerClusters::read(&session.paths.speaker_clusters_json())
+                .unwrap();
+        assert!(stored.clusters.is_empty());
+    }
+
+    /// Re-running must produce the same transcript, byte for byte. Labels that moved between
+    /// runs would mean "Unknown 2" is not a thing a user can act on -- and `--force` exists
+    /// precisely so a transcript can be regenerated.
+    #[test]
+    fn re_transcribing_the_same_session_produces_an_identical_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+
+        let transcribe = |id: &str| {
+            let (session, mut asr, mut diarizer) = two_party(&paths, id);
+            let transcript =
+                transcribe_session(&session, &mut asr, &mut diarizer, &mut quiet()).unwrap();
+            transcript.write(&session.paths).unwrap();
+            (
+                std::fs::read(session.paths.transcript_json()).unwrap(),
+                std::fs::read(session.paths.transcript_md()).unwrap(),
+            )
+        };
+
+        // Compared as bytes rather than as parsed turns, because what a user diffs is the
+        // file: a re-ordered tie or a renumbered label would show up here and nowhere else.
+        let first = transcribe("20260809-052600");
+        let second = transcribe("20260809-052600");
+        assert_eq!(first, second);
     }
 
     /// Acceptance criterion #1. The derived track appears; the recording it was derived from
@@ -649,7 +968,7 @@ mod tests {
         let before = std::fs::read(session.paths.mic_wav()).unwrap();
 
         let mut asr = FakeAsr::default();
-        transcribe_session(&session, &mut asr, &mut quiet()).unwrap();
+        mic_only(&session, &mut asr).unwrap();
 
         assert!(session.paths.mic_cleaned_wav().is_file());
         assert_eq!(
@@ -669,13 +988,13 @@ mod tests {
         let session = make_bleeding_session(&paths, "20260809-052600");
 
         let mut asr = FakeAsr::default();
-        transcribe_session(&session, &mut asr, &mut quiet()).unwrap();
+        mic_only(&session, &mut asr).unwrap();
 
         let raw = audio::read_track_16k_mono(&session.paths.mic_wav()).unwrap();
         let cleaned = audio::read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap();
-        assert_eq!(asr.heard, cleaned, "ASR must read mic.cleaned.wav");
+        assert_eq!(asr.heard[0], cleaned, "ASR must read mic.cleaned.wav");
         assert_ne!(
-            asr.heard, raw,
+            asr.heard[0], raw,
             "on a session with real bleed the cleaned track must differ from the raw one, \
              otherwise this test would pass without any cancellation happening at all"
         );
@@ -691,11 +1010,20 @@ mod tests {
         std::fs::remove_file(session.paths.speaker_wav()).unwrap();
 
         let mut asr = FakeAsr::default();
+        let mut diarizer = FakeDiarizer::default();
         let mut progress = Vec::new();
-        transcribe_session(&session, &mut asr, &mut progress).unwrap();
+        transcribe_session(&session, &mut asr, &mut diarizer, &mut progress).unwrap();
 
         let raw = audio::read_track_16k_mono(&session.paths.mic_wav()).unwrap();
-        assert_eq!(asr.heard, raw);
+        assert_eq!(
+            asr.heard,
+            std::slice::from_ref(&raw),
+            "only the mic track exists to hear"
+        );
+        assert!(
+            diarizer.heard.is_empty(),
+            "there is no speaker track to diarize, so the models must not be run at all"
+        );
         // Still written, and still what ASR read: one input file, no branch downstream.
         assert_eq!(
             audio::read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap(),
@@ -733,8 +1061,9 @@ mod tests {
         assert_eq!(second.transcribed, 0);
         assert_eq!(second.skipped, 1);
         assert!(output.contains("already transcribed"), "{output}");
-        // The sharp edge: a no-op rerun must not fetch a 1.6 GB model in order to do nothing.
-        assert_eq!(opened, 0, "a fully skipped batch must not open the model");
+        // The sharp edge: a no-op rerun must not fetch 1.7 GB of models in order to do
+        // nothing. One factory for all three is what keeps this a single decision.
+        assert_eq!(opened, 0, "a fully skipped batch must not open any model");
 
         let (third, _, _) = run(&paths, &[], true);
         assert_eq!(third.transcribed, 1);

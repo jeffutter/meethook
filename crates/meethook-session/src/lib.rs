@@ -40,7 +40,7 @@ pub use speaker_clusters::{
     SpeakerCluster, SpeakerClusters,
 };
 pub use transcript::{
-    SourceTrack, TRANSCRIPT_SCHEMA_VERSION, Transcript, Turn, YOU as SPEAKER_YOU,
+    SourceTrack, TRANSCRIPT_SCHEMA_VERSION, Transcript, Turn, YOU as SPEAKER_YOU, unknown_speaker,
 };
 
 use std::path::PathBuf;

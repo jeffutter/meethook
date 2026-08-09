@@ -17,6 +17,24 @@ pub const TRANSCRIPT_SCHEMA_VERSION: u32 = 1;
 /// can make it anyone else.
 pub const YOU: &str = "You";
 
+/// The label for a voice on the speaker track that nobody has named yet.
+///
+/// `number` is the speaker's rank by *first appearance* in the session, starting at 1, so
+/// "Unknown 1" means "the first unidentified person to speak". Numbering by first
+/// appearance rather than by cluster id is what makes the label stable across a `--force`
+/// re-transcribe and meaningful to a user who is reading the transcript top to bottom.
+///
+/// It lives here, beside [`YOU`], because `enroll` has to recognise the label it is about
+/// to replace with a real name -- that makes the format part of the on-disk contract rather
+/// than a detail of whatever produced the transcript.
+///
+/// Numbers are assigned over *all* speaker-track voices, named or not. When `enroll`
+/// substitutes a name it leaves the number it replaced unused rather than renumbering the
+/// rest, so naming one person never silently changes anybody else's label.
+pub fn unknown_speaker(number: usize) -> String {
+    format!("Unknown {number}")
+}
+
 /// Which captured track a turn came from.
 ///
 /// Kept as an explicit field even though it is currently derivable from

@@ -5,14 +5,18 @@
 //! they can be tested without a terminal.
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use meethook_models::ensure_model;
+use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
 use meethook_session::{Paths, SessionId};
-use meethook_transcribe::{SpeechToText, WHISPER_MODEL, WhisperEngine, run_batch};
+use meethook_transcribe::{
+    EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, WHISPER_MODEL, WhisperEngine,
+    run_batch,
+};
 
 /// The three waits the record loop's behaviour depends on.
 ///
@@ -350,22 +354,33 @@ fn await_end(rx: &Receiver<Event>, grace: Duration) -> Outcome {
 /// Transcribes recorded sessions.
 ///
 /// Fully non-interactive, deliberately: this is meant to be aimed at a directory of
-/// meetings and left alone. The model is acquired lazily through the factory below, so a
-/// run that turns out to have nothing to do never pays for a download.
+/// meetings and left alone. All three models are acquired lazily through the one factory
+/// below, so a run that turns out to have nothing to do never pays for a download.
 pub fn transcribe(paths: &Paths, session_ids: &[String], force: bool) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
 
     let models_dir = paths.models_dir();
-    let mut open_engine = || -> std::result::Result<
-        Box<dyn SpeechToText>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        let mut report = DownloadProgress::default();
-        let model = ensure_model(&models_dir, &WHISPER_MODEL, &mut |done, total| {
-            report.update(done, total)
-        })?;
-        Ok(Box::new(WhisperEngine::load(&model)?))
-    };
+    let mut open_engine =
+        || -> std::result::Result<Engines, Box<dyn std::error::Error + Send + Sync>> {
+            // Diarization's two models are 32 MB against Whisper's 1.6 GB, and are fetched
+            // first so that a first run reaches its slowest download last -- by which point
+            // everything else is known to be in place.
+            let segmentation = fetch(&models_dir, &SEGMENTATION_MODEL)?;
+            let embedding = fetch(&models_dir, &EMBEDDING_MODEL)?;
+            let whisper = fetch(&models_dir, &WHISPER_MODEL)?;
+
+            let diarizer = OnnxDiarizer::load(&segmentation, &embedding)?;
+            if !diarizer.accelerated() {
+                // Correct but several times slower. Worth a line: the alternative is a user
+                // wondering why transcribing a meeting suddenly takes minutes.
+                eprintln!("Note: CoreML declined these graphs; diarization is running on CPU.");
+            }
+
+            Ok(Engines {
+                asr: Box::new(WhisperEngine::load(&whisper)?),
+                diarizer: Box::new(diarizer),
+            })
+        };
 
     let stdout = io::stdout();
     let report = run_batch(
@@ -388,26 +403,48 @@ pub fn transcribe(paths: &Paths, session_ids: &[String], force: bool) -> Result<
     Ok(())
 }
 
+/// Acquires one model, reporting its download identically to every other model's.
+fn fetch(
+    models_dir: &std::path::Path,
+    spec: &'static ModelSpec,
+) -> meethook_models::Result<PathBuf> {
+    let mut report = DownloadProgress::new(spec);
+    ensure_model(models_dir, spec, &mut |done, total| {
+        report.update(done, total)
+    })
+}
+
 /// Prints download progress on stderr, one line, rewritten in place.
 ///
 /// stderr rather than stdout so the batch's own output stays a clean, greppable record of
 /// what happened to each session. Throttled to whole percent because a 1.6 GB download at a
 /// megabyte a chunk would otherwise emit sixteen hundred lines.
-#[derive(Default)]
 struct DownloadProgress {
+    spec: &'static ModelSpec,
     last_percent: u64,
     started: bool,
 }
 
 impl DownloadProgress {
+    fn new(spec: &'static ModelSpec) -> DownloadProgress {
+        DownloadProgress {
+            spec,
+            last_percent: 0,
+            started: false,
+        }
+    }
+
     fn update(&mut self, done: u64, total: u64) {
         if !self.started {
             self.started = true;
-            eprintln!(
-                "Fetching {} ({:.1} GB, one time)",
-                WHISPER_MODEL.file_name,
-                total as f64 / 1e9
-            );
+            // Megabytes for the two diarization graphs, gigabytes for Whisper: "0.0 GB"
+            // against a 6 MB file reads as a bug in the downloader.
+            let size = if total >= 1_000_000_000 {
+                format!("{:.1} GB", total as f64 / 1e9)
+            } else {
+                format!("{:.0} MB", total as f64 / 1e6)
+            };
+            eprintln!("Fetching {} ({size}, one time)", self.spec.file_name);
         }
         let percent = (done * 100).checked_div(total).unwrap_or(0);
         if percent == self.last_percent && done < total {
