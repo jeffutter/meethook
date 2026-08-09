@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use meethook_session::{SPEAKER_YOU, SourceTrack, Turn, unknown_speaker};
+use meethook_session::{SPEAKER_YOU, SourceTrack, Turn, unknown_labels, unknown_speaker};
 
 use crate::asr::AsrSegment;
 use crate::diarize::SpeakerTurn;
@@ -94,43 +94,23 @@ pub fn merge(
 }
 
 /// Labels every voice on the speaker track: an enrolled speaker's name where there is one,
-/// otherwise "Unknown N", numbered by when that voice first spoke.
+/// otherwise the "Unknown N" [`unknown_labels`] hands it.
 ///
-/// Cluster ids are an artifact of clustering order -- they rank voices by how much they
-/// talked -- and mean nothing to someone reading a transcript from the top. Numbering by
-/// first appearance makes "Unknown 1" the first unidentified person to speak, which is
-/// reproducible across reruns and is the only version of the label a user can act on.
-///
-/// Numbers are handed out over *every* voice and a name then replaces one, leaving the number
-/// it took unused: a meeting whose second speaker is enrolled reads "Unknown 1 / Alice /
-/// Unknown 3". The gap is deliberate. Renumbering the unnamed instead would mean enrolling one
-/// person silently relabels everybody else -- and `enroll` rewrites existing transcripts in
-/// place, so that would land as a diff across meetings nobody touched.
+/// The numbering rule -- first appearance, ties by cluster id, from 1 -- deliberately is not
+/// implemented here. `enroll` has to work out which cluster an "Unknown 2" in an existing
+/// transcript refers to, so it needs the identical numbering, and a second copy of the rule
+/// would drift from this one with a misplaced name as the only symptom. See
+/// [`unknown_labels`] for the rule and why the numbers a name displaces stay unused.
 fn label_by_first_appearance(
     diarized: &[SpeakerTurn],
     identified: &BTreeMap<u32, Identification>,
 ) -> BTreeMap<u32, Label> {
-    let mut first: BTreeMap<u32, f64> = BTreeMap::new();
-    for turn in diarized {
-        first
-            .entry(turn.cluster)
-            .and_modify(|earliest| *earliest = earliest.min(turn.start_s))
-            .or_insert(turn.start_s);
-    }
-
-    // Ascending cluster id out of the map, then a stable sort by time: two voices whose
-    // first turns begin at the same instant are numbered by cluster id, so the labels do not
-    // depend on which order the turns happened to arrive in.
-    let mut order: Vec<(u32, f64)> = first.into_iter().collect();
-    order.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-    order
+    unknown_labels(diarized.iter().map(|turn| (turn.cluster, turn.start_s)))
         .into_iter()
-        .enumerate()
-        .map(|(rank, (id, _))| {
+        .map(|(id, unknown)| {
             let label = match identified.get(&id) {
                 Some(who) => (who.name.clone(), Some(who.similarity)),
-                None => (unknown_speaker(rank + 1), None),
+                None => (unknown, None),
             };
             (id, label)
         })

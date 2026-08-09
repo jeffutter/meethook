@@ -135,6 +135,14 @@ pub fn cluster_speaker_turns(
             id: id as u32,
             embedding: reference_embedding(group, &embeddings),
             speech_seconds: spoken(group),
+            // `agglomerate` never returns an empty group, but the type allows one and the
+            // alternative fold would leave an infinity here -- which serializes as `null`
+            // and makes the whole clusters file unreadable rather than merely odd.
+            first_spoke_seconds: members
+                .iter()
+                .map(|turn| turn.start_s)
+                .min_by(f64::total_cmp)
+                .unwrap_or(0.0),
             representatives: representatives(&members, track_end_s),
         });
     }
@@ -655,5 +663,46 @@ mod tests {
         assert_eq!(clustering.assignment, [Some(0), None]);
         assert_eq!(clustering.skipped(), 1);
         assert_eq!(clustering.clusters.len(), 1);
+    }
+
+    /// What `enroll` will read out of `speaker_clusters.json` to recover the "Unknown N"
+    /// numbering: each cluster's first appearance is the earliest turn it actually holds.
+    ///
+    /// The turns are handed over latest-first, because that is the mistake worth guarding --
+    /// taking the group's first member rather than its earliest one would answer 12 s here,
+    /// and the only symptom downstream would be two voices numbered the wrong way round.
+    #[test]
+    fn a_clusters_first_appearance_is_the_earliest_turn_it_holds() {
+        let Some(mut embedder) = model(&crate::EMBEDDING_MODEL) else {
+            return;
+        };
+        let mut track = vec![0.0f32; 20 * TARGET_RATE as usize];
+        let mut speak = |at_s: f64, samples: Vec<f32>| {
+            let start = (at_s * TARGET_RATE as f64) as usize;
+            track[start..start + samples.len()].copy_from_slice(&samples);
+        };
+        speak(1.0, voice(3.0, 130.0, [730.0, 1090.0, 2440.0]));
+        speak(12.0, voice(3.0, 300.0, [270.0, 2300.0, 3000.0]));
+
+        let turns = [turn(12.0, 15.0), turn(1.0, 4.0)];
+        let clustering = cluster_speaker_turns(&track, &turns, &mut embedder).unwrap();
+
+        for cluster in &clustering.clusters {
+            let earliest = turns
+                .iter()
+                .zip(&clustering.assignment)
+                .filter(|(_, assigned)| **assigned == Some(cluster.id))
+                .map(|(turn, _)| turn.start_s)
+                .fold(f64::INFINITY, f64::min);
+            assert_eq!(cluster.first_spoke_seconds, earliest, "{cluster:?}");
+        }
+        assert!(
+            clustering
+                .clusters
+                .iter()
+                .any(|c| c.first_spoke_seconds == 1.0),
+            "{:?}",
+            clustering.clusters
+        );
     }
 }

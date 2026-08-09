@@ -38,7 +38,7 @@ pub use metadata::{SESSION_SCHEMA_VERSION, SessionMetadata, TrackSync};
 pub use paths::{Paths, SessionPaths};
 pub use speaker_clusters::{
     MIN_REPRESENTATIVE_SECONDS, RepresentativeSegment, SPEAKER_CLUSTERS_SCHEMA_VERSION,
-    SpeakerCluster, SpeakerClusters,
+    SpeakerCluster, SpeakerClusters, unknown_labels,
 };
 pub use speakers::{ENROLLED_SPEAKERS_SCHEMA_VERSION, EnrolledSpeaker, EnrolledSpeakers};
 pub use transcript::{

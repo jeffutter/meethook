@@ -551,11 +551,15 @@ mod tests {
         embedding
     }
 
-    fn cluster(id: u32, seconds: f64) -> meethook_session::SpeakerCluster {
+    /// `first_spoke` is seconds into the speaker track, and every caller below keeps it
+    /// consistent with the turns it hands the same fake diarizer -- that agreement is what
+    /// production computes, so a fixture that broke it would be testing nothing.
+    fn cluster(id: u32, seconds: f64, first_spoke: f64) -> meethook_session::SpeakerCluster {
         meethook_session::SpeakerCluster {
             id,
             embedding: voice(id),
             speech_seconds: seconds,
+            first_spoke_seconds: first_spoke,
             representatives: vec![meethook_session::RepresentativeSegment {
                 start: 0.0,
                 end: 2.0,
@@ -571,7 +575,7 @@ mod tests {
             )),
             diarizer: Box::new(FakeDiarizer {
                 diarization: Diarization {
-                    clusters: vec![cluster(0, 1.0)],
+                    clusters: vec![cluster(0, 1.0, 0.0)],
                     turns: vec![SpeakerTurn {
                         start_s: 0.0,
                         end_s: 1.0,
@@ -871,7 +875,7 @@ mod tests {
         );
         let diarizer = FakeDiarizer {
             diarization: Diarization {
-                clusters: vec![cluster(0, 1.9), cluster(1, 1.0)],
+                clusters: vec![cluster(0, 1.9, 0.0), cluster(1, 1.0, 3.0)],
                 turns: vec![
                     SpeakerTurn {
                         start_s: 0.0,
@@ -990,6 +994,26 @@ mod tests {
             assert!(!cluster.embedding.is_empty(), "{cluster:?}");
             assert!(!cluster.representatives.is_empty(), "{cluster:?}");
         }
+
+        // The one thing in here that cannot be recovered from the rest of the file, and the
+        // whole reason `enroll` can map an "Unknown N" back to a cluster: `unknown_labels`
+        // over these has to reproduce the labels the transcript was just written with.
+        assert_eq!(
+            stored
+                .clusters
+                .iter()
+                .map(|c| (c.id, c.first_spoke_seconds))
+                .collect::<Vec<_>>(),
+            [(0, 0.0), (1, 3.0)]
+        );
+        let recovered = meethook_session::unknown_labels(
+            stored
+                .clusters
+                .iter()
+                .map(|c| (c.id, c.first_spoke_seconds)),
+        );
+        assert_eq!(recovered[&0], "Unknown 1");
+        assert_eq!(recovered[&1], "Unknown 2");
     }
 
     /// The file is written on every path, including the one where there was nobody to find.

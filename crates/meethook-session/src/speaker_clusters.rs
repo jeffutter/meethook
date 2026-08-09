@@ -1,15 +1,24 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result, SessionId, SessionPaths, write_atomic};
+use crate::{Error, Result, SessionId, SessionPaths, unknown_speaker, write_atomic};
 
 /// Bumped whenever `speaker_clusters.json`'s shape changes incompatibly.
 ///
 /// Separate from the transcript's and the session's versions for the same reason those two
 /// are separate from each other: this file is written by diarization and read by `enroll`,
 /// on its own schedule.
-pub const SPEAKER_CLUSTERS_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 added [`SpeakerCluster::first_spoke_seconds`], and added it as a required
+/// field: a version 1 file now fails to parse rather than being read with a first
+/// appearance of zero. Defaulting would be worse than refusing. Every cluster would tie at
+/// zero, [`unknown_labels`] would fall through to its cluster-id tie-break, and the
+/// "Unknown N" numbering a reader recovered would silently be talk-time order instead of
+/// first-appearance order -- which in `enroll` means one person's name written onto another
+/// person's turns. Re-transcribing the session rewrites the file correctly.
+pub const SPEAKER_CLUSTERS_SCHEMA_VERSION: u32 = 2;
 
 /// The shortest clip a representative segment is allowed to be.
 ///
@@ -74,11 +83,68 @@ pub struct SpeakerCluster {
     /// how a consumer tells a participant from someone who coughed once.
     pub speech_seconds: f64,
 
+    /// When this voice was first heard: seconds **into `speaker.wav`**, the same track time
+    /// [`RepresentativeSegment`] uses rather than the session timeline [`crate::Turn`] is on.
+    ///
+    /// It is here because it is the one thing about a cluster that cannot be recovered from
+    /// the rest of this file, and the whole "Unknown N" numbering rests on it: [`id`] ranks
+    /// voices by talk time and `representatives` are the longest clips, so neither says who
+    /// spoke first. A reader holding only this file reproduces the labels a transcript was
+    /// written with by handing these to [`unknown_labels`].
+    ///
+    /// [`id`]: SpeakerCluster::id
+    pub first_spoke_seconds: f64,
+
     /// Clips to play when asking who this is, longest first.
     ///
     /// Each spans at least [`MIN_REPRESENTATIVE_SECONDS`]. Never empty for a cluster that
     /// made it into this file.
     pub representatives: Vec<RepresentativeSegment>,
+}
+
+/// The "Unknown N" label each voice gets, keyed by cluster id.
+///
+/// `first_spoke` is when each voice was heard: `(cluster id, seconds into the speaker
+/// track)`. A cluster may appear more than once -- handing over every diarized turn is as
+/// valid as handing over one pair per cluster -- and the earliest time given for it wins.
+///
+/// Voices are numbered from 1 in order of first appearance, ties broken by ascending
+/// cluster id. Ordering by first appearance is what makes "Unknown 1" mean "the first
+/// unidentified person to speak"; cluster ids rank voices by how much they talked and mean
+/// nothing to somebody reading a transcript from the top. The tie-break matters for two
+/// people who started talking over each other, and keeps the labels independent of the
+/// order the turns arrived in.
+///
+/// Numbers are handed out over *every* voice, including ones a caller is about to rename:
+/// substituting a name leaves the number it took unused, so a meeting whose second speaker
+/// is enrolled reads "Unknown 1 / Alice / Unknown 3". The gap is deliberate. Renumbering the
+/// unnamed instead would mean enrolling one person silently relabels everybody else -- and
+/// `enroll` rewrites existing transcripts in place, so that would land as a diff across
+/// meetings nobody touched.
+///
+/// This rule lives here, in the on-disk contract, because two parties need the identical
+/// numbering: `transcribe` renders these labels into a transcript, and `enroll` has to work
+/// out which cluster an "Unknown 2" it is about to replace refers to. Two implementations
+/// would drift, and the symptom would be a name written onto the wrong person's turns.
+pub fn unknown_labels(first_spoke: impl IntoIterator<Item = (u32, f64)>) -> BTreeMap<u32, String> {
+    let mut earliest: BTreeMap<u32, f64> = BTreeMap::new();
+    for (cluster, seconds) in first_spoke {
+        earliest
+            .entry(cluster)
+            .and_modify(|first| *first = first.min(seconds))
+            .or_insert(seconds);
+    }
+
+    // Ascending cluster id out of the map, then a stable sort by time, which is the
+    // tie-break stated above.
+    let mut order: Vec<(u32, f64)> = earliest.into_iter().collect();
+    order.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+    order
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (cluster, _))| (cluster, unknown_speaker(rank + 1)))
+        .collect()
 }
 
 /// `speaker_clusters.json`: the voices found on one session's speaker track.
@@ -118,18 +184,34 @@ impl SpeakerClusters {
 mod tests {
     use super::*;
 
+    /// Two voices whose talk-time order is the opposite of their first-appearance order --
+    /// cluster 1 spoke first and cluster 0 did most of the talking -- so nothing below can
+    /// pass by confusing the two.
     fn clusters() -> SpeakerClusters {
         SpeakerClusters::new(
             SessionId::parse("20260809-052600").unwrap(),
-            vec![SpeakerCluster {
-                id: 0,
-                embedding: vec![0.6, 0.8],
-                speech_seconds: 42.5,
-                representatives: vec![RepresentativeSegment {
-                    start: 10.0,
-                    end: 13.0,
-                }],
-            }],
+            vec![
+                SpeakerCluster {
+                    id: 0,
+                    embedding: vec![0.6, 0.8],
+                    speech_seconds: 42.5,
+                    first_spoke_seconds: 31.75,
+                    representatives: vec![RepresentativeSegment {
+                        start: 10.0,
+                        end: 13.0,
+                    }],
+                },
+                SpeakerCluster {
+                    id: 1,
+                    embedding: vec![0.8, 0.6],
+                    speech_seconds: 8.0,
+                    first_spoke_seconds: 2.5,
+                    representatives: vec![RepresentativeSegment {
+                        start: 2.5,
+                        end: 5.5,
+                    }],
+                },
+            ],
         )
     }
 
@@ -178,5 +260,99 @@ mod tests {
 
         let read = SpeakerClusters::read(&paths.speaker_clusters_json()).unwrap();
         assert!(read.clusters.is_empty());
+    }
+
+    /// The field `enroll` cannot do its job without, stated on its own rather than left to
+    /// the struct-wide equality above: it has to come back off disk as the number that went
+    /// on, not as a zero that happens to compare equal to another zero.
+    #[test]
+    fn first_appearance_survives_a_write_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(dir.path());
+
+        clusters().write(&paths).unwrap();
+
+        let read = SpeakerClusters::read(&paths.speaker_clusters_json()).unwrap();
+        assert_eq!(
+            read.clusters
+                .iter()
+                .map(|c| (c.id, c.first_spoke_seconds))
+                .collect::<Vec<_>>(),
+            [(0, 31.75), (1, 2.5)]
+        );
+    }
+
+    /// A `speaker_clusters.json` written by a version 1 build has no first appearance in it,
+    /// and there is no honest value to invent: every cluster would tie at zero and the
+    /// numbering below would quietly become talk-time order. So it must fail to parse, and
+    /// say which file it was, since that is all `enroll` has to tell the user to re-transcribe.
+    #[test]
+    fn a_version_1_file_is_refused_rather_than_read_with_a_defaulted_first_appearance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("speaker_clusters.json");
+        std::fs::write(
+            &path,
+            br#"{
+              "schema_version": 1,
+              "session_id": "20260809-052600",
+              "clusters": [
+                {
+                  "id": 0,
+                  "embedding": [0.6, 0.8],
+                  "speech_seconds": 42.5,
+                  "representatives": [{ "start": 10.0, "end": 13.0 }]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let error = SpeakerClusters::read(&path).unwrap_err();
+
+        assert!(
+            matches!(&error, Error::Json { path: at, .. } if at == &path),
+            "{error:?}"
+        );
+    }
+
+    /// The rule itself: order of first appearance, not the order of the map and not cluster
+    /// id. Cluster ids rank voices by talk time, so the first person to speak is routinely
+    /// not cluster 0 -- and a transcript whose opening line is "Unknown 3" reads as a bug.
+    #[test]
+    fn voices_are_numbered_by_first_appearance_rather_than_by_cluster_id() {
+        let labels = unknown_labels([(0, 30.0), (1, 10.0), (2, 20.0)]);
+
+        assert_eq!(labels[&1], "Unknown 1");
+        assert_eq!(labels[&2], "Unknown 2");
+        assert_eq!(labels[&0], "Unknown 3");
+    }
+
+    /// Two people who started talking over each other still have to be numbered
+    /// reproducibly, whichever order the caller happens to hand them over in.
+    #[test]
+    fn voices_that_first_speak_at_the_same_instant_are_numbered_by_cluster_id() {
+        for order in [[(1, 4.0), (0, 4.0)], [(0, 4.0), (1, 4.0)]] {
+            let labels = unknown_labels(order);
+            assert_eq!(labels[&0], "Unknown 1");
+            assert_eq!(labels[&1], "Unknown 2");
+        }
+    }
+
+    /// Callers may hand over every turn rather than one pair per voice, which is what
+    /// `merge` has in front of it; a voice's *first* appearance is what counts, however many
+    /// later ones come with it.
+    #[test]
+    fn a_voice_seen_more_than_once_is_ranked_by_its_earliest_appearance() {
+        let labels = unknown_labels([(0, 9.0), (1, 5.0), (0, 1.0), (1, 12.0)]);
+
+        assert_eq!(labels[&0], "Unknown 1");
+        assert_eq!(labels[&1], "Unknown 2");
+    }
+
+    /// Diarization finding nobody -- an unusually quiet or noisy track -- is an ordinary
+    /// meeting, not an error.
+    #[test]
+    fn no_voices_yields_no_labels() {
+        assert!(unknown_labels([]).is_empty());
     }
 }

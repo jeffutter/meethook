@@ -134,6 +134,9 @@ mod tests {
             id,
             embedding,
             speech_seconds: 10.0,
+            // Distinct per cluster, and never zero, so nothing here can pass by accident on
+            // a tie between two voices that supposedly began at the same instant.
+            first_spoke_seconds: 5.0 + id as f64,
             representatives: vec![RepresentativeSegment {
                 start: 0.0,
                 end: 2.0,
