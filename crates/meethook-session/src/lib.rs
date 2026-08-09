@@ -29,7 +29,7 @@ mod metadata;
 mod paths;
 mod transcript;
 
-pub use atomic::write_atomic;
+pub use atomic::{write_atomic, write_atomic_with};
 pub use discovery::{Classification, DiscoveredSession, discover_sessions};
 pub use id::{SessionId, create_session_dir};
 pub use metadata::{SESSION_SCHEMA_VERSION, SessionMetadata, TrackSync};

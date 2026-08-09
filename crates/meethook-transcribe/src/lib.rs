@@ -16,6 +16,7 @@ mod audio;
 use std::io::Write;
 use std::path::PathBuf;
 
+pub use aec::{Cleaned, Cleaning, PassThrough, cancel_bleed};
 pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
 pub use audio::TARGET_RATE;
@@ -117,16 +118,23 @@ pub struct BatchReport {
 
 /// Transcribes one session, returning the transcript without writing it.
 ///
-/// Not writing is deliberate: the caller decides, which is what keeps skip and `--force`
-/// logic in one place instead of spread between here and there.
+/// Not writing the *transcript* is deliberate: the caller decides, which is what keeps skip
+/// and `--force` logic in one place instead of spread between here and there.
+/// `mic.cleaned.wav` is a different matter and is written here, because it is an input to
+/// the recognition that happens here rather than a result the caller chooses to keep.
+///
+/// `progress` receives one line about the echo-cancellation pre-pass. A user whose sessions
+/// quietly stopped being cleaned should be able to see that from normal output rather than
+/// from a mysteriously worse transcript.
 pub fn transcribe_session(
     session: &DiscoveredSession,
     asr: &mut dyn SpeechToText,
+    progress: &mut dyn Write,
 ) -> Result<Transcript> {
     let metadata = session.load_metadata()?;
     let offset = mic_offset_seconds(&metadata)?;
 
-    let audio = audio::read_track_16k_mono(&session.paths.mic_wav())?;
+    let audio = clean_mic_track(session, mic_minus_speaker_seconds(&metadata)?, progress)?;
     let segments = asr.transcribe(&audio)?;
 
     let mut turns: Vec<Turn> = segments
@@ -231,7 +239,7 @@ pub fn run_batch(
 
     for session in work {
         writeln!(out, "{}  transcribing...", session.id)?;
-        match transcribe_and_write(session, engine.as_mut()) {
+        match transcribe_and_write(session, engine.as_mut(), out) {
             Ok(turns) => {
                 writeln!(out, "{}  {turns} turn(s)", session.id)?;
                 report.transcribed += 1;
@@ -247,10 +255,40 @@ pub fn run_batch(
     Ok(report)
 }
 
-fn transcribe_and_write(session: &DiscoveredSession, asr: &mut dyn SpeechToText) -> Result<usize> {
-    let transcript = transcribe_session(session, asr)?;
+fn transcribe_and_write(
+    session: &DiscoveredSession,
+    asr: &mut dyn SpeechToText,
+    progress: &mut dyn Write,
+) -> Result<usize> {
+    let transcript = transcribe_session(session, asr, progress)?;
     transcript.write(&session.paths)?;
     Ok(transcript.turns.len())
+}
+
+/// Removes speaker bleed from the mic track, writes the result to `mic.cleaned.wav`, and
+/// returns it for recognition.
+///
+/// The cleaned track is written on every path, including the ones where nothing was
+/// cancelled. That is what lets everything downstream read one file with no branch to get
+/// wrong, and it means `mic.wav` is never the thing being transcribed -- so nobody can
+/// accidentally re-point ASR at the uncleaned track.
+///
+/// An unreadable or absent `speaker.wav` is not fatal here, unlike `mic.wav`. A session with
+/// no reference is a session with nothing to cancel, which is a normal recording, not a
+/// broken one.
+fn clean_mic_track(
+    session: &DiscoveredSession,
+    mic_minus_speaker_s: f64,
+    progress: &mut dyn Write,
+) -> Result<Vec<f32>> {
+    let mic = audio::read_track_16k_mono(&session.paths.mic_wav())?;
+    let speaker = audio::read_track_16k_mono(&session.paths.speaker_wav()).unwrap_or_default();
+
+    let cleaned = aec::cancel_bleed(&mic, &speaker, mic_minus_speaker_s);
+    writeln!(progress, "{}  {}", session.id, cleaned.cleaning)?;
+    aec::write_cleaned_track(&session.paths.mic_cleaned_wav(), &cleaned.audio)?;
+
+    Ok(cleaned.audio)
 }
 
 /// Seconds from session start to the microphone track's first sample.
@@ -260,14 +298,23 @@ fn transcribe_and_write(session: &DiscoveredSession, asr: &mut dyn SpeechToText)
 /// with no recorded pairing to mach tick space, so it cannot be compared to either track's
 /// `host_ticks`. Using the earliest track instead keeps every turn non-negative once
 /// speaker-track turns join the same timeline.
+fn mic_offset_seconds(metadata: &SessionMetadata) -> Result<f64> {
+    Ok(mic_minus_speaker_seconds(metadata)?.max(0.0))
+}
+
+/// How much later the microphone track's first sample is than the speaker track's, negative
+/// if the microphone started first.
 ///
 /// The conversion is exact -- integer ticks scaled by the machine's rational timebase in
-/// `u128`, rounded once at the end. Going through `f64` first would lose the low bits of a
+/// `i128`, rounded once at the end. Going through `f64` first would lose the low bits of a
 /// mach tick count within a day of uptime.
 ///
-/// This is metadata alignment only. Correcting the acoustic offset between the two capture
-/// APIs has to be measured from the signals themselves and is not this function's business.
-fn mic_offset_seconds(metadata: &SessionMetadata) -> Result<f64> {
+/// This is metadata alignment only, and the sign is the whole reason it exists separately
+/// from [`mic_offset_seconds`]: the echo canceller's delay search needs to know which track
+/// actually started first, and clamping that to zero would centre the search in the wrong
+/// place. Correcting the *acoustic* offset between the two capture APIs is a different
+/// problem again, measured from the signals themselves in [`align`].
+fn mic_minus_speaker_seconds(metadata: &SessionMetadata) -> Result<f64> {
     let mic = metadata.mic;
     if mic.timebase_numer == 0 || mic.timebase_denom == 0 {
         return Err(Error::DegenerateTimebase {
@@ -277,9 +324,8 @@ fn mic_offset_seconds(metadata: &SessionMetadata) -> Result<f64> {
         });
     }
 
-    let origin = mic.host_ticks.min(metadata.speaker.host_ticks);
-    let delta = u128::from(mic.host_ticks - origin);
-    let nanos = delta * u128::from(mic.timebase_numer) / u128::from(mic.timebase_denom);
+    let delta = i128::from(mic.host_ticks) - i128::from(metadata.speaker.host_ticks);
+    let nanos = delta * i128::from(mic.timebase_numer) / i128::from(mic.timebase_denom);
     Ok(nanos as f64 / 1e9)
 }
 
@@ -298,12 +344,17 @@ mod tests {
     const NUMER: u32 = 125;
     const DENOM: u32 = 3;
 
+    #[derive(Default)]
     struct FakeAsr {
         segments: Vec<AsrSegment>,
+        /// Whatever audio the recognizer was handed, so a test can assert on *which* track
+        /// reached it rather than trusting that the right file was opened.
+        heard: Vec<f32>,
     }
 
     impl SpeechToText for FakeAsr {
-        fn transcribe(&mut self, _audio: &[f32]) -> Result<Vec<AsrSegment>> {
+        fn transcribe(&mut self, audio: &[f32]) -> Result<Vec<AsrSegment>> {
+            self.heard = audio.to_vec();
             Ok(self.segments.clone())
         }
     }
@@ -311,7 +362,13 @@ mod tests {
     fn fake_engine() -> Box<dyn SpeechToText> {
         Box::new(FakeAsr {
             segments: vec![segment(0.0, 1.0, "hello")],
+            heard: Vec::new(),
         })
+    }
+
+    /// Progress output no test is asserting on.
+    fn quiet() -> std::io::Sink {
+        std::io::sink()
     }
 
     fn segment(start: f64, end: f64, text: &str) -> AsrSegment {
@@ -362,6 +419,66 @@ mod tests {
         // A tick magnitude large enough that an accidental f64 round-trip would lose bits.
         let base = 900_000_000_000u64;
         metadata(&id, base + mic_lag_ticks, base)
+            .write(&session_paths.session_json())
+            .unwrap();
+
+        DiscoveredSession {
+            id,
+            paths: session_paths,
+            classification: Classification::Valid,
+        }
+    }
+
+    /// A session whose microphone genuinely heard its own speakers: 30 s of far-end speech
+    /// played into the room 120 ms late, over a local talker on a different schedule.
+    ///
+    /// Written at 16 kHz so what lands on disk is exactly what the pre-pass will work with,
+    /// leaving nothing between the fixture and the assertion but the code under test.
+    fn make_bleeding_session(paths: &Paths, id: &str) -> DiscoveredSession {
+        let rate = TARGET_RATE as usize;
+        let len = rate * 30;
+        let lag = rate * 120 / 1000;
+
+        // Deterministic band-limited noise, gated into bursts: speech-shaped enough that the
+        // delay estimator has something to lock onto, and reproducible so a marginal
+        // threshold fails every time rather than once a month.
+        let speech = |seed: u64, cycle_s: usize, talk_s: usize| -> Vec<f32> {
+            let mut state = seed;
+            let (mut low, mut previous, mut high) = (0.0f32, 0.0f32, 0.0f32);
+            (0..len)
+                .map(|i| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    low = 0.6 * low + 0.4 * ((state >> 40) as f32 / 8_388_608.0 - 1.0);
+                    high = 0.99 * high + low - previous;
+                    previous = low;
+                    if i % (rate * cycle_s) < rate * talk_s {
+                        high * 0.3
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        };
+
+        let speaker = speech(11, 4, 3);
+        let near = speech(29, 5, 2);
+        let mut mic: Vec<f32> = near.iter().map(|n| n * 0.7).collect();
+        for (tap, gain) in [(0usize, 0.55f32), (rate * 3 / 1000, 0.30)] {
+            for (i, played) in speaker.iter().enumerate() {
+                if let Some(sample) = mic.get_mut(i + lag + tap) {
+                    *sample += played * gain;
+                }
+            }
+        }
+
+        let id = SessionId::parse(id).unwrap();
+        let session_paths = paths.session(&id);
+        std::fs::create_dir_all(session_paths.dir()).unwrap();
+        aec::write_cleaned_track(&session_paths.mic_wav(), &mic).unwrap();
+        aec::write_cleaned_track(&session_paths.speaker_wav(), &speaker).unwrap();
+        metadata(&id, 900_000_000_000, 900_000_000_000)
             .write(&session_paths.session_json())
             .unwrap();
 
@@ -424,8 +541,9 @@ mod tests {
 
         let mut asr = FakeAsr {
             segments: vec![segment(2.0, 3.0, "second"), segment(0.5, 1.0, "first")],
+            ..FakeAsr::default()
         };
-        let transcript = transcribe_session(&session, &mut asr).unwrap();
+        let transcript = transcribe_session(&session, &mut asr, &mut quiet()).unwrap();
 
         assert_eq!(transcript.turns.len(), 2);
         // Sorted, and every timestamp shifted by the mic's 41.67 ms late start.
@@ -445,15 +563,79 @@ mod tests {
         let paths = Paths::new(root.path());
         let session = make_session(&paths, "20260809-052600", 0);
 
-        let mut asr = FakeAsr {
-            segments: Vec::new(),
-        };
-        let transcript = transcribe_session(&session, &mut asr).unwrap();
+        let mut asr = FakeAsr::default();
+        let transcript = transcribe_session(&session, &mut asr, &mut quiet()).unwrap();
         assert!(transcript.turns.is_empty());
 
         transcript.write(&session.paths).unwrap();
         assert!(session.paths.transcript_json().is_file());
         assert!(session.paths.transcript_md().is_file());
+    }
+
+    /// Acceptance criterion #1. The derived track appears; the recording it was derived from
+    /// is not touched, compared byte for byte rather than by size or mtime.
+    #[test]
+    fn transcribing_produces_a_cleaned_track_and_leaves_the_raw_mic_track_byte_identical() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_bleeding_session(&paths, "20260809-052600");
+        let before = std::fs::read(session.paths.mic_wav()).unwrap();
+
+        let mut asr = FakeAsr::default();
+        transcribe_session(&session, &mut asr, &mut quiet()).unwrap();
+
+        assert!(session.paths.mic_cleaned_wav().is_file());
+        assert_eq!(
+            std::fs::read(session.paths.mic_wav()).unwrap(),
+            before,
+            "mic.wav must survive transcription unmodified"
+        );
+    }
+
+    /// Acceptance criterion #2. Not "a cleaned file exists" -- that the samples the
+    /// recognizer actually saw are the cleaned ones, which is the only version of this claim
+    /// that a future refactor cannot quietly break.
+    #[test]
+    fn the_recognizer_is_handed_the_cleaned_track_rather_than_the_raw_one() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_bleeding_session(&paths, "20260809-052600");
+
+        let mut asr = FakeAsr::default();
+        transcribe_session(&session, &mut asr, &mut quiet()).unwrap();
+
+        let raw = audio::read_track_16k_mono(&session.paths.mic_wav()).unwrap();
+        let cleaned = audio::read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap();
+        assert_eq!(asr.heard, cleaned, "ASR must read mic.cleaned.wav");
+        assert_ne!(
+            asr.heard, raw,
+            "on a session with real bleed the cleaned track must differ from the raw one, \
+             otherwise this test would pass without any cancellation happening at all"
+        );
+    }
+
+    /// Acceptance criterion #3, from the outside: the pre-pass is reference-based against
+    /// `speaker.wav`, so removing that file has to change the outcome to a pass-through.
+    #[test]
+    fn without_a_speaker_track_there_is_nothing_to_cancel_and_the_mic_passes_through() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_bleeding_session(&paths, "20260809-052600");
+        std::fs::remove_file(session.paths.speaker_wav()).unwrap();
+
+        let mut asr = FakeAsr::default();
+        let mut progress = Vec::new();
+        transcribe_session(&session, &mut asr, &mut progress).unwrap();
+
+        let raw = audio::read_track_16k_mono(&session.paths.mic_wav()).unwrap();
+        assert_eq!(asr.heard, raw);
+        // Still written, and still what ASR read: one input file, no branch downstream.
+        assert_eq!(
+            audio::read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap(),
+            raw
+        );
+        let progress = String::from_utf8(progress).unwrap();
+        assert!(progress.contains("no echo cancellation"), "{progress}");
     }
 
     #[test]
