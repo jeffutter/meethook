@@ -14,15 +14,35 @@
 //! property never hit that, because it only *observed* the device -- it never opened it.
 //!
 //! The predicate is therefore derived from CoreAudio's per-process audio objects
-//! (macOS 14.4+), with meethook's own pid filtered out:
+//! (macOS 14.4+), with our own capture filtered out:
 //!
 //! ```text
-//! active = any process object P where pid(P) != our pid and IsRunningInput(P) == 1
+//! active = any process object P where IsRunningInput(P) == 1
+//!                                 and pid(P) != our pid
+//!                                 and bundle_id(P) is not one of our helpers
 //! ```
 //!
 //! Excluding ourselves is what makes the signal immune to our own capture: when recording
 //! starts, our process object flips to `IsRunningInput = 1`, the predicate is recomputed,
 //! and the answer does not change.
+//!
+//! # Why excluding our own pid is not enough
+//!
+//! Our capture is not confined to our process. ScreenCaptureKit services system-audio
+//! capture out of process, in `com.apple.replayd`, and that helper registers a process
+//! object of its own with `IsRunningInput = 1`. Its pid is not ours, so the pid filter
+//! does not catch it, and the predicate stays true for as long as we hold the capture --
+//! which is the whole session. Observed on hardware (TASK-005.01): `replayd` is absent
+//! from the process list before `Recorder::start` and appears immediately after it, and
+//! when the Teams call ended, Teams left the list entirely while `replayd` went on
+//! reporting `IsRunningInput = true`, so no stop edge was ever emitted.
+//!
+//! Helpers are therefore excluded by bundle id as well, unconditionally rather than only
+//! while recording: a process whose reason for existing is to service screen capture is
+//! never itself the signal that a meeting is under way. The cost is that another app
+//! capturing system audio through ScreenCaptureKit no longer reads as microphone activity.
+//! That is the right answer -- screen recording is not a meeting, and a meeting app holds
+//! the input device directly, as Teams does above.
 //!
 //! `IsRunningSomewhere` is still listened to, as a *trigger* rather than as the predicate.
 //! It is the fastest signal for the start edge -- it fires before we hold the mic, so the
@@ -345,21 +365,30 @@ impl State {
         }
     }
 
-    /// The predicate. See the module docs for why our own pid is excluded.
-    ///
-    /// A process whose pid cannot be read is treated as not capturing: without the pid we
-    /// cannot prove it is not us, and mistaking ourselves for a meeting would mean a
-    /// session that never ends.
+    /// The predicate: is any process other than us and our helpers capturing input?
     fn someone_else_is_capturing(&self) -> bool {
         object_list(
             kAudioObjectSystemObject as AudioObjectID,
             kAudioHardwarePropertyProcessObjectList,
         )
         .into_iter()
-        .any(|process| {
-            process_pid(process).is_some_and(|pid| pid != self.our_pid)
-                && process_is_running_input(process)
-        })
+        .any(|process| self.bearing_of(process) == Bearing::Activity)
+    }
+
+    /// Reads one process object and asks [`bearing`] what it means.
+    ///
+    /// The reads are ordered cheapest-first and short-circuit: a process that is not
+    /// capturing -- almost all of them -- costs one property read, and the bundle id is
+    /// only fetched for one that is.
+    fn bearing_of(&self, process: AudioObjectID) -> Bearing {
+        if !process_is_running_input(process) {
+            return Bearing::Idle;
+        }
+        bearing(
+            process_pid(process),
+            process_bundle_id(process).as_deref(),
+            self.our_pid,
+        )
     }
 
     /// Everything needed to confirm or refute the reasoning in the module docs, at the
@@ -383,15 +412,24 @@ impl State {
         ) {
             let pid = process_pid(process);
             let ours = pid == Some(self.our_pid);
-            let capturing = process_is_running_input(process);
-            if !capturing && !ours {
+            // The verdict comes from the same classifier the predicate uses, so the log
+            // cannot describe a rule the recorder is not actually applying.
+            let bearing = self.bearing_of(process);
+            if bearing == Bearing::Idle && !ours {
                 continue;
             }
             eprintln!(
-                "[activity]   pid={} {} IsRunningInput={capturing}{}",
+                "[activity]   pid={} {} IsRunningInput={}{}",
                 pid.map_or_else(|| "?".to_owned(), |p| p.to_string()),
                 process_bundle_id(process).unwrap_or_else(|| "(no bundle id)".to_owned()),
-                if ours { "   <- meethook, excluded" } else { "" },
+                bearing != Bearing::Idle,
+                match bearing {
+                    Bearing::Excluded(why) => format!("   <- excluded: {why}"),
+                    // Idle and ours: shown anyway, because "meethook is not capturing yet"
+                    // is the baseline the later lines are read against.
+                    _ if ours => "   <- meethook".to_owned(),
+                    _ => String::new(),
+                },
             );
         }
     }
@@ -450,6 +488,45 @@ impl State {
         listeners.extend(std::mem::take(&mut self.processes).into_values());
         listeners
     }
+}
+
+/// Bundle ids that capture input only because meethook asked something to.
+///
+/// `com.apple.replayd` is the ScreenCaptureKit system-audio capture service: starting the
+/// speaker track starts it, and it reports `IsRunningInput = 1` under its own pid for as
+/// long as we record. See the module docs for the hardware evidence.
+const OUR_HELPER_BUNDLE_IDS: &[&str] = &["com.apple.replayd"];
+
+/// What one capturing process means for the predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bearing {
+    /// Not capturing input.
+    Idle,
+    /// Capturing, and it is somebody else: this is the meeting signal.
+    Activity,
+    /// Capturing, but it is us or on our behalf. Carries the reason, for the debug log.
+    Excluded(&'static str),
+}
+
+/// The exclusion rule, over facts already read from a capturing process object.
+///
+/// Pure so that the rule the whole trigger turns on can be tested with no CoreAudio device
+/// present -- which the sandbox this is developed in does not have.
+///
+/// A process whose pid cannot be read is excluded: without the pid we cannot prove it is
+/// not us, and mistaking our own capture for a meeting means a session that never ends.
+/// That is the failure this rule exists to prevent, so it is the safe direction to fail in.
+fn bearing(pid: Option<i32>, bundle_id: Option<&str>, our_pid: i32) -> Bearing {
+    let Some(pid) = pid else {
+        return Bearing::Excluded("pid unreadable, so it cannot be shown not to be meethook");
+    };
+    if pid == our_pid {
+        return Bearing::Excluded("meethook");
+    }
+    if bundle_id.is_some_and(|id| OUR_HELPER_BUNDLE_IDS.contains(&id)) {
+        return Bearing::Excluded("captures on meethook's behalf");
+    }
+    Bearing::Activity
 }
 
 /// The transition, if the predicate actually moved.
@@ -596,7 +673,10 @@ fn process_is_running_input(process: AudioObjectID) -> bool {
         .is_some_and(|running| running != 0)
 }
 
-/// The bundle id of a process object, for the debug log only.
+/// The bundle id of a process object, or `None` for one that does not report it.
+///
+/// Read by the predicate, not only by the log: it is how a helper capturing on our behalf
+/// is told apart from a meeting app.
 fn process_bundle_id(process: AudioObjectID) -> Option<String> {
     // SAFETY: this selector returns a single `CFStringRef`. `Option<NonNull<_>>` is used
     // as the destination because it is pointer-sized and its `Default` is null, which is
@@ -610,7 +690,52 @@ fn process_bundle_id(process: AudioObjectID) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Activity, edge};
+    use super::{Activity, Bearing, bearing, edge};
+
+    const OUR_PID: i32 = 500;
+
+    #[test]
+    fn a_meeting_app_capturing_is_the_signal() {
+        assert_eq!(
+            bearing(
+                Some(26975),
+                Some("com.microsoft.teams2.modulehost"),
+                OUR_PID
+            ),
+            Bearing::Activity
+        );
+        // A meeting app that reports no bundle id is still a meeting app.
+        assert_eq!(bearing(Some(26975), None, OUR_PID), Bearing::Activity);
+    }
+
+    #[test]
+    fn our_own_capture_is_not_the_signal() {
+        assert!(matches!(
+            bearing(Some(OUR_PID), Some("com.meethook"), OUR_PID),
+            Bearing::Excluded(_)
+        ));
+    }
+
+    #[test]
+    fn the_screencapturekit_helper_is_not_the_signal() {
+        // The regression this rule exists for: replayd captures input under its own pid
+        // for as long as we record the speaker track, so a pid filter alone leaves the
+        // predicate pinned true and the session never ends.
+        assert!(matches!(
+            bearing(Some(997), Some("com.apple.replayd"), OUR_PID),
+            Bearing::Excluded(_)
+        ));
+    }
+
+    #[test]
+    fn a_process_with_no_readable_pid_is_not_the_signal() {
+        // Excluded rather than counted: it cannot be shown not to be us, and counting it
+        // would be the never-ending session again.
+        assert!(matches!(
+            bearing(None, Some("com.example.mystery"), OUR_PID),
+            Bearing::Excluded(_)
+        ));
+    }
 
     #[test]
     fn an_unchanged_predicate_emits_nothing() {
