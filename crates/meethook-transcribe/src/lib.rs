@@ -25,6 +25,7 @@ mod onnx;
 mod segmentation;
 mod speakers;
 mod trials;
+mod vad;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -43,6 +44,7 @@ pub use onnx::{Loaded, open_session};
 pub use segmentation::{LocalTurn, segment_speaker_track};
 pub use speakers::{Clustering, cluster_speaker_turns};
 pub use trials::{EqualError, Spread, Trial, TrialReport, ZeroFalseAccept, score_trials};
+pub use vad::{SileroVad, SpeechRegion, VadTuning};
 
 use meethook_models::ModelSpec;
 use meethook_session::{
@@ -114,6 +116,28 @@ pub const EMBEDDING_MODEL: ModelSpec = ModelSpec {
     size_bytes: 26_530_309,
 };
 
+/// The voice-activity detector that says which stretches of a track hold speech.
+///
+/// Silero v5.1.2, in whisper.cpp's own ggml format. 885 KB, and no new crate dependency at
+/// all: whisper.cpp 1.8.3 is already vendored by `whisper-rs-sys`, and `whisper-rs` 0.16
+/// exposes a safe wrapper around its standalone VAD. See [`SileroVad`] for why a separate
+/// detector rather than the pyannote graph already installed.
+///
+/// v5.1.2 rather than the v6.2.0 that also sits in that repository: v5.1.2 is what
+/// whisper.cpp's own documentation and default tooling use, so it is the version its
+/// thresholds and post-processing were tuned against.
+///
+/// Like [`WHISPER_MODEL`], the URL pins an immutable revision rather than `main`, and the hash
+/// and size come from the git-LFS pointer Hugging Face serves at the `raw/` path -- so bumping
+/// the revision does not require downloading the weights to re-derive them.
+pub const SILERO_VAD_MODEL: ModelSpec = ModelSpec {
+    file_name: "ggml-silero-v5.1.2.bin",
+    url: "https://huggingface.co/ggml-org/whisper-vad/resolve/\
+          9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v5.1.2.bin",
+    sha256: "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf",
+    size_bytes: 885_098,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -170,6 +194,14 @@ pub enum Error {
     /// is not the 256-dimensional vector clustering compares.
     #[error("speaker embedding failed: {0}")]
     Embedding(String),
+
+    /// Loading or running the voice-activity detector. A `String` rather than a `#[source]`
+    /// because whisper-rs's VAD errors carry no information at all -- `NullPointer` on load
+    /// and on segmentation, `GenericError(-1)` on detection -- with the real diagnosis going
+    /// to the logging hooks. Since the crate will not say what went wrong, the message
+    /// [`SileroVad`] builds has to.
+    #[error("voice activity detection failed: {0}")]
+    Vad(String),
 
     #[error("could not load the ONNX model at {path}: {source}")]
     Onnx {

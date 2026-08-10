@@ -50,6 +50,19 @@ const MAX_THREADS: usize = 8;
 /// whisper.cpp emits this instead of text when a window contains no speech.
 const BLANK_AUDIO: &str = "[BLANK_AUDIO]";
 
+/// Routes ggml's and whisper.cpp's own log output through Rust, once per process.
+///
+/// Without this, both write their progress and load messages straight to stderr, interleaved
+/// with whatever the CLI or a diagnostic is printing. Every whisper.cpp entry point in this
+/// crate has to call it before loading anything -- [`crate::SileroVad`] as well as
+/// [`WhisperEngine`] -- which is why the `Once` lives here rather than inside `load`. One
+/// global gets one piece of state; a second `Once` elsewhere would be two states for one
+/// global, and that is how a global ends up half-initialised.
+pub(crate) fn install_logging_hooks() {
+    static HOOKS: Once = Once::new();
+    HOOKS.call_once(whisper_rs::install_logging_hooks);
+}
+
 /// A loaded Whisper model, reusable across sessions.
 ///
 /// Loading is the expensive part -- gigabytes read and uploaded to the GPU -- so a batch
@@ -74,10 +87,7 @@ impl WhisperEngine {
     /// to touch. See the `gpu` module for why a missing device is an error rather than a silent
     /// CPU fallback.
     pub fn load(model_path: &Path) -> Result<WhisperEngine> {
-        static HOOKS: Once = Once::new();
-        // Without this, ggml and whisper.cpp write their own progress and load messages
-        // straight to stderr, interleaved with the CLI's output.
-        HOOKS.call_once(whisper_rs::install_logging_hooks);
+        install_logging_hooks();
 
         let mut params = WhisperContextParameters::default();
         assert!(
