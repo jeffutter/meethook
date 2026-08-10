@@ -237,9 +237,19 @@ impl SpeechToText for WhisperEngine {
         // 3. What bounds priming *between* the 30 s windows of one call is `n_max_text_ctx`
         //    (`:7090`), not this -- `prompt_past` is rebuilt after each window (`:7591`) and
         //    fed to the next (`:7107`) regardless of `no_context`. It is left at its default
-        //    because the gate removes the windows that were hallucinating in the first place;
-        //    see the measurement in this crate's TASK-016 notes. Setting it to 0 costs the
-        //    rolling prompt outright, so it is not worth spending before it is needed.
+        //    because the gate removes the windows that were repeating, which is measured rather
+        //    than assumed: re-transcribing `20260810-093047` with the gate took the longest run
+        //    of identical consecutive turns from 63 to 7 on the mic track (the 63 were
+        //    "Thank you." over 723-2612 s) and from 38 to 7 on the speaker track, with the 76
+        //    silence hallucinations reduced to one 0.15 s turn inside real detected speech.
+        //    So the repetition went with the silent windows, and no decoder flag was needed to
+        //    take it. Setting `n_max_text_ctx` to 0 costs the rolling prompt outright, and the
+        //    runs that survive are seconds long rather than the 25 minutes that motivated this,
+        //    so it is not worth spending yet. The residue is a real ceiling, not a clean zero:
+        //    the surviving speaker-track run of 7 (308-311 s) repeats one phrase over audio
+        //    where the pre-gate transcript had different words, so it is a within-window
+        //    repetition artefact and this is the knob to reach for if that becomes the
+        //    complaint.
         params.set_no_context(true);
 
         // Every other decoder parameter is left at whisper.cpp's default, checked rather than
