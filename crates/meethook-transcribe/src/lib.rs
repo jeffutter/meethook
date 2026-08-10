@@ -16,6 +16,7 @@ mod asr;
 mod audio;
 mod diarize;
 mod fbank;
+mod gate;
 mod gpu;
 mod identify;
 mod import;

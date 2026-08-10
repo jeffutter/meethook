@@ -17,8 +17,8 @@ use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
 use meethook_session::{Paths, SessionId};
 use meethook_transcribe::{
-    EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, WHISPER_MODEL, WhisperEngine,
-    run_batch,
+    EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, SILERO_VAD_MODEL, WHISPER_MODEL,
+    WhisperEngine, run_batch,
 };
 
 /// The three waits the record loop's behaviour depends on.
@@ -357,7 +357,7 @@ fn await_end(rx: &Receiver<Event>, grace: Duration) -> Outcome {
 /// Transcribes recorded sessions.
 ///
 /// Fully non-interactive, deliberately: this is meant to be aimed at a directory of
-/// meetings and left alone. All three models are acquired lazily through the one factory
+/// meetings and left alone. All four models are acquired lazily through the one factory
 /// below, so a run that turns out to have nothing to do never pays for a download.
 pub fn transcribe(paths: &Paths, session_ids: &[String], force: bool) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
@@ -365,9 +365,10 @@ pub fn transcribe(paths: &Paths, session_ids: &[String], force: bool) -> Result<
     let models_dir = paths.models_dir();
     let mut open_engine =
         || -> std::result::Result<Engines, Box<dyn std::error::Error + Send + Sync>> {
-            // Diarization's two models are 32 MB against Whisper's 1.6 GB, and are fetched
-            // first so that a first run reaches its slowest download last -- by which point
-            // everything else is known to be in place.
+            // Smallest first, so that a first run reaches its slowest download last -- by which
+            // point everything else is known to be in place. The VAD weights are 885 KB,
+            // diarization's two models are 32 MB, and Whisper is 1.6 GB.
+            let silero = fetch(&models_dir, &SILERO_VAD_MODEL)?;
             let segmentation = fetch(&models_dir, &SEGMENTATION_MODEL)?;
             let embedding = fetch(&models_dir, &EMBEDDING_MODEL)?;
             let whisper = fetch(&models_dir, &WHISPER_MODEL)?;
@@ -379,7 +380,7 @@ pub fn transcribe(paths: &Paths, session_ids: &[String], force: bool) -> Result<
                 eprintln!("Note: CoreML declined these graphs; diarization is running on CPU.");
             }
 
-            let asr = WhisperEngine::load(&whisper)?;
+            let asr = WhisperEngine::load(&whisper, &silero)?;
             if !asr.accelerated() {
                 // Only reachable via MEETHOOK_CPU, so this confirms an explicit choice rather
                 // than reporting a surprise -- and says out loud what that choice costs.
