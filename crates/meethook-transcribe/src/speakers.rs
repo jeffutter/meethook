@@ -51,10 +51,12 @@ use crate::{Error, Result};
 /// average below it while the closest two dominant clusters average 0.604 apart, so the
 /// nearest merge this constant declined is a long way above the cut.
 ///
-/// What that does *not* establish is that the six dominant clusters are six different people:
-/// nobody's identity was checked. Two of them are 0.429 apart by centroid, close enough that
-/// enrollment matches one to the other's stored reference, and settling whether they are two
-/// voices or one split voice needs a human ear. See TASK-018 and TASK-020.
+/// The closest of those two clusters were confirmed by ear to be two different people, so
+/// this constant is known to have separated them and not merely assumed to have. It is also
+/// the case that they sit only 0.429 apart by *centroid* -- close enough that
+/// [`crate::IDENTIFY_DISTANCE`], which thresholds that other distance at this same number,
+/// files one of them under the other's name. Averaging distances is not the distance of
+/// averages, and the two constants are not interchangeable despite being equal. See TASK-020.
 ///
 /// The cut is not what strands short turns in clusters of their own -- that is average
 /// linkage against a large group, and raising this constant to absorb them would need 0.6-0.8
