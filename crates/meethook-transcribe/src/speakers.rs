@@ -35,6 +35,25 @@ use crate::{Error, Result};
 /// perfectly ordinary and that nobody will re-check. A visible extra speaker is a cheap
 /// error and a silent misattribution is an expensive one, so the threshold is biased toward
 /// splitting.
+///
+/// Measured on a real 43-minute meeting (session `20260810-093047`, six dominant speakers on
+/// the speaker track, 87.5% of all speech) rather than inherited from the checkpoint's
+/// published behaviour:
+///
+/// | population                                          | min   | median      | max   |
+/// |-----------------------------------------------------|-------|-------------|-------|
+/// | two turns of one speaker                            | 0.077 | 0.232-0.396 | 0.683 |
+/// | two speakers heard in one window, so known different | 0.270 | 0.837       | 1.118 |
+///
+/// The populations overlap across `[0.270, 0.683]`, so no threshold separates them and 0.45
+/// buys one kind of mistake with the other. It is kept because it is the value that got the
+/// six real speakers right: the closest two of them are 0.304 apart at their nearest turns
+/// and 0.604 apart at the median, so the nearest wrong merge is a long way above the cut,
+/// while every dominant speaker's own turns average below it.
+///
+/// The cut is not what strands short turns in clusters of their own -- that is average
+/// linkage against a large group, and raising this constant to absorb them would need 0.6-0.8
+/// and would merge the people above. See TASK-018.
 const MERGE_DISTANCE: f32 = 0.45;
 
 /// The shortest turn worth embedding.
