@@ -7,6 +7,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# A session-contract crate depends on an audio library because it owns the *spelling* of the
+# tracks it names, not only their file names: see `wav`, which corrects the channel mask hound
+# hardcodes so a mono recording does not arrive in one ear.
+hound = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -612,6 +612,7 @@ dependencies = [
 name = "meethook-session"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "jiff",
  "serde",
  "serde_json",

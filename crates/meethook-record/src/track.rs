@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use hound::{SampleFormat, WavSpec, WavWriter};
+use hound::{SampleFormat, WavSpec};
 
 use crate::{Error, Result};
 
@@ -251,7 +251,10 @@ impl TrackWriter {
             bits_per_sample: 32,
             sample_format: SampleFormat::Float,
         };
-        let mut writer = WavWriter::create(path, spec).map_err(|e| Error::wav(path, e))?;
+        // Not `WavWriter::create`: that writes a mono channel mask of `SPEAKER_FRONT_LEFT`,
+        // which players honour by putting the whole recording in one ear.
+        let mut writer =
+            meethook_session::wav::create(path, spec).map_err(|e| Error::wav(path, e))?;
 
         let (tx, rx) = mpsc::channel::<Message>();
         let thread_path = path.to_path_buf();
@@ -428,6 +431,14 @@ mod tests {
         let read: Vec<f32> = reader.samples::<f32>().map(|s| s.unwrap()).collect();
         let expected: Vec<f32> = first.into_iter().chain(second).collect();
         assert_eq!(read, expected);
+
+        // A mono track must not claim to be a left channel, or a player routes the whole
+        // recording to one ear.
+        let wav = std::fs::read(&path).unwrap();
+        assert_eq!(
+            meethook_session::wav::channel_mask_of(&wav),
+            Some(meethook_session::wav::MONO_CHANNEL_MASK)
+        );
     }
 
     /// A track that never received audio must still leave a valid, playable (empty) file --
@@ -470,6 +481,14 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(frames, 128);
+
+        // And it plays *centred*, not in one ear: the mask correction is applied when the
+        // header is first written, so it is already on disk in a file nothing finalized.
+        let wav = std::fs::read(&path).unwrap();
+        assert_eq!(
+            meethook_session::wav::channel_mask_of(&wav),
+            Some(meethook_session::wav::MONO_CHANNEL_MASK)
+        );
 
         // Leak deliberately: dropping would send nothing, but joining is exactly what a
         // killed process does not get to do, and that is the case under test.

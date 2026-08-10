@@ -31,6 +31,12 @@ mod speaker_clusters;
 mod speakers;
 mod transcript;
 
+// The header spelling of the tracks named above. A module rather than a flat re-export
+// because its surface is constructors: `wav::create` reads better than `create_wav`.
+// (A plain comment, not a doc comment: outer docs on a `mod` item resolve their intra-doc
+// links in *this* scope, which breaks the links in wav.rs's own module doc.)
+pub mod wav;
+
 pub use atomic::{write_atomic, write_atomic_with};
 pub use discovery::{Classification, DiscoveredSession, discover_sessions};
 pub use id::{SessionId, create_session_dir};

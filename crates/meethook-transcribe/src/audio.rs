@@ -100,8 +100,9 @@ pub(crate) fn resample_to_target(samples: &[f32], source_rate: u32) -> Result<Ve
 pub(crate) fn write_track_16k_mono(path: &Path, audio: &[f32]) -> Result<()> {
     write_atomic_with(path, |file| {
         // Buffered: hound writes each sample straight through, and an hour of audio is 57
-        // million of them.
-        let mut writer = hound::WavWriter::new(std::io::BufWriter::new(file), TRACK_SPEC)
+        // million of them. Via `meethook_session::wav` rather than hound directly, so the mono
+        // channel mask says front-centre instead of hound's front-left.
+        let mut writer = meethook_session::wav::new(std::io::BufWriter::new(file), TRACK_SPEC)
             .map_err(|e| Error::wav(path, e))?;
         for sample in audio {
             writer
@@ -326,6 +327,22 @@ mod tests {
         write_track_16k_mono(&path, &samples).unwrap();
 
         assert_eq!(read_track_16k_mono(&path).unwrap(), samples);
+    }
+
+    /// One writer covers `mic.cleaned.wav` and every track [`crate::import`] builds, so this
+    /// one assertion is every WAV the transcribe side produces.
+    #[test]
+    fn a_written_track_is_tagged_mono_rather_than_front_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mic.cleaned.wav");
+
+        write_track_16k_mono(&path, &tone(16_000, 0.1, 440.0)).unwrap();
+
+        let wav = std::fs::read(&path).unwrap();
+        assert_eq!(
+            meethook_session::wav::channel_mask_of(&wav),
+            Some(meethook_session::wav::MONO_CHANNEL_MASK)
+        );
     }
 
     /// The in-memory conversion is the file one, so audio imported from a foreign wav is the

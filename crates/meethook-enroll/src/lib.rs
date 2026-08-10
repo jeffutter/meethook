@@ -511,7 +511,9 @@ pub fn write_clip(path: &Path, clip: &[f32]) -> Result<()> {
         source,
     };
 
-    let mut writer = hound::WavWriter::create(path, spec).map_err(wav)?;
+    // Not `hound::WavWriter::create`: it tags a mono stream `SPEAKER_FRONT_LEFT`, and a clip
+    // that exists so a human can recognise a voice is the last place to send it to one ear.
+    let mut writer = meethook_session::wav::create(path, spec).map_err(wav)?;
     for sample in clip {
         writer.write_sample(*sample).map_err(wav)?;
     }
@@ -690,6 +692,21 @@ mod tests {
             .iter()
             .map(|t| (t.speaker.as_str(), t.text.as_str(), t.speaker_id_confidence))
             .collect()
+    }
+
+    /// A clip exists to be handed to `afplay`, so its header is part of what it is for: a
+    /// mono stream tagged `SPEAKER_FRONT_LEFT` reaches the listener in one ear.
+    #[test]
+    fn a_clip_is_tagged_mono_so_a_player_does_not_put_it_in_one_ear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.wav");
+        write_clip(&path, &[0.0, 0.25, -0.25, 0.5]).unwrap();
+
+        let wav = std::fs::read(&path).unwrap();
+        assert_eq!(
+            meethook_session::wav::channel_mask_of(&wav),
+            Some(meethook_session::wav::MONO_CHANNEL_MASK)
+        );
     }
 
     /// Acceptance criteria #5 and #6, at the level a user meets them: one answer puts a
