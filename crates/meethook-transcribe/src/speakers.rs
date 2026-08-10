@@ -36,20 +36,25 @@ use crate::{Error, Result};
 /// error and a silent misattribution is an expensive one, so the threshold is biased toward
 /// splitting.
 ///
-/// Measured on a real 43-minute meeting (session `20260810-093047`, six dominant speakers on
-/// the speaker track, 87.5% of all speech) rather than inherited from the checkpoint's
-/// published behaviour:
+/// Measured on a real 43-minute meeting (session `20260810-093047`, six dominant clusters
+/// holding 87.5% of the speech on a track the user confirms carried six people) rather than
+/// inherited from the checkpoint's published behaviour:
 ///
 /// | population                                          | min   | median      | max   |
 /// |-----------------------------------------------------|-------|-------------|-------|
 /// | two turns of one speaker                            | 0.077 | 0.232-0.396 | 0.683 |
 /// | two speakers heard in one window, so known different | 0.270 | 0.837       | 1.118 |
 ///
-/// The populations overlap across `[0.270, 0.683]`, so no threshold separates them and 0.45
-/// buys one kind of mistake with the other. It is kept because it is the value that got the
-/// six real speakers right: the closest two of them are 0.304 apart at their nearest turns
-/// and 0.604 apart at the median, so the nearest wrong merge is a long way above the cut,
-/// while every dominant speaker's own turns average below it.
+/// Both populations are ground truth from segmentation co-occurrence, not from assuming who
+/// is who. They overlap across `[0.270, 0.683]`, so no threshold separates them and 0.45 buys
+/// one kind of mistake with the other. It is kept because every dominant speaker's own turns
+/// average below it while the closest two dominant clusters average 0.604 apart, so the
+/// nearest merge this constant declined is a long way above the cut.
+///
+/// What that does *not* establish is that the six dominant clusters are six different people:
+/// nobody's identity was checked. Two of them are 0.429 apart by centroid, close enough that
+/// enrollment matches one to the other's stored reference, and settling whether they are two
+/// voices or one split voice needs a human ear. See TASK-018 and TASK-020.
 ///
 /// The cut is not what strands short turns in clusters of their own -- that is average
 /// linkage against a large group, and raising this constant to absorb them would need 0.6-0.8
