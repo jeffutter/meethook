@@ -24,6 +24,7 @@ mod import;
 mod levels;
 mod merge;
 mod onnx;
+mod reference;
 mod segmentation;
 mod speakers;
 mod trials;
@@ -46,6 +47,10 @@ pub use import::{BuiltSession, ImportedSource, MIC_SILENCE_S, SPLICE_GAP_S, buil
 pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
 pub use merge::merge;
 pub use onnx::{Loaded, open_session};
+pub use reference::{
+    Decline, DeclinedPoint, FragmentProbe, ORIGIN_DISTANCE, Sampling, StoredReference, Sweep,
+    SweepPoint, Verdict, fragment_probe, reference_duration_sweep, stored_reference_distances,
+};
 pub use segmentation::{LocalTurn, segment_speaker_track};
 pub use speakers::{
     ADOPTION_DISTANCE, Clustering, GroupDistance, MERGE_DISTANCE, SPEAKER_FLOOR_SECONDS,

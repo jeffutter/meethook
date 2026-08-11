@@ -870,7 +870,12 @@ pub fn group_distance(a: &[&[f32]], b: &[&[f32]]) -> Option<GroupDistance> {
 /// [`None`] for an empty group, and for one whose members cancel exactly. The second is
 /// unreachable for real voices but trivially reachable in a test, and a zero vector normalizes
 /// to itself, which would otherwise be reported as a confident distance of 1.0 to everything.
-fn group_mean(members: &[&[f32]]) -> Option<(Vec<f32>, f32)> {
+///
+/// Visible to the crate because [`crate::reference_duration_sweep`] builds references out of
+/// parts of a cluster and has to build them the way [`reference_embedding`] does, or it would be
+/// measuring an algorithm meethook does not run. Reaching for this rather than re-deriving a
+/// mean over there is what makes that a fact about the code instead of a comment.
+pub(crate) fn group_mean(members: &[&[f32]]) -> Option<(Vec<f32>, f32)> {
     let mut mean = vec![0.0f32; members.first()?.len()];
     for member in members {
         for (m, v) in mean.iter_mut().zip(*member) {
