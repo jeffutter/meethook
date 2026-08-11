@@ -10,8 +10,8 @@
 //! A session directory means its `speaker.wav`; any other path is used as given. `--write`
 //! saves `speaker_clusters.json` into the session directory, which is how `enroll` gets
 //! something real to develop against without re-running transcription. `--floor` sets the
-//! talk-time below which a cluster is treated as a fragment rather than a speaker; see
-//! [`DEFAULT_FLOOR_SECONDS`].
+//! talk-time below which a cluster is treated as a fragment rather than a speaker, defaulting to
+//! the [`SPEAKER_FLOOR_SECONDS`] the adoption pass ships with.
 //!
 //! Output runs to thousands of lines on a long meeting, so redirect it to a file.
 //!
@@ -51,12 +51,15 @@
 //! The two blocks after that are about the other failure this clustering has, which is not a
 //! speaker split in two but a speaker shattered into ninety: a handful of real voices plus a
 //! long tail of one- and two-second fragments, each in a cluster of its own. Both blocks exist
-//! to say whether a second pass could sweep that tail up, and at what cost, *before* the pass
-//! is written. The first prints every fragment's distance to every real speaker under both
-//! criteria -- the average linkage clustering merged on and the centroid distance a second pass
-//! would threshold -- plus the shrinkage factor that makes the two disagree, which is the
-//! mechanism stranding the fragments in the first place. The second sweeps candidate thresholds
-//! and says how much of the tail each one would actually adopt.
+//! to say how much of that tail a sweep can take and at what cost. **They now run on a
+//! clustering `adopt_below_floor` has already swept**, so what they describe is the residue that
+//! pass declined and what a *further* sweep would do to it -- not the material
+//! `ADOPTION_DISTANCE` was chosen from, which was measured before the pass existed and cannot be
+//! re-derived from a run that includes it. The first prints every remaining fragment's distance
+//! to every real speaker under both criteria -- the average linkage clustering merged on and the
+//! centroid distance `ADOPTION_DISTANCE` thresholds -- plus the shrinkage factor that makes the
+//! two disagree, which is the mechanism stranding the fragments in the first place. The second
+//! sweeps candidate thresholds and says how much of what is left each one would adopt.
 //!
 //! The last block is the other half of the free supervision. The known-different block above
 //! uses one direction of segmentation's local speaker index; two turns in one window under the
@@ -82,22 +85,11 @@ use meethook_session::{
     EnrolledSpeakers, Paths, SessionId, SessionPaths, SpeakerCluster, SpeakerClusters,
 };
 use meethook_transcribe::{
-    AdoptionPopulations, CentroidPair, Clustering, EMBEDDING_MODEL, IDENTIFY_DISTANCE, LocalTurn,
-    MERGE_DISTANCE, PairLabel, SEGMENTATION_MODEL, TARGET_RATE, TrialReport, adoption_populations,
-    identify_clusters, open_session, score_trials,
+    ADOPTION_DISTANCE, AdoptionPopulations, CentroidPair, Clustering, EMBEDDING_MODEL,
+    IDENTIFY_DISTANCE, LocalTurn, MERGE_DISTANCE, PairLabel, SEGMENTATION_MODEL,
+    SPEAKER_FLOOR_SECONDS, TARGET_RATE, TrialReport, adoption_populations, identify_clusters,
+    open_session, score_trials,
 };
-
-/// Talk-time below which the stranded-cluster blocks treat a cluster as a fragment looking for
-/// an owner rather than as a speaker that could own one.
-///
-/// A flag rather than a constant in the library on purpose. Whatever floor a leftover-adoption
-/// pass eventually ships has to be chosen from evidence, and a number baked in here would be a
-/// number picked by eye that the pass then inherited. This default is only for reading the
-/// report: 30 s sits inside the gap that separates the two populations on session
-/// `20260810-093047` -- smallest of the six dominant clusters 47.8 s, largest of the eighty-nine
-/// fragments 8.7 s -- so it reproduces the split without being load-bearing anywhere. Move it
-/// with `--floor` on any recording where that gap sits elsewhere.
-const DEFAULT_FLOOR_SECONDS: f64 = 30.0;
 
 /// Pairs below which the adoption-population block reports a population as too thin to choose a
 /// threshold from.
@@ -116,15 +108,19 @@ fn main() {
         "usage: cluster-speaker-track <session-dir | wav-file> [--write] [--floor <s>] [--cut <d>]";
     let mut target: Option<PathBuf> = None;
     let mut write = false;
-    let mut floor = DEFAULT_FLOOR_SECONDS;
+    // The floor the shipped pass partitions on, so that this report describes the clustering
+    // that ships rather than a neighbouring one. `SPEAKER_FLOOR_SECONDS` carries the evidence
+    // the value came from -- the 12.3-47.0 s band of floors that give the same partition on
+    // session `20260810-093047`. `--floor` stays, because re-measuring that band on a recording
+    // whose gap sits elsewhere is exactly what it is for.
+    let mut floor = SPEAKER_FLOOR_SECONDS;
     // The cut the adoption trial list's false-accept and false-reject counts are taken at.
-    // `IDENTIFY_DISTANCE` because it is the one shipped constant that thresholds *this* quantity
-    // -- a cluster's centroid against another centroid -- and not `MERGE_DISTANCE`, which
-    // thresholds average linkage and would be a number printed beside a decision it does not
-    // govern. It still governs a different decision from the one being measured, which the block
-    // says out loud; `--cut` is there so that asking "what would 0.25 have done" costs a re-score
-    // rather than a re-run of the embedding.
-    let mut cut = IDENTIFY_DISTANCE;
+    // `ADOPTION_DISTANCE` because it is the constant the pass this section measures actually
+    // thresholds, over exactly this quantity -- a small group's centroid against a speaker's --
+    // and not `MERGE_DISTANCE`, which thresholds average linkage and would be a number printed
+    // beside a decision it does not govern. `--cut` is there so that asking "what would 0.30
+    // have done" costs a re-score rather than a re-run of the embedding.
+    let mut cut = ADOPTION_DISTANCE;
 
     // Scanned rather than taken positionally, because `--floor` carries a value and the old
     // `args.any(|a| a == "--write")` consumed the whole remaining iterator to find its flag.
@@ -467,8 +463,8 @@ fn pairs_heard_at_once(
     pairs
 }
 
-/// Every cluster below the talk-time floor, its distance to every cluster above it, and what a
-/// second pass thresholding those distances would adopt.
+/// Every cluster still below the talk-time floor after `adopt_below_floor` has run, its distance
+/// to every cluster above it, and what a further sweep of those distances would adopt.
 ///
 /// Two blocks in one function because they share the same scaffolding -- which clusters are
 /// below the floor, which are above, each one's embeddings, and whether the constraint forbids
@@ -478,8 +474,9 @@ fn pairs_heard_at_once(
 /// Three distance columns, because the two criteria are two numbers and the third says why.
 /// `linkage` is the average of the cross-pair cosine distances, which is what `agglomerate`
 /// compared against [`MERGE_DISTANCE`] and declined. `centroid` is the distance between the two
-/// clusters' reference vectors, which is what a leftover-adoption pass would threshold and what
-/// [`IDENTIFY_DISTANCE`] already thresholds elsewhere. `shrinkage` is the factor between them,
+/// clusters' reference vectors, which is what [`ADOPTION_DISTANCE`] thresholds here and what
+/// [`IDENTIFY_DISTANCE`] thresholds against an enrolled reference. `shrinkage` is the factor
+/// between them,
 /// and it is the mechanism of the bug rather than a curiosity: it is at most 1 and falls as a
 /// group grows and spreads, so a fragment is charged for the spread of whatever group it is
 /// offered to, and the cluster most likely to own it resists it hardest.
@@ -511,7 +508,11 @@ fn print_stranded_clusters(
     let below = &populations.below;
     let above = &populations.above;
 
-    println!("\nstranded clusters, and where each would go (floor {floor:.1} s of speech):");
+    println!(
+        "\nstranded clusters, and where each would go (floor {floor:.1} s of speech). These are \
+         what the shipped adoption pass DECLINED -- it has already run on this clustering, so \
+         every row below is residue rather than the material its constant was chosen from:"
+    );
 
     // Every degenerate shape says so in a sentence. A block that renders as no lines is
     // indistinguishable from a block that is broken, and two of these -- a recording with one
@@ -548,7 +549,8 @@ fn print_stranded_clusters(
     );
     println!(
         "  linkage is what agglomerate merged on and declined, against its cut of \
-         {MERGE_DISTANCE:.3}; centroid is what a second pass would threshold; shrinkage is the \
+         {MERGE_DISTANCE:.3}; centroid is what ADOPTION_DISTANCE ({ADOPTION_DISTANCE:.3}) \
+         thresholds; shrinkage is the \
          factor between them, 1 - linkage = shrinkage * (1 - centroid); blocked means the \
          same-window constraint forbids this merge whatever the distances say"
     );
@@ -605,14 +607,18 @@ fn print_stranded_clusters(
         nearest.push((small, best.map(|(centroid, _, _)| centroid)));
     }
 
-    // The sweep. Centroid distance, because that is what a second pass would threshold and
+    // The sweep. Centroid distance, because that is what `ADOPTION_DISTANCE` thresholds and
     // saying so is the only thing keeping the two criteria from being confused for each other.
-    // Argmax among permitted targets and then the cut, matching `identify_clusters`; centroids
-    // frozen, because the pass being measured here adopts in one pass and does not re-centroid
-    // as it goes. An iterative pass would adopt more and would need its own sweep.
+    // Argmax among permitted targets and then the cut, matching `adopt_below_floor`; centroids
+    // frozen, because that pass adopts in one pass and does not re-centroid as it goes. An
+    // iterative pass would adopt more and would need its own sweep.
+    //
+    // Read as a *further* sweep: the shipped pass has already taken everything under its own cut,
+    // so the row at that cut adopts nothing and the rows above it price widening it.
     println!(
-        "\n  adoption sweep over centroid distance, one pass, argmax among permitted targets \
-         then the cut:"
+        "\n  further adoption sweep over centroid distance, one pass, argmax among permitted \
+         targets then the cut. The shipped pass has already run at {ADOPTION_DISTANCE:.3}, so \
+         this prices widening it rather than choosing it:"
     );
     println!("    threshold   adopted              remaining            clusters after");
     for step in 4..=16 {
@@ -680,8 +686,13 @@ fn is_blocked(offer: &CentroidPair) -> bool {
     matches!(offer.label, PairLabel::CannotLink { .. })
 }
 
-/// The two segmentation-labelled populations of the distance an adoption pass would threshold,
+/// The two segmentation-labelled populations of the distance [`ADOPTION_DISTANCE`] thresholds,
 /// scored, with the pairs behind every number.
+///
+/// Measured on the clustering that ships, which is the one `adopt_below_floor` has already swept:
+/// the positives are now classes inside a cluster the pass may have added fragments to, and the
+/// offer grid holds only what it declined. So this verifies the constant, and the numbers it was
+/// *chosen* from are the ones recorded on TASK-018.02.02 from before the pass existed.
 ///
 /// The blocks above print the raw material and never join it: every below-floor cluster against
 /// every above-floor one with a `blocked` column, and every must-link pair with its cluster ids.
@@ -690,7 +701,8 @@ fn is_blocked(offer: &CentroidPair) -> bool {
 ///
 /// The quantity is centroid distance, a small group's normalized mean against a larger group's,
 /// and the section says so on every line that prints a number. `MERGE_DISTANCE` thresholds the
-/// other quantity, average linkage; `IDENTIFY_DISTANCE` thresholds this one. They were once the
+/// other quantity, average linkage; [`ADOPTION_DISTANCE`] thresholds this one, for this decision,
+/// and [`IDENTIFY_DISTANCE`] thresholds it for another. The first two were once the
 /// same number, and TASK-020 is the bug that cost -- one confirmed pair of speakers landing on
 /// opposite sides of the two criteria at a shared 0.45 -- which is why the insistence is worth
 /// the words even now that the values differ.
@@ -866,10 +878,11 @@ fn print_adoption_populations(
          reject a same-speaker pair at or above it, percentiles are nearest-rank."
     );
     println!(
-        "    at the cut {:.3} -- IDENTIFY_DISTANCE unless --cut moved it. That constant \
-         thresholds this same quantity for a DIFFERENT decision, a cluster against an enrolled \
-         reference; the adoption constant does not exist yet, so these two counts price a \
-         borrowed number rather than a chosen one:",
+        "    at the cut {:.3} -- ADOPTION_DISTANCE unless --cut moved it, so these two counts \
+         price the shipped pass on the populations it was chosen from. Read them with the \
+         negatives' caveat above: every different-speaker pair here is one the constraint \
+         already refuses and the pass never offers, so a false accept in this column is a cut a \
+         DISTANCE-ONLY rule would have got wrong, not one this pass does:",
         report.threshold
     );
     print_costs("      ", &report);

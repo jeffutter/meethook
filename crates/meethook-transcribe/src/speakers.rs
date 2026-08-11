@@ -14,7 +14,7 @@
 //!
 //! For the same reason it also gets [`group_distance`]: a way to ask how far two groups of
 //! turns sit apart under either of the two criteria that disagree about it -- the average
-//! linkage clustering merges on, and the centroid distance a later pass would threshold --
+//! linkage clustering merges on, and the centroid distance `adopt_below_floor` thresholds --
 //! together with the factor that relates them. Asking that here rather than re-deriving it
 //! outside is what keeps a diagnostic from quietly disagreeing with the code it diagnoses.
 
@@ -78,6 +78,136 @@ use crate::{Error, Result};
 /// its reader to remember the threshold, and a reader who misremembers it reads the whole
 /// report backwards.
 pub const MERGE_DISTANCE: f32 = 0.45;
+
+/// How close a stranded fragment has to sit to a speaker before `adopt_below_floor` hands it
+/// over.
+///
+/// # What this thresholds
+///
+/// Cosine distance between **two group means**: a below-floor group's normalized mean on one
+/// side, an above-floor cluster's on the other -- [`GroupDistance::centroid`], 0 for the same
+/// direction and 1 for orthogonal. Not turn-to-turn, and *not* [`GroupDistance::average_linkage`],
+/// which is a different number on the same pair of groups.
+///
+/// # Where the value comes from
+///
+/// From two populations segmentation labelled by itself on session `20260810-093047`
+/// (TASK-018.02.02.01). Neither needed an enrolment and neither was settled by ear:
+///
+/// | population                                    | pairs | min   | median | p95   | max   |
+/// |-----------------------------------------------|-------|-------|--------|-------|-------|
+/// | same speaker, leave-one-class-out             | 39    | 0.060 | 0.137  | 0.221 | 0.284 |
+/// | different speakers, cannot-link               | 20    | 0.173 | 0.731  | 1.012 | 1.051 |
+///
+/// A **positive** is a must-link class -- two or more embedded turns sharing one
+/// `(window, local_speaker)`, which segmentation heard as one person -- that landed wholly inside
+/// an above-floor cluster, measured against the rest of that cluster with the class excluded. That
+/// is this pass's own shape: a few seconds of one voice against a speaker estimated from minutes.
+/// A **negative** is a below-floor cluster the same-window cannot-link constraint bars from an
+/// above-floor one.
+///
+/// Scored through [`crate::score_trials`], so the boundary convention below is the one that module
+/// states and tests -- accept is *strictly* below the cut. The two populations **overlap across
+/// `[0.173, 0.284]`**, so no cut separates them; equal error is 10.1% at 0.196, and the largest cut
+/// that misattributes nobody is 0.173, which rejects 30.8% of the labelled same-speaker pairs.
+///
+/// # Why the value is not that misattribution-free 0.173
+///
+/// Two halves, and neither softens the other.
+///
+/// **The negatives price a rule this pass does not use.** Every one of those 20 pairs is a pair the
+/// same-window constraint *already refuses*, and `adopt_below_floor` takes its argmax **among
+/// permitted targets only** -- a barred target is never a candidate, so its distance is never
+/// looked at. A cut at 0.25 does not adopt the 0.173 pair; that pair is vetoed before any distance
+/// is compared. Reading 0.173 as the safe cut double-counts a protection the pass already has.
+/// What the negatives legitimately bound is trust in the *unblocked* offers, where nothing
+/// protects anybody.
+///
+/// **And 20 pairs is one observation.** The misattribution-free cut *is* the minimum of the
+/// different-speaker side, so it moves wherever that single closest pair moves, and nothing says
+/// the closest pair seen is near the closest pair possible. The report prints it as a bound to
+/// check by ear rather than a number to ship, and this constant treats it that way.
+///
+/// The population that does share this pass's shape is the positives, and all 39 sit at or below
+/// 0.284. So the admissible window is `[0.196, 0.296)` -- bounded below by where rejecting real
+/// same-speaker fragments begins to bite, above by the ceiling in the next paragraph -- and
+/// **0.25** is the low side of it: it rejects only the upper tail of the labelled positives, and
+/// on that session it adopts 15 fragments holding 100.4 s. Every cut in `[0.254, 0.296)` adopts
+/// the same 16, so the extra 0.04 of width buys exactly one fragment.
+///
+/// # The ceiling, and the fragment that lowers it
+///
+/// Hard-capped strictly below **0.429**: the centroid gap between clusters 1 and 3 of that session,
+/// Andrew and Ryan, confirmed by ear to be two different people. A cut at or above that is
+/// measuring a gap two speakers fit inside.
+///
+/// Capped further below **0.296**, which is where a 7.8 s fragment (turns 100.4-101.6 and
+/// 103.3-110.0) sits from Andrew. That clip may be Alex, a real seventh participant, and
+/// the enrolled evidence cannot settle it -- Alex's stored reference *is* the centroid of the old
+/// blended cluster that clip came out of, so distances to it are circular for exactly this
+/// question. Adopting it costs a silent 7.8 s misattribution of a real participant if it is his;
+/// declining it costs one more visible `Unknown N` if it is not. 0.25 keeps 0.046 of margin under
+/// it where 0.29 would keep 0.006.
+///
+/// # Why it is not [`MERGE_DISTANCE`], and this is not a calibration difference
+///
+/// Because it thresholds a **different quantity**, not because it is a different pass.
+/// `MERGE_DISTANCE` governs average linkage -- the mean over every cross-group pair of turn
+/// distances -- and for unit-length members [`group_distance`] gives the exact relation:
+///
+/// ```text
+/// average_linkage = 1 - shrinkage * (1 - centroid)
+/// ```
+///
+/// so average linkage is centroid distance inflated by the shrinkage of the two means, and the two
+/// numbers diverge further the larger and more spread out either group is. The worked pair is the
+/// ceiling above: clusters 1 and 3 read **0.604** linkage and **0.429** centroid, putting the
+/// shrinkage at **0.693**. Two constants of equal value would therefore be two different cuts.
+/// TASK-020 is the live bug that came of describing two quantities in one set of words; that is
+/// the mistake this comment exists to not repeat.
+///
+/// Public for the same reason [`MERGE_DISTANCE`] is: `cluster-speaker-track` scores its two
+/// populations at this cut and prints the sweep around it, and a calibration constant a
+/// diagnostic has to keep its own copy of is a constant that drifts out of agreement with the
+/// code it claims to describe.
+pub const ADOPTION_DISTANCE: f32 = 0.25;
+
+/// How much speech a cluster's centroid has to rest on before `adopt_below_floor` will offer
+/// fragments to it.
+///
+/// The quantity is not "how small a fragment is". It is how much evidence a mean is estimated
+/// from before it is trustworthy enough to own somebody else's speech: below the floor a cluster
+/// is a fragment looking for an owner, at or above it a cluster is a speaker that could be one.
+/// The convention is `speech_seconds < floor` is a fragment and `>= floor` is a speaker, so a
+/// cluster sitting exactly *on* the floor is a speaker -- which is the same convention
+/// `crate::adoption_populations` partitions on, and the two must agree or the report describes a
+/// different pass from the one that ships.
+///
+/// # Where 30 s comes from
+///
+/// On session `20260810-093047` the six clusters the user confirms are the six people in the room
+/// hold 426.8 / 372.3 / 124.8 / 105.0 / 66.0 / 47.0 s, and the largest of the 65 leftovers holds
+/// 12.3 s. **Any floor `f` with `12.3 < f <= 47.0` gives exactly that partition** -- 6 speakers and
+/// 65 fragments -- so this value is insensitive across a 34.7 s band rather than fitted to one
+/// recording. 30 s sits near the middle of that band.
+///
+/// Both edges are consequences rather than curiosities. Below 12.3 s the largest leftover becomes
+/// an adoption *target*, so a fragment could be adopted into 12.3 s of speech -- which is the
+/// failure the floor exists to prevent. Above 47.0 s the smallest real speaker stops being one and
+/// 47.0 s of a participant goes looking for an owner.
+///
+/// # Why absolute seconds rather than a share of the meeting
+///
+/// The quantity is how much evidence a centroid rests on, and that does not change because
+/// somebody else talked more. The consequence is that on a short recording where nobody clears the
+/// floor nothing is adopted at all, which is the conservative direction and is exactly the no-op
+/// the model-gated tests in this module see.
+///
+/// Public because `cluster-speaker-track` partitions its report on this and defaults `--floor` to
+/// it, so that the report describes the pass that ships rather than a neighbouring one. The flag
+/// stays, because reading the report at another floor is how the band above gets re-measured on a
+/// recording whose gap sits elsewhere.
+pub const SPEAKER_FLOOR_SECONDS: f64 = 30.0;
 
 /// The shortest turn worth embedding.
 ///
@@ -160,9 +290,13 @@ pub fn cluster_speaker_turns(
     let track_end_s = samples_16k.len() as f64 / TARGET_RATE as f64;
     let mut fbank = Fbank::new();
 
-    // Embedded turns, and where each came from in `turns`.
+    // Embedded turns, where each came from in `turns`, and how long each one is. The durations
+    // are built here rather than derived where they are needed, so that the talk time the
+    // adoption pass partitions on and the talk time that reaches
+    // [`SpeakerCluster::speech_seconds`] cannot become two numbers.
     let mut embeddings = Vec::new();
     let mut sources = Vec::new();
+    let mut seconds = Vec::new();
     for (index, turn) in turns.iter().enumerate() {
         if turn.end_s - turn.start_s < MIN_EMBEDDABLE_SECONDS {
             continue;
@@ -172,29 +306,30 @@ pub fn cluster_speaker_turns(
         };
         embeddings.push(embedding);
         sources.push(index);
+        seconds.push(turn.end_s - turn.start_s);
     }
 
     let constraints: Vec<(usize, usize)> = sources
         .iter()
         .map(|&i| (turns[i].window, turns[i].local_speaker))
         .collect();
-    let mut groups = agglomerate(&embeddings, &constraints);
+    let mut groups = adopt_below_floor(
+        agglomerate(&embeddings, &constraints),
+        &embeddings,
+        &constraints,
+        &seconds,
+    );
 
     // Most talkative first, so cluster 0 is the person the meeting was mostly with and the
     // ids mean something to a human reading the file.
-    let spoken = |group: &Vec<usize>| -> f64 {
-        group
-            .iter()
-            .map(|&e| turns[sources[e]].end_s - turns[sources[e]].start_s)
-            .sum()
-    };
+    let spoken = |group: &Vec<usize>| -> f64 { group.iter().map(|&e| seconds[e]).sum() };
     groups.sort_by(|a, b| spoken(b).total_cmp(&spoken(a)));
 
     // After the sort, so the indices are cluster ids; and after every pass that rewrites
-    // `groups`, which is the only placement that stays correct. A leftover-adoption pass
-    // belongs between `agglomerate` and this sort, because it moves members between groups
-    // and can empty one -- so a relation computed before it would describe a grouping that
-    // no longer exists, while one computed here describes the grouping that ships.
+    // `groups`, which is the only placement that stays correct. `adopt_below_floor` runs
+    // between `agglomerate` and this sort, because it moves members between groups and empties
+    // the ones it adopts -- so a relation computed before it would describe a grouping that no
+    // longer exists, while one computed here describes the grouping that ships.
     let exclusions = heard_at_once_between(&groups, &constraints);
 
     let mut assignment = vec![None; turns.len()];
@@ -441,7 +576,166 @@ pub(crate) fn heard_at_once(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 == b.0 && a.1 != b.1
 }
 
-/// Lifts [`heard_at_once`] from turns to groups: for each group, the ids of the groups it
+/// Lifts [`heard_at_once`] from turns to groups: whether any turn of one was heard at once with
+/// any turn of the other, which makes the two groups two different people.
+///
+/// One witnessing pair is proof and the search stops there. Counting them would invite a
+/// threshold on evidence that is already categorical.
+fn heard_apart(a: &[usize], b: &[usize], constraints: &[(usize, usize)]) -> bool {
+    a.iter().any(|&i| {
+        b.iter()
+            .any(|&j| heard_at_once(constraints[i], constraints[j]))
+    })
+}
+
+/// Hands each group holding less than [`SPEAKER_FLOOR_SECONDS`] of speech to the nearest speaker
+/// that is allowed to have it, and leaves it alone when there is no such speaker.
+///
+/// Clustering strands short turns: a two-second fragment is charged for the spread of any large
+/// group it is compared to (see [`group_distance`]), so the cluster most likely to own it is the
+/// hardest one for it to join, and it ends up a cluster of one. On session `20260810-093047` that
+/// is 65 leftover clusters beside 6 real speakers. This is the second pass that sweeps them up,
+/// and it is settled practice -- pyannote's clustering prunes clusters under a `min_cluster_size`
+/// and reassigns them to the nearest retained centroid. What is specific here is that it can
+/// **decline**, and that it honours the cannot-link constraint pyannote has no equivalent of.
+///
+/// `groups` is what [`agglomerate`] returned, `embeddings` the unit-length vector per embedded
+/// turn, `constraints` each turn's `(window, local_speaker)`, and `seconds` each turn's duration
+/// -- all four indexed the same way. Returns the same members regrouped: every input turn appears
+/// in exactly one output group, and no output group is empty.
+///
+/// # The decisions, rather than the mechanics
+///
+/// **Targets are above-floor groups only.** A fragment is never adopted into another fragment, and
+/// two above-floor groups are never merged with each other however close they sit -- so the six
+/// speakers a recording has stay six by construction rather than by luck. Whether two speakers
+/// should have merged was `agglomerate`'s question and it has already been answered.
+///
+/// **Argmax among permitted targets, then the cut** -- not argmax then veto. A fragment whose
+/// nearest speaker is barred by the constraint is offered to its next-nearest *permitted* one; a
+/// fragment every speaker bars is declined. `identify_clusters` applies the same constraint the
+/// other way round and its documentation says why the two differ: adoption's constraint holds
+/// between a fragment and each candidate, so it is known before the choice; identification's does
+/// not exist until some other cluster has taken the name. Adoption vetoes candidates.
+/// Identification vetoes decisions.
+///
+/// **Permitted is judged against the target as it stands, not as it arrived.** Two fragments that
+/// were heard at once with *each other* can both be nearest to one speaker, and adopting both
+/// would put a forbidden pair in one cluster by the back door. So the second one is offered its
+/// next-nearest permitted speaker instead, exactly as if the first had always been part of that
+/// group. This is the only order-dependent step, and fragments are visited in ascending group
+/// index, which [`agglomerate`] fixes deterministically.
+///
+/// **Centroids are frozen and there is one pass.** Every distance is measured against the grouping
+/// as it arrived, so what one fragment is given cannot move the mean another is measured against.
+/// That makes the result independent of the order adoptions are applied in -- determinism for
+/// free rather than argued -- and makes it the same operation the sweep in TASK-018.02.02 measured.
+/// Iterative re-centroiding is a different pass and deliberately not this one.
+///
+/// **Strictly below [`ADOPTION_DISTANCE`]**, which is how `crate::score_trials` and
+/// `identify_clusters` spell the same comparison, so the report the constant was chosen from and
+/// the pass that ships it cannot differ by one `<`.
+///
+/// **An exact tie goes to the lowest group index**, which after `agglomerate` is
+/// `(window, local_speaker)` order -- stated so that a rerun cannot move a fragment between two
+/// equidistant speakers with nothing having changed.
+///
+/// # What happens to the fragments it declines: they stay clusters, and are not suppressed
+///
+/// A declined fragment comes back as its own cluster and reaches the user as another `Unknown N`.
+/// Suppressing it instead -- dropping its assignment -- is tempting, because the residue is large:
+/// on the session above this pass leaves roughly 56 clusters, not 7. It is refused for three
+/// reasons.
+///
+/// This module is on record that the two mistakes are not symmetric: a visible extra speaker is an
+/// error the user fixes in `enroll` in ten seconds, and a silent misattribution lands in a
+/// transcript nobody will re-read. See [`MERGE_DISTANCE`].
+///
+/// And suppression is **not** the absence of a misattribution. `merge::attribute` falls back to
+/// the nearest diarized turn in time when no turn overlaps a span, so a suppressed fragment is
+/// still attributed -- to whoever happened to be speaking beside it, invisibly, with no cluster to
+/// inspect. That is already what the turns under [`MIN_EMBEDDABLE_SECONDS`] get, and it is a worse
+/// answer here because these turns are long enough to have an opinion about.
+///
+/// Mechanically, too: [`Clustering::skipped`] counts `assignment.is_none()` and is documented as
+/// how many turns were too short to embed. Routing declined fragments through the same `None`
+/// would make that counter conflate two unrelated reasons, and it is the first line of every
+/// report. Suppression would have to split that count in two before it could be honest.
+fn adopt_below_floor(
+    groups: Vec<Vec<usize>>,
+    embeddings: &[Vec<f32>],
+    constraints: &[(usize, usize)],
+    seconds: &[f64],
+) -> Vec<Vec<usize>> {
+    let vectors = |group: &[usize]| -> Vec<&[f32]> {
+        group.iter().map(|&e| embeddings[e].as_slice()).collect()
+    };
+    let is_speaker = |group: &[usize]| -> bool {
+        group.iter().map(|&e| seconds[e]).sum::<f64>() >= SPEAKER_FLOOR_SECONDS
+    };
+
+    let above: Vec<usize> = (0..groups.len())
+        .filter(|&g| is_speaker(&groups[g]))
+        .collect();
+    let below: Vec<usize> = (0..groups.len())
+        .filter(|&g| !is_speaker(&groups[g]))
+        .collect();
+    // Nobody to adopt into, or nobody to adopt: both are the no-op, and both are ordinary. A
+    // recording where one person talked for four minutes has no fragments; one where nobody
+    // cleared the floor has no speaker whose mean is worth trusting.
+    if above.is_empty() || below.is_empty() {
+        return groups;
+    }
+
+    // Every offer, measured before any adoption is applied. This is what "frozen centroids"
+    // means concretely: the grid is complete before a single member moves.
+    let offers: Vec<Vec<Option<f32>>> = below
+        .iter()
+        .map(|&small| {
+            above
+                .iter()
+                .map(|&large| {
+                    group_distance(&vectors(&groups[small]), &vectors(&groups[large]))
+                        .map(|distance| distance.centroid)
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut groups = groups;
+    for (nth, &small) in below.iter().enumerate() {
+        let mut nearest: Option<(f32, usize)> = None;
+        for (mth, &large) in above.iter().enumerate() {
+            if heard_apart(&groups[small], &groups[large], constraints) {
+                continue;
+            }
+            // No direction to compare -- unreachable for real voices, and a decline rather
+            // than an arbitrary distance if it ever happens.
+            let Some(distance) = offers[nth][mth] else {
+                continue;
+            };
+            // Strictly nearer, and `above` ascends, so an exact tie keeps the lower group.
+            if nearest.is_none_or(|(held, _)| distance < held) {
+                nearest = Some((distance, large));
+            }
+        }
+
+        if let Some((_, large)) = nearest.filter(|&(distance, _)| distance < ADOPTION_DISTANCE) {
+            let adopted = std::mem::take(&mut groups[small]);
+            groups[large].extend(adopted);
+            // Members ascend, which is the invariant `agglomerate` maintains and which
+            // `reference_embedding` and the report order downstream both read.
+            groups[large].sort_unstable();
+        }
+    }
+
+    // An adopted group is empty now, and an empty group is not merely untidy: it would reach
+    // `reference_embedding`, which indexes `members[0]`.
+    groups.retain(|group| !group.is_empty());
+    groups
+}
+
+/// Lifts [`heard_apart`] to a whole grouping: for each group, the ids of the groups it
 /// holds a turn heard at once with.
 ///
 /// `groups` arrives in cluster-id order -- sorted by talk time -- so a position in the
@@ -451,28 +745,20 @@ pub(crate) fn heard_at_once(a: (usize, usize), b: (usize, usize)) -> bool {
 ///
 /// `constraints` is indexed by embedded-turn index, the way the members of `groups` are.
 ///
-/// Two groups are related on the *first* witnessing pair, not on how many there are: one
-/// overlap is proof, and counting them would invite a threshold on evidence that is already
-/// categorical. Pure, so the rule can be tested without a model or an audio track.
+/// Pure, so the rule can be tested without a model or an audio track.
 fn heard_at_once_between(groups: &[Vec<usize>], constraints: &[(usize, usize)]) -> Vec<Vec<u32>> {
-    let related = |a: &[usize], b: &[usize]| {
-        a.iter().any(|&i| {
-            b.iter()
-                .any(|&j| heard_at_once(constraints[i], constraints[j]))
-        })
-    };
-
     let mut exclusions = vec![Vec::new(); groups.len()];
     for a in 0..groups.len() {
         // `agglomerate` seeds one group per turn and only ever merges pairs whose distance
-        // is finite, so a group can never contain two turns heard at once and no group can
-        // exclude itself. Cheap to keep honest rather than assumed.
+        // is finite, and `adopt_below_floor` only adopts into a group nothing in the fragment
+        // was heard at once with -- so a group can never contain two turns heard at once and no
+        // group can exclude itself. Cheap to keep honest rather than assumed.
         debug_assert!(
-            !related(&groups[a], &groups[a]),
+            !heard_apart(&groups[a], &groups[a], constraints),
             "group {a} excludes itself"
         );
         for b in (a + 1)..groups.len() {
-            if related(&groups[a], &groups[b]) {
+            if heard_apart(&groups[a], &groups[b], constraints) {
                 exclusions[a].push(b as u32);
                 exclusions[b].push(a as u32);
             }
@@ -513,7 +799,7 @@ pub struct GroupDistance {
 
     /// The cosine distance between the two groups' normalized means.
     ///
-    /// This is what a leftover-adoption pass would threshold, and the quantity
+    /// This is what [`ADOPTION_DISTANCE`] thresholds, and the quantity
     /// [`crate::IDENTIFY_DISTANCE`] is measured in -- the distance between a cluster's
     /// reference vector and another's.
     pub centroid: f32,
@@ -841,6 +1127,278 @@ mod tests {
     /// Borrowed views of the members of one group, the shape [`group_distance`] takes.
     fn vectors<'a>(embeddings: &'a [Vec<f32>], group: &[usize]) -> Vec<&'a [f32]> {
         group.iter().map(|&i| embeddings[i].as_slice()).collect()
+    }
+
+    // [`adopt_below_floor`]. These pure tests are the pass's only coverage, and that is worth
+    // saying out loud rather than assuming: every model-gated test in this module runs on a
+    // track holding well under [`SPEAKER_FLOOR_SECONDS`] of speech -- 18 s in the longest --
+    // so at the shipped floor none of them has a speaker to adopt into and none of them
+    // exercises this pass at all. A green `MEETHOOK_ROOT` run says the pass is a no-op on a
+    // short track, which is a real guarantee and is not the same one.
+
+    /// A speaker with 40 s of speech and a two-second fragment 10 degrees away -- a centroid
+    /// distance of 0.015, well inside the cut. The ordinary case the pass exists for.
+    #[test]
+    fn a_fragment_near_a_speaker_is_adopted_into_it() {
+        let embeddings = vec![at(0.0), at(0.0), at(10.0)];
+
+        let groups = adopt_below_floor(
+            vec![vec![0, 1], vec![2]],
+            &embeddings,
+            &unconstrained(3),
+            &[20.0, 20.0, 2.0],
+        );
+
+        assert_eq!(groups, vec![vec![0, 1, 2]]);
+    }
+
+    /// The pass declining, which is the half pyannote's equivalent does not have. 60 degrees is
+    /// a centroid distance of 0.500, twice the cut: this fragment is nobody in the room, and
+    /// filing it under the only speaker present would be the misattribution the constant exists
+    /// to prevent.
+    #[test]
+    fn a_fragment_that_belongs_to_nobody_present_stays_a_cluster_of_its_own() {
+        let embeddings = vec![at(0.0), at(0.0), at(60.0)];
+
+        let groups = adopt_below_floor(
+            vec![vec![0, 1], vec![2]],
+            &embeddings,
+            &unconstrained(3),
+            &[20.0, 20.0, 2.0],
+        );
+
+        assert_eq!(groups, vec![vec![0, 1], vec![2]]);
+    }
+
+    /// AC#2 at the level that decides it, and the strongest possible case against the
+    /// constraint: the fragment is *identical* to the speaker, distance 0.000, so nothing about
+    /// their voices argues for keeping them apart. Segmentation heard turn 2 while turn 0 was
+    /// speaking, under a different local speaker index, so it is somebody else whatever the
+    /// embedding says.
+    #[test]
+    fn a_fragment_the_constraint_forbids_is_declined_however_close_it_sounds() {
+        let embeddings = vec![at(0.0), at(0.0), at(0.0)];
+
+        let groups = adopt_below_floor(
+            vec![vec![0, 1], vec![2]],
+            &embeddings,
+            &[(0, 0), (1, 0), (0, 1)],
+            &[20.0, 20.0, 2.0],
+        );
+
+        assert_eq!(groups, vec![vec![0, 1], vec![2]]);
+    }
+
+    /// Argmax among permitted targets rather than argmax then veto, as an assertion. The
+    /// fragment's nearest speaker is the first (0.001) and its second choice the other (0.049),
+    /// both far inside the cut; the first is barred. "Argmax then veto" would decline this
+    /// fragment, which is the other rule and is not this one.
+    #[test]
+    fn a_fragment_whose_nearest_speaker_is_barred_is_offered_the_next_permitted_one() {
+        let embeddings = vec![at(0.0), at(0.0), at(20.0), at(20.0), at(2.0)];
+        // Turn 4 was heard at once with turn 0, and with nothing in the second speaker.
+        let constraints = [(0, 0), (1, 0), (2, 0), (3, 0), (0, 1)];
+
+        let groups = adopt_below_floor(
+            vec![vec![0, 1], vec![2, 3], vec![4]],
+            &embeddings,
+            &constraints,
+            &[20.0, 20.0, 20.0, 20.0, 2.0],
+        );
+
+        assert_eq!(groups, vec![vec![0, 1], vec![2, 3, 4]]);
+    }
+
+    /// And when every speaker is barred there is no next choice: the fragment is declined
+    /// rather than handed to the least-bad option.
+    #[test]
+    fn a_fragment_every_speaker_bars_is_declined_rather_than_adopted_anywhere() {
+        let embeddings = vec![at(0.0), at(0.0), at(5.0), at(5.0), at(2.0)];
+        // Window 0 held three local speakers: one turn of each speaker, and the fragment.
+        let constraints = [(0, 0), (1, 0), (0, 2), (3, 0), (0, 1)];
+
+        let groups = adopt_below_floor(
+            vec![vec![0, 1], vec![2, 3], vec![4]],
+            &embeddings,
+            &constraints,
+            &[20.0, 20.0, 20.0, 20.0, 2.0],
+        );
+
+        assert_eq!(groups, vec![vec![0, 1], vec![2, 3], vec![4]]);
+    }
+
+    /// The back door into AC#2, and the reason the constraint is read against the target as it
+    /// stands rather than as it arrived. Both fragments are inside the cut of the only speaker,
+    /// and segmentation heard the two of *them* at once -- so adopting both would put a
+    /// forbidden pair in one cluster without either adoption having crossed a barred pair.
+    ///
+    /// The second call is the counterfactual that stops this passing vacuously: with nothing
+    /// forbidden, both are adopted.
+    #[test]
+    fn two_fragments_heard_at_once_with_each_other_do_not_both_join_one_speaker() {
+        let embeddings = vec![at(0.0), at(0.0), at(5.0), at(8.0)];
+        let seconds = [20.0, 20.0, 2.0, 2.0];
+
+        let groups = adopt_below_floor(
+            vec![vec![0, 1], vec![2], vec![3]],
+            &embeddings,
+            &[(0, 0), (1, 0), (9, 0), (9, 1)],
+            &seconds,
+        );
+        assert_eq!(groups, vec![vec![0, 1, 2], vec![3]]);
+
+        let groups = adopt_below_floor(
+            vec![vec![0, 1], vec![2], vec![3]],
+            &embeddings,
+            &unconstrained(4),
+            &seconds,
+        );
+        assert_eq!(groups, vec![vec![0, 1, 2, 3]], "both are inside the cut");
+    }
+
+    /// Frozen centroids as an assertion rather than a sentence. The speaker sits at 0 degrees;
+    /// the first fragment is 40 degrees away (0.234, inside the cut) and the second 45 degrees
+    /// away (0.293, outside it). Adopting the first would swing a *recomputed* centroid to 13.1
+    /// degrees and pull the second inside, so a pass that re-centroided would take both -- and
+    /// would take a different pair if the fragments arrived in the other order.
+    ///
+    /// The `merged` assertion is what keeps this from passing vacuously: it says the
+    /// re-centroided answer really would have differed.
+    #[test]
+    fn centroids_are_frozen_so_one_adoption_cannot_change_another_s_answer() {
+        let embeddings = vec![at(0.0), at(0.0), at(40.0), at(45.0)];
+
+        let groups = adopt_below_floor(
+            vec![vec![0, 1], vec![2], vec![3]],
+            &embeddings,
+            &unconstrained(4),
+            &[20.0, 20.0, 2.0, 2.0],
+        );
+
+        assert_eq!(groups, vec![vec![0, 1, 2], vec![3]]);
+
+        let merged = group_distance(
+            &vectors(&embeddings, &[0, 1, 2]),
+            &vectors(&embeddings, &[3]),
+        )
+        .expect("neither group is empty");
+        assert!(
+            merged.centroid < ADOPTION_DISTANCE,
+            "re-centroiding would not have changed the second answer, so this proves nothing: \
+             {merged:?}"
+        );
+    }
+
+    /// AC#7's guarantee by construction: two speakers 5 degrees apart -- a centroid distance of
+    /// 0.004, far inside the cut -- stay two speakers, because an above-floor group is never a
+    /// candidate for adoption into anything. Whether those two should have merged was
+    /// `agglomerate`'s question and this pass does not reopen it.
+    ///
+    /// Also the emptied group: the fragment's own group must not come back as an empty `Vec`,
+    /// which `reference_embedding` would index into.
+    #[test]
+    fn speakers_are_never_merged_into_each_other_and_no_empty_group_survives() {
+        let embeddings = vec![at(0.0), at(0.0), at(5.0), at(5.0), at(1.0)];
+
+        let groups = adopt_below_floor(
+            vec![vec![0, 1], vec![2, 3], vec![4]],
+            &embeddings,
+            &unconstrained(5),
+            &[20.0, 20.0, 20.0, 20.0, 2.0],
+        );
+
+        assert_eq!(groups, vec![vec![0, 1, 4], vec![2, 3]]);
+        assert!(groups.iter().all(|group| !group.is_empty()));
+    }
+
+    /// An exact tie has to resolve the same way on every run, or a `--force` re-transcribe
+    /// could move a fragment between two equidistant speakers with nothing having changed.
+    /// This fragment sits 10 degrees from each; the lower group keeps it.
+    #[test]
+    fn an_exact_tie_goes_to_the_lower_group() {
+        let embeddings = vec![at(-10.0), at(-10.0), at(10.0), at(10.0), at(0.0)];
+
+        let groups = adopt_below_floor(
+            vec![vec![0, 1], vec![2, 3], vec![4]],
+            &embeddings,
+            &unconstrained(5),
+            &[20.0, 20.0, 20.0, 20.0, 2.0],
+        );
+
+        assert_eq!(groups, vec![vec![0, 1, 4], vec![2, 3]]);
+    }
+
+    /// The floor's convention, which has to match the instrument that measured it exactly:
+    /// `speech_seconds < floor` is a fragment and `>= floor` is a speaker, so a cluster sitting
+    /// *on* the floor can be adopted into. A hair under it and there is no speaker anywhere, so
+    /// the same two groups come back untouched.
+    #[test]
+    fn a_cluster_sitting_exactly_on_the_floor_is_a_speaker() {
+        let embeddings = vec![at(0.0), at(2.0)];
+        let offered = |speech: f64| {
+            adopt_below_floor(
+                vec![vec![0], vec![1]],
+                &embeddings,
+                &unconstrained(2),
+                &[speech, 2.0],
+            )
+        };
+
+        assert_eq!(offered(SPEAKER_FLOOR_SECONDS), vec![vec![0, 1]]);
+        assert_eq!(
+            offered(SPEAKER_FLOOR_SECONDS - 0.001),
+            vec![vec![0], vec![1]]
+        );
+    }
+
+    /// Every degenerate shape is the input back rather than a panic: no turns at all, nothing
+    /// above the floor, and nothing below it. The last is the common one -- a meeting where one
+    /// person talked and nothing was stranded.
+    #[test]
+    fn degenerate_shapes_are_no_ops_rather_than_panics() {
+        assert!(adopt_below_floor(Vec::new(), &[], &[], &[]).is_empty());
+
+        let embeddings = vec![at(0.0), at(3.0)];
+        assert_eq!(
+            adopt_below_floor(
+                vec![vec![0, 1]],
+                &embeddings,
+                &unconstrained(2),
+                &[20.0, 20.0]
+            ),
+            vec![vec![0, 1]],
+            "one speaker and nothing looking for an owner"
+        );
+        assert_eq!(
+            adopt_below_floor(
+                vec![vec![0], vec![1]],
+                &embeddings,
+                &unconstrained(2),
+                &[2.0, 2.0]
+            ),
+            vec![vec![0], vec![1]],
+            "two fragments and no speaker either of them could join"
+        );
+    }
+
+    /// AC#11 without a model: a track carrying one voice comes back as one cluster, and the
+    /// pass leaves it alone whether that voice cleared the floor or not.
+    #[test]
+    fn one_voice_stays_one_cluster_through_the_pass() {
+        let embeddings: Vec<Vec<f32>> = [0.0, 12.0, -9.0, 30.0, 5.0]
+            .iter()
+            .map(|d| at(*d))
+            .collect();
+        let constraints = unconstrained(5);
+        let one = agglomerate(&embeddings, &constraints);
+        assert_eq!(one.len(), 1);
+
+        for speech in [1.0, 20.0] {
+            assert_eq!(
+                adopt_below_floor(one.clone(), &embeddings, &constraints, &[speech; 5]),
+                one
+            );
+        }
     }
 
     /// Group shapes worth measuring a distance over: two singletons, a singleton against a

@@ -48,7 +48,8 @@ pub use merge::merge;
 pub use onnx::{Loaded, open_session};
 pub use segmentation::{LocalTurn, segment_speaker_track};
 pub use speakers::{
-    Clustering, GroupDistance, MERGE_DISTANCE, cluster_speaker_turns, group_distance,
+    ADOPTION_DISTANCE, Clustering, GroupDistance, MERGE_DISTANCE, SPEAKER_FLOOR_SECONDS,
+    cluster_speaker_turns, group_distance,
 };
 pub use trials::{EqualError, Spread, Trial, TrialReport, ZeroFalseAccept, score_trials};
 pub use vad::{SileroVad, SpeechRegion, VadTuning};
