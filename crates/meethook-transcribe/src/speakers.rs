@@ -18,6 +18,8 @@
 //! together with the factor that relates them. Asking that here rather than re-deriving it
 //! outside is what keeps a diagnostic from quietly disagreeing with the code it diagnoses.
 
+use std::collections::BTreeMap;
+
 use meethook_session::{MIN_REPRESENTATIVE_SECONDS, RepresentativeSegment, SpeakerCluster};
 use ort::session::Session;
 use ort::value::TensorRef;
@@ -293,8 +295,8 @@ fn reference_embedding(members: &[usize], embeddings: &[Vec<f32>]) -> Vec<f32> {
 
 /// Groups unit-length embeddings into speakers, returning each group's member indices.
 ///
-/// Agglomerative with average linkage: start with every turn alone, repeatedly merge the
-/// two closest groups, stop when the closest pair is further apart than [`MERGE_DISTANCE`].
+/// Agglomerative with average linkage: start from segmentation's own grouping, repeatedly merge
+/// the two closest groups, stop when the closest pair is further apart than [`MERGE_DISTANCE`].
 /// Average linkage rather than single (which chains one speaker into the next through a
 /// single ambiguous turn) or complete (which shatters a speaker over one bad clip).
 ///
@@ -302,15 +304,65 @@ fn reference_embedding(members: &[usize], embeddings: &[Vec<f32>]) -> Vec<f32> {
 /// every merge -- because a meeting has hundreds of turns and a cleverer one would trade
 /// something that is obviously correct for time nobody is waiting on.
 ///
-/// `constraints` carries each embedding's `(window, local_speaker)` from segmentation, and
-/// it is free supervision: two turns the model heard *in the same window* with different
-/// local speaker indices are definitely different people, so no merge is allowed to put
-/// them together however close their embeddings look.
+/// `constraints` carries each embedding's `(window, local_speaker)` from segmentation, and it is
+/// free supervision in *both* directions, because a local speaker index is an assertion about
+/// who was talking inside one window:
+///
+///   - Two turns the model heard in one window under **different** indices are definitely
+///     different people, so no merge may ever put them together however close their embeddings
+///     look. [`pairwise_distances`] encodes that as an infinity.
+///   - Two turns heard in one window under the **same** index are one person on exactly the same
+///     authority. Windows do not overlap and segmentation reopens a turn for one index whenever
+///     the silence inside it runs past `MAX_GAP_IN_TURN_S`, so such a pair is two turns only
+///     because real silence separated them -- not because anything doubted it was one voice.
+///
+/// The second direction is applied by *seeding*: the initial partition is one group per distinct
+/// `(window, local_speaker)` rather than one group per turn, so turns segmentation already called
+/// one person start together and no sequence of merges can pull them apart. Seeding rather than
+/// substituting a zero -- or a negative -- distance for a must-link pair, because a substitution
+/// would change the criterion the loop merges on and poison every average running through that
+/// pair; this changes only where the loop starts.
+///
+/// **The two directions cannot conflict.** Every turn carries exactly one
+/// `(window, local_speaker)`, so the seeds are the equivalence classes of that key rather than a
+/// transitive closure over pairs, and every pair inside one seed shares *both* halves of it. A
+/// cannot-link pair needs the same window and *different* indices, which no intra-seed pair has.
+/// So a seed is always internally finite, and the cannot-link constraint keeps working untouched:
+/// a forbidden pair still makes every average linkage spanning it infinite, so no merge can bring
+/// the two groups holding it together.
+///
+/// Seeding is not free, and the cost is a merge rather than a misattribution: a seed holding two
+/// turns that sound different has a spread-out mean, and average linkage is centroid distance
+/// inflated by that spread (see [`group_distance`]), so forcing turns together *raises* the
+/// group's distance to everything else and can cost a merge elsewhere.
 fn agglomerate(embeddings: &[Vec<f32>], constraints: &[(usize, usize)]) -> Vec<Vec<usize>> {
     let n = embeddings.len();
     let distances = pairwise_distances(embeddings, constraints);
 
-    let mut groups: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+    // A `BTreeMap` rather than a hash map because the seed order decides which of two equally
+    // close pairs the greedy search below takes first, so a randomized iteration order would make
+    // clustering irreproducible -- and not even stable within one run, since two hash maps in one
+    // process are seeded differently. Ordering by `(window, local_speaker)` is close to
+    // chronological, a window index being the turn's start divided by the window length.
+    let mut seeds: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+    // `take(n)` because a group may only hold turns the distance matrix has rows for; `turn`
+    // ascends, so every seed comes out sorted, which is the invariant the merge step below
+    // maintains with `sort_unstable`.
+    for (turn, &key) in constraints.iter().enumerate().take(n) {
+        seeds.entry(key).or_default().push(turn);
+    }
+    let mut groups: Vec<Vec<usize>> = seeds.into_values().collect();
+
+    // The argument above, asserted against the matrix that actually encodes it: a seed can never
+    // hold a forbidden pair, so no starting group is infinitely far from itself.
+    debug_assert!(
+        groups.iter().all(|seed| {
+            seed.iter()
+                .all(|&i| seed.iter().all(|&j| distances[i * n + j].is_finite()))
+        }),
+        "a seed held a cannot-link pair, which one key per turn makes impossible"
+    );
+
     loop {
         let mut best = None;
         for a in 0..groups.len() {
@@ -537,7 +589,10 @@ mod tests {
         vec![radians.cos(), radians.sin(), 0.0, 0.0]
     }
 
-    /// Constraints that never forbid a merge: every turn in its own window.
+    /// Constraints that say nothing in either direction: every turn alone in its own window, so
+    /// no pair is forbidden from merging and no pair is forced to start together either. The
+    /// distances are then the only thing grouping these turns, which is what every test using
+    /// this is about.
     fn unconstrained(n: usize) -> Vec<(usize, usize)> {
         (0..n).map(|i| (i, 0)).collect()
     }
@@ -607,6 +662,70 @@ mod tests {
         let embeddings = vec![at(0.0), at(0.0)];
         let groups = agglomerate(&embeddings, &[(7, 0), (7, 1)]);
         assert_eq!(group_sizes(&groups), [1, 1]);
+    }
+
+    /// The must-link direction, and the strongest possible case against it: two turns
+    /// segmentation heard in one window under one local speaker index, whose embeddings are
+    /// orthogonal -- distance 1.0 against a cut of 0.45. Distance does not get a vote, because
+    /// segmentation already said this is one person talking with a pause in it.
+    #[test]
+    fn one_local_speaker_stays_one_speaker_however_far_apart_the_turns_sound() {
+        let groups = agglomerate(&[at(0.0), at(90.0)], &[(3, 1), (3, 1)]);
+        assert_eq!(groups, vec![vec![0, 1]]);
+    }
+
+    /// A whole seed class rather than a chain of pairwise merges: three turns under one
+    /// `(window, local_speaker)` are one group even though no two of them would have merged on
+    /// their own.
+    #[test]
+    fn every_turn_of_one_local_speaker_lands_in_one_group() {
+        let embeddings = vec![at(0.0), at(85.0), at(-80.0)];
+        let groups = agglomerate(&embeddings, &[(5, 2), (5, 2), (5, 2)]);
+        assert_eq!(groups, vec![vec![0, 1, 2]]);
+    }
+
+    /// Where the two directions of the constraint meet, and the case that says which one wins.
+    /// Turn 2 is *identical* to turn 0, so nothing about their voices argues for keeping them
+    /// apart -- but turn 2 was heard at once with turn 1, and turns 0 and 1 are one local
+    /// speaker, so admitting turn 2 would put a forbidden pair in one cluster. It stays out.
+    #[test]
+    fn a_must_link_class_never_absorbs_a_turn_heard_at_once_with_one_of_its_members() {
+        let embeddings = vec![at(0.0), at(90.0), at(0.0)];
+        let groups = agglomerate(&embeddings, &[(3, 1), (3, 1), (3, 0)]);
+        // Seeded in `(window, local_speaker)` order, so local speaker 0 comes back first.
+        assert_eq!(groups, vec![vec![2], vec![0, 1]]);
+    }
+
+    /// AC#4 at the unit level: the same turns and constraints produce the same clusters in the
+    /// same order, twice. Seeding puts a map between segmentation and the greedy merge loop, and
+    /// the loop breaks ties by group position, so a randomized iteration order would make
+    /// clustering irreproducible -- this is what fails if anyone reaches for a hash map.
+    ///
+    /// The expected value also pins the documented seed order, `(window, local_speaker)`
+    /// ascending, so that tie-break order is a stated contract rather than an accident. These
+    /// four classes are mutually orthogonal, so no merge happens and the groups returned are the
+    /// seeds themselves.
+    #[test]
+    fn clustering_is_reproducible_and_seeded_in_window_order() {
+        let embeddings = vec![
+            at(0.0),
+            at(4.0),
+            at(90.0),
+            at(94.0),
+            at(180.0),
+            at(184.0),
+            at(270.0),
+        ];
+        let constraints = [(0, 1), (0, 1), (1, 0), (1, 0), (1, 2), (1, 2), (2, 0)];
+
+        let groups = agglomerate(&embeddings, &constraints);
+
+        assert_eq!(groups, agglomerate(&embeddings, &constraints));
+        assert_eq!(
+            groups,
+            vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6]],
+            "seeds must come out ordered by (window, local_speaker)"
+        );
     }
 
     /// Borrowed views of the members of one group, the shape [`group_distance`] takes.
@@ -729,11 +848,19 @@ mod tests {
         assert!((length - 1.0).abs() < 1e-6, "length {length}");
     }
 
+    /// A turn as segmentation would report it: in the window its start falls inside.
+    ///
+    /// The window is derived rather than fixed at 0 because it is not decoration -- turns sharing
+    /// a `(window, local_speaker)` are must-linked by [`agglomerate`], so a helper that filed
+    /// every turn in window 0 would silently force every turn a test built into one cluster. Real
+    /// windows are [`crate::segmentation::WINDOW_SECONDS`] long and laid end to end, so a turn
+    /// starts inside its own window; tests that need two local speakers set that field
+    /// themselves.
     fn turn(start_s: f64, end_s: f64) -> LocalTurn {
         LocalTurn {
             start_s,
             end_s,
-            window: 0,
+            window: (start_s / crate::segmentation::WINDOW_SECONDS) as usize,
             local_speaker: 0,
         }
     }

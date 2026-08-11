@@ -41,7 +41,9 @@ pub struct LocalTurn {
 /// out of distribution, because the receptive field and the training regime are both built
 /// around this number.
 const WINDOW_SAMPLES: usize = 10 * TARGET_RATE as usize;
-const WINDOW_SECONDS: f64 = WINDOW_SAMPLES as f64 / TARGET_RATE as f64;
+/// `pub(crate)` so that a test building a [`LocalTurn`] by hand can put it in the window its
+/// start really falls inside rather than restating "ten" and drifting from it.
+pub(crate) const WINDOW_SECONDS: f64 = WINDOW_SAMPLES as f64 / TARGET_RATE as f64;
 
 /// Windows are laid end to end: the step equals the window.
 ///

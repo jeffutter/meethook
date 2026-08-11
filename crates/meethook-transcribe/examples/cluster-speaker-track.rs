@@ -60,10 +60,14 @@
 //!
 //! The last block is the other half of the free supervision. The known-different block above
 //! uses one direction of segmentation's local speaker index; two turns in one window under the
-//! *same* index are the same person on exactly that same authority, and nothing in meethook
-//! reads that direction today. Where clustering split such a pair it is wrong, provably, with
-//! no embedding and no threshold involved -- so how much speech sits in that population is a
-//! number worth having before reaching for a distance.
+//! *same* index are the same person on exactly that same authority. Where clustering split such
+//! a pair it is wrong, provably, with no embedding and no threshold involved -- which is what
+//! this block measured before `agglomerate` read that direction, and 73 of 206 such pairs were
+//! split. `agglomerate` now seeds its groups by `(window, local_speaker)`, so the block has
+//! become a regression check on the constraint the library applies rather than a report of an
+//! opportunity going unused: its "split across two" count should read 0 on every session, and
+//! any other number means seeding is not doing what it claims. The pairs with a turn too short
+//! to embed stay out of reach either way -- the constraint only covers turns that were embedded.
 //!
 //! The enrolled-reference table at the end answers the other threshold's version of that
 //! question, `IDENTIFY_DISTANCE`. `transcript.json` records a similarity only for clusters
@@ -648,18 +652,29 @@ fn print_stranded_clusters(
 /// Turn pairs segmentation heard in one window under the same local speaker index, and what
 /// clustering did with them.
 ///
-/// The other direction of the constraint `agglomerate` already uses, and the only one nothing in
-/// meethook reads. Different indices in one window are different people; the *same* index in one
-/// window is one person, on exactly the same authority. Windows do not overlap and segmentation
-/// closes and reopens a turn for one index whenever the silence inside it runs past a quarter
-/// second, so a pair like this is two turns of one speaker rather than an artefact of the
-/// decoder -- and wherever clustering put such a pair in two clusters, it is wrong, with no
-/// embedding, no threshold and no model standing behind the claim.
+/// The must-link direction of the constraint. Different indices in one window are different
+/// people; the *same* index in one window is one person, on exactly the same authority. Windows do
+/// not overlap and segmentation closes and reopens a turn for one index whenever the silence
+/// inside it runs past a quarter second, so a pair like this is two turns of one speaker rather
+/// than an artefact of the decoder -- and wherever clustering put such a pair in two clusters, it
+/// is wrong, with no embedding, no threshold and no model standing behind the claim.
 ///
-/// So the number this block exists for is the last one it prints: how many clusters would be
-/// left if those pairs were applied as merges. That is free supervision, and it is the lever
-/// that costs nothing to pull, so its size decides whether a distance threshold has to carry the
-/// whole tail on its own.
+/// `agglomerate` reads that direction now: it seeds its groups by `(window, local_speaker)`, so
+/// every embedded pair this block finds is in one cluster by construction. That makes the block a
+/// regression check rather than the opportunity report it was written as -- **the line to read is
+/// "split across two", and it must be 0.** Anything else means seeding is broken, and no unit test
+/// says so as directly, because this is the constraint measured on the audio it came from.
+///
+/// The other two counts still say something. "Already in one cluster" is the population the
+/// seeding covers, and the pairs with a turn too short to embed are out of its reach in principle:
+/// `constraints` only carries embedded turns, so lowering `MIN_EMBEDDABLE_SECONDS` is the only
+/// thing that would reach them, and that is a separate judgement.
+///
+/// The last line -- how many clusters transitive cluster-level merging of these pairs would
+/// leave -- is kept because it is not the same operation the library performs. It merges whole
+/// clusters, which can drag turns from other windows along with the pair; seeding merges turns.
+/// Now that the split count should be 0 it will normally have nothing to do, and a session where
+/// it does is a session where the two operations disagree.
 fn print_must_link_splits(clustering: &Clustering, turns: &[LocalTurn], members: &[Vec<usize>]) {
     println!("\nmust-link pairs (heard in one window under the same local speaker index):");
 
