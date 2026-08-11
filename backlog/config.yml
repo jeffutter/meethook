@@ -1,6 +1,6 @@
 project_name: "meethook"
 default_status: "To Do"
-statuses: ["Backlog", "To Do", "Needs Plan", "Dev Ready", "In Progress", "Done"]
+statuses: ["Backlog", "To Do", "Blocked", "Needs Plan", "Dev Ready", "In Progress", "Done"]
 labels: []
 definition_of_done: []
 date_format: yyyy-mm-dd
