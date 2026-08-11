@@ -12,14 +12,9 @@ use std::collections::BTreeMap;
 use meethook_session::{SPEAKER_YOU, SourceTrack, Turn, unknown_labels, unknown_speaker};
 
 use crate::asr::AsrSegment;
+use crate::attribution::{Attribution, attributions};
 use crate::diarize::SpeakerTurn;
 use crate::identify::Identification;
-
-/// A speaker-track voice's label, and how confident the *identity* claim in it is.
-///
-/// `None` for an "Unknown N" label, because that label makes no identity claim at all -- there
-/// is nothing for a number to be the confidence of.
-type Label = (String, Option<f32>);
 
 /// Combines both tracks into one chronological, speaker-labelled transcript.
 ///
@@ -81,18 +76,18 @@ pub fn merge(
         // than an empty label or a dropped sentence. The `None` is recorded on the turn as
         // well: `enroll` must be able to read "this turn came from no cluster" off the file
         // rather than infer it, which is why the field is required rather than defaulted.
-        let cluster = attribute(&segment, diarized);
-        let (speaker, confidence) = cluster
+        let cluster = speaking_cluster(&segment, diarized);
+        let attribution = cluster
             .and_then(|id| labels.get(&id).cloned())
-            .unwrap_or_else(|| (unknown_speaker(1), None));
+            .unwrap_or_else(|| Attribution::Unknown(unknown_speaker(1)));
         Turn {
-            speaker,
+            speaker: attribution.label().to_string(),
             start: speaker_offset_s + segment.start_s,
             end: speaker_offset_s + segment.end_s,
             text: segment.text,
             source_track: SourceTrack::Speaker,
             cluster,
-            speaker_id_confidence: confidence,
+            speaker_id_confidence: attribution.confidence(),
         }
     }));
 
@@ -107,25 +102,18 @@ pub fn merge(
 /// Labels every voice on the speaker track: an enrolled speaker's name where there is one,
 /// otherwise the "Unknown N" [`unknown_labels`] hands it.
 ///
-/// The numbering rule -- first appearance, ties by cluster id, from 1 -- deliberately is not
-/// implemented here. `enroll` has to work out which cluster an "Unknown 2" in an existing
-/// transcript refers to, so it needs the identical numbering, and a second copy of the rule
-/// would drift from this one with a misplaced name as the only symptom. See
-/// [`unknown_labels`] for the rule and why the numbers a name displaces stay unused.
+/// What this owns is the projection from diarized turns to when each voice was first heard.
+/// The labelling itself is [`attributions`], which `enroll` reaches through too -- that is
+/// what makes a transcript it rewrote identical to what `transcribe --force` would produce.
+/// The numbering rule is [`unknown_labels`]', for the same reason one layer further down.
 fn label_by_first_appearance(
     diarized: &[SpeakerTurn],
     identified: &BTreeMap<u32, Identification>,
-) -> BTreeMap<u32, Label> {
-    unknown_labels(diarized.iter().map(|turn| (turn.cluster, turn.start_s)))
-        .into_iter()
-        .map(|(id, unknown)| {
-            let label = match identified.get(&id) {
-                Some(who) => (who.name.clone(), Some(who.similarity)),
-                None => (unknown, None),
-            };
-            (id, label)
-        })
-        .collect()
+) -> BTreeMap<u32, Attribution> {
+    attributions(
+        &unknown_labels(diarized.iter().map(|turn| (turn.cluster, turn.start_s))),
+        identified,
+    )
 }
 
 /// Decides whose voice a recognised segment is.
@@ -147,7 +135,7 @@ fn label_by_first_appearance(
 /// land in `speaker_id_confidence`, which now answers a different question -- how sure the
 /// *name* is -- and one field carrying two incompatible scales, told apart only by inspecting
 /// the label, would be worse than not reporting the overlap at all.
-fn attribute(segment: &AsrSegment, diarized: &[SpeakerTurn]) -> Option<u32> {
+fn speaking_cluster(segment: &AsrSegment, diarized: &[SpeakerTurn]) -> Option<u32> {
     let mut overlap: BTreeMap<u32, f64> = BTreeMap::new();
     for turn in diarized {
         let shared = turn.end_s.min(segment.end_s) - turn.start_s.max(segment.start_s);
@@ -210,7 +198,7 @@ mod tests {
     }
 
     /// The state of every session before anybody has been enrolled, which is what all the
-    /// labelling and attribution tests below are about: voices, none of them with a name.
+    /// labelling and speaking-cluster tests below are about: voices, none of them with a name.
     fn nobody() -> BTreeMap<u32, Identification> {
         BTreeMap::new()
     }
@@ -296,7 +284,7 @@ mod tests {
     }
 
     /// The recorded cluster is the one the label was looked up from, so the two can never
-    /// disagree about whose voice a turn is -- including where attribution had to decide.
+    /// disagree about whose voice a turn is -- including where [`speaking_cluster`] had to decide.
     #[test]
     fn a_straddling_segment_records_the_same_cluster_its_label_came_from() {
         let merged = merge(
@@ -398,7 +386,7 @@ mod tests {
         );
     }
 
-    /// The case attribution exists for: one recognised sentence spanning a hand-over goes to
+    /// The case [`speaking_cluster`] exists for: one recognised sentence spanning a hand-over goes to
     /// whoever held most of it.
     #[test]
     fn a_segment_straddling_two_turns_goes_to_the_majority_holder() {
@@ -531,14 +519,14 @@ mod tests {
     fn voices_that_first_speak_at_the_same_instant_are_numbered_by_cluster_id() {
         let diarized = [turn(0.0, 2.0, 1), turn(0.0, 2.0, 0)];
         let labels = label_by_first_appearance(&diarized, &nobody());
-        assert_eq!(labels[&0].0, "Unknown 1");
-        assert_eq!(labels[&1].0, "Unknown 2");
+        assert_eq!(labels[&0].label(), "Unknown 1");
+        assert_eq!(labels[&1].label(), "Unknown 2");
     }
 
     /// Overlap is measured in seconds, not in turns: three short turns from one voice must
     /// not out-vote one long turn from another.
     #[test]
-    fn attribution_counts_time_rather_than_the_number_of_turns() {
+    fn the_speaking_cluster_is_decided_by_time_rather_than_by_the_number_of_turns() {
         let merged = merge(
             Vec::new(),
             0.0,

@@ -14,6 +14,7 @@ mod adoption;
 mod aec;
 mod align;
 mod asr;
+mod attribution;
 mod audio;
 mod diarize;
 mod fbank;
@@ -39,6 +40,7 @@ pub use adoption::{
 pub use aec::{Cleaned, Cleaning, PassThrough, cancel_bleed};
 pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
+pub use attribution::{Attribution, attributions};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
 pub use gpu::NoMetalDevice;

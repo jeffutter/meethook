@@ -37,7 +37,9 @@ use meethook_session::{
     Classification, DiscoveredSession, EnrolledSpeaker, EnrolledSpeakers, Paths, SessionId,
     SourceTrack, SpeakerCluster, SpeakerClusters, Transcript, discover_sessions, unknown_labels,
 };
-use meethook_transcribe::{TARGET_RATE, identify_clusters, read_track_16k_mono};
+use meethook_transcribe::{
+    Attribution, TARGET_RATE, attributions, identify_clusters, read_track_16k_mono,
+};
 
 /// How many of a voice's lines to show before asking who it is.
 ///
@@ -217,10 +219,6 @@ pub struct EnrollReport {
     pub passed_over: usize,
     pub failed: usize,
 }
-
-/// A speaker label, and how confident the identity claim in it is: `None` for an "Unknown N",
-/// which claims no identity at all.
-type Label = (String, Option<f32>);
 
 /// Whether the queue should carry on to the next session.
 enum Outcome {
@@ -405,13 +403,13 @@ fn enroll_session(
     // what lets `--all` and `--correct` compose without either knowing about the other.
     let candidates: Vec<&SpeakerCluster> = order
         .into_iter()
-        .filter(|c| offer.named || shown[&c.id].1.is_none())
+        .filter(|c| offer.named || !shown[&c.id].is_named())
         .collect();
     if candidates.is_empty() {
         // A session whose voices are all identified is exactly where somebody stands when one
         // of those identifications is wrong, and this line is the only thing it prints -- so
         // it names the escape, the way the held-back line already names `--all`.
-        let named = shown.values().filter(|label| label.1.is_some()).count();
+        let named = shown.values().filter(|label| label.is_named()).count();
         if named == 0 {
             writeln!(out, "{}  passed over: nothing unresolved", session.id)?;
         } else {
@@ -456,7 +454,7 @@ fn enroll_session(
     // "Unresolved" is false under `--correct`, where most of the queue is resolved and the
     // point is to review it. The default wording is left exactly as it was.
     let counted = if offer.named {
-        let already = offered.iter().filter(|c| shown[&c.id].1.is_some()).count();
+        let already = offered.iter().filter(|c| shown[&c.id].is_named()).count();
         format!(
             "{} voice(s) to review, {already} of them already named",
             offered.len()
@@ -490,18 +488,18 @@ fn enroll_session(
         // A voice an answer given earlier in this run has already put a name to: clustering
         // that split one person in two must not ask about them twice. Only an in-run answer
         // can have moved a label since `baseline` was taken, so "named, and not the name it
-        // had when we queued it" is exactly that case and nothing else. The `is_some()` half
-        // matters as much: an in-run answer can also *un*-name a voice -- re-anchoring a
+        // had when we queued it" is exactly that case and nothing else. The `is_named()`
+        // half matters as much: an in-run answer can also *un*-name a voice -- re-anchoring a
         // reference to another cluster drops this one back to its "Unknown N" -- and that is a
         // question this run created and has not answered.
-        if shown[&cluster.id].1.is_some() && shown[&cluster.id] != baseline[&cluster.id] {
+        if shown[&cluster.id].is_named() && shown[&cluster.id] != baseline[&cluster.id] {
             continue;
         }
 
         // Scoped so the borrows of `transcript` and `shown` inside the voice end before the
         // answer is acted on.
         let answer = {
-            let (label, confidence) = &shown[&cluster.id];
+            let attribution = &shown[&cluster.id];
             // Keyed on the cluster, not on the label text: under `--correct` two voices can
             // sit under one enrolled name -- which is the false accept being corrected -- and
             // a prompt showing the other person's lines cannot be answered.
@@ -518,8 +516,8 @@ fn enroll_session(
 
             interviewer.identify(&Voice {
                 session: &session.id,
-                label,
-                confidence: *confidence,
+                label: attribution.label(),
+                confidence: attribution.confidence(),
                 speech_seconds: cluster.speech_seconds,
                 snippets,
                 clip: clip_for(&track, cluster),
@@ -529,7 +527,7 @@ fn enroll_session(
         // Leaving an already-named voice alone is keeping that identification, which is an
         // answer; leaving an unnamed one alone is the question going unanswered. Same write --
         // none -- and different enough that the summary must not conflate them.
-        let left_alone = if shown[&cluster.id].1.is_some() {
+        let left_alone = if shown[&cluster.id].is_named() {
             &mut report.kept
         } else {
             &mut report.skipped
@@ -612,25 +610,18 @@ fn enroll_session(
 /// matched, otherwise the "Unknown N" its first appearance earned it.
 ///
 /// This is the labelling `merge` performs when it writes a transcript, reached through the
-/// same two functions, which is what makes a rewrite here and a `--force` re-transcribe agree
-/// on the answer.
+/// same [`attributions`], which is what makes a rewrite here and a `--force` re-transcribe
+/// agree on the answer rather than merely be written to.
+///
+/// `clusters` is what identification runs over; `unknown` is what the transcript was written
+/// with, and is the key set of the result. The two are built from the same file, so every
+/// voice gets an entry.
 fn effective_labels(
     clusters: &[SpeakerCluster],
     unknown: &BTreeMap<u32, String>,
     speakers: &EnrolledSpeakers,
-) -> BTreeMap<u32, Label> {
-    let identified = identify_clusters(clusters, speakers);
-    clusters
-        .iter()
-        .map(|cluster| {
-            let label = match identified.get(&cluster.id) {
-                Some(who) => (who.name.clone(), Some(who.similarity)),
-                // `unknown` was built from these same clusters, so the lookup is total.
-                None => (unknown[&cluster.id].clone(), None),
-            };
-            (cluster.id, label)
-        })
-        .collect()
+) -> BTreeMap<u32, Attribution> {
+    attributions(unknown, &identify_clusters(clusters, speakers))
 }
 
 /// Rewrites every speaker-track turn to what `labels` says its voice should now be called,
@@ -656,7 +647,7 @@ fn effective_labels(
 ///
 /// Nothing is written when nothing changed, which is what makes a skipped session leave its
 /// files byte-identical rather than merely equivalent.
-fn relabel(transcript: &mut Transcript, labels: &BTreeMap<u32, Label>) -> bool {
+fn relabel(transcript: &mut Transcript, labels: &BTreeMap<u32, Attribution>) -> bool {
     let mut changed = false;
     for turn in &mut transcript.turns {
         if turn.source_track != SourceTrack::Speaker {
@@ -665,9 +656,9 @@ fn relabel(transcript: &mut Transcript, labels: &BTreeMap<u32, Label>) -> bool {
         let Some(label) = turn.cluster.and_then(|id| labels.get(&id)) else {
             continue;
         };
-        if turn.speaker != label.0 || turn.speaker_id_confidence != label.1 {
-            turn.speaker = label.0.clone();
-            turn.speaker_id_confidence = label.1;
+        if turn.speaker != label.label() || turn.speaker_id_confidence != label.confidence() {
+            turn.speaker = label.label().to_string();
+            turn.speaker_id_confidence = label.confidence();
             changed = true;
         }
     }
@@ -1134,9 +1125,21 @@ mod tests {
         }
 
         // The database after the correction: cluster 3 is Ryan, cluster 1 is still Andrew.
-        let labels: BTreeMap<u32, Label> = [
-            (1, ("Andrew".to_string(), Some(0.71))),
-            (3, ("Ryan".to_string(), Some(0.88))),
+        let labels: BTreeMap<u32, Attribution> = [
+            (
+                1,
+                Attribution::Identified {
+                    name: "Andrew".to_string(),
+                    similarity: 0.71,
+                },
+            ),
+            (
+                3,
+                Attribution::Identified {
+                    name: "Ryan".to_string(),
+                    similarity: 0.88,
+                },
+            ),
         ]
         .into_iter()
         .collect();
