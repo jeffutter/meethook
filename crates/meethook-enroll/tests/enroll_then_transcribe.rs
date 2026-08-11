@@ -163,7 +163,7 @@ impl Interviewer for AsksOnce {
 }
 
 fn enroll(paths: &Paths, interviewer: &mut dyn Interviewer) -> EnrollReport {
-    run_enroll(paths, &[], interviewer, &mut std::io::sink()).unwrap()
+    run_enroll(paths, &[], false, interviewer, &mut std::io::sink()).unwrap()
 }
 
 /// Who the transcript says spoke, in order -- what a reader of the file sees.

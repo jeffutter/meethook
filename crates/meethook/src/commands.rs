@@ -474,15 +474,23 @@ impl DownloadProgress {
     }
 }
 
-pub fn enroll(paths: &Paths, session_ids: &[String]) -> Result<()> {
+pub fn enroll(paths: &Paths, session_ids: &[String], all: bool) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
     let mut terminal = Terminal::default();
-    let report = run_enroll(paths, &requested, &mut terminal, &mut io::stdout())?;
+    let report = run_enroll(paths, &requested, all, &mut terminal, &mut io::stdout())?;
 
     println!(
         "\n{} named, {} skipped, {} session(s) passed over",
         report.named, report.skipped, report.passed_over
     );
+    // Only when there were any: a run that asked about everything should not end on a line
+    // about the nothing it held back.
+    if report.held_back > 0 {
+        println!(
+            "{} quieter voice(s) not offered -- meethook enroll --all asks about those too",
+            report.held_back
+        );
+    }
     // Skips and pass-overs are ordinary; a session that could not be read is what makes the
     // run unsuccessful, exactly as in `transcribe`.
     if report.failed > 0 {

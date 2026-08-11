@@ -204,7 +204,7 @@ fn a_session_built_from_a_wav_file_transcribes_enrolls_and_stores_that_audio() {
         answer: Some("Alice".to_string()),
         asked: Vec::new(),
     };
-    let report = run_enroll(&paths, &[], &mut interviewer, &mut std::io::sink()).unwrap();
+    let report = run_enroll(&paths, &[], false, &mut interviewer, &mut std::io::sink()).unwrap();
     assert_eq!(report.failed, 0);
     assert_eq!(report.named, 1);
     assert_eq!(interviewer.asked, ["Unknown 1"]);
@@ -299,6 +299,7 @@ fn building_and_transcribing_touches_only_the_root_it_was_given() {
     run_enroll(
         &paths,
         &[],
+        false,
         &mut AsksOnce {
             answer: Some("Alice".to_string()),
             asked: Vec::new(),

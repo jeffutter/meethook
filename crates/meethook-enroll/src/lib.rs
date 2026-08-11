@@ -47,6 +47,58 @@ const SNIPPETS: usize = 3;
 /// How much of one line to show. Long enough for a sentence, short enough to stay on a line.
 const SNIPPET_CHARS: usize = 100;
 
+/// How much a voice has to have spoken before it is worth a question.
+///
+/// A rule about the prompt queue and nothing else. A cluster below this still keeps its
+/// "Unknown N", still holds its turns, and is still relabelled when somebody else's answer
+/// turns out to name it -- it is only not *asked about* unless `enroll --all` is passed.
+/// Nothing on disk depends on it.
+///
+/// # Where 5 s comes from
+///
+/// Clustering emits one cluster per voice it is sure of plus a long tail of fragments it
+/// cannot place, and the tail is not a tuning failure: a one-second embedding describes a
+/// phoneme and a prosody rather than a person, so no distance rule puts it anywhere. On
+/// session `20260810-093047` -- seven people, 1368.7 s of speech -- the shipped clustering
+/// leaves 56 clusters, 8 of which identification resolves, so without a floor `enroll` asks
+/// 48 questions about a meeting with seven people in it.
+///
+/// Sorted by talk time those 56 clusters run 426.8 / 423.7 / 124.8 / 119.5 / 96.0 / 51.5 --
+/// the six voices the user confirms are the six main speakers, 1242.2 s between them -- and
+/// then fall off a cliff to 8.6 / 8.5 / 7.8 / 7.5 / 6.0 / 5.6 / 5.4 / 4.9 / 4.2 / 3.9 / ...
+/// into a tail where 29 of the 56 hold under two seconds and 126.5 s covers all fifty of them.
+/// Of the 48 clusters left unresolved after identification, **every floor `f` with
+/// `4.9 < f <= 5.9` offers the same seven voices and holds back the same 41**; over all 56
+/// clusters, ignoring which happen to be enrolled, the partition is fixed across
+/// `4.9 < f <= 5.4`. 5 s is the round number in that band rather than a value fitted to this
+/// recording.
+///
+/// Both edges are consequences. Above 7.8 s Alex -- a real seventh participant,
+/// 9.8 s of speech split across clusters of 7.83 s and 1.99 s -- stops being offered and can
+/// only be reached through `--all`, which is the failure TASK-021 AC #3 names; he happens to
+/// be enrolled already in this session, so the cost lands on the next participant like him.
+/// Below it the tail arrives fast: 9 voices at a 4 s floor, 15 at 3 s, 21 at 2 s, which is the
+/// 48-question prompt again with a smaller number on it.
+///
+/// # Not [`meethook_transcribe::SPEAKER_FLOOR_SECONDS`], and not TASK-019's write-side floor
+///
+/// Same units, three different questions, and they do not imply one another:
+///
+/// - `SPEAKER_FLOOR_SECONDS` (30 s) decides **which clusters are solid enough to adopt
+///   fragments into** -- how much evidence a centroid rests on before it is allowed to claim
+///   somebody else's turns. It is necessarily the larger: at 30 s the seventh participant
+///   would not be asked about at all.
+/// - This one decides **which voices are worth asking about**. Getting it wrong costs a
+///   question, in one direction or the other, and nothing else.
+/// - The write-side floor TASK-019 still owns decides **which answers become references in
+///   `speakers.json`**. Naming somebody who spoke 8 s is right; storing a reference built from
+///   8 s of audio is what that ticket measured going wrong. This ticket does not add it.
+///
+/// The comparison is `speech_seconds >= PROMPT_FLOOR_SECONDS`, the same convention
+/// `SPEAKER_FLOOR_SECONDS` states: a cluster sitting exactly on the floor is offered. Two
+/// floors in one codebase disagreeing about their own boundary is a bug waiting to happen.
+const PROMPT_FLOOR_SECONDS: f64 = 5.0;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -113,13 +165,18 @@ pub trait Interviewer {
 
 /// What a run did, so the caller can pick an exit status without re-deriving it.
 ///
-/// `named` and `skipped` count *voices*; `passed_over` counts *sessions* that were never
-/// asked about at all; `failed` counts sessions that could not be read, plus ids that were
-/// requested and are not on disk.
+/// `named`, `skipped` and `held_back` count *voices*; `passed_over` counts *sessions* that were
+/// never asked about at all; `failed` counts sessions that could not be read, plus ids that
+/// were requested and are not on disk.
+///
+/// `held_back` is unresolved voices that sat under `PROMPT_FLOOR_SECONDS` and so were never
+/// asked about. Reported rather than merely not-counted, because a run that asked seven
+/// questions about a meeting of fifty-six voices should say what it did not ask about.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EnrollReport {
     pub named: usize,
     pub skipped: usize,
+    pub held_back: usize,
     pub passed_over: usize,
     pub failed: usize,
 }
@@ -145,9 +202,14 @@ enum Outcome {
 /// accepted name and written before anything else. That is what makes the second session's
 /// copy of a person somebody was just named in the first one a match rather than a second
 /// prompt.
+///
+/// `all` asks about every unresolved voice, including the ones under `PROMPT_FLOOR_SECONDS`
+/// that are normally held back. It changes which questions get asked and nothing else -- the
+/// same answers write the same two files either way.
 pub fn run_enroll(
     paths: &Paths,
     requested: &[SessionId],
+    all: bool,
     interviewer: &mut dyn Interviewer,
     out: &mut dyn Write,
 ) -> Result<EnrollReport> {
@@ -182,7 +244,15 @@ pub fn run_enroll(
     let mut speakers = EnrolledSpeakers::read_or_empty(paths)?;
 
     for session in selected {
-        match enroll_session(paths, session, &mut speakers, interviewer, out, &mut report)? {
+        match enroll_session(
+            paths,
+            session,
+            all,
+            &mut speakers,
+            interviewer,
+            out,
+            &mut report,
+        )? {
             Outcome::Finished => {}
             Outcome::Quit => break,
         }
@@ -205,6 +275,7 @@ pub fn run_enroll(
 fn enroll_session(
     paths: &Paths,
     session: &DiscoveredSession,
+    all: bool,
     speakers: &mut EnrolledSpeakers,
     interviewer: &mut dyn Interviewer,
     out: &mut dyn Write,
@@ -285,20 +356,63 @@ fn enroll_session(
             .then(a.id.cmp(&b.id))
     });
 
-    let unresolved = order.iter().filter(|c| shown[&c.id].1.is_none()).count();
-    if unresolved == 0 {
+    let unresolved: Vec<&SpeakerCluster> = order
+        .into_iter()
+        .filter(|c| shown[&c.id].1.is_none())
+        .collect();
+    if unresolved.is_empty() {
         writeln!(out, "{}  passed over: nothing unresolved", session.id)?;
         report.passed_over += 1;
         return Ok(Outcome::Finished);
     }
-    writeln!(out, "{}  {unresolved} unresolved voice(s)", session.id)?;
+
+    let queued = unresolved.len();
+
+    // Only the voices worth a question, unless the user asked for the rest. Clustering emits a
+    // long tail of one- and two-second fragments it cannot place -- 48 unresolved clusters for
+    // a meeting of seven people, measured on `20260810-093047` -- and asking about each of
+    // them is how a five-minute job becomes an hour. Filtering preserves first-appearance
+    // order, which is what the user reads the transcript in.
+    let mut offered: Vec<&SpeakerCluster> = if all {
+        unresolved.clone()
+    } else {
+        unresolved
+            .iter()
+            .copied()
+            .filter(|c| c.speech_seconds >= PROMPT_FLOOR_SECONDS)
+            .collect()
+    };
+    // A floor that hides every voice in a session is not a floor, it is a command that does
+    // nothing. A short recording where nobody clears it -- the three-second fixtures the
+    // end-to-end tests are built on, and any real meeting that ran for a minute -- offers
+    // everybody instead. Decided here rather than defended against, because the alternative is
+    // `enroll` reporting "nothing to do" on a session with unnamed people in it.
+    if offered.is_empty() {
+        offered = unresolved;
+    }
+    let held_back = queued - offered.len();
+    report.held_back += held_back;
+
+    if held_back == 0 {
+        writeln!(out, "{}  {} unresolved voice(s)", session.id, offered.len())?;
+    } else {
+        // Naming the escape rather than only the count: a voice nobody is told about is not
+        // reachable, which is what AC #3 asks for.
+        writeln!(
+            out,
+            "{}  {} unresolved voice(s), {held_back} quieter voice(s) not offered -- \
+             meethook enroll --all",
+            session.id,
+            offered.len()
+        )?;
+    }
 
     // Read after that check, so a session with nothing to ask about never resamples an hour
     // of audio in order to then ask nothing. Unreadable is empty rather than fatal: a voice
     // with no clip can still be named from its snippets.
     let track = read_track_16k_mono(&session.paths.speaker_wav()).unwrap_or_default();
 
-    for cluster in order {
+    for cluster in offered {
         // Identified before this run started, or named by an answer given a moment ago:
         // clustering that split one person in two must not ask about them twice.
         if shown[&cluster.id].1.is_some() {
@@ -674,12 +788,72 @@ mod tests {
         session
     }
 
+    /// One voice worth naming and three fragments under the floor, which is the shape real
+    /// clustering leaves a meeting in: a handful of speakers and a tail of turns too short
+    /// for any distance rule to place.
+    fn make_fragmented_session(paths: &Paths, id: &str) -> SessionPaths {
+        let session = make_session(paths, id);
+        let parsed = SessionId::parse(id).unwrap();
+
+        let mut clusters = vec![
+            cluster(0, 0.0, (0.5, 2.5)),
+            cluster(1, 3.0, (3.0, 5.0)),
+            cluster(2, 3.5, (1.0, 2.0)),
+            cluster(3, 4.5, (2.0, 3.0)),
+        ];
+        for (cluster, seconds) in clusters.iter_mut().zip([40.0, 1.5, 0.9, 2.0]) {
+            cluster.speech_seconds = seconds;
+        }
+        SpeakerClusters::new(parsed.clone(), clusters)
+            .write(&session)
+            .unwrap();
+
+        Transcript::new(
+            parsed,
+            vec![
+                speaker_turn(0.0, "Unknown 1", "hi there"),
+                mic_turn(1.0, "morning"),
+                speaker_turn(3.0, "Unknown 2", "and from me"),
+                speaker_turn(3.5, "Unknown 3", "mm"),
+                speaker_turn(4.5, "Unknown 4", "yes"),
+            ],
+        )
+        .write(&session)
+        .unwrap();
+
+        session
+    }
+
     fn run(paths: &Paths, ids: &[&str], interviewer: &mut Scripted) -> (EnrollReport, String) {
+        run_asking(paths, ids, false, interviewer)
+    }
+
+    /// `run`, with the "ask about the quiet ones too" flag exposed. Separate so that the
+    /// dozen tests that have nothing to do with the floor do not carry a `false` each.
+    fn run_asking(
+        paths: &Paths,
+        ids: &[&str],
+        all: bool,
+        interviewer: &mut Scripted,
+    ) -> (EnrollReport, String) {
         let requested: Vec<SessionId> =
             ids.iter().map(|id| SessionId::parse(id).unwrap()).collect();
         let mut out = Vec::new();
-        let report = run_enroll(paths, &requested, interviewer, &mut out).unwrap();
+        let report = run_enroll(paths, &requested, all, interviewer, &mut out).unwrap();
         (report, String::from_utf8(out).unwrap())
+    }
+
+    /// Rewrites this session's clusters with the talk times given, ids in order, leaving
+    /// first appearances and representatives as [`make_session`] wrote them.
+    ///
+    /// The fixture's default is `10.0 + id`, which clears the floor for every voice; the
+    /// floor tests are the ones that need to say otherwise.
+    fn with_speech_seconds(session: &SessionPaths, seconds: &[f64]) {
+        let mut clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
+        for (cluster, seconds) in clusters.clusters.iter_mut().zip(seconds) {
+            cluster.speech_seconds = *seconds;
+        }
+        clusters.write(session).unwrap();
     }
 
     fn transcript_of(session: &SessionPaths) -> Transcript {
@@ -1174,6 +1348,135 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Alice", "You", "Alice", "Alice"]
         );
+    }
+
+    /// TASK-021 acceptance criterion #1, at the scale a unit test can hold it: a voice under
+    /// [`PROMPT_FLOOR_SECONDS`] is not asked about, and the run says both how many it held
+    /// back and how to get at them.
+    #[test]
+    fn a_voice_too_quiet_to_be_worth_a_question_is_not_asked_about() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_speech_seconds(&session, &[40.0, 1.5]);
+
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Unknown 1"], "{output}");
+        assert_eq!(report.held_back, 1, "{output}");
+        assert_eq!(report.named, 1, "{output}");
+        assert!(
+            output.contains("1 unresolved voice(s), 1 quieter voice(s) not offered"),
+            "{output}"
+        );
+        assert!(
+            output.contains("meethook enroll --all"),
+            "a held-back voice nobody is told how to reach is not reachable: {output}"
+        );
+    }
+
+    /// The escape the line above advertises actually reaches them, in the same
+    /// first-appearance order the queue always follows.
+    #[test]
+    fn all_asks_about_the_voices_the_floor_holds_back() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_speech_seconds(&session, &[40.0, 1.5]);
+
+        let mut interviewer = Scripted::default();
+        let (report, output) = run_asking(&paths, &[], true, &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Unknown 1", "Unknown 2"], "{output}");
+        assert_eq!(report.held_back, 0, "{output}");
+        assert!(!output.contains("not offered"), "{output}");
+    }
+
+    /// TASK-021 acceptance criterion #2, which is the one that matters: the floor filters
+    /// *questions*. Nothing is merged, deleted, renumbered or re-attributed, so the clusters
+    /// file is byte-identical and every held-back voice still reads the "Unknown N" it was
+    /// written with -- while the voice that was named reads their name.
+    #[test]
+    fn holding_a_voice_back_changes_no_cluster_and_no_unknown_numbering() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_fragmented_session(&paths, "20260809-052600");
+        let before = std::fs::read(session.speaker_clusters_json()).unwrap();
+
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Unknown 1"], "{output}");
+        assert_eq!(report.held_back, 3, "{output}");
+        assert_eq!(
+            std::fs::read(session.speaker_clusters_json()).unwrap(),
+            before,
+            "the floor must not touch the clustering"
+        );
+        assert_eq!(
+            said(&transcript_of(&session))
+                .iter()
+                .map(|(speaker, _, _)| *speaker)
+                .collect::<Vec<_>>(),
+            ["Alice", "You", "Unknown 2", "Unknown 3", "Unknown 4"],
+            "held-back voices keep the labels transcribe gave them"
+        );
+    }
+
+    /// The proof that the floor is a filter on questions and not on labelling: one person
+    /// clustering split into a large half and a fragment is named once, from the half that
+    /// was offered, and the held-back half is relabelled with them -- exactly as a `--force`
+    /// re-transcribe would do it.
+    #[test]
+    fn naming_an_offered_voice_still_relabels_its_held_back_half() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+
+        let nearly = |degrees: f32| {
+            let radians: f32 = degrees.to_radians();
+            vec![radians.cos(), radians.sin(), 0.0, 0.0]
+        };
+        let mut clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
+        clusters.clusters[0].embedding = nearly(0.0);
+        clusters.clusters[0].speech_seconds = 40.0;
+        clusters.clusters[1].embedding = nearly(20.0);
+        clusters.clusters[1].speech_seconds = 1.5;
+        clusters.write(&session).unwrap();
+
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Unknown 1"], "{output}");
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(
+            said(&transcript_of(&session))
+                .iter()
+                .map(|(speaker, _, _)| *speaker)
+                .collect::<Vec<_>>(),
+            ["Alice", "You", "Alice", "Alice"],
+            "the floor decides which voices are asked about, not which turns are labelled"
+        );
+    }
+
+    /// A floor that hides every voice in a session would be a command that does nothing, so
+    /// a recording where nobody clears it offers everybody. This is what keeps the
+    /// end-to-end tests -- three seconds of synthesised audio apiece -- meaningful.
+    #[test]
+    fn a_session_where_nobody_clears_the_floor_offers_everybody() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_speech_seconds(&session, &[1.0, 2.0]);
+
+        let mut interviewer = Scripted::default();
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Unknown 1", "Unknown 2"], "{output}");
+        assert_eq!(report.held_back, 0, "{output}");
+        assert!(output.contains("2 unresolved voice(s)"), "{output}");
+        assert!(!output.contains("not offered"), "{output}");
     }
 
     /// The transcript's schema version survives a rewrite: `enroll` edits turns, it does not

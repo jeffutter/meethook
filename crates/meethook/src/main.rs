@@ -58,6 +58,10 @@ enum Command {
         /// Session ids to enroll speakers for; omit to consider all sessions
         #[arg(value_name = "SESSION_ID")]
         session_ids: Vec<String>,
+
+        /// Ask about every unresolved voice, including ones too quiet to be offered by default
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -70,7 +74,7 @@ fn main() -> Result<()> {
         Command::Transcribe { session_ids, force } => {
             commands::transcribe(&paths, &session_ids, force)
         }
-        Command::Enroll { session_ids } => commands::enroll(&paths, &session_ids),
+        Command::Enroll { session_ids, all } => commands::enroll(&paths, &session_ids, all),
     }
 }
 
