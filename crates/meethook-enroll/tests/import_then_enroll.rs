@@ -94,6 +94,7 @@ impl Diarize for FingerprintDiarizer {
                 embedding: fingerprint(speaker_16k_mono),
                 speech_seconds: seconds,
                 first_spoke_seconds: 0.0,
+                heard_at_once_with: Vec::new(),
                 representatives: vec![RepresentativeSegment {
                     start: 0.0,
                     end: seconds.min(2.0),

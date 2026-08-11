@@ -190,6 +190,13 @@ pub fn cluster_speaker_turns(
     };
     groups.sort_by(|a, b| spoken(b).total_cmp(&spoken(a)));
 
+    // After the sort, so the indices are cluster ids; and after every pass that rewrites
+    // `groups`, which is the only placement that stays correct. A leftover-adoption pass
+    // belongs between `agglomerate` and this sort, because it moves members between groups
+    // and can empty one -- so a relation computed before it would describe a grouping that
+    // no longer exists, while one computed here describes the grouping that ships.
+    let exclusions = heard_at_once_between(&groups, &constraints);
+
     let mut assignment = vec![None; turns.len()];
     let mut clusters = Vec::with_capacity(groups.len());
     for (id, group) in groups.iter().enumerate() {
@@ -209,6 +216,7 @@ pub fn cluster_speaker_turns(
                 .map(|turn| turn.start_s)
                 .min_by(f64::total_cmp)
                 .unwrap_or(0.0),
+            heard_at_once_with: exclusions[id].clone(),
             representatives: representatives(&members, track_end_s),
         });
     }
@@ -431,6 +439,46 @@ fn pairwise_distances(embeddings: &[Vec<f32>], constraints: &[(usize, usize)]) -
 /// place is how a report comes to disagree with the clustering it reports on.
 pub(crate) fn heard_at_once(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 == b.0 && a.1 != b.1
+}
+
+/// Lifts [`heard_at_once`] from turns to groups: for each group, the ids of the groups it
+/// holds a turn heard at once with.
+///
+/// `groups` arrives in cluster-id order -- sorted by talk time -- so a position in the
+/// returned outer vector *is* the cluster id, and so are the ids inside it. Each inner list
+/// is ascending and holds no duplicates, and the relation is emitted in both directions,
+/// which is the symmetry [`SpeakerCluster::heard_at_once_with`] promises.
+///
+/// `constraints` is indexed by embedded-turn index, the way the members of `groups` are.
+///
+/// Two groups are related on the *first* witnessing pair, not on how many there are: one
+/// overlap is proof, and counting them would invite a threshold on evidence that is already
+/// categorical. Pure, so the rule can be tested without a model or an audio track.
+fn heard_at_once_between(groups: &[Vec<usize>], constraints: &[(usize, usize)]) -> Vec<Vec<u32>> {
+    let related = |a: &[usize], b: &[usize]| {
+        a.iter().any(|&i| {
+            b.iter()
+                .any(|&j| heard_at_once(constraints[i], constraints[j]))
+        })
+    };
+
+    let mut exclusions = vec![Vec::new(); groups.len()];
+    for a in 0..groups.len() {
+        // `agglomerate` seeds one group per turn and only ever merges pairs whose distance
+        // is finite, so a group can never contain two turns heard at once and no group can
+        // exclude itself. Cheap to keep honest rather than assumed.
+        debug_assert!(
+            !related(&groups[a], &groups[a]),
+            "group {a} excludes itself"
+        );
+        for b in (a + 1)..groups.len() {
+            if related(&groups[a], &groups[b]) {
+                exclusions[a].push(b as u32);
+                exclusions[b].push(a as u32);
+            }
+        }
+    }
+    exclusions
 }
 
 /// The average distance between two groups' members -- the criterion [`agglomerate`] merges on.
@@ -745,6 +793,49 @@ mod tests {
             vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6]],
             "seeds must come out ordered by (window, local_speaker)"
         );
+    }
+
+    /// The relation the clusters carry to disk, at the level that decides it. Groups 0 and 2
+    /// each hold a turn from window 5 under a different local speaker, so they are two people;
+    /// group 1 shares no window with either.
+    ///
+    /// Both directions must be present, and each list ascending, because that is the shape
+    /// `SpeakerCluster::heard_at_once_with` promises its readers.
+    #[test]
+    fn groups_sharing_a_window_under_different_local_speakers_exclude_each_other() {
+        // turn:              0       1       2       3       4
+        let constraints = [(5, 0), (7, 0), (5, 1), (9, 0), (5, 1)];
+        let groups = vec![vec![0, 1], vec![3], vec![2, 4]];
+
+        assert_eq!(
+            heard_at_once_between(&groups, &constraints),
+            vec![vec![2], vec![], vec![0]]
+        );
+    }
+
+    /// The same local speaker index in the same window is the *must*-link direction, and two
+    /// turns in different windows say nothing at all. Neither is an exclusion, and a rule that
+    /// keyed on the window alone would report both.
+    #[test]
+    fn groups_that_never_overlapped_exclude_nobody() {
+        let constraints = [(5, 0), (6, 1), (5, 0)];
+        let groups = vec![vec![0], vec![1], vec![2]];
+
+        assert_eq!(
+            heard_at_once_between(&groups, &constraints),
+            vec![Vec::<u32>::new(), Vec::new(), Vec::new()]
+        );
+    }
+
+    /// A group of one turn has nothing to be excluded from, and the empty case is a meeting
+    /// where nobody spoke rather than an error.
+    #[test]
+    fn a_lone_group_and_no_groups_at_all_yield_no_exclusions() {
+        assert_eq!(
+            heard_at_once_between(&[vec![0]], &[(5, 0)]),
+            vec![Vec::<u32>::new()]
+        );
+        assert!(heard_at_once_between(&[], &[]).is_empty());
     }
 
     /// Borrowed views of the members of one group, the shape [`group_distance`] takes.

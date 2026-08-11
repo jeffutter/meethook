@@ -18,7 +18,15 @@ use crate::{Error, Result, SessionId, SessionPaths, unknown_speaker, write_atomi
 /// "Unknown N" numbering a reader recovered would silently be talk-time order instead of
 /// first-appearance order -- which in `enroll` means one person's name written onto another
 /// person's turns. Re-transcribing the session rewrites the file correctly.
-pub const SPEAKER_CLUSTERS_SCHEMA_VERSION: u32 = 2;
+///
+/// Version 3 added [`SpeakerCluster::heard_at_once_with`], required on the same terms. The
+/// argument is not quite version 2's and is worth stating because of that: an empty list is
+/// not obviously a fabricated value -- it is *today's behaviour*, and today's behaviour is
+/// the defect. An empty list is a positive assertion that these voices were never heard
+/// talking over each other, made about audio the reader never saw, and its consequence is
+/// exactly the silent misattribution the naming rules elsewhere spend visible "Unknown N"
+/// labels to avoid. So a version 2 file is refused, and re-transcribing rewrites it.
+pub const SPEAKER_CLUSTERS_SCHEMA_VERSION: u32 = 3;
 
 /// The shortest clip a representative segment is allowed to be.
 ///
@@ -94,6 +102,31 @@ pub struct SpeakerCluster {
     ///
     /// [`id`]: SpeakerCluster::id
     pub first_spoke_seconds: f64,
+
+    /// Cluster ids this voice is *provably* a different person from, whatever the two
+    /// embeddings look like.
+    ///
+    /// Segmentation supplies this for free: when the model is asked who spoke during one
+    /// ten-second window and answers with two different local speakers, those two voices
+    /// overlapped in time and cannot be one person. Clustering already refuses to merge
+    /// across such a pair. This field is how the same fact reaches everyone downstream --
+    /// notably `enroll`, which reads this file and never sees the audio, so a constraint
+    /// that is not written here is a constraint it cannot honour.
+    ///
+    /// Ids are session-scoped, exactly as [`id`] is. The list is ascending, holds no
+    /// duplicates, never contains the cluster's own id, and is symmetric: if `a` lists `b`
+    /// then `b` lists `a`. Producers write every cluster's list in one pass, so the symmetry
+    /// holds by construction rather than by validation -- and a consumer should still read
+    /// *both* directions, so that a hand-edited file that broke the symmetry reads
+    /// conservatively (one side asserting the exclusion is enough) rather than differently
+    /// depending on which cluster it examined first.
+    ///
+    /// Empty for a voice segmentation never heard alongside another, which is the common
+    /// case: an exclusion is positive evidence of overlap, not the absence of evidence of
+    /// sameness. Two people who politely took turns all meeting exclude nobody.
+    ///
+    /// [`id`]: SpeakerCluster::id
+    pub heard_at_once_with: Vec<u32>,
 
     /// Clips to play when asking who this is, longest first.
     ///
@@ -186,7 +219,8 @@ mod tests {
 
     /// Two voices whose talk-time order is the opposite of their first-appearance order --
     /// cluster 1 spoke first and cluster 0 did most of the talking -- so nothing below can
-    /// pass by confusing the two.
+    /// pass by confusing the two. They also talked over each other, so the exclusion is
+    /// non-empty on both sides and a round trip that dropped it would show.
     fn clusters() -> SpeakerClusters {
         SpeakerClusters::new(
             SessionId::parse("20260809-052600").unwrap(),
@@ -196,6 +230,7 @@ mod tests {
                     embedding: vec![0.6, 0.8],
                     speech_seconds: 42.5,
                     first_spoke_seconds: 31.75,
+                    heard_at_once_with: vec![1],
                     representatives: vec![RepresentativeSegment {
                         start: 10.0,
                         end: 13.0,
@@ -206,6 +241,7 @@ mod tests {
                     embedding: vec![0.8, 0.6],
                     speech_seconds: 8.0,
                     first_spoke_seconds: 2.5,
+                    heard_at_once_with: vec![0],
                     representatives: vec![RepresentativeSegment {
                         start: 2.5,
                         end: 5.5,
@@ -279,6 +315,61 @@ mod tests {
                 .map(|c| (c.id, c.first_spoke_seconds))
                 .collect::<Vec<_>>(),
             [(0, 31.75), (1, 2.5)]
+        );
+    }
+
+    /// The other field nothing else in the file can reconstruct: `enroll` never sees the
+    /// audio, so an exclusion that did not survive the write is an exclusion it will never
+    /// know about. Stated on its own rather than left to the struct-wide equality above.
+    #[test]
+    fn the_heard_at_once_relation_survives_a_write_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(dir.path());
+
+        clusters().write(&paths).unwrap();
+
+        let read = SpeakerClusters::read(&paths.speaker_clusters_json()).unwrap();
+        assert_eq!(
+            read.clusters
+                .iter()
+                .map(|c| (c.id, c.heard_at_once_with.clone()))
+                .collect::<Vec<_>>(),
+            [(0, vec![1]), (1, vec![0])]
+        );
+    }
+
+    /// A version 2 file predates the relation, and an empty list is not a neutral stand-in
+    /// for it: it asserts that no two of these voices ever overlapped, which is a claim about
+    /// audio this file no longer describes, and acting on it is how two people end up filed
+    /// under one name. Refuse, and name the file, since that is all `enroll` has to go on when
+    /// it tells the user to re-transcribe.
+    #[test]
+    fn a_version_2_file_is_refused_rather_than_read_with_no_exclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("speaker_clusters.json");
+        std::fs::write(
+            &path,
+            br#"{
+              "schema_version": 2,
+              "session_id": "20260809-052600",
+              "clusters": [
+                {
+                  "id": 0,
+                  "embedding": [0.6, 0.8],
+                  "speech_seconds": 42.5,
+                  "first_spoke_seconds": 31.75,
+                  "representatives": [{ "start": 10.0, "end": 13.0 }]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let error = SpeakerClusters::read(&path).unwrap_err();
+
+        assert!(
+            matches!(&error, Error::Json { path: at, .. } if at == &path),
+            "{error:?}"
         );
     }
 

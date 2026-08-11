@@ -639,6 +639,9 @@ mod tests {
                     .iter()
                     .map(|&t| turns[t].start_s)
                     .fold(f64::INFINITY, f64::min),
+                // This instrument measures adoption distances and never identifies anybody,
+                // so it does not carry the relation `cluster_speaker_turns` computes.
+                heard_at_once_with: Vec::new(),
                 representatives: Vec::new(),
             });
         }

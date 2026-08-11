@@ -60,6 +60,7 @@ impl Diarize for FakeDiarizer {
                 embedding: self.embedding.clone(),
                 speech_seconds: 1.0,
                 first_spoke_seconds: 0.0,
+                heard_at_once_with: Vec::new(),
                 representatives: vec![RepresentativeSegment {
                     start: 0.0,
                     end: 0.2,

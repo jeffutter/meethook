@@ -125,20 +125,114 @@ pub struct Identification {
 /// An empty database identifies nobody, which is the normal state of every install before
 /// anyone has been enrolled.
 ///
-/// Two clusters both matching one person -- clustering split a voice in two -- both get that
-/// name. That is the honest reading of the evidence, and it renders as one person speaking
-/// throughout, which is what happened.
+/// # Two clusters that both match one person
+///
+/// There are two of these cases and they want opposite answers, so the rule turns on which
+/// one it is.
+///
+/// When nothing says the two are different people, **both get the name**. That is the honest
+/// reading of the evidence -- clustering split one voice in two -- and it renders as one
+/// person speaking throughout, which is what happened.
+///
+/// When [`SpeakerCluster::heard_at_once_with`] says they are different people, both cannot.
+/// Segmentation heard those two voices overlapping, so no similarity between their centroids
+/// makes them one person; clustering already refuses to merge such a pair, and identification
+/// handing them one name puts it straight back together under a name. So:
+///
+/// - For each enrolled name **independently**, take the clusters whose argmax is that name
+///   and which cleared [`IDENTIFY_DISTANCE`] -- the contenders, decided exactly as before.
+/// - Order them by similarity descending, ties by ascending cluster id, so the outcome does
+///   not depend on the order `clusters` arrived in.
+/// - Walk that order and award the name to a contender **iff it is not heard-at-once with any
+///   contender already awarded this name**.
+/// - A contender that is vetoed is simply unidentified. It does **not** fall back to its
+///   second-nearest reference, and it does not go on to contest another name.
+///
+/// Three parts of that are decisions rather than phrasing.
+///
+/// **The nearest keeps the name, rather than both being rejected.** Rejecting both throws
+/// away an answer that is provably right in order to avoid one that is provably wrong, and
+/// invents two `Unknown N`s where one of them is correct. It is also the "ambiguous" middle
+/// tier this function deliberately does not have, under another name.
+///
+/// **The veto is against every contender already awarded, not just the nearest one.** This is
+/// the case the obvious rule gets wrong, and it is why it matters that exclusion is not
+/// transitive: with contenders C1 (nearest), C2, C3 and the only exclusion between C2 and C3,
+/// "drop whoever is excluded from the winner" awards the name to all three and leaves C2 and
+/// C3 -- two people the segmenter heard at once -- under it. Greedy against the awarded set
+/// gives it to C1 and C2 and drops C3. It is deterministic for any number of contenders, and
+/// it degenerates to exactly the old behaviour when there are no exclusions.
+///
+/// **Greedy, not a maximum independent set.** Maximising the count awarded could hand a name
+/// to two distant clusters in preference to one near one, which is the wrong bias -- and it is
+/// NP-hard besides. This is not an oversight to improve on.
+///
+/// **No fallback to a second reference,** here or in the leftover-adoption pass. The
+/// second-nearest reference is by construction the one that already lost the argmax, and
+/// awarding it is the same operation that filed 124.1 s of one person under another's name in
+/// session `20260810-093047` (TASK-020). It also cascades: a fallback can contest a third
+/// name, whose loser can contest a fourth, turning a per-name decision into a global
+/// assignment problem with no evidence behind it.
+///
+/// # Why this is not the shape the adoption pass uses, which is not a divergence
+///
+/// The leftover-adoption pass in `speakers.rs` applies the same constraint *before* its
+/// argmax -- a blocked target is simply not a candidate. This applies it after. The two are
+/// answers to differently-shaped questions rather than two answers to one: adoption's
+/// constraint holds between a fragment and each candidate target, so it is known before the
+/// choice is made; identification's holds between two clusters, and no reference is blocked
+/// for a cluster a priori -- the conflict does not exist until some *other* cluster has taken
+/// the name. Adoption vetoes candidates. Identification vetoes decisions. See TASK-018.02.02.
 pub fn identify_clusters(
     clusters: &[SpeakerCluster],
     enrolled: &EnrolledSpeakers,
 ) -> BTreeMap<u32, Identification> {
-    let mut identified = BTreeMap::new();
+    // Each cluster's own argmax-then-threshold, unchanged, grouped by the name it claimed
+    // because the conflict resolved below is per name.
+    let mut contenders: BTreeMap<String, Vec<(&SpeakerCluster, f32)>> = BTreeMap::new();
     for cluster in clusters {
         if let Some(best) = best_match(&cluster.embedding, enrolled) {
-            identified.insert(cluster.id, best);
+            contenders
+                .entry(best.name)
+                .or_default()
+                .push((cluster, best.similarity));
+        }
+    }
+
+    let mut identified = BTreeMap::new();
+    for (name, mut claiming) in contenders {
+        claiming.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.id.cmp(&b.0.id)));
+
+        let mut awarded: Vec<&SpeakerCluster> = Vec::new();
+        for (cluster, similarity) in claiming {
+            if awarded.iter().any(|held| heard_at_once(cluster, held)) {
+                continue;
+            }
+            awarded.push(cluster);
+            identified.insert(
+                cluster.id,
+                Identification {
+                    name: name.clone(),
+                    similarity,
+                },
+            );
         }
     }
     identified
+}
+
+/// Whether segmentation proved these two clusters are different people.
+///
+/// Reads **both** directions of a relation [`SpeakerCluster::heard_at_once_with`] documents as
+/// symmetric, so that a file which somehow lost one side of a pair still excludes -- one side
+/// asserting it is enough -- rather than excluding or not depending on which cluster this
+/// happened to be called with first. Cheaper than validating the invariant and it fails safe.
+///
+/// Private because the *convention* belongs to the on-disk contract, which is where it is
+/// written down; only one party reads it, so a method over there would be interface for no
+/// leverage.
+fn heard_at_once(a: &SpeakerCluster, b: &SpeakerCluster) -> bool {
+    a.heard_at_once_with.contains(&b.id) || b.heard_at_once_with.contains(&a.id)
 }
 
 /// The closest enrolled speaker to one voice, if any is close enough.
@@ -206,10 +300,21 @@ mod tests {
             // Distinct per cluster, and never zero, so nothing here can pass by accident on
             // a tie between two voices that supposedly began at the same instant.
             first_spoke_seconds: 5.0 + id as f64,
+            heard_at_once_with: Vec::new(),
             representatives: vec![RepresentativeSegment {
                 start: 0.0,
                 end: 2.0,
             }],
+        }
+    }
+
+    /// A cluster segmentation heard talking over the given ones. Spelled as a wrapper so that
+    /// every test which does not turn on the relation reads exactly as it did before it
+    /// existed, and the ones that do state it in the call.
+    fn excluding(id: u32, embedding: Vec<f32>, heard_at_once_with: Vec<u32>) -> SpeakerCluster {
+        SpeakerCluster {
+            heard_at_once_with,
+            ..cluster(id, embedding)
         }
     }
 
@@ -368,6 +473,9 @@ mod tests {
     /// One person the clusterer split in two gets their name on both halves. The alternative
     /// -- awarding the name to the better half and leaving the other Unknown -- would invent a
     /// second participant who was never in the room.
+    ///
+    /// The regression the exclusion rule below must not break: nothing here says these two are
+    /// different people, so nothing may stop them sharing a name.
     #[test]
     fn two_clusters_matching_one_person_both_get_that_name() {
         let identified = identify_clusters(
@@ -377,6 +485,116 @@ mod tests {
 
         assert_eq!(identified[&0].name, "Alice");
         assert_eq!(identified[&1].name, "Alice");
+    }
+
+    /// The defect this rule exists to close: two voices segmentation heard talking over each
+    /// other are two people, so one enrolled name cannot cover both however close their
+    /// centroids are. The nearer keeps it; the other is unidentified, not merely re-ranked.
+    ///
+    /// Cluster 1 is the nearer, so a rule that resolved by cluster id instead of by distance
+    /// would pass this by luck.
+    #[test]
+    fn two_clusters_heard_at_once_cannot_both_take_one_name() {
+        let identified = identify_clusters(
+            &[
+                excluding(0, voice(25.0), vec![1]),
+                excluding(1, voice(5.0), vec![0]),
+            ],
+            &enrolled(&[("Alice", voice(10.0))]),
+        );
+
+        assert_eq!(identified[&1].name, "Alice");
+        assert!(!identified.contains_key(&0), "{identified:?}");
+    }
+
+    /// The case that separates the rule from the obvious one. Three clusters claim Alice and
+    /// the only exclusion is between the two *losers*: "drop whoever is excluded from the
+    /// winner" excludes nobody here and files all three, leaving clusters 1 and 2 -- provably
+    /// two people -- under one name. Vetoing against everything already awarded drops 2.
+    ///
+    /// Exclusion is not transitive, which is exactly why the winner is not a sufficient
+    /// reference point.
+    #[test]
+    fn a_contender_is_vetoed_by_any_cluster_already_awarded_not_just_the_nearest() {
+        let identified = identify_clusters(
+            &[
+                cluster(0, voice(5.0)),
+                excluding(1, voice(15.0), vec![2]),
+                excluding(2, voice(25.0), vec![1]),
+            ],
+            &enrolled(&[("Alice", voice(0.0))]),
+        );
+
+        assert_eq!(identified[&0].name, "Alice");
+        assert_eq!(identified[&1].name, "Alice");
+        assert!(!identified.contains_key(&2), "{identified:?}");
+    }
+
+    /// Losing a contested name is not a demotion to the runner-up. Cluster 1's second-nearest
+    /// reference is Bob, comfortably inside the threshold, and it must still come back
+    /// unidentified: the runner-up is by construction the reference that already lost the
+    /// argmax, and awarding it is the misattribution this whole rule is about, one name over.
+    #[test]
+    fn a_vetoed_cluster_does_not_fall_back_to_its_second_nearest_reference() {
+        let identified = identify_clusters(
+            &[
+                excluding(0, voice(0.0), vec![1]),
+                excluding(1, voice(8.0), vec![0]),
+            ],
+            &enrolled(&[("Alice", voice(2.0)), ("Bob", voice(20.0))]),
+        );
+
+        assert_eq!(identified[&0].name, "Alice");
+        assert!(!identified.contains_key(&1), "{identified:?}");
+    }
+
+    /// Two excluded clusters exactly equidistant from one reference still have to resolve the
+    /// same way on every run, and independently of the order the slice happens to be in --
+    /// otherwise a `--force` re-transcribe could move a name between two speakers with nothing
+    /// in the session having changed. Ascending cluster id breaks it.
+    #[test]
+    fn an_exact_tie_between_two_excluded_clusters_goes_to_the_lower_cluster_id() {
+        for order in [[0u32, 1], [1, 0]] {
+            let by_id = |id: u32| match id {
+                0 => excluding(0, voice(10.0), vec![1]),
+                _ => excluding(1, voice(-10.0), vec![0]),
+            };
+            let identified = identify_clusters(
+                &[by_id(order[0]), by_id(order[1])],
+                &enrolled(&[("Alice", voice(0.0))]),
+            );
+
+            assert_eq!(identified[&0].name, "Alice", "input order {order:?}");
+            assert!(!identified.contains_key(&1), "input order {order:?}");
+        }
+    }
+
+    /// The relation is documented as symmetric, and a file that lost one side of a pair must
+    /// still exclude rather than exclude or not depending on which cluster was examined first.
+    /// Here only cluster 0 names cluster 1, and cluster 1 is the nearer, so the veto can only
+    /// fire if the losing side's own list is read.
+    #[test]
+    fn a_one_sided_exclusion_still_excludes() {
+        let identified = identify_clusters(
+            &[excluding(0, voice(25.0), vec![1]), cluster(1, voice(5.0))],
+            &enrolled(&[("Alice", voice(10.0))]),
+        );
+
+        assert_eq!(identified[&1].name, "Alice");
+        assert!(!identified.contains_key(&0), "{identified:?}");
+    }
+
+    /// Both production callers hand over the whole cluster list, but the contract is total
+    /// rather than resting on that: an id the slice does not contain excludes nothing, and in
+    /// particular does not silently suppress the cluster naming it.
+    #[test]
+    fn an_exclusion_naming_a_cluster_outside_the_slice_is_ignored() {
+        let identified = identify_clusters(
+            &[excluding(0, voice(0.0), vec![99])],
+            &enrolled(&[("Alice", voice(10.0))]),
+        );
+
+        assert_eq!(identified[&0].name, "Alice");
     }
 
     /// A cluster with no embedding at all cannot be compared to anything, and must not match

@@ -624,6 +624,7 @@ mod tests {
             embedding: voice(id),
             speech_seconds: seconds,
             first_spoke_seconds: first_spoke,
+            heard_at_once_with: Vec::new(),
             representatives: vec![meethook_session::RepresentativeSegment {
                 start: 0.0,
                 end: 2.0,

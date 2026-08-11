@@ -884,6 +884,9 @@ fn identify(probe: &Voice, enrolled: &EnrolledSpeakers) -> Option<String> {
         embedding: probe.embedding.clone(),
         speech_seconds: probe.speech_seconds,
         first_spoke_seconds: 0.0,
+        // One cluster at a time, so there is nobody for it to be excluded from: this
+        // instrument measures the reference distances, not the contested-name rule.
+        heard_at_once_with: Vec::new(),
         representatives: vec![RepresentativeSegment {
             start: 0.0,
             end: probe.speech_seconds.min(2.0),

@@ -600,6 +600,7 @@ mod tests {
             embedding: voice(id),
             speech_seconds: 10.0 + f64::from(id),
             first_spoke_seconds: first_spoke,
+            heard_at_once_with: Vec::new(),
             representatives: vec![RepresentativeSegment {
                 start: representative.0,
                 end: representative.1,
