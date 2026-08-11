@@ -11,7 +11,7 @@ export const meta = {
     {
       title: "State",
       detail:
-        "detect In Progress / Dev Ready / Needs Plan tickets via backlog CLI",
+        "detect dependency-ready In Progress / Dev Ready / Needs Plan tickets via backlog CLI",
       model: "haiku",
     },
     { title: "Execute", detail: "run /backlog-execute on one ticket" },
@@ -126,9 +126,13 @@ Report via structured output:
 
 const STATE_PROMPT = `In the meethook repo (repo root, no git submodules), run exactly one command:
 
-  backlog task list --exclude-status "Backlog,To Do,Blocked,Done" --json
+  backlog task list --exclude-status "Backlog,To Do,Blocked,Done" --ready --json
 
 That returns versioned JSON of shape {schemaVersion, kind: "task-list", tasks: [{id, title, status, labels, ordinal, ...}]}. Do not add --plain; --json and --plain cannot be combined.
+
+\`--ready\` restricts the result to tickets whose dependencies are all Done, and it applies independently of a ticket's own status. That filter is what keeps a parent off this list while the children it depends on are still open. Without it a parent sitting in "Dev Ready" gets selected for execution before its children have landed, and the run spends a full execute rediscovering it cannot finish, parks it, and comes back to repeat the cycle — the same waste shows up in planning, where a parent gets re-planned against children that do not exist yet.
+
+A parent hidden here is not stranded. The moment its last child is marked Done it becomes ready and reappears, and it is then worked exactly once, with all of that child work already in the tree.
 
 Group the returned tasks by their \`status\` field and report the ticket IDs for each of "In Progress", "Dev Ready", and "Needs Plan", preserving the order they appear in the \`tasks\` array. Any status outside those three should be ignored.`;
 
