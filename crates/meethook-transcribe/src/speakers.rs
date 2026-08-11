@@ -57,7 +57,9 @@ use crate::{Error, Result};
 /// is who. They overlap across `[0.270, 0.683]`, so no threshold separates them and 0.45 buys
 /// one kind of mistake with the other. It is kept because every dominant speaker's own turns
 /// average below it while the closest two dominant clusters average 0.604 apart, so the
-/// nearest merge this constant declined is a long way above the cut.
+/// nearest merge this constant declined is a long way above the cut. That 0.604 was measured
+/// before TASK-018 changed the grouping; on the clustering that ships now the same two voices
+/// average **0.656** apart, so the margin above the cut grew rather than shrank.
 ///
 /// The closest of those two clusters were confirmed by ear to be two different people, so
 /// this constant is known to have separated them and not merely assumed to have. It is also

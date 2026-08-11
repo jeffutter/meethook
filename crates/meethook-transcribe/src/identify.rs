@@ -51,6 +51,15 @@ use meethook_session::{EnrolledSpeakers, SpeakerCluster};
 /// at 0.429 and filed 124.1 s of Ryan -- 9% of the speech on that track -- under Andrew.
 /// See TASK-020.
 ///
+/// Those three numbers are the ones the defect was found at, on the clustering that shipped
+/// before TASK-018. Re-measured on the clustering that ships now -- where the same two voices
+/// hold 423.7 s and 119.5 s rather than 396.7 s and 124.1 s -- that pair reads **0.656**
+/// linkage, **0.429** centroid, shrinkage **0.603**, which `cluster-speaker-track` prints in
+/// its speaker-vs-speaker block. Both restatements satisfy the identity above, the centroid is
+/// unchanged to three figures, and the gap between the quantities has *widened* rather than
+/// closed, so nothing here rests on the older grouping. Two constants, 0.45 and 0.35, now sit
+/// either side of that pair rather than both above it.
+///
 /// # Where the value comes from
 ///
 /// From the two measured populations below, not from `MERGE_DISTANCE`.
