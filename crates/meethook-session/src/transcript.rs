@@ -1,15 +1,52 @@
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{Error, Result, SessionId, SessionPaths, write_atomic};
+
+/// Deserializes an `Option` field that must nonetheless be *present*.
+///
+/// This looks like a no-op and is not one. serde treats a missing `Option<T>` field as `None`
+/// rather than as an error, which for [`Turn::cluster`] would quietly turn "written by a tool
+/// that did not record provenance" into the positive claim "came from no cluster" -- exactly
+/// the defaulting [`TRANSCRIPT_SCHEMA_VERSION`] refuses. Naming a `deserialize_with` is what
+/// makes serde emit a real missing-field error instead, because it can no longer route the
+/// absent field through its `Option`-aware fallback.
+///
+/// Do not remove this in the belief that it is a redundant wrapper: deleting it silently
+/// restores the default and no round-trip test can see the difference.
+fn present_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
 
 /// Bumped whenever `transcript.json`'s shape changes incompatibly.
 ///
 /// Deliberately separate from [`crate::SESSION_SCHEMA_VERSION`]: `session.json` and
 /// `transcript.json` are written by different commands at different times and evolve
 /// independently, so one shared number would force a lie in one of the two files.
-pub const TRANSCRIPT_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 added [`Turn::cluster`], and added it as a required field: a version 1 file now
+/// fails to parse rather than being read with every turn's cluster defaulted to `null`.
+/// Defaulting would be worse than refusing, and specifically so. `null` on this field is a
+/// positive assertion -- "this turn's voice came from no cluster" -- which is true only for
+/// the mic track and for a session diarization found nobody in. Fabricating it across a whole
+/// speaker track would leave `enroll` with no handle on those turns at all, so it would have
+/// to go back to guessing which voice a turn belongs to from the label text it currently
+/// reads; that guess is exactly what recording the cluster exists to delete, and its failure
+/// mode is one person's name written onto another person's words. Refusing also keeps `null`
+/// meaning "not applicable" and never "written by an older tool", which is the distinction
+/// [`Turn::speaker_id_confidence`] already pays a present-null to preserve. Re-transcribing
+/// the session with `--force` rewrites the file correctly.
+///
+/// The refusal comes from serde's missing-field error rather than from a version comparison,
+/// which is how [`crate::SPEAKER_CLUSTERS_SCHEMA_VERSION`]'s two bumps work as well: one file
+/// in the session contract checking its version while its neighbours do not would cost more
+/// than the better message buys.
+pub const TRANSCRIPT_SCHEMA_VERSION: u32 = 2;
 
 /// The speaker label used for every turn recognised on the microphone track.
 ///
@@ -61,6 +98,27 @@ pub struct Turn {
     pub end: f64,
     pub text: String,
     pub source_track: SourceTrack,
+    /// The id of the `speaker_clusters.json` cluster this turn's voice was attributed to.
+    ///
+    /// This is the turn's provenance, not its name: it says which voice said the words, while
+    /// `speaker` says what that voice is currently called. `enroll` needs the first to change
+    /// the second exactly -- two voices can sit under one label, and without a cluster the
+    /// only handle on a turn is the label text, which cannot tell them apart.
+    ///
+    /// `null` for mic-track turns, where the local speaker is known by construction and comes
+    /// from no cluster, and for a speaker-track turn in a session where diarization found no
+    /// clusters at all.
+    ///
+    /// Written by transcription's merge step and never rewritten afterwards: `enroll` changes
+    /// only what a cluster is *called*, which is what keeps a rewritten transcript identical
+    /// to what `transcribe --force` would produce. Ids are only meaningful within their own
+    /// session -- cluster 3 in two meetings is two different people.
+    ///
+    /// No `skip_serializing_if`, for the same reason as `speaker_id_confidence` below, and a
+    /// `deserialize_with` on the way in so that an absent key is refused rather than read as
+    /// a null -- see `present_option`, which exists only for that.
+    #[serde(deserialize_with = "present_option")]
+    pub cluster: Option<u32>,
     /// How confident the claim that `speaker` names the right *person* is: the cosine
     /// similarity between this voice and that person's enrolled reference, in `[-1, 1]` and
     /// in practice near 1.
@@ -150,6 +208,7 @@ mod tests {
             end,
             text: text.to_string(),
             source_track: SourceTrack::Mic,
+            cluster: None,
             speaker_id_confidence: None,
         }
     }
@@ -169,6 +228,52 @@ mod tests {
             "confidence key missing from {json}"
         );
         assert!(json.contains(r#""source_track":"mic""#), "{json}");
+    }
+
+    /// The same argument as above, for the same reason: a mic turn's `null` cluster is the
+    /// claim "this voice came from no cluster", and a reader can only tell that from "written
+    /// by a tool that did not record provenance" if the key is there.
+    #[test]
+    fn a_null_cluster_is_written_as_a_present_key() {
+        let transcript = Transcript::new(
+            SessionId::parse("20260809-052600").unwrap(),
+            vec![mic_turn(0.0, 1.0, "hello")],
+        );
+        let json = serde_json::to_string(&transcript).unwrap();
+        assert!(
+            json.contains(r#""cluster":null"#),
+            "cluster key missing from {json}"
+        );
+    }
+
+    /// The compatibility decision recorded on [`TRANSCRIPT_SCHEMA_VERSION`], made visible:
+    /// a version 1 transcript is refused rather than read with its turns' provenance
+    /// fabricated as "no cluster".
+    #[test]
+    fn a_transcript_without_clusters_is_refused_rather_than_defaulted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.json");
+        std::fs::write(
+            &path,
+            br#"{
+              "schema_version": 1,
+              "session_id": "20260809-052600",
+              "turns": [
+                {
+                  "speaker": "Unknown 1",
+                  "start": 0.0,
+                  "end": 1.0,
+                  "text": "hi there",
+                  "source_track": "speaker",
+                  "speaker_id_confidence": null
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let error = Transcript::read(&path).unwrap_err().to_string();
+        assert!(error.contains("cluster"), "{error}");
     }
 
     #[test]

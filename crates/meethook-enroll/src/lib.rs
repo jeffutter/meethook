@@ -28,7 +28,6 @@
 //! for good. Files that already agree are left alone, byte for byte.
 
 use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -316,8 +315,15 @@ fn enroll_session(
     };
     let mut transcript = match Transcript::read(&session.paths.transcript_json()) {
         Ok(transcript) => transcript,
+        // As above, and with the same remedy: the expected instance is a `transcript.json`
+        // from before turns recorded which cluster they came from. A user told only "missing
+        // field `cluster`" has been given a diagnosis with no next step.
         Err(e) => {
-            writeln!(out, "{}  failed: {e}", session.id)?;
+            writeln!(
+                out,
+                "{}  failed: {e} -- re-transcribe this session with --force",
+                session.id
+            )?;
             report.failed += 1;
             return Ok(Outcome::Finished);
         }
@@ -341,7 +347,7 @@ fn enroll_session(
     // is what stops a session with nothing left to ask about from keeping a stale label
     // forever, since it would be passed over on every later run too. Nothing is written when
     // nothing differs.
-    if relabel(&mut transcript, &unknown, &shown, &shown) {
+    if relabel(&mut transcript, &shown) {
         transcript.write(&session.paths)?;
         writeln!(out, "{}  transcript brought up to date", session.id)?;
     }
@@ -481,7 +487,7 @@ fn enroll_session(
         // can also name a second cluster in this session, if clustering split that person in
         // two, and a `--force` re-transcribe would name both.
         let now = effective_labels(&clusters.clusters, &unknown, speakers);
-        if relabel(&mut transcript, &unknown, &shown, &now) {
+        if relabel(&mut transcript, &now) {
             transcript.write(&session.paths)?;
         }
         shown = now;
@@ -515,54 +521,36 @@ fn effective_labels(
         .collect()
 }
 
-/// Rewrites the speaker-track turns whose voice should now read something else, reporting
-/// whether anything changed.
+/// Rewrites every speaker-track turn to what `labels` says its voice should now be called,
+/// reporting whether anything changed.
 ///
-/// Turns are found by the label they currently read, because that is the only handle on them:
-/// `transcript.json` records what each turn was called, not which cluster it came from. A
-/// voice can be sitting under either of two labels -- the "Unknown N" it was written with, or
-/// a name identification gave it -- so both are accepted as the source, which is what lets
-/// this repair a transcript written before its speaker was ever enrolled as well as one
-/// written a moment ago.
+/// Turns are found by the cluster they were attributed to, which `transcript.json` records for
+/// exactly this: it is an exact handle on one voice's turns, so what a turn currently *reads*
+/// never enters into it. That matters most in the case a label lookup cannot survive -- two
+/// voices both matched to one enrolled person, then corrected so they belong to different
+/// people. Keyed on text those turns are indistinguishable and the only safe answer is to
+/// rewrite neither; keyed on the cluster there is no ambiguity to resolve, and correcting one
+/// voice leaves the other's turns exactly where they were.
 ///
-/// Two voices sharing a source label -- both matched to one enrolled person -- are
-/// indistinguishable here, so if the database now sends them to *different* labels neither is
-/// rewritten. That can only happen when replacing a reference stops one of them matching, and
-/// guessing which turns belong to which half would put one person's name on another person's
-/// words; `transcribe --force` re-derives it from the audio.
+/// The cluster is never written back. `merge` is the sole producer of that field and `enroll`
+/// only ever changes what a cluster is *called*, which is what keeps a transcript rewritten
+/// here identical to what `transcribe --force` would now produce.
+///
+/// A turn with no cluster is left alone: on the mic track that is the local speaker, whose
+/// name is not `enroll`'s to change, and on the speaker track it only arises in a session
+/// where diarization found no clusters -- which has no labels to map and nothing to ask about.
+/// A cluster absent from `labels` is left alone for the same reason `merge` ignores an
+/// identification for a cluster diarization did not produce.
 ///
 /// Nothing is written when nothing changed, which is what makes a skipped session leave its
 /// files byte-identical rather than merely equivalent.
-fn relabel(
-    transcript: &mut Transcript,
-    unknown: &BTreeMap<u32, String>,
-    shown: &BTreeMap<u32, Label>,
-    now: &BTreeMap<u32, Label>,
-) -> bool {
-    let mut destination: BTreeMap<&str, Option<&Label>> = BTreeMap::new();
-    for (id, was) in shown {
-        let is_now = now.get(id).unwrap_or(was);
-        let sources = [was.0.as_str(), unknown[id].as_str()];
-        for source in sources {
-            match destination.entry(source) {
-                Entry::Vacant(slot) => {
-                    slot.insert(Some(is_now));
-                }
-                Entry::Occupied(mut slot) => {
-                    if slot.get() != &Some(is_now) {
-                        slot.insert(None);
-                    }
-                }
-            }
-        }
-    }
-
+fn relabel(transcript: &mut Transcript, labels: &BTreeMap<u32, Label>) -> bool {
     let mut changed = false;
     for turn in &mut transcript.turns {
         if turn.source_track != SourceTrack::Speaker {
             continue;
         }
-        let Some(Some(label)) = destination.get(turn.speaker.as_str()) else {
+        let Some(label) = turn.cluster.and_then(|id| labels.get(&id)) else {
             continue;
         };
         if turn.speaker != label.0 || turn.speaker_id_confidence != label.1 {
@@ -722,13 +710,18 @@ mod tests {
         }
     }
 
-    fn speaker_turn(start: f64, speaker: &str, text: &str) -> Turn {
+    /// `cluster` is the voice the turn came from, exactly as `merge` would have recorded it,
+    /// and `speaker` is what that voice was called when the transcript was written. The two
+    /// have to agree for a fixture to mean anything: the tests below read a label off the
+    /// file and expect the cluster underneath it to be the one they named.
+    fn speaker_turn(start: f64, cluster: u32, speaker: &str, text: &str) -> Turn {
         Turn {
             speaker: speaker.to_string(),
             start,
             end: start + 1.0,
             text: text.to_string(),
             source_track: SourceTrack::Speaker,
+            cluster: Some(cluster),
             speaker_id_confidence: None,
         }
     }
@@ -740,6 +733,7 @@ mod tests {
             end: start + 1.0,
             text: text.to_string(),
             source_track: SourceTrack::Mic,
+            cluster: None,
             speaker_id_confidence: None,
         }
     }
@@ -776,10 +770,10 @@ mod tests {
         Transcript::new(
             id,
             vec![
-                speaker_turn(0.0, "Unknown 1", "  hi there  "),
+                speaker_turn(0.0, 0, "Unknown 1", "  hi there  "),
                 mic_turn(1.0, "morning"),
-                speaker_turn(3.0, "Unknown 2", "and from me"),
-                speaker_turn(4.0, "Unknown 1", "let us start"),
+                speaker_turn(3.0, 1, "Unknown 2", "and from me"),
+                speaker_turn(4.0, 0, "Unknown 1", "let us start"),
             ],
         )
         .write(&session)
@@ -811,11 +805,11 @@ mod tests {
         Transcript::new(
             parsed,
             vec![
-                speaker_turn(0.0, "Unknown 1", "hi there"),
+                speaker_turn(0.0, 0, "Unknown 1", "hi there"),
                 mic_turn(1.0, "morning"),
-                speaker_turn(3.0, "Unknown 2", "and from me"),
-                speaker_turn(3.5, "Unknown 3", "mm"),
-                speaker_turn(4.5, "Unknown 4", "yes"),
+                speaker_turn(3.0, 1, "Unknown 2", "and from me"),
+                speaker_turn(3.5, 2, "Unknown 3", "mm"),
+                speaker_turn(4.5, 3, "Unknown 4", "yes"),
             ],
         )
         .write(&session)
@@ -956,6 +950,121 @@ mod tests {
             .map(|t| (t.speaker.clone(), t.speaker_id_confidence))
             .collect();
         assert_eq!(written, expected);
+    }
+
+    /// The case this whole handle exists for, and the one a label lookup cannot survive: a
+    /// false accept has filed cluster 3's voice under the name of the person who is really
+    /// cluster 1, so two clusters read "Andrew", and the correction sends them to
+    /// different names. Keyed on the label text both turn-groups are one indistinguishable
+    /// bucket and the only safe answer is to rewrite neither -- silently leaving the user
+    /// looking at an uncorrected transcript. Keyed on the cluster the two are simply
+    /// different turns.
+    #[test]
+    fn correcting_one_of_two_voices_sharing_a_label_leaves_the_other_alone() {
+        let mut transcript = Transcript::new(
+            SessionId::parse("20260809-052600").unwrap(),
+            vec![
+                speaker_turn(0.0, 1, "Andrew", "the real one"),
+                mic_turn(1.0, "morning"),
+                speaker_turn(2.0, 3, "Andrew", "actually Ryan"),
+                speaker_turn(3.0, 1, "Andrew", "the real one again"),
+            ],
+        );
+        for turn in &mut transcript.turns {
+            if turn.source_track == SourceTrack::Speaker {
+                turn.speaker_id_confidence = Some(0.71);
+            }
+        }
+
+        // The database after the correction: cluster 3 is Ryan, cluster 1 is still Andrew.
+        let labels: BTreeMap<u32, Label> = [
+            (1, ("Andrew".to_string(), Some(0.71))),
+            (3, ("Ryan".to_string(), Some(0.88))),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(
+            relabel(&mut transcript, &labels),
+            "the correction must be reported as a change, not silently declined"
+        );
+        assert_eq!(
+            said(&transcript),
+            [
+                ("Andrew", "the real one", Some(0.71)),
+                ("You", "morning", None),
+                ("Ryan", "actually Ryan", Some(0.88)),
+                ("Andrew", "the real one again", Some(0.71)),
+            ]
+        );
+    }
+
+    /// The guard on `merge` staying the sole producer of a turn's provenance: `enroll` changes
+    /// what a cluster is called and never which cluster a turn came from. That is what keeps
+    /// a rewritten transcript identical to a `--force` re-transcribe, since the field would
+    /// otherwise be one `enroll` could drift.
+    #[test]
+    fn a_rewrite_leaves_every_turns_cluster_exactly_as_it_was() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        let before: Vec<Option<u32>> = transcript_of(&session)
+            .turns
+            .iter()
+            .map(|t| t.cluster)
+            .collect();
+
+        let mut interviewer = Scripted::answering(vec![named("Alice"), named("Bob")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(report.named, 2, "{output}");
+        let after: Vec<Option<u32>> = transcript_of(&session)
+            .turns
+            .iter()
+            .map(|t| t.cluster)
+            .collect();
+        assert_eq!(after, before);
+        assert_eq!(before, [Some(0), None, Some(1), Some(0)]);
+    }
+
+    /// The compatibility decision on `TRANSCRIPT_SCHEMA_VERSION`, at the level a user meets
+    /// it: a transcript written before turns recorded their cluster is refused rather than
+    /// read with that provenance fabricated, it says how to fix it, and the session after it
+    /// is still asked about.
+    #[test]
+    fn a_transcript_without_clusters_fails_its_session_without_ending_the_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let stale = make_session(&paths, "20260809-052600");
+        make_session(&paths, "20260809-052700");
+        std::fs::write(
+            stale.transcript_json(),
+            br#"{
+              "schema_version": 1,
+              "session_id": "20260809-052600",
+              "turns": [
+                {
+                  "speaker": "Unknown 1",
+                  "start": 0.0,
+                  "end": 1.0,
+                  "text": "hi there",
+                  "source_track": "speaker",
+                  "speaker_id_confidence": null
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(report.failed, 1, "{output}");
+        assert!(output.contains("--force"), "{output}");
+        assert_eq!(report.named, 1, "{output}");
+        for voice in &interviewer.seen {
+            assert_eq!(voice.session, "20260809-052700", "{voice:?}");
+        }
     }
 
     /// Acceptance criterion #7: a skip changes nothing, and "nothing" is byte-for-byte. A

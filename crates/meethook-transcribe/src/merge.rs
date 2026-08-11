@@ -41,6 +41,10 @@ type Label = (String, Option<f32>);
 /// turn whose voice was identified carries the similarity the match was decided on; one that
 /// was not carries no confidence, for the same reason the mic track does not.
 ///
+/// Every speaker-track turn also records the cluster it was attributed to. This is the only
+/// place that provenance is known, and it is what lets `enroll` later rewrite exactly the turns
+/// of one voice when two voices are sitting under one label; see [`meethook_session::Turn`].
+///
 /// No overlap or cross-talk handling: two people talking at once produce two turns whose
 /// times overlap, ordered by where each started.
 pub fn merge(
@@ -64,6 +68,9 @@ pub fn merge(
             // the units the recogniser was actually confident about.
             text: segment.text,
             source_track: SourceTrack::Mic,
+            // The local speaker is known by construction and comes from no cluster: the mic
+            // track is never diarized, so there is no provenance to record.
+            cluster: None,
             speaker_id_confidence: None,
         })
         .collect();
@@ -71,8 +78,11 @@ pub fn merge(
     turns.extend(speaker.into_iter().map(|segment| {
         // No cluster at all means diarization found nobody on a track Whisper still heard
         // words on. One unnamed speaker is the honest reading of that, and a far better one
-        // than an empty label or a dropped sentence.
-        let (speaker, confidence) = attribute(&segment, diarized)
+        // than an empty label or a dropped sentence. The `None` is recorded on the turn as
+        // well: `enroll` must be able to read "this turn came from no cluster" off the file
+        // rather than infer it, which is why the field is required rather than defaulted.
+        let cluster = attribute(&segment, diarized);
+        let (speaker, confidence) = cluster
             .and_then(|id| labels.get(&id).cloned())
             .unwrap_or_else(|| (unknown_speaker(1), None));
         Turn {
@@ -81,6 +91,7 @@ pub fn merge(
             end: speaker_offset_s + segment.end_s,
             text: segment.text,
             source_track: SourceTrack::Speaker,
+            cluster,
             speaker_id_confidence: confidence,
         }
     }));
@@ -246,7 +257,76 @@ mod tests {
             assert_eq!(turn.speaker, SPEAKER_YOU);
             assert_eq!(turn.source_track, SourceTrack::Mic);
             assert_eq!(turn.speaker_id_confidence, None);
+            // The local speaker comes from no cluster however the other track was diarized.
+            assert_eq!(turn.cluster, None);
         }
+    }
+
+    /// The provenance the whole recording exists for: a speaker turn says which voice said
+    /// it, not only what that voice is currently called, so `enroll` has an exact handle on
+    /// the turns of one cluster even when two clusters read the same label.
+    #[test]
+    fn a_speaker_turn_records_the_cluster_it_was_attributed_to() {
+        let merged = merge(
+            Vec::new(),
+            0.0,
+            vec![
+                segment(0.0, 1.0, "first voice"),
+                segment(2.0, 3.0, "second voice"),
+                segment(4.0, 5.0, "first again"),
+            ],
+            0.0,
+            &[turn(0.0, 1.0, 7), turn(2.0, 3.0, 4), turn(4.0, 5.0, 7)],
+            &nobody(),
+        );
+
+        let provenance: Vec<(&str, Option<u32>)> = merged
+            .iter()
+            .map(|t| (t.speaker.as_str(), t.cluster))
+            .collect();
+        assert_eq!(
+            provenance,
+            [
+                ("Unknown 1", Some(7)),
+                ("Unknown 2", Some(4)),
+                ("Unknown 1", Some(7)),
+            ],
+            "the recorded cluster is the raw cluster id, not the label's rank"
+        );
+    }
+
+    /// The recorded cluster is the one the label was looked up from, so the two can never
+    /// disagree about whose voice a turn is -- including where attribution had to decide.
+    #[test]
+    fn a_straddling_segment_records_the_same_cluster_its_label_came_from() {
+        let merged = merge(
+            Vec::new(),
+            0.0,
+            vec![segment(0.0, 4.0, "...and then, right, yes")],
+            0.0,
+            &[turn(0.0, 1.0, 0), turn(1.0, 4.0, 1)],
+            &nobody(),
+        );
+
+        assert_eq!(merged[0].speaker, "Unknown 2");
+        assert_eq!(merged[0].cluster, Some(1));
+    }
+
+    /// A segment the diarizer heard no speech under is still somebody's: it is attributed to
+    /// the nearest voice, and it records that voice rather than a null that would read as
+    /// "came from no cluster".
+    #[test]
+    fn a_segment_overlapping_nothing_records_the_nearest_cluster_rather_than_none() {
+        let merged = merge(
+            Vec::new(),
+            0.0,
+            vec![segment(10.0, 11.0, "mm-hm")],
+            0.0,
+            &[turn(0.0, 5.0, 0), turn(12.0, 20.0, 1)],
+            &nobody(),
+        );
+
+        assert_eq!(merged[0].cluster, Some(1));
     }
 
     /// Acceptance criterion #1: one timeline, both tracks, strictly chronological. The two
@@ -369,6 +449,9 @@ mod tests {
         let speakers: Vec<&str> = merged.iter().map(|t| t.speaker.as_str()).collect();
         assert_eq!(speakers, ["Unknown 1", "Unknown 1"]);
         assert!(merged.iter().all(|t| t.speaker_id_confidence.is_none()));
+        // The one case where a speaker turn legitimately came from no cluster, and the only
+        // shape of session in which a null on that track is not a contradiction.
+        assert!(merged.iter().all(|t| t.cluster.is_none()));
     }
 
     /// Determinism at a tie, which is what makes a `--force` rerun byte-identical. Sorting
