@@ -10,6 +10,7 @@
 //! 1.6 GB model in order to do nothing -- and they need to be testable against a fake
 //! recognizer rather than a real one.
 
+mod adoption;
 mod aec;
 mod align;
 mod asr;
@@ -31,6 +32,9 @@ mod vad;
 use std::io::Write;
 use std::path::PathBuf;
 
+pub use adoption::{
+    AdoptionPopulations, CentroidPair, Declined, PairLabel, Side, adoption_populations,
+};
 pub use aec::{Cleaned, Cleaning, PassThrough, cancel_bleed};
 pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};

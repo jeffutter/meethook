@@ -400,18 +400,34 @@ fn pairwise_distances(embeddings: &[Vec<f32>], constraints: &[(usize, usize)]) -
                 .zip(&embeddings[j])
                 .map(|(a, b)| a * b)
                 .sum();
-            let distance =
-                if constraints[i].0 == constraints[j].0 && constraints[i].1 != constraints[j].1 {
-                    // Heard at once: no evidence about their voices can make them one person.
-                    f32::INFINITY
-                } else {
-                    1.0 - cosine
-                };
+            let distance = if heard_at_once(constraints[i], constraints[j]) {
+                // Heard at once: no evidence about their voices can make them one person.
+                f32::INFINITY
+            } else {
+                1.0 - cosine
+            };
             distances[i * n + j] = distance;
             distances[j * n + i] = distance;
         }
     }
     distances
+}
+
+/// Whether segmentation heard these two turns at once under different local speaker indices,
+/// which makes them different people whatever their embeddings look like.
+///
+/// Each argument is one turn's `(window, local_speaker)`. The same window means the model was
+/// asked who was talking during one ten-second stretch, and two different indices mean it
+/// answered with two of them -- the cannot-link direction of the free supervision described on
+/// [`agglomerate`].
+///
+/// One spelling of the rule for the two places that need it. [`pairwise_distances`] encodes it
+/// as an infinity so that no merge can span it; `adoption.rs` reads it as a *label* on a pair
+/// clustering never made, which is a question about a distance rather than about a merge and so
+/// cannot be answered by reading the matrix. A second `==` and `!=` written out in the other
+/// place is how a report comes to disagree with the clustering it reports on.
+pub(crate) fn heard_at_once(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0 == b.0 && a.1 != b.1
 }
 
 /// The average distance between two groups' members -- the criterion [`agglomerate`] merges on.
