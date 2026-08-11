@@ -26,6 +26,10 @@ clap = { version = "4", features = ["derive", "env"] }
 ctrlc = { version = "3", features = ["termination"] }
 hound = "3.5"
 jiff = "0.2"
+# Only for `proc_pidpath`, the one libproc call meethook-record needs to name the
+# executable behind a capturing pid. Already in the tree transitively, so this adds no
+# crate to the build graph.
+libc = "0.2"
 mach2 = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

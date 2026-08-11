@@ -20,6 +20,7 @@
 //! active = any process object P where IsRunningInput(P) == 1
 //!                                 and pid(P) != our pid
 //!                                 and bundle_id(P) is not one of our helpers
+//!                                 and executable(P) != our executable
 //! ```
 //!
 //! Excluding ourselves is what makes the signal immune to our own capture: when recording
@@ -49,6 +50,24 @@
 //! feedback problem does not apply there -- and it is re-attached whenever the default
 //! input device changes.
 //!
+//! # Why neither of those catches a second meethook
+//!
+//! A second `meethook record` has a different pid, and being a plain Rust binary it reports
+//! no bundle id at all, so both exclusions above miss it and it classifies as somebody
+//! else's meeting. Two concurrent instances then hold each other recording for as long as
+//! both are alive, and neither ever sees a stop edge. Observed on hardware (TASK-005.03.01),
+//! where a meethook left over from an earlier run was still counted as the meeting signal
+//! 41 minutes later.
+//!
+//! The third exclusion is therefore keyed on the *executable* behind the pid, which is the
+//! only fact that distinguishes another copy of ourselves from an unbundled meeting app.
+//!
+//! Its known limit: two meethooks launched from *different* binaries -- `target/debug/meethook`
+//! under `cargo run` next to an installed copy -- have different executables and are not
+//! caught. That is the development-time shape rather than the user-facing one, and the
+//! general answer is a single-instance lock at startup, which would define the whole class
+//! away instead of filtering it.
+//!
 //! # Shape
 //!
 //! Four listener sites all feed one recomputation, and nothing is polled on a timer:
@@ -65,7 +84,9 @@
 //! session: whatever notifications a mute produces, none of them change the answer.
 
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -127,6 +148,12 @@ impl MicActivityWatcher {
                 queue: queue.clone(),
                 on_change: Box::new(on_change),
                 our_pid: std::process::id() as i32,
+                // Resolved once here rather than per predicate walk, and canonicalized so
+                // it compares equal to the canonicalized path of another instance however
+                // that one was invoked.
+                our_exe: std::env::current_exe()
+                    .ok()
+                    .and_then(|path| std::fs::canonicalize(path).ok()),
                 debug: std::env::var_os("MEETHOOK_ACTIVITY_DEBUG").is_some(),
                 active: false,
                 system: Vec::new(),
@@ -220,6 +247,9 @@ struct State {
     queue: DispatchRetained<DispatchQueue>,
     on_change: Box<dyn Fn(Activity) + Send + Sync>,
     our_pid: i32,
+    /// Our own executable, canonicalized. `None` when it cannot be resolved, which turns
+    /// the second-instance exclusion off rather than making it fire on everything.
+    our_exe: Option<PathBuf>,
     debug: bool,
     /// The last value delivered to `on_change`.
     active: bool,
@@ -378,16 +408,19 @@ impl State {
     /// Reads one process object and asks [`bearing`] what it means.
     ///
     /// The reads are ordered cheapest-first and short-circuit: a process that is not
-    /// capturing -- almost all of them -- costs one property read, and the bundle id is
-    /// only fetched for one that is.
+    /// capturing -- almost all of them -- costs one property read, and the bundle id and
+    /// executable path are only fetched for one that is.
     fn bearing_of(&self, process: AudioObjectID) -> Bearing {
         if !process_is_running_input(process) {
             return Bearing::Idle;
         }
+        let pid = process_pid(process);
         bearing(
-            process_pid(process),
+            pid,
             process_bundle_id(process).as_deref(),
+            pid.and_then(process_executable).as_deref(),
             self.our_pid,
+            self.our_exe.as_deref(),
         )
     }
 
@@ -516,7 +549,20 @@ enum Bearing {
 /// A process whose pid cannot be read is excluded: without the pid we cannot prove it is
 /// not us, and mistaking our own capture for a meeting means a session that never ends.
 /// That is the failure this rule exists to prevent, so it is the safe direction to fail in.
-fn bearing(pid: Option<i32>, bundle_id: Option<&str>, our_pid: i32) -> Bearing {
+///
+/// An unreadable `executable` fails the *other* way, and the asymmetry is deliberate: by
+/// the time it is consulted the pid has already been read and shown not to be ours, so the
+/// only thing an unknown path leaves open is which *other* program it is -- while excluding
+/// every process whose path we cannot read would silence the trigger for whole classes of
+/// meeting app. Missing an exclusion costs a session that overstays; over-excluding costs
+/// every session, so the unknown is counted as activity.
+fn bearing(
+    pid: Option<i32>,
+    bundle_id: Option<&str>,
+    executable: Option<&Path>,
+    our_pid: i32,
+    our_exe: Option<&Path>,
+) -> Bearing {
     let Some(pid) = pid else {
         return Bearing::Excluded("pid unreadable, so it cannot be shown not to be meethook");
     };
@@ -525,6 +571,11 @@ fn bearing(pid: Option<i32>, bundle_id: Option<&str>, our_pid: i32) -> Bearing {
     }
     if bundle_id.is_some_and(|id| OUR_HELPER_BUNDLE_IDS.contains(&id)) {
         return Bearing::Excluded("captures on meethook's behalf");
+    }
+    if let (Some(exe), Some(ours)) = (executable, our_exe)
+        && exe == ours
+    {
+        return Bearing::Excluded("another meethook instance");
     }
     Bearing::Activity
 }
@@ -688,11 +739,46 @@ fn process_bundle_id(process: AudioObjectID) -> Option<String> {
     Some(string.to_string())
 }
 
+/// The executable behind a pid, canonicalized, or `None` for one that cannot be read.
+///
+/// Not a CoreAudio property: the HAL reports a bundle id, and a plain binary has none,
+/// which is exactly why a second meethook is invisible to the bundle-id rule. The path
+/// comes from libproc instead, and is canonicalized so a symlinked or `../`-flavoured
+/// invocation still compares equal to our own.
+///
+/// `None` covers every failure alike -- a process that has already exited, one owned by
+/// another user, a path that no longer resolves. [`bearing`] treats that as "not known to
+/// be us", which is the direction its doc comment explains.
+fn process_executable(pid: i32) -> Option<PathBuf> {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buffer` is owned, writable storage of exactly the length passed alongside
+    // it. `proc_pidpath` writes at most that many bytes and returns the length written.
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    std::fs::canonicalize(PathBuf::from(OsString::from_vec(buffer))).ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Activity, Bearing, bearing, edge};
+    use std::path::Path;
+
+    use super::{Activity, Bearing, bearing, edge, process_executable};
 
     const OUR_PID: i32 = 500;
+
+    /// Our own executable, as `MicActivityWatcher::start` would have canonicalized it.
+    fn our_exe() -> &'static Path {
+        Path::new("/usr/local/bin/meethook")
+    }
 
     #[test]
     fn a_meeting_app_capturing_is_the_signal() {
@@ -700,18 +786,31 @@ mod tests {
             bearing(
                 Some(26975),
                 Some("com.microsoft.teams2.modulehost"),
-                OUR_PID
+                Some(Path::new(
+                    "/Applications/Microsoft Teams.app/Contents/MacOS/MSTeams"
+                )),
+                OUR_PID,
+                Some(our_exe()),
             ),
             Bearing::Activity
         );
         // A meeting app that reports no bundle id is still a meeting app.
-        assert_eq!(bearing(Some(26975), None, OUR_PID), Bearing::Activity);
+        assert_eq!(
+            bearing(Some(26975), None, None, OUR_PID, Some(our_exe())),
+            Bearing::Activity
+        );
     }
 
     #[test]
     fn our_own_capture_is_not_the_signal() {
         assert!(matches!(
-            bearing(Some(OUR_PID), Some("com.meethook"), OUR_PID),
+            bearing(
+                Some(OUR_PID),
+                Some("com.meethook"),
+                Some(our_exe()),
+                OUR_PID,
+                Some(our_exe()),
+            ),
             Bearing::Excluded(_)
         ));
     }
@@ -722,9 +821,65 @@ mod tests {
         // for as long as we record the speaker track, so a pid filter alone leaves the
         // predicate pinned true and the session never ends.
         assert!(matches!(
-            bearing(Some(997), Some("com.apple.replayd"), OUR_PID),
+            bearing(
+                Some(997),
+                Some("com.apple.replayd"),
+                Some(Path::new("/usr/libexec/replayd")),
+                OUR_PID,
+                Some(our_exe()),
+            ),
             Bearing::Excluded(_)
         ));
+    }
+
+    #[test]
+    fn a_second_meethook_instance_is_not_the_signal() {
+        // Run 3 of the TASK-005.02 hardware matrix: pid 41809, a meethook left over from
+        // the previous run, reported IsRunningInput=true with no bundle id and was counted
+        // as the meeting signal, so the live instance never saw a stop edge. Different pid,
+        // no bundle id, same executable -- the executable is the only fact that catches it.
+        //
+        // The reason is asserted exactly, not just matched: `State::log` renders it as
+        // `<- excluded: {why}`, so this string is what a hardware run shows against the
+        // filtered pid.
+        assert_eq!(
+            bearing(Some(41809), None, Some(our_exe()), OUR_PID, Some(our_exe())),
+            Bearing::Excluded("another meethook instance")
+        );
+    }
+
+    #[test]
+    fn a_meeting_app_with_a_different_executable_is_still_the_signal() {
+        // The over-exclusion guard: an unbundled binary looks like a second meethook in
+        // every respect except the one that matters.
+        assert_eq!(
+            bearing(
+                Some(26975),
+                None,
+                Some(Path::new("/opt/homebrew/bin/some-meeting-app")),
+                OUR_PID,
+                Some(our_exe()),
+            ),
+            Bearing::Activity
+        );
+    }
+
+    #[test]
+    fn an_unreadable_executable_does_not_exclude() {
+        // The opposite direction from an unreadable pid, on purpose: the pid has already
+        // been read and is not ours, so the only open question is which other program this
+        // is -- and excluding every path we cannot read would silence the trigger for whole
+        // classes of meeting app.
+        assert_eq!(
+            bearing(Some(26975), None, None, OUR_PID, Some(our_exe())),
+            Bearing::Activity
+        );
+        // Same when it is *our* path that could not be resolved: the exclusion turns off
+        // rather than firing on everything.
+        assert_eq!(
+            bearing(Some(26975), None, Some(our_exe()), OUR_PID, None),
+            Bearing::Activity
+        );
     }
 
     #[test]
@@ -732,9 +887,45 @@ mod tests {
         // Excluded rather than counted: it cannot be shown not to be us, and counting it
         // would be the never-ending session again.
         assert!(matches!(
-            bearing(None, Some("com.example.mystery"), OUR_PID),
+            bearing(
+                None,
+                Some("com.example.mystery"),
+                None,
+                OUR_PID,
+                Some(our_exe())
+            ),
             Bearing::Excluded(_)
         ));
+    }
+
+    #[test]
+    fn a_pid_resolves_to_the_executable_the_exclusion_compares() {
+        // The rule above is pure, so it would pass just as well if `proc_pidpath` never
+        // returned anything and the whole arm were dead on hardware. This is the other
+        // half: the live reader, against the one pid whose executable the test knows.
+        let ours = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(
+            process_executable(std::process::id() as i32),
+            Some(ours.clone())
+        );
+        // And the two halves joined: the reader's output, fed to the rule, excludes.
+        assert_eq!(
+            bearing(
+                Some(41809),
+                None,
+                process_executable(std::process::id() as i32).as_deref(),
+                OUR_PID,
+                Some(&ours),
+            ),
+            Bearing::Excluded("another meethook instance")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_pid_resolves_to_no_executable() {
+        // pid 0 is the kernel, which has no path libproc will hand back. Exercises the
+        // `length <= 0` arm, which is what feeds the "counted as activity" direction.
+        assert_eq!(process_executable(0), None);
     }
 
     #[test]

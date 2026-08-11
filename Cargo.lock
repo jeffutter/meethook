@@ -591,6 +591,7 @@ dependencies = [
  "dispatch2",
  "hound",
  "jiff",
+ "libc",
  "mach2",
  "meethook-session",
  "objc2",
