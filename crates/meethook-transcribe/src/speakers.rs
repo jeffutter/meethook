@@ -61,10 +61,13 @@ use crate::{Error, Result};
 ///
 /// The closest of those two clusters were confirmed by ear to be two different people, so
 /// this constant is known to have separated them and not merely assumed to have. It is also
-/// the case that they sit only 0.429 apart by *centroid* -- close enough that
-/// [`crate::IDENTIFY_DISTANCE`], which thresholds that other distance at this same number,
-/// files one of them under the other's name. Averaging distances is not the distance of
-/// averages, and the two constants are not interchangeable despite being equal. See TASK-020.
+/// the case that they sit only 0.429 apart by *centroid*, which is the distance
+/// [`crate::IDENTIFY_DISTANCE`] thresholds -- and while that constant was also 0.45 it filed
+/// one of them under the other's name. Averaging distances is not the distance of averages,
+/// which is why one value cannot serve both: see [`group_distance`] for the identity relating
+/// them, and `IDENTIFY_DISTANCE` for the populations that have since moved it to its own,
+/// lower value. That constant's value is not this one's and neither follows the other.
+/// See TASK-020.
 ///
 /// The cut is not what strands short turns in clusters of their own -- that is average
 /// linkage against a large group, and raising this constant to absorb them would need 0.6-0.8

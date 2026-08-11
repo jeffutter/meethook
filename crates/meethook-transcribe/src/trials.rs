@@ -1,9 +1,8 @@
 //! Scoring a speaker trial list: how far apart one person sits from themselves, and from
 //! everybody else.
 //!
-//! [`crate::IDENTIFY_DISTANCE`] is an argued starting point rather than a measured one, and
-//! the thing that would turn it into a measured one is not another distance -- it is a
-//! *population* of them. Hundreds of pairs, split into the two that matter: two recordings of
+//! [`crate::IDENTIFY_DISTANCE`] is only as good as the population it was priced against, and
+//! the thing that prices it is not another distance -- it is a *population* of them. Hundreds of pairs, split into the two that matter: two recordings of
 //! one person, and two recordings of two people. `cluster-speaker-track` prints every
 //! cluster-to-reference distance for one session, which is the right arithmetic at the wrong
 //! scale; false-accept rate, false-reject rate, equal-error rate and "is there any cut that
@@ -116,7 +115,8 @@ pub struct EqualError {
     pub rate: f32,
 
     /// The cut it happens at, which is as interesting as the rate: an equal-error rate of 3%
-    /// occurring at 0.62 says the current 0.45 is conservative, and the rate alone does not.
+    /// occurring at 0.62 says [`crate::IDENTIFY_DISTANCE`] is conservative, and the rate alone
+    /// does not.
     pub threshold: f32,
 }
 

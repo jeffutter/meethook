@@ -690,9 +690,10 @@ fn is_blocked(offer: &CentroidPair) -> bool {
 ///
 /// The quantity is centroid distance, a small group's normalized mean against a larger group's,
 /// and the section says so on every line that prints a number. `MERGE_DISTANCE` thresholds the
-/// other quantity, average linkage, at coincidentally the same value as `IDENTIFY_DISTANCE`
-/// thresholds this one; TASK-020 is a live bug caused by that coincidence, which is why the
-/// insistence is worth the words.
+/// other quantity, average linkage; `IDENTIFY_DISTANCE` thresholds this one. They were once the
+/// same number, and TASK-020 is the bug that cost -- one confirmed pair of speakers landing on
+/// opposite sides of the two criteria at a shared 0.45 -- which is why the insistence is worth
+/// the words even now that the values differ.
 ///
 /// Nothing here decides anything. The construction and its exclusions live in
 /// `meethook_transcribe::adoption_populations`, where they are unit-tested, and the scoring lives

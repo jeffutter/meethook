@@ -16,21 +16,82 @@ use meethook_session::{EnrolledSpeakers, SpeakerCluster};
 
 /// How far apart a meeting's voice and an enrolled reference may be and still be one person.
 ///
-/// Cosine distance, so 0 is the same vector and 1 is orthogonal -- the same units as
-/// `speakers::MERGE_DISTANCE`, which it deliberately starts equal to and is deliberately not
-/// shared with. That constant answers "are these two clips from one meeting the same voice?";
-/// this one answers "is this meeting's voice the person we recorded weeks ago?", across a
-/// different microphone, a different room and a different call's codec. The two will diverge
-/// the moment either is measured on real audio, and one shared value would silently move both
-/// when only one was calibrated.
+/// # What this thresholds
 ///
-/// The two mistakes here are not symmetric either, and the bias is the same. A false match
-/// puts one person's words under another person's name in a transcript nobody will re-read.
-/// A false rejection is an `Unknown N` the user fixes in `enroll` in ten seconds. So: strictly
-/// below the crossover, accepting that some real matches are missed.
+/// Cosine distance between **two single vectors**: the cluster's normalized mean-pooled
+/// centroid on one side, an enrolled reference on the other. 0 is the same direction, 1 is
+/// orthogonal. Nothing is averaged over pairs on either side.
 ///
-/// TASK-014 tracks measuring this against real cross-session recordings; it is an argued
-/// starting point, not a measured one.
+/// # It is not `speakers::MERGE_DISTANCE`, and not merely because it is calibrated separately
+///
+/// A reader arriving from `speakers.rs` expects two constants that are both cosine distances,
+/// both about "same voice or not", to be the same measurement applied in two places. They are
+/// not, and that reader is the one these paragraphs exist to stop.
+///
+/// `MERGE_DISTANCE` thresholds **average linkage**: the mean over every cross-group pair of
+/// turn embeddings, one distance per pair of turns, averaged. This constant thresholds the
+/// distance between the two sides' *means*. Averaging distances is not the distance of
+/// averages, and for unit-length members [`crate::group_distance`] gives the exact relation
+/// between the two, word for word as it states it there:
+///
+/// ```text
+/// average_linkage = 1 - shrinkage * (1 - centroid)
+/// ```
+///
+/// `shrinkage` is the product of the two *unnormalized* group-mean lengths: at most 1, and
+/// falling as either group grows or spreads out. So average linkage is centroid distance
+/// inflated by the shrinkage of the two means -- always the larger of the two numbers, with a
+/// gap that widens as either group gets less coherent. Two constants set to one value are
+/// therefore two different cuts, and a pair of voices can sit on opposite sides of both.
+///
+/// A pair that did. On clusters 1 and 3 of session `20260810-093047` the two group distances
+/// read **0.604** linkage and **0.429** centroid, putting the shrinkage at **0.693**. Both
+/// clusters were confirmed by ear to be two different people (Andrew, and Ryan). At a
+/// shared 0.45, clustering correctly declined the merge at 0.604 while identification accepted
+/// at 0.429 and filed 124.1 s of Ryan -- 9% of the speech on that track -- under Andrew.
+/// See TASK-020.
+///
+/// # Where the value comes from
+///
+/// From the two measured populations below, not from `MERGE_DISTANCE`.
+///
+/// **Cross-session corpus (TASK-014.04):** LibriSpeech dev-clean, 40 speakers, 67 items,
+/// grouped so every same-speaker pair spans different recording occasions. Same-speaker 36
+/// pairs, min 0.037 / median 0.129 / max 0.702; different-speaker 2170 pairs, min **0.364** /
+/// median 0.897. The two populations overlap across `[0.364, 0.702]`, so no cut separates them
+/// and every choice here buys one mistake with the other. Re-priced from that ticket's cached
+/// embeddings:
+///
+/// | cut   | different-speaker accepted | same-speaker rejected |
+/// |-------|----------------------------|-----------------------|
+/// | 0.350 | 0/2170 = 0.00%             | 2/36 = 5.56%          |
+/// | 0.450 | 9/2170 = 0.41%             | 2/36 = 5.56%          |
+/// | 0.550 | 17/2170 = 0.78%            | 2/36 = 5.56%          |
+///
+/// The false-reject column barely moves across that band because the same-speaker distribution
+/// is tight, so in this region the trade is bought almost entirely with false accepts. And all
+/// 9 false accepts at 0.45 are a *single* pair of speakers, whose cross-session distances sit
+/// at 0.364-0.416 -- confusable at every occasion rather than occasionally.
+///
+/// **Real meethook audio:** the Andrew/Ryan pair above, at centroid 0.429, is an upper bound
+/// measured within one session on one microphone and one call. That is the easiest condition
+/// this constant will ever face, cross-session variation being strictly larger, and 0.45
+/// already fails it.
+///
+/// So **0.35**: it removes every misattribution measured on the corpus, at a cost of at most
+/// one extra false reject in 86, and it rejects the ear-confirmed different-speaker pair with
+/// 0.079 of margin.
+///
+/// Two caveats belong with those numbers. The corpus holds the channel constant -- one
+/// volunteer, room and microphone per speaker -- so its same-speaker distances are a *floor*
+/// and its false-reject rate is optimistic. And 36 same-speaker pairs put the false-reject rate
+/// at roughly one significant figure: a 95% interval of about 1.5%-18%. TASK-014 still owes the
+/// recording sitting that would measure this against meethook's own capture channel.
+///
+/// The two mistakes here are not symmetric, and the bias follows from that. A false match puts
+/// one person's words under another person's name in a transcript nobody will re-read. A false
+/// rejection is an `Unknown N` the user fixes in `enroll` in ten seconds. So: below the
+/// crossover, accepting that some real matches are missed.
 ///
 /// Public so that the measurement can name the cut it is measuring against: the
 /// `cluster-speaker-track` example prints every cluster-to-reference distance alongside this
@@ -39,7 +100,7 @@ use meethook_session::{EnrolledSpeakers, SpeakerCluster};
 /// not for deciding -- [`identify_clusters`] is argmax *then* threshold, so anything that
 /// compares against this on its own will call a reference that clears the cut but is not the
 /// closest a match, which it is not.
-pub const IDENTIFY_DISTANCE: f32 = 0.45;
+pub const IDENTIFY_DISTANCE: f32 = 0.35;
 
 /// A cluster matched to an enrolled speaker.
 #[derive(Debug, Clone, PartialEq)]
