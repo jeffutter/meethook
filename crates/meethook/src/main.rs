@@ -62,6 +62,10 @@ enum Command {
         /// Ask about every unresolved voice, including ones too quiet to be offered by default
         #[arg(long)]
         all: bool,
+
+        /// Also ask about voices already named, so a wrong identification can be corrected
+        #[arg(long)]
+        correct: bool,
     },
 }
 
@@ -74,7 +78,11 @@ fn main() -> Result<()> {
         Command::Transcribe { session_ids, force } => {
             commands::transcribe(&paths, &session_ids, force)
         }
-        Command::Enroll { session_ids, all } => commands::enroll(&paths, &session_ids, all),
+        Command::Enroll {
+            session_ids,
+            all,
+            correct,
+        } => commands::enroll(&paths, &session_ids, all, correct),
     }
 }
 

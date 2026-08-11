@@ -26,7 +26,7 @@ use std::f32::consts::TAU;
 use std::path::{Path, PathBuf};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
-use meethook_enroll::{Answer, Interviewer, UnknownVoice, run_enroll};
+use meethook_enroll::{Answer, Interviewer, Offer, Voice, run_enroll};
 use meethook_session::{
     EnrolledSpeakers, Paths, RepresentativeSegment, SessionId, SpeakerCluster, SpeakerClusters,
     Transcript,
@@ -116,7 +116,7 @@ struct AsksOnce {
 }
 
 impl Interviewer for AsksOnce {
-    fn identify(&mut self, voice: &UnknownVoice<'_>) -> Answer {
+    fn identify(&mut self, voice: &Voice<'_>) -> Answer {
         self.asked.push(voice.label.to_string());
         // A voice a user cannot hear is a voice they cannot name, so the clip reaching the
         // prompt is part of what "enroll accepts this session" has to mean.
@@ -204,7 +204,14 @@ fn a_session_built_from_a_wav_file_transcribes_enrolls_and_stores_that_audio() {
         answer: Some("Alice".to_string()),
         asked: Vec::new(),
     };
-    let report = run_enroll(&paths, &[], false, &mut interviewer, &mut std::io::sink()).unwrap();
+    let report = run_enroll(
+        &paths,
+        &[],
+        Offer::default(),
+        &mut interviewer,
+        &mut std::io::sink(),
+    )
+    .unwrap();
     assert_eq!(report.failed, 0);
     assert_eq!(report.named, 1);
     assert_eq!(interviewer.asked, ["Unknown 1"]);
@@ -299,7 +306,7 @@ fn building_and_transcribing_touches_only_the_root_it_was_given() {
     run_enroll(
         &paths,
         &[],
-        false,
+        Offer::default(),
         &mut AsksOnce {
             answer: Some("Alice".to_string()),
             asked: Vec::new(),

@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use meethook_enroll::{Answer, Interviewer, UnknownVoice, run_enroll, write_clip};
+use meethook_enroll::{Answer, Interviewer, Offer, Voice, run_enroll, write_clip};
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
 use meethook_session::{Paths, SessionId};
@@ -474,15 +474,26 @@ impl DownloadProgress {
     }
 }
 
-pub fn enroll(paths: &Paths, session_ids: &[String], all: bool) -> Result<()> {
+pub fn enroll(paths: &Paths, session_ids: &[String], all: bool, correct: bool) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
     let mut terminal = Terminal::default();
-    let report = run_enroll(paths, &requested, all, &mut terminal, &mut io::stdout())?;
+    // Named at the one production call site, so which flag answers which question is readable
+    // here rather than positional.
+    let offer = Offer {
+        quiet: all,
+        named: correct,
+    };
+    let report = run_enroll(paths, &requested, offer, &mut terminal, &mut io::stdout())?;
 
     println!(
         "\n{} named, {} skipped, {} session(s) passed over",
         report.named, report.skipped, report.passed_over
     );
+    // A voice left as it was found is a kept identification, not an unanswered question, and
+    // only ever arises under `--correct`.
+    if report.kept > 0 {
+        println!("{} identification(s) kept as they were", report.kept);
+    }
     // Only when there were any: a run that asked about everything should not end on a line
     // about the nothing it held back.
     if report.held_back > 0 {
@@ -544,13 +555,24 @@ impl Terminal {
 }
 
 impl Interviewer for Terminal {
-    fn identify(&mut self, voice: &UnknownVoice<'_>) -> Answer {
-        println!(
-            "\n{}  {} -- {} of speech",
-            voice.session,
-            voice.label,
-            speech(voice.speech_seconds)
-        );
+    fn identify(&mut self, voice: &Voice<'_>) -> Answer {
+        // An already-named voice is a different question -- "is this right", not "who is
+        // this" -- and asking the second one with a name already on the screen invites the
+        // user to type that name straight back in. Both lines say which question it is.
+        match voice.confidence {
+            Some(confidence) => println!(
+                "\n{}  {} -- {} of speech, identified at {confidence:.2} confidence",
+                voice.session,
+                voice.label,
+                speech(voice.speech_seconds)
+            ),
+            None => println!(
+                "\n{}  {} -- {} of speech",
+                voice.session,
+                voice.label,
+                speech(voice.speech_seconds)
+            ),
+        }
         if voice.snippets.is_empty() {
             println!("    (nothing was transcribed for this voice)");
         }
@@ -559,7 +581,15 @@ impl Interviewer for Terminal {
         }
         self.play(voice.clip);
 
-        print!("Who is this? (name, Enter to skip, Ctrl-D to stop) ");
+        // Enter is `Answer::Skip` either way, and `Skip` writes nothing -- which is exactly
+        // what keeping an identification means, so no new answer variant is needed.
+        match voice.confidence {
+            Some(_) => print!(
+                "Who is this? (name to correct, Enter to keep {}, Ctrl-D to stop) ",
+                voice.label
+            ),
+            None => print!("Who is this? (name, Enter to skip, Ctrl-D to stop) "),
+        }
         // Without this the question sits in the buffer behind the answer.
         if io::stdout().flush().is_err() {
             return Answer::Quit;

@@ -17,7 +17,9 @@
 //! *Unresolved* is decided against the database as it stands right now, not against the text
 //! of the transcript. Name someone in the first session and their voice in the third is
 //! matched and passed over, with no cross-session comparison of unnamed voices anywhere: the
-//! deduplication is enrollment itself.
+//! deduplication is enrollment itself. The one exception is [`Offer::named`], which asks about
+//! resolved voices too so that an identification the database got wrong can be answered --
+//! without it a false accept would be permanent short of hand-editing `speakers.json`.
 //!
 //! A rewritten transcript is exactly what `transcribe --force` would now produce. That is the
 //! invariant everything below is implemented against, because it is what stops `enroll` and
@@ -116,16 +118,29 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// One unresolved voice, and everything needed to ask who it is.
+/// One voice being asked about, and everything needed to ask.
+///
+/// Usually a voice nothing in the database matched, which is what `enroll` exists for. Under
+/// [`Offer::named`] it can also be one the database has already put a name to, and then the
+/// question is a different one -- not "who is this" but "is this right" -- which is what
+/// `confidence` tells the caller.
 ///
 /// Deliberately one value rather than a play-then-ask pair of calls: the order those two
 /// would have to be made in is exactly the sort of thing a seam should not be leaking.
-pub struct UnknownVoice<'a> {
+pub struct Voice<'a> {
     pub session: &'a SessionId,
 
-    /// Exactly as the transcript reads -- "Unknown 2" -- so the user can find this voice in
-    /// the file in front of them.
+    /// Exactly as the transcript reads -- "Unknown 2", or the name the database put on this
+    /// voice -- so the user can find it in the file in front of them.
     pub label: &'a str,
+
+    /// How confident the identity claim in `label` is, or `None` when `label` is an
+    /// "Unknown N" -- which claims no identity at all.
+    ///
+    /// `Some(_)` means the database has already decided who this is and the question being
+    /// asked is a different one. The prompt has to say so, or a user looking at a name on the
+    /// screen will type it back in.
+    pub confidence: Option<f32>,
 
     /// Total speech attributed to this voice, in seconds. How the user tells a participant
     /// from someone who coughed once.
@@ -159,22 +174,45 @@ pub enum Answer {
 /// that cannot be read has `Quit`; making this fallible would push terminal errors into the
 /// sequencing, which is the one place this design keeps them out of.
 pub trait Interviewer {
-    fn identify(&mut self, voice: &UnknownVoice<'_>) -> Answer;
+    fn identify(&mut self, voice: &Voice<'_>) -> Answer;
+}
+
+/// Which voices a run offers beyond the ones it offers by default.
+///
+/// Two orthogonal questions -- how quiet a voice may be, and whether the database has already
+/// named it -- deliberately not one flag, because `--all` already answers the first and a user
+/// who wants to correct one identification is not asking to be shown the two-second fragments
+/// as well. The two filters compose: the floor decides whether a voice is worth a question
+/// whatever put it in the list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Offer {
+    /// `--all`: voices below `PROMPT_FLOOR_SECONDS`, which are normally held back.
+    pub quiet: bool,
+
+    /// `--correct`: voices the database has already put a name to, so a wrong identification
+    /// can be answered instead of being permanent.
+    pub named: bool,
 }
 
 /// What a run did, so the caller can pick an exit status without re-deriving it.
 ///
-/// `named`, `skipped` and `held_back` count *voices*; `passed_over` counts *sessions* that were
-/// never asked about at all; `failed` counts sessions that could not be read, plus ids that
-/// were requested and are not on disk.
+/// `named`, `skipped`, `kept` and `held_back` count *voices*; `passed_over` counts *sessions*
+/// that were never asked about at all; `failed` counts sessions that could not be read, plus
+/// ids that were requested and are not on disk.
 ///
 /// `held_back` is unresolved voices that sat under `PROMPT_FLOOR_SECONDS` and so were never
 /// asked about. Reported rather than merely not-counted, because a run that asked seven
 /// questions about a meeting of fifty-six voices should say what it did not ask about.
+///
+/// `kept` is already-named voices the user left as they were -- an answer, and the common one
+/// under [`Offer::named`]. Counted apart from `skipped` because they write the same nothing
+/// but mean opposite things: a kept voice *has* a name, and folding it into the skipped count
+/// would have the summary report a named voice as unnamed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EnrollReport {
     pub named: usize,
     pub skipped: usize,
+    pub kept: usize,
     pub held_back: usize,
     pub passed_over: usize,
     pub failed: usize,
@@ -202,13 +240,13 @@ enum Outcome {
 /// copy of a person somebody was just named in the first one a match rather than a second
 /// prompt.
 ///
-/// `all` asks about every unresolved voice, including the ones under `PROMPT_FLOOR_SECONDS`
-/// that are normally held back. It changes which questions get asked and nothing else -- the
-/// same answers write the same two files either way.
+/// [`Offer`] widens which voices get asked about -- the quiet ones, the already-named ones, or
+/// both. It changes which questions get asked and nothing else: the same answers write the
+/// same two files however a voice came to be offered.
 pub fn run_enroll(
     paths: &Paths,
     requested: &[SessionId],
-    all: bool,
+    offer: Offer,
     interviewer: &mut dyn Interviewer,
     out: &mut dyn Write,
 ) -> Result<EnrollReport> {
@@ -246,7 +284,7 @@ pub fn run_enroll(
         match enroll_session(
             paths,
             session,
-            all,
+            offer,
             &mut speakers,
             interviewer,
             out,
@@ -274,7 +312,7 @@ pub fn run_enroll(
 fn enroll_session(
     paths: &Paths,
     session: &DiscoveredSession,
-    all: bool,
+    offer: Offer,
     speakers: &mut EnrolledSpeakers,
     interviewer: &mut dyn Interviewer,
     out: &mut dyn Write,
@@ -362,27 +400,43 @@ fn enroll_session(
             .then(a.id.cmp(&b.id))
     });
 
-    let unresolved: Vec<&SpeakerCluster> = order
+    // The one place "already named" is decided. Everything below -- the floor, the in-run
+    // guard, the prompt -- treats a voice the same however it got into this list, which is
+    // what lets `--all` and `--correct` compose without either knowing about the other.
+    let candidates: Vec<&SpeakerCluster> = order
         .into_iter()
-        .filter(|c| shown[&c.id].1.is_none())
+        .filter(|c| offer.named || shown[&c.id].1.is_none())
         .collect();
-    if unresolved.is_empty() {
-        writeln!(out, "{}  passed over: nothing unresolved", session.id)?;
+    if candidates.is_empty() {
+        // A session whose voices are all identified is exactly where somebody stands when one
+        // of those identifications is wrong, and this line is the only thing it prints -- so
+        // it names the escape, the way the held-back line already names `--all`.
+        let named = shown.values().filter(|label| label.1.is_some()).count();
+        if named == 0 {
+            writeln!(out, "{}  passed over: nothing unresolved", session.id)?;
+        } else {
+            writeln!(
+                out,
+                "{}  passed over: nothing unresolved ({named} named voice(s) -- \
+                 meethook enroll --correct)",
+                session.id
+            )?;
+        }
         report.passed_over += 1;
         return Ok(Outcome::Finished);
     }
 
-    let queued = unresolved.len();
+    let queued = candidates.len();
 
     // Only the voices worth a question, unless the user asked for the rest. Clustering emits a
     // long tail of one- and two-second fragments it cannot place -- 48 unresolved clusters for
     // a meeting of seven people, measured on `20260810-093047` -- and asking about each of
     // them is how a five-minute job becomes an hour. Filtering preserves first-appearance
     // order, which is what the user reads the transcript in.
-    let mut offered: Vec<&SpeakerCluster> = if all {
-        unresolved.clone()
+    let mut offered: Vec<&SpeakerCluster> = if offer.quiet {
+        candidates.clone()
     } else {
-        unresolved
+        candidates
             .iter()
             .copied()
             .filter(|c| c.speech_seconds >= PROMPT_FLOOR_SECONDS)
@@ -394,22 +448,31 @@ fn enroll_session(
     // everybody instead. Decided here rather than defended against, because the alternative is
     // `enroll` reporting "nothing to do" on a session with unnamed people in it.
     if offered.is_empty() {
-        offered = unresolved;
+        offered = candidates;
     }
     let held_back = queued - offered.len();
     report.held_back += held_back;
 
+    // "Unresolved" is false under `--correct`, where most of the queue is resolved and the
+    // point is to review it. The default wording is left exactly as it was.
+    let counted = if offer.named {
+        let already = offered.iter().filter(|c| shown[&c.id].1.is_some()).count();
+        format!(
+            "{} voice(s) to review, {already} of them already named",
+            offered.len()
+        )
+    } else {
+        format!("{} unresolved voice(s)", offered.len())
+    };
     if held_back == 0 {
-        writeln!(out, "{}  {} unresolved voice(s)", session.id, offered.len())?;
+        writeln!(out, "{}  {counted}", session.id)?;
     } else {
         // Naming the escape rather than only the count: a voice nobody is told about is not
         // reachable, which is what AC #3 asks for.
         writeln!(
             out,
-            "{}  {} unresolved voice(s), {held_back} quieter voice(s) not offered -- \
-             meethook enroll --all",
-            session.id,
-            offered.len()
+            "{}  {counted}, {held_back} quieter voice(s) not offered -- meethook enroll --all",
+            session.id
         )?;
     }
 
@@ -418,39 +481,64 @@ fn enroll_session(
     // with no clip can still be named from its snippets.
     let track = read_track_16k_mono(&session.paths.speaker_wav()).unwrap_or_default();
 
+    // What each voice was called when this queue was built. The guard below compares against
+    // *this* rather than against the live labels, because under `--correct` a queued voice may
+    // legitimately be one the database had already named.
+    let baseline = shown.clone();
+
     for cluster in offered {
-        // Identified before this run started, or named by an answer given a moment ago:
-        // clustering that split one person in two must not ask about them twice.
-        if shown[&cluster.id].1.is_some() {
+        // A voice an answer given earlier in this run has already put a name to: clustering
+        // that split one person in two must not ask about them twice. Only an in-run answer
+        // can have moved a label since `baseline` was taken, so "named, and not the name it
+        // had when we queued it" is exactly that case and nothing else. The `is_some()` half
+        // matters as much: an in-run answer can also *un*-name a voice -- re-anchoring a
+        // reference to another cluster drops this one back to its "Unknown N" -- and that is a
+        // question this run created and has not answered.
+        if shown[&cluster.id].1.is_some() && shown[&cluster.id] != baseline[&cluster.id] {
             continue;
         }
 
         // Scoped so the borrows of `transcript` and `shown` inside the voice end before the
         // answer is acted on.
         let answer = {
-            let label = shown[&cluster.id].0.as_str();
+            let (label, confidence) = &shown[&cluster.id];
+            // Keyed on the cluster, not on the label text: under `--correct` two voices can
+            // sit under one enrolled name -- which is the false accept being corrected -- and
+            // a prompt showing the other person's lines cannot be answered.
             let snippets: Vec<&str> = transcript
                 .turns
                 .iter()
-                .filter(|turn| turn.source_track == SourceTrack::Speaker && turn.speaker == label)
+                .filter(|turn| {
+                    turn.source_track == SourceTrack::Speaker && turn.cluster == Some(cluster.id)
+                })
                 .map(|turn| snippet(&turn.text))
                 .filter(|text| !text.is_empty())
                 .take(SNIPPETS)
                 .collect();
 
-            interviewer.identify(&UnknownVoice {
+            interviewer.identify(&Voice {
                 session: &session.id,
                 label,
+                confidence: *confidence,
                 speech_seconds: cluster.speech_seconds,
                 snippets,
                 clip: clip_for(&track, cluster),
             })
         };
 
+        // Leaving an already-named voice alone is keeping that identification, which is an
+        // answer; leaving an unnamed one alone is the question going unanswered. Same write --
+        // none -- and different enough that the summary must not conflate them.
+        let left_alone = if shown[&cluster.id].1.is_some() {
+            &mut report.kept
+        } else {
+            &mut report.skipped
+        };
+
         let name = match answer {
             Answer::Quit => return Ok(Outcome::Quit),
             Answer::Skip => {
-                report.skipped += 1;
+                *left_alone += 1;
                 continue;
             }
             Answer::Named(name) => name,
@@ -459,8 +547,32 @@ fn enroll_session(
         // the buffer, not a request for an entry called "".
         let name = name.trim();
         if name.is_empty() {
-            report.skipped += 1;
+            *left_alone += 1;
             continue;
+        }
+
+        // A reference identical to this cluster was built from this voice, and the user has
+        // just told us this voice is somebody else -- so it is a stored claim about a person it
+        // is not of, and it competes as an argmax in every future meeting, winning whenever its
+        // name sorts first (`identify::best_match`'s tie-break). Exact equality is the whole
+        // condition: a reference derived from another recording of that person is a different
+        // vector and a legitimate one, and is left alone.
+        let displaced: Vec<String> = speakers
+            .speakers
+            .iter()
+            .filter(|s| s.name != name && s.embedding == cluster.embedding)
+            .map(|s| s.name.clone())
+            .collect();
+        speakers
+            .speakers
+            .retain(|s| s.name == name || s.embedding != cluster.embedding);
+        for who in displaced {
+            // An enrollment that vanishes without a line about it is worse than the bug.
+            writeln!(
+                out,
+                "{}  {who} no longer has a reference: that voice is {name}",
+                session.id
+            )?;
         }
 
         // An existing name is replaced rather than appended to or averaged with: typing a
@@ -599,8 +711,8 @@ fn sample_at(seconds: f64) -> usize {
 /// Writes a clip where an external player can reach it: mono, 16 kHz, 32-bit float.
 ///
 /// Here rather than in the caller because the format is this crate's knowledge -- the clip in
-/// an [`UnknownVoice`] is 16 kHz mono because that is the track it was cut from -- and a
-/// player that had to be told the rate could be told the wrong one.
+/// a [`Voice`] is 16 kHz mono because that is the track it was cut from -- and a player that
+/// had to be told the rate could be told the wrong one.
 pub fn write_clip(path: &Path, clip: &[f32]) -> Result<()> {
     let spec = hound::WavSpec {
         channels: 1,
@@ -644,6 +756,9 @@ mod tests {
     struct Shown {
         session: String,
         label: String,
+        /// What the prompt claimed about `label`'s identity, which is the only way a test can
+        /// check that a correction prompt asked "is this right" rather than "who is this".
+        confidence: Option<f32>,
         speech_seconds: f64,
         snippets: Vec<String>,
         clip_samples: usize,
@@ -672,10 +787,11 @@ mod tests {
     }
 
     impl Interviewer for Scripted {
-        fn identify(&mut self, voice: &UnknownVoice<'_>) -> Answer {
+        fn identify(&mut self, voice: &Voice<'_>) -> Answer {
             self.seen.push(Shown {
                 session: voice.session.to_string(),
                 label: voice.label.to_string(),
+                confidence: voice.confidence,
                 speech_seconds: voice.speech_seconds,
                 snippets: voice.snippets.iter().map(|s| s.to_string()).collect(),
                 clip_samples: voice.clip.len(),
@@ -694,6 +810,14 @@ mod tests {
         let mut embedding = vec![0.0f32; 4];
         embedding[id as usize % 4] = 1.0;
         embedding
+    }
+
+    /// A unit vector `degrees` away from cluster 0's, for the fixtures that are about how
+    /// close two voices are: one person clustering split in two, or one reference that matches
+    /// both halves. 0.35 of cosine distance is `IDENTIFY_DISTANCE`, so 49 degrees is the edge.
+    fn nearly(degrees: f32) -> Vec<f32> {
+        let radians = degrees.to_radians();
+        vec![radians.cos(), radians.sin(), 0.0, 0.0]
     }
 
     fn cluster(id: u32, first_spoke: f64, representative: (f64, f64)) -> SpeakerCluster {
@@ -819,23 +943,45 @@ mod tests {
     }
 
     fn run(paths: &Paths, ids: &[&str], interviewer: &mut Scripted) -> (EnrollReport, String) {
-        run_asking(paths, ids, false, interviewer)
+        run_asking(paths, ids, Offer::default(), interviewer)
     }
 
-    /// `run`, with the "ask about the quiet ones too" flag exposed. Separate so that the
-    /// dozen tests that have nothing to do with the floor do not carry a `false` each.
+    /// `run`, with the widening flags exposed. Separate so that the dozen tests that have
+    /// nothing to do with the floor or with corrections do not carry an [`Offer`] each.
     fn run_asking(
         paths: &Paths,
         ids: &[&str],
-        all: bool,
+        offer: Offer,
         interviewer: &mut Scripted,
     ) -> (EnrollReport, String) {
         let requested: Vec<SessionId> =
             ids.iter().map(|id| SessionId::parse(id).unwrap()).collect();
         let mut out = Vec::new();
-        let report = run_enroll(paths, &requested, all, interviewer, &mut out).unwrap();
+        let report = run_enroll(paths, &requested, offer, interviewer, &mut out).unwrap();
         (report, String::from_utf8(out).unwrap())
     }
+
+    /// The database `enroll` would have written by naming these clusters, so a test can start
+    /// from "the wrong person is already on this voice" without running a first pass.
+    fn enrolled(entries: &[(&str, Vec<f32>)], paths: &Paths) {
+        EnrolledSpeakers::new(
+            entries
+                .iter()
+                .map(|(name, embedding)| EnrolledSpeaker {
+                    name: name.to_string(),
+                    embedding: embedding.clone(),
+                })
+                .collect(),
+        )
+        .write(paths)
+        .unwrap();
+    }
+
+    /// `--correct` on its own: reach the already-named voices, leave the floor where it is.
+    const CORRECT: Offer = Offer {
+        quiet: false,
+        named: true,
+    };
 
     /// Rewrites this session's clusters with the talk times given, ids in order, leaving
     /// first appearances and representatives as [`make_session`] wrote them.
@@ -846,6 +992,17 @@ mod tests {
         let mut clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
         for (cluster, seconds) in clusters.clusters.iter_mut().zip(seconds) {
             cluster.speech_seconds = *seconds;
+        }
+        clusters.write(session).unwrap();
+    }
+
+    /// Rewrites this session's cluster embeddings, ids in order, leaving everything else as
+    /// [`make_session`] wrote it. The fixture's default is one orthogonal vector per cluster;
+    /// the tests about near voices are the ones that need to say otherwise.
+    fn with_embeddings(session: &SessionPaths, embeddings: &[Vec<f32>]) {
+        let mut clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
+        for (cluster, embedding) in clusters.clusters.iter_mut().zip(embeddings) {
+            cluster.embedding = embedding.clone();
         }
         clusters.write(session).unwrap();
     }
@@ -1198,6 +1355,12 @@ mod tests {
         assert_eq!(report.passed_over, 3, "{output}");
         assert_eq!(report.failed, 0, "{output}");
         assert!(output.contains("nothing unresolved"), "{output}");
+        // A session where everybody is already named is the one somebody is looking at when
+        // one of those names is wrong, and this line is all it prints.
+        assert!(
+            output.contains("2 named voice(s) -- meethook enroll --correct"),
+            "a correction nobody is told how to reach is not reachable: {output}"
+        );
         assert!(output.contains("not transcribed yet"), "{output}");
         assert!(output.contains("no session.json"), "{output}");
         // Nobody was asked, and the transcript still caught up with the database: a session
@@ -1430,14 +1593,7 @@ mod tests {
         let session = make_session(&paths, "20260809-052600");
 
         // Two clusters a few degrees apart: one voice the clusterer did not join up.
-        let nearly = |degrees: f32| {
-            let radians: f32 = degrees.to_radians();
-            vec![radians.cos(), radians.sin(), 0.0, 0.0]
-        };
-        let mut clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
-        clusters.clusters[0].embedding = nearly(0.0);
-        clusters.clusters[1].embedding = nearly(20.0);
-        clusters.write(&session).unwrap();
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
 
         let mut interviewer = Scripted::answering(vec![named("Alice")]);
         let (report, output) = run(&paths, &[], &mut interviewer);
@@ -1457,6 +1613,292 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Alice", "You", "Alice", "Alice"]
         );
+    }
+
+    /// TASK-019.03 acceptance criteria #1 and #2, which is the whole ticket in one test: a
+    /// voice the database has named the wrong person is reached, corrected, and lands in both
+    /// files -- and a later default run does not ask about it again.
+    #[test]
+    fn correcting_a_named_voice_updates_the_database_and_this_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+
+        // Cluster 0 is enrolled under the wrong name.
+        let mut first = Scripted::answering(vec![named("Alice"), named("Carol")]);
+        run(&paths, &[], &mut first);
+
+        let mut interviewer = Scripted::answering(vec![named("Bob")]);
+        let (report, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+        // The question that was asked: a name, and how confident the claim behind it was.
+        assert_eq!(interviewer.labels(), ["Alice", "Carol"], "{output}");
+        assert_eq!(interviewer.seen[0].confidence, Some(1.0), "{output}");
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(report.kept, 1, "{output}");
+
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        let stored: Vec<(&str, &[f32])> = speakers
+            .speakers
+            .iter()
+            .map(|s| (s.name.as_str(), s.embedding.as_slice()))
+            .collect();
+        assert_eq!(
+            stored,
+            [("Carol", voice(1).as_slice()), ("Bob", voice(0).as_slice())],
+            "the corrected name owns this voice, and the wrong one no longer claims it"
+        );
+        assert_eq!(
+            said(&transcript_of(&session))
+                .iter()
+                .map(|(speaker, _, _)| *speaker)
+                .collect::<Vec<_>>(),
+            ["Bob", "You", "Carol", "Bob"]
+        );
+
+        // ...and the correction sticks: a later default run has nothing to ask about.
+        let mut again = Scripted::default();
+        let (report, output) = run(&paths, &[], &mut again);
+        assert!(again.seen.is_empty(), "{:?}", again.seen);
+        assert_eq!(report.passed_over, 1, "{output}");
+    }
+
+    /// Acceptance criterion #3: reaching an already-named voice takes an explicit request. A
+    /// default run over a half-identified session offers only the half nothing matched.
+    #[test]
+    fn a_default_run_still_asks_only_about_unresolved_voices() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        enrolled(&[("Alice", voice(0))], &paths);
+
+        let mut default = Scripted::default();
+        let (_, output) = run(&paths, &[], &mut default);
+        assert_eq!(default.labels(), ["Unknown 2"], "{output}");
+        assert!(output.contains("1 unresolved voice(s)"), "{output}");
+
+        let mut correcting = Scripted::default();
+        let (report, output) = run_asking(&paths, &[], CORRECT, &mut correcting);
+        assert_eq!(correcting.labels(), ["Alice", "Unknown 2"], "{output}");
+        assert_eq!(correcting.seen[0].confidence, Some(1.0), "{output}");
+        assert_eq!(correcting.seen[1].confidence, None, "{output}");
+        assert!(
+            output.contains("2 voice(s) to review, 1 of them already named"),
+            "{output}"
+        );
+        assert_eq!(report.kept, 1, "{output}");
+        assert_eq!(report.skipped, 1, "{output}");
+    }
+
+    /// Acceptance criterion #4's other half: pressing Enter on an already-named voice keeps
+    /// that identification. The same nothing a skip writes -- byte for byte -- and counted
+    /// apart from it, because a kept voice has a name and a skipped one does not.
+    #[test]
+    fn keeping_an_identification_writes_nothing_and_is_not_counted_as_a_skip() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        enrolled(&[("Alice", voice(0)), ("Bob", voice(1))], &paths);
+
+        // A default run first, so the snapshot below is of a transcript already in step with
+        // the database and any difference is the correcting run's doing.
+        run(&paths, &[], &mut Scripted::default());
+        let before = (
+            std::fs::read(session.transcript_json()).unwrap(),
+            std::fs::read(session.transcript_md()).unwrap(),
+            std::fs::read(session.speaker_clusters_json()).unwrap(),
+            std::fs::read(paths.speakers_json()).unwrap(),
+        );
+
+        // Enter, then Enter with a stray space in the buffer.
+        let mut interviewer = Scripted::answering(vec![Answer::Skip, named("   ")]);
+        let (report, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Alice", "Bob"], "{output}");
+        assert_eq!(report.kept, 2, "{output}");
+        assert_eq!(report.skipped, 0, "{output}");
+        assert_eq!(report.named, 0, "{output}");
+        assert_eq!(
+            (
+                std::fs::read(session.transcript_json()).unwrap(),
+                std::fs::read(session.transcript_md()).unwrap(),
+                std::fs::read(session.speaker_clusters_json()).unwrap(),
+                std::fs::read(paths.speakers_json()).unwrap(),
+            ),
+            before
+        );
+    }
+
+    /// Acceptance criterion #5 under `--correct`, which is where it could regress: the in-run
+    /// guard no longer looks at "is this named" alone, so the split-voice case has to be
+    /// checked with the flag on as well as off.
+    #[test]
+    fn correcting_still_asks_once_about_one_voice_clustering_split_in_two() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
+
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (report, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+        assert_eq!(
+            interviewer.labels(),
+            ["Unknown 1"],
+            "the second half of one voice must not be asked about: {output}"
+        );
+        assert_eq!(report.named, 1, "{output}");
+    }
+
+    /// The other half of that guard, and the reason it is two conditions rather than one: an
+    /// answer can *un*-name a voice. Re-affirming cluster 0 re-anchors Alice's reference to it,
+    /// which puts cluster 1 out of range and back to its "Unknown N" -- a question this run
+    /// created and has not answered, so it must still be asked.
+    #[test]
+    fn a_voice_an_answer_unnamed_is_still_asked_about() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        // 80 degrees apart, with Alice's reference sitting between them: inside
+        // `IDENTIFY_DISTANCE` of both now, and of only cluster 0 once it is re-anchored there.
+        with_embeddings(&session, &[nearly(0.0), nearly(80.0)]);
+        enrolled(&[("Alice", nearly(40.0))], &paths);
+
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (report, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Alice", "Unknown 2"], "{output}");
+        assert!(interviewer.seen[0].confidence.is_some(), "{output}");
+        assert_eq!(
+            interviewer.seen[1].confidence, None,
+            "the answer took this voice's name away, so the prompt must not claim one"
+        );
+        assert_eq!(report.kept, 0, "{output}");
+        assert_eq!(report.skipped, 1, "{output}");
+    }
+
+    /// One voice cannot be two people's stored reference. Correcting a voice enrolled under
+    /// the wrong name leaves that name holding a reference built from somebody else's audio,
+    /// which then competes as an exact tie in every future meeting -- and wins whenever it
+    /// sorts first. Both orderings are checked, so the fix cannot be about the alphabet.
+    #[test]
+    fn correcting_a_voice_removes_the_reference_the_wrong_name_kept_of_it() {
+        for correction in ["Ryan", "Aaron"] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = Paths::new(root.path());
+            let session = make_session(&paths, "20260809-052600");
+            enrolled(&[("Nate", voice(0))], &paths);
+
+            let mut interviewer = Scripted::answering(vec![named(correction)]);
+            let (report, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+            assert_eq!(report.named, 1, "{output}");
+            assert!(
+                output.contains(&format!(
+                    "Nate no longer has a reference: that voice is {correction}"
+                )),
+                "an enrollment must not vanish without a line about it: {output}"
+            );
+            let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+            let stored: Vec<&str> = speakers.speakers.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(stored, [correction], "{output}");
+            assert_eq!(
+                transcript_of(&session).turns[0].speaker,
+                correction,
+                "{output}"
+            );
+        }
+    }
+
+    /// A reference built from a *different* recording of the same person is a legitimate one
+    /// and is left alone: only a reference identical to this cluster is a claim about a voice
+    /// the user has just said is somebody else.
+    #[test]
+    fn correcting_a_voice_leaves_the_wrong_names_other_reference_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        // Nate, enrolled from audio that is not either cluster here, matched to cluster 0 by
+        // being merely close to it -- which is the false accept this ticket opens with.
+        with_embeddings(
+            &paths.session(&SessionId::parse("20260809-052600").unwrap()),
+            &[nearly(0.0), nearly(80.0)],
+        );
+        enrolled(&[("Nate", nearly(20.0))], &paths);
+
+        let mut interviewer = Scripted::answering(vec![named("Ryan")]);
+        let (report, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+        assert_eq!(report.named, 1, "{output}");
+        assert!(!output.contains("no longer has a reference"), "{output}");
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        let stored: Vec<(&str, &[f32])> = speakers
+            .speakers
+            .iter()
+            .map(|s| (s.name.as_str(), s.embedding.as_slice()))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                ("Nate", nearly(20.0).as_slice()),
+                ("Ryan", nearly(0.0).as_slice())
+            ],
+            "Nate's own enrollment must survive somebody else's correction"
+        );
+    }
+
+    /// The prompt finds its lines by the cluster the turns came from, not by what they read.
+    /// Two voices under one enrolled name is exactly the case a correction is for, and keyed
+    /// on the label text both prompts would show the same person's words.
+    #[test]
+    fn each_correction_prompt_carries_only_its_own_voices_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        // One reference matching both clusters: two voices, one name in the transcript.
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
+        enrolled(&[("Andrew", nearly(10.0))], &paths);
+
+        let mut interviewer = Scripted::default();
+        let (_, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+        assert_eq!(
+            interviewer.labels(),
+            ["Andrew", "Andrew"],
+            "{output}"
+        );
+        assert_eq!(interviewer.seen[0].snippets, ["hi there", "let us start"]);
+        assert_eq!(interviewer.seen[1].snippets, ["and from me"]);
+    }
+
+    /// The two flags stay orthogonal: `--correct` reaches the named voices, the floor still
+    /// decides which are worth a question, and only `--all` lifts it.
+    #[test]
+    fn correcting_does_not_lift_the_floor_and_all_does_not_reach_named_voices() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_speech_seconds(&session, &[40.0, 1.5]);
+        enrolled(&[("Bob", voice(1))], &paths);
+
+        let mut correcting = Scripted::default();
+        let (report, output) = run_asking(&paths, &[], CORRECT, &mut correcting);
+        assert_eq!(correcting.labels(), ["Unknown 1"], "{output}");
+        assert_eq!(report.held_back, 1, "{output}");
+        assert!(output.contains("meethook enroll --all"), "{output}");
+
+        let mut both = Scripted::default();
+        let (report, output) = run_asking(
+            &paths,
+            &[],
+            Offer {
+                quiet: true,
+                named: true,
+            },
+            &mut both,
+        );
+        assert_eq!(both.labels(), ["Unknown 1", "Bob"], "{output}");
+        assert_eq!(report.held_back, 0, "{output}");
     }
 
     /// TASK-021 acceptance criterion #1, at the scale a unit test can hold it: a voice under
@@ -1495,7 +1937,15 @@ mod tests {
         with_speech_seconds(&session, &[40.0, 1.5]);
 
         let mut interviewer = Scripted::default();
-        let (report, output) = run_asking(&paths, &[], true, &mut interviewer);
+        let (report, output) = run_asking(
+            &paths,
+            &[],
+            Offer {
+                quiet: true,
+                ..Offer::default()
+            },
+            &mut interviewer,
+        );
 
         assert_eq!(interviewer.labels(), ["Unknown 1", "Unknown 2"], "{output}");
         assert_eq!(report.held_back, 0, "{output}");
@@ -1543,16 +1993,8 @@ mod tests {
         let paths = Paths::new(root.path());
         let session = make_session(&paths, "20260809-052600");
 
-        let nearly = |degrees: f32| {
-            let radians: f32 = degrees.to_radians();
-            vec![radians.cos(), radians.sin(), 0.0, 0.0]
-        };
-        let mut clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
-        clusters.clusters[0].embedding = nearly(0.0);
-        clusters.clusters[0].speech_seconds = 40.0;
-        clusters.clusters[1].embedding = nearly(20.0);
-        clusters.clusters[1].speech_seconds = 1.5;
-        clusters.write(&session).unwrap();
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
+        with_speech_seconds(&session, &[40.0, 1.5]);
 
         let mut interviewer = Scripted::answering(vec![named("Alice")]);
         let (report, output) = run(&paths, &[], &mut interviewer);

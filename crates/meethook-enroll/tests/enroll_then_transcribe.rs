@@ -18,7 +18,7 @@
 //! inside `IDENTIFY_DISTANCE` -- is a question about the embedding model and a real recording
 //! rather than about this code. It is TASK-014, and it needs a microphone.
 
-use meethook_enroll::{Answer, EnrollReport, Interviewer, UnknownVoice, run_enroll, write_clip};
+use meethook_enroll::{Answer, EnrollReport, Interviewer, Offer, Voice, run_enroll, write_clip};
 use meethook_session::{
     Paths, RepresentativeSegment, SessionId, SessionMetadata, SpeakerCluster, TrackSync, Transcript,
 };
@@ -152,7 +152,7 @@ impl AsksOnce {
 }
 
 impl Interviewer for AsksOnce {
-    fn identify(&mut self, voice: &UnknownVoice<'_>) -> Answer {
+    fn identify(&mut self, voice: &Voice<'_>) -> Answer {
         self.asked
             .push(format!("{} {}", voice.session, voice.label));
         match self.answer.take() {
@@ -163,7 +163,14 @@ impl Interviewer for AsksOnce {
 }
 
 fn enroll(paths: &Paths, interviewer: &mut dyn Interviewer) -> EnrollReport {
-    run_enroll(paths, &[], false, interviewer, &mut std::io::sink()).unwrap()
+    run_enroll(
+        paths,
+        &[],
+        Offer::default(),
+        interviewer,
+        &mut std::io::sink(),
+    )
+    .unwrap()
 }
 
 /// Who the transcript says spoke, in order -- what a reader of the file sees.
