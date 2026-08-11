@@ -237,10 +237,11 @@ pub fn identify_clusters(
 /// asserting it is enough -- rather than excluding or not depending on which cluster this
 /// happened to be called with first. Cheaper than validating the invariant and it fails safe.
 ///
-/// Private because the *convention* belongs to the on-disk contract, which is where it is
-/// written down; only one party reads it, so a method over there would be interface for no
-/// leverage.
-fn heard_at_once(a: &SpeakerCluster, b: &SpeakerCluster) -> bool {
+/// Crate-private because the *convention* belongs to the on-disk contract, which is where it
+/// is written down; only this crate reads it, so a method over there would be interface for no
+/// leverage. [`crate::attribution`] applies the same exclusion to hand-given names and shares
+/// this rather than restating it, since two readings of one relation could disagree.
+pub(crate) fn heard_at_once(a: &SpeakerCluster, b: &SpeakerCluster) -> bool {
     a.heard_at_once_with.contains(&b.id) || b.heard_at_once_with.contains(&a.id)
 }
 

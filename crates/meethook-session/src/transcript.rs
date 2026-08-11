@@ -125,8 +125,12 @@ pub struct Turn {
     ///
     /// `null` wherever no such claim is being made, which is every turn that is not a matched
     /// enrolled speaker: mic-track turns, where the speaker is known by construction rather
-    /// than inferred, and "Unknown N" turns, where the label names nobody. A number on either
-    /// would be a number about a different question.
+    /// than inferred; "Unknown N" turns, where the label names nobody; and turns whose speaker
+    /// the user named by hand against this session (`speaker_names.json`), where the name came
+    /// from a person listening to the clip rather than from a comparison with a reference. A
+    /// number on any of them would be a number about a different question -- and note that the
+    /// last case means a named turn may legitimately carry no confidence, so this field is not
+    /// a way to tell whether `speaker` is a person's name.
     ///
     /// No `skip_serializing_if`: the key must be present and null rather than absent, so a
     /// consumer can tell "not applicable" from "written by an older tool".

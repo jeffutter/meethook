@@ -12,13 +12,13 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use meethook_enroll::{Answer, Interviewer, Offer, Voice, run_enroll, write_clip};
+use meethook_enroll::{Answer, Enrolment, Interviewer, Offer, Voice, run_enroll, write_clip};
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
 use meethook_session::{Paths, SessionId};
 use meethook_transcribe::{
-    EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, SILERO_VAD_MODEL, WHISPER_MODEL,
-    WhisperEngine, run_batch,
+    Attribution, EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, SILERO_VAD_MODEL,
+    WHISPER_MODEL, WhisperEngine, run_batch,
 };
 
 /// The three waits the record loop's behaviour depends on.
@@ -474,7 +474,13 @@ impl DownloadProgress {
     }
 }
 
-pub fn enroll(paths: &Paths, session_ids: &[String], all: bool, correct: bool) -> Result<()> {
+pub fn enroll(
+    paths: &Paths,
+    session_ids: &[String],
+    all: bool,
+    correct: bool,
+    force_reference: bool,
+) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
     let mut terminal = Terminal::default();
     // Named at the one production call site, so which flag answers which question is readable
@@ -483,12 +489,37 @@ pub fn enroll(paths: &Paths, session_ids: &[String], all: bool, correct: bool) -
         quiet: all,
         named: correct,
     };
-    let report = run_enroll(paths, &requested, offer, &mut terminal, &mut io::stdout())?;
+    // A separate axis from `offer`: that one decides which voices are asked about, this one
+    // what an answer to a quiet voice writes.
+    let enrolment = if force_reference {
+        Enrolment::Always
+    } else {
+        Enrolment::AboveTheFloor
+    };
+    let report = run_enroll(
+        paths,
+        &requested,
+        offer,
+        enrolment,
+        &mut terminal,
+        &mut io::stdout(),
+    )?;
 
     println!(
         "\n{} named, {} skipped, {} session(s) passed over",
         report.named, report.skipped, report.passed_over
     );
+    // A sub-count of `named` rather than a separate outcome, so this reads as a qualification
+    // of the line above rather than as more voices. Says where the name went, because "named"
+    // on its own would leave a user expecting those people to be recognised in the next
+    // meeting -- which is exactly what a session-scoped name does not do.
+    if report.session_only > 0 {
+        println!(
+            "{} of those named in their own session only, too quiet for a reference -- \
+             meethook enroll --force-reference stores one anyway",
+            report.session_only
+        );
+    }
     // A voice left as it was found is a kept identification, not an unanswered question, and
     // only ever arises under `--correct`.
     if report.kept > 0 {
@@ -559,17 +590,23 @@ impl Interviewer for Terminal {
         // An already-named voice is a different question -- "is this right", not "who is
         // this" -- and asking the second one with a name already on the screen invites the
         // user to type that name straight back in. Both lines say which question it is.
-        match voice.confidence {
-            Some(confidence) => println!(
-                "\n{}  {} -- {} of speech, identified at {confidence:.2} confidence",
+        match voice.attribution {
+            Attribution::Identified { name, similarity } => println!(
+                "\n{}  {name} -- {} of speech, identified at {similarity:.2} confidence",
                 voice.session,
-                voice.label,
                 speech(voice.speech_seconds)
             ),
-            None => println!(
-                "\n{}  {} -- {} of speech",
+            // No confidence to print, and saying so matters: this name is here because
+            // somebody typed it, and it is recorded against this session rather than as a
+            // reference, so it will not follow the person into the next meeting.
+            Attribution::Assigned { name } => println!(
+                "\n{}  {name} -- {} of speech, named for this session",
                 voice.session,
-                voice.label,
+                speech(voice.speech_seconds)
+            ),
+            Attribution::Unknown(label) => println!(
+                "\n{}  {label} -- {} of speech",
+                voice.session,
                 speech(voice.speech_seconds)
             ),
         }
@@ -583,12 +620,13 @@ impl Interviewer for Terminal {
 
         // Enter is `Answer::Skip` either way, and `Skip` writes nothing -- which is exactly
         // what keeping an identification means, so no new answer variant is needed.
-        match voice.confidence {
-            Some(_) => print!(
+        if voice.attribution.is_named() {
+            print!(
                 "Who is this? (name to correct, Enter to keep {}, Ctrl-D to stop) ",
-                voice.label
-            ),
-            None => print!("Who is this? (name, Enter to skip, Ctrl-D to stop) "),
+                voice.attribution.label()
+            );
+        } else {
+            print!("Who is this? (name, Enter to skip, Ctrl-D to stop) ");
         }
         // Without this the question sits in the buffer behind the answer.
         if io::stdout().flush().is_err() {

@@ -40,7 +40,7 @@ pub use adoption::{
 pub use aec::{Cleaned, Cleaning, PassThrough, cancel_bleed};
 pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
-pub use attribution::{Attribution, attributions};
+pub use attribution::{Attribution, Naming, attributions};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
 pub use gpu::NoMetalDevice;
@@ -64,7 +64,7 @@ pub use vad::{SileroVad, SpeechRegion, VadTuning};
 use meethook_models::ModelSpec;
 use meethook_session::{
     Classification, DiscoveredSession, EnrolledSpeakers, Paths, SessionId, SessionMetadata,
-    SpeakerClusters, Transcript, discover_sessions,
+    SpeakerClusters, SpeakerNames, Transcript, discover_sessions,
 };
 
 /// The Whisper checkpoint this tool transcribes with.
@@ -335,9 +335,15 @@ pub fn transcribe_session(
     // Names are decided here rather than inside `merge`, and are never written back into
     // `speaker_clusters.json`: that file is what diarization honestly knows about the audio,
     // and `enroll` reads it expecting to find no names in it.
-    let identified = identify::identify_clusters(&diarization.clusters, speakers);
+    let clusters = SpeakerClusters::new(session.id.clone(), diarization.clusters);
+    clusters.write(&session.paths)?;
 
-    SpeakerClusters::new(session.id.clone(), diarization.clusters).write(&session.paths)?;
+    let identified = identify::identify_clusters(&clusters.clusters, speakers);
+    // Voices the user named by hand in an earlier `enroll` run over this session. Read here
+    // rather than passed in like `speakers` because it is one file per session, so there is no
+    // batch-level read to hoist it into -- and reading it is what makes a `--force`
+    // re-transcribe keep the names a person gave instead of silently reverting them.
+    let assigned = SpeakerNames::read_or_empty(&session.paths, &session.id)?;
 
     let turns = merge::merge(
         mic_segments,
@@ -345,7 +351,7 @@ pub fn transcribe_session(
         speaker_segments,
         speaker_offset_seconds(&metadata)?,
         &diarization.turns,
-        &identified,
+        Naming::new(&clusters.clusters, &identified, &assigned.names),
     );
 
     Ok(Transcript::new(session.id.clone(), turns))

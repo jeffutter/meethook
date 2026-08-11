@@ -66,6 +66,11 @@ enum Command {
         /// Also ask about voices already named, so a wrong identification can be corrected
         #[arg(long)]
         correct: bool,
+
+        /// Store a reference for every name given, even from a voice too short to make a
+        /// reliable one; without this a quiet voice is named in its own session only
+        #[arg(long)]
+        force_reference: bool,
     },
 }
 
@@ -82,7 +87,8 @@ fn main() -> Result<()> {
             session_ids,
             all,
             correct,
-        } => commands::enroll(&paths, &session_ids, all, correct),
+            force_reference,
+        } => commands::enroll(&paths, &session_ids, all, correct, force_reference),
     }
 }
 

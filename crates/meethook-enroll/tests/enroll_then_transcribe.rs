@@ -18,9 +18,12 @@
 //! inside `IDENTIFY_DISTANCE` -- is a question about the embedding model and a real recording
 //! rather than about this code. It is TASK-014, and it needs a microphone.
 
-use meethook_enroll::{Answer, EnrollReport, Interviewer, Offer, Voice, run_enroll, write_clip};
+use meethook_enroll::{
+    Answer, EnrollReport, Enrolment, Interviewer, Offer, Voice, run_enroll, write_clip,
+};
 use meethook_session::{
-    Paths, RepresentativeSegment, SessionId, SessionMetadata, SpeakerCluster, TrackSync, Transcript,
+    Paths, RepresentativeSegment, SessionId, SessionMetadata, SpeakerCluster, SpeakerNames,
+    TrackSync, Transcript,
 };
 use meethook_transcribe::{
     AsrSegment, BatchReport, Diarization, Diarize, Engines, Result, SpeakerTurn, SpeechToText,
@@ -50,6 +53,11 @@ impl SpeechToText for FakeAsr {
 /// Diarization without a model: one voice, whichever one the test says was in the room.
 struct FakeDiarizer {
     embedding: Vec<f32>,
+
+    /// How much that voice spoke. Which side of `enroll`'s reference floor this sits on is
+    /// what decides whether naming it writes a reference or a session-scoped name, so it is a
+    /// parameter rather than a constant even though the audio is a quarter second either way.
+    speech_seconds: f64,
 }
 
 impl Diarize for FakeDiarizer {
@@ -58,7 +66,7 @@ impl Diarize for FakeDiarizer {
             clusters: vec![SpeakerCluster {
                 id: 0,
                 embedding: self.embedding.clone(),
-                speech_seconds: 1.0,
+                speech_seconds: self.speech_seconds,
                 first_spoke_seconds: 0.0,
                 heard_at_once_with: Vec::new(),
                 representatives: vec![RepresentativeSegment {
@@ -115,20 +123,34 @@ fn make_session(paths: &Paths, id: &str) -> SessionId {
     id
 }
 
-/// Transcribes exactly one session, as the CLI would, with `who` the only voice on its far end.
+/// Transcribes exactly one session, as the CLI would, with `who` the only voice on its far
+/// end -- a voice that spoke long enough for a name given to it to become a reference.
 fn transcribe(paths: &Paths, id: &SessionId, who: u32) -> BatchReport {
+    transcribe_speaking(paths, id, who, 10.0, false)
+}
+
+/// `transcribe`, with the far-end voice's talk time and `--force` exposed. Separate so the
+/// tests about the enrolled database carry neither.
+fn transcribe_speaking(
+    paths: &Paths,
+    id: &SessionId,
+    who: u32,
+    speech_seconds: f64,
+    force: bool,
+) -> BatchReport {
     let mut factory = || {
         Ok(Engines {
             asr: Box::new(FakeAsr),
             diarizer: Box::new(FakeDiarizer {
                 embedding: voice(who),
+                speech_seconds,
             }),
         })
     };
     run_batch(
         paths,
         std::slice::from_ref(id),
-        false,
+        force,
         &mut factory,
         &mut std::io::sink(),
     )
@@ -154,7 +176,7 @@ impl AsksOnce {
 impl Interviewer for AsksOnce {
     fn identify(&mut self, voice: &Voice<'_>) -> Answer {
         self.asked
-            .push(format!("{} {}", voice.session, voice.label));
+            .push(format!("{} {}", voice.session, voice.attribution.label()));
         match self.answer.take() {
             Some(name) => Answer::Named(name),
             None => Answer::Skip,
@@ -162,11 +184,25 @@ impl Interviewer for AsksOnce {
     }
 }
 
+/// `--all`: the only way a voice under `PROMPT_FLOOR_SECONDS` is offered at all, and so the
+/// only way the tests below reach one quiet enough to be named for its session alone.
+const QUIET: Offer = Offer {
+    quiet: true,
+    named: false,
+};
+
 fn enroll(paths: &Paths, interviewer: &mut dyn Interviewer) -> EnrollReport {
+    enroll_offering(paths, Offer::default(), interviewer)
+}
+
+/// `enroll`, reaching the quiet voices too, which is the only way a voice under the reference
+/// floor is asked about in a session that also holds a louder one.
+fn enroll_offering(paths: &Paths, offer: Offer, interviewer: &mut dyn Interviewer) -> EnrollReport {
     run_enroll(
         paths,
         &[],
-        Offer::default(),
+        offer,
+        Enrolment::default(),
         interviewer,
         &mut std::io::sink(),
     )
@@ -237,6 +273,134 @@ fn a_person_named_in_one_session_is_named_by_transcribe_in_the_next() {
     );
     assert_eq!(report.named, 0);
     assert_eq!(report.passed_over, 2);
+}
+
+/// The other join, for a voice too short to build a reference from: `enroll` writes the name
+/// into the session, and `transcribe --force` over that same session reads it back.
+///
+/// This is the pair of commands the session-scoped name exists for. Naming somebody costs
+/// nothing in `speakers.json` -- the file is never even created here -- and the name still
+/// survives a re-transcribe, which is the thing that used to silently revert it.
+#[test]
+fn a_voice_too_quiet_for_a_reference_is_named_in_its_own_session_and_survives_a_re_transcribe() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let january = make_session(&paths, "20260105-090000");
+
+    // Two seconds of speech: a real participant, and far too little to fingerprint.
+    transcribe_speaking(&paths, &january, 0, 2.0, false);
+
+    let mut interviewer = AsksOnce::answering(Some("Alex"));
+    let report = enroll_offering(&paths, QUIET, &mut interviewer);
+
+    assert_eq!(report.named, 1);
+    assert_eq!(
+        report.session_only, 1,
+        "a voice under the reference floor should be named against its session"
+    );
+    assert!(
+        !paths.speakers_json().exists(),
+        "naming a voice this quiet must not write the enrolled database at all"
+    );
+    let names = SpeakerNames::read_or_empty(&paths.session(&january), &january).unwrap();
+    assert_eq!(
+        names
+            .names
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<&str>>(),
+        ["Alex"]
+    );
+    assert!(
+        speakers_in(&paths, &january).contains(&"Alex".to_string()),
+        "the transcript should read as the person the user named, was {:?}",
+        speakers_in(&paths, &january)
+    );
+
+    // The claim. Re-transcribing from the audio is what used to throw a name like this away.
+    transcribe_speaking(&paths, &january, 0, 2.0, true);
+    assert!(
+        speakers_in(&paths, &january).contains(&"Alex".to_string()),
+        "a forced re-transcribe should keep the name, was {:?}",
+        speakers_in(&paths, &january)
+    );
+
+    // And a later default run has nothing to ask: the name is an answer, even without a
+    // similarity behind it.
+    let mut again = AsksOnce::answering(None);
+    enroll_offering(&paths, QUIET, &mut again);
+    assert_eq!(
+        again.asked,
+        Vec::<String>::new(),
+        "a voice already named must not be asked about again"
+    );
+}
+
+/// The negative that keeps that test honest, and the point of the whole file being per
+/// session: a name given to one meeting's voice is a claim about that meeting. The same
+/// person, recorded again next month, is still a stranger -- because nothing was enrolled.
+#[test]
+fn a_name_given_to_one_session_does_not_name_that_voice_in_the_next() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let january = make_session(&paths, "20260105-090000");
+    let february = make_session(&paths, "20260209-090000");
+
+    transcribe_speaking(&paths, &january, 0, 2.0, false);
+    enroll_offering(
+        &paths,
+        QUIET,
+        &mut AsksOnce::answering(Some("Alex")),
+    );
+
+    transcribe_speaking(&paths, &february, 0, 2.0, false);
+
+    let february_says = speakers_in(&paths, &february);
+    assert!(
+        february_says.contains(&"Unknown 1".to_string()),
+        "a session-scoped name must not name that voice elsewhere, was {february_says:?}"
+    );
+    // And February is the only thing left to ask about.
+    let mut interviewer = AsksOnce::answering(None);
+    enroll_offering(&paths, QUIET, &mut interviewer);
+    assert_eq!(interviewer.asked, vec![format!("{february} Unknown 1")]);
+}
+
+/// A name is a claim about the voice it was given to, not about a cluster number. When
+/// re-clustering redraws that voice the claim no longer has anything to attach to, and the
+/// turns go back to their number rather than carrying the name onto whoever inherited the id.
+#[test]
+fn a_name_recorded_against_a_clustering_that_changed_is_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let january = make_session(&paths, "20260105-090000");
+
+    transcribe_speaking(&paths, &january, 0, 2.0, false);
+    enroll_offering(
+        &paths,
+        QUIET,
+        &mut AsksOnce::answering(Some("Alex")),
+    );
+    assert!(speakers_in(&paths, &january).contains(&"Alex".to_string()));
+
+    // One element of the recorded centroid moved, which is what a re-clustering that redrew
+    // this voice would look like from here.
+    let session = paths.session(&january);
+    let mut names = SpeakerNames::read_or_empty(&session, &january).unwrap();
+    names.names[0].embedding[0] += 0.000_1;
+    names.write(&session).unwrap();
+
+    transcribe_speaking(&paths, &january, 0, 2.0, true);
+
+    let says = speakers_in(&paths, &january);
+    assert!(
+        says.contains(&"Unknown 1".to_string()),
+        "a stale name should leave the voice numbered, was {says:?}"
+    );
+    assert!(
+        !says.contains(&"Alex".to_string()),
+        "a stale name must not be applied by cluster id, was {says:?}"
+    );
 }
 
 /// The negative that keeps the test above honest: what joins the two sessions is the database,

@@ -18,6 +18,7 @@
 //!       speaker.wav               system/speaker track
 //!       session.json              presence == "valid/complete session"
 //!       speaker_clusters.json     diarization output reused by enroll
+//!       speaker_names.json        voices named by hand in this session only
 //!       transcript.json           presence == "already transcribed"
 //!       transcript.md             human-readable rendering
 //! ```
@@ -28,6 +29,7 @@ mod id;
 mod metadata;
 mod paths;
 mod speaker_clusters;
+mod speaker_names;
 mod speakers;
 mod transcript;
 
@@ -46,6 +48,7 @@ pub use speaker_clusters::{
     MIN_REPRESENTATIVE_SECONDS, RepresentativeSegment, SPEAKER_CLUSTERS_SCHEMA_VERSION,
     SpeakerCluster, SpeakerClusters, unknown_labels,
 };
+pub use speaker_names::{AssignedName, SPEAKER_NAMES_SCHEMA_VERSION, SpeakerNames};
 pub use speakers::{ENROLLED_SPEAKERS_SCHEMA_VERSION, EnrolledSpeaker, EnrolledSpeakers};
 pub use transcript::{
     SourceTrack, TRANSCRIPT_SCHEMA_VERSION, Transcript, Turn, YOU as SPEAKER_YOU, unknown_speaker,

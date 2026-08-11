@@ -13,6 +13,7 @@ const MIC_CLEANED_WAV: &str = "mic.cleaned.wav";
 const SPEAKER_WAV: &str = "speaker.wav";
 const SESSION_JSON: &str = "session.json";
 const SPEAKER_CLUSTERS_JSON: &str = "speaker_clusters.json";
+const SPEAKER_NAMES_JSON: &str = "speaker_names.json";
 const TRANSCRIPT_JSON: &str = "transcript.json";
 const TRANSCRIPT_MD: &str = "transcript.md";
 
@@ -89,6 +90,11 @@ impl SessionPaths {
 
     pub fn speaker_clusters_json(&self) -> PathBuf {
         self.dir.join(SPEAKER_CLUSTERS_JSON)
+    }
+
+    /// Voices in this session the user named without enrolling. Absent until one is.
+    pub fn speaker_names_json(&self) -> PathBuf {
+        self.dir.join(SPEAKER_NAMES_JSON)
     }
 
     /// Presence marks the session as already transcribed.

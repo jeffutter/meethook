@@ -12,18 +12,17 @@ use std::collections::BTreeMap;
 use meethook_session::{SPEAKER_YOU, SourceTrack, Turn, unknown_labels, unknown_speaker};
 
 use crate::asr::AsrSegment;
-use crate::attribution::{Attribution, attributions};
+use crate::attribution::{Attribution, Naming, attributions};
 use crate::diarize::SpeakerTurn;
-use crate::identify::Identification;
 
 /// Combines both tracks into one chronological, speaker-labelled transcript.
 ///
 /// `mic` and `speaker` are what the recogniser heard on each track, timed from the start of
 /// that track; the two offsets place each track on the session timeline (exactly one of them
 /// is non-zero, since the timeline starts at whichever track began first). `diarized` is the
-/// speaker track's attributed speech, in that same track's time. `identified` is which of
-/// those voices the enrolled database recognised, keyed by cluster id and empty when nobody
-/// has been enrolled yet.
+/// speaker track's attributed speech, in that same track's time. `naming` is who those voices
+/// are -- what the database recognised and what the user named by hand -- and is
+/// [`Naming::nothing`] on a fresh install where neither has happened.
 ///
 /// Every mic-track segment becomes a turn labelled [`SPEAKER_YOU`] with no confidence: the
 /// speaker there is known by construction rather than inferred, and reporting a number for it
@@ -48,9 +47,9 @@ pub fn merge(
     speaker: Vec<AsrSegment>,
     speaker_offset_s: f64,
     diarized: &[SpeakerTurn],
-    identified: &BTreeMap<u32, Identification>,
+    naming: Naming<'_>,
 ) -> Vec<Turn> {
-    let labels = label_by_first_appearance(diarized, identified);
+    let labels = label_by_first_appearance(diarized, naming);
 
     let mut turns: Vec<Turn> = mic
         .into_iter()
@@ -99,8 +98,8 @@ pub fn merge(
     turns
 }
 
-/// Labels every voice on the speaker track: an enrolled speaker's name where there is one,
-/// otherwise the "Unknown N" [`unknown_labels`] hands it.
+/// Labels every voice on the speaker track: whatever name it has been given, otherwise the
+/// "Unknown N" [`unknown_labels`] hands it.
 ///
 /// What this owns is the projection from diarized turns to when each voice was first heard.
 /// The labelling itself is [`attributions`], which `enroll` reaches through too -- that is
@@ -108,11 +107,11 @@ pub fn merge(
 /// The numbering rule is [`unknown_labels`]', for the same reason one layer further down.
 fn label_by_first_appearance(
     diarized: &[SpeakerTurn],
-    identified: &BTreeMap<u32, Identification>,
+    naming: Naming<'_>,
 ) -> BTreeMap<u32, Attribution> {
     attributions(
         &unknown_labels(diarized.iter().map(|turn| (turn.cluster, turn.start_s))),
-        identified,
+        naming,
     )
 }
 
@@ -180,6 +179,7 @@ fn gap(segment: &AsrSegment, turn: &SpeakerTurn) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identify::Identification;
 
     fn segment(start_s: f64, end_s: f64, text: &str) -> AsrSegment {
         AsrSegment {
@@ -199,8 +199,8 @@ mod tests {
 
     /// The state of every session before anybody has been enrolled, which is what all the
     /// labelling and speaking-cluster tests below are about: voices, none of them with a name.
-    fn nobody() -> BTreeMap<u32, Identification> {
-        BTreeMap::new()
+    fn nobody() -> Naming<'static> {
+        Naming::nothing()
     }
 
     /// Enrolled speakers matched to clusters, as `identify` would have returned them.
@@ -237,7 +237,7 @@ mod tests {
             Vec::new(),
             0.0,
             &[turn(0.0, 10.0, 0)],
-            &nobody(),
+            nobody(),
         );
 
         assert_eq!(merged.len(), 2);
@@ -265,7 +265,7 @@ mod tests {
             ],
             0.0,
             &[turn(0.0, 1.0, 7), turn(2.0, 3.0, 4), turn(4.0, 5.0, 7)],
-            &nobody(),
+            nobody(),
         );
 
         let provenance: Vec<(&str, Option<u32>)> = merged
@@ -293,7 +293,7 @@ mod tests {
             vec![segment(0.0, 4.0, "...and then, right, yes")],
             0.0,
             &[turn(0.0, 1.0, 0), turn(1.0, 4.0, 1)],
-            &nobody(),
+            nobody(),
         );
 
         assert_eq!(merged[0].speaker, "Unknown 2");
@@ -311,7 +311,7 @@ mod tests {
             vec![segment(10.0, 11.0, "mm-hm")],
             0.0,
             &[turn(0.0, 5.0, 0), turn(12.0, 20.0, 1)],
-            &nobody(),
+            nobody(),
         );
 
         assert_eq!(merged[0].cluster, Some(1));
@@ -329,7 +329,7 @@ mod tests {
             vec![segment(0.5, 1.5, "hi there"), segment(5.0, 6.0, "thanks")],
             0.0,
             &[turn(0.0, 8.0, 0)],
-            &nobody(),
+            nobody(),
         );
 
         assert_eq!(
@@ -358,7 +358,7 @@ mod tests {
             ],
             0.0,
             &[turn(0.0, 1.0, 0), turn(2.0, 3.0, 1), turn(4.0, 5.0, 0)],
-            &nobody(),
+            nobody(),
         );
 
         let speakers: Vec<&str> = merged.iter().map(|t| t.speaker.as_str()).collect();
@@ -377,7 +377,7 @@ mod tests {
             0.0,
             // Cluster 2 speaks first; cluster 0 -- the most talkative -- speaks second.
             &[turn(0.0, 1.0, 2), turn(5.0, 6.0, 0)],
-            &nobody(),
+            nobody(),
         );
 
         assert_eq!(
@@ -396,7 +396,7 @@ mod tests {
             vec![segment(0.0, 4.0, "...and then, right, yes")],
             0.0,
             &[turn(0.0, 1.0, 0), turn(1.0, 4.0, 1)],
-            &nobody(),
+            nobody(),
         );
 
         // Three of the segment's four seconds belonged to cluster 1, which is the second
@@ -415,7 +415,7 @@ mod tests {
             vec![segment(10.0, 11.0, "mm-hm")],
             0.0,
             &[turn(0.0, 5.0, 0), turn(12.0, 20.0, 1)],
-            &nobody(),
+            nobody(),
         );
 
         assert_eq!(said(&merged), [("Unknown 2", 10.0, "mm-hm")]);
@@ -431,7 +431,7 @@ mod tests {
             vec![segment(0.0, 1.0, "one"), segment(2.0, 3.0, "two")],
             0.0,
             &[],
-            &nobody(),
+            nobody(),
         );
 
         let speakers: Vec<&str> = merged.iter().map(|t| t.speaker.as_str()).collect();
@@ -452,7 +452,7 @@ mod tests {
             vec![segment(3.0, 4.0, "theirs")],
             0.0,
             &[turn(0.0, 10.0, 0)],
-            &nobody(),
+            nobody(),
         );
 
         assert_eq!(
@@ -471,7 +471,7 @@ mod tests {
             Vec::new(),
             0.0,
             &[],
-            &nobody(),
+            nobody(),
         );
         assert_eq!(said(&mic_only), [("You", 0.0, "just me")]);
 
@@ -481,11 +481,11 @@ mod tests {
             vec![segment(0.0, 1.0, "just them")],
             0.0,
             &[turn(0.0, 1.0, 0)],
-            &nobody(),
+            nobody(),
         );
         assert_eq!(said(&speaker_only), [("Unknown 1", 0.0, "just them")]);
 
-        assert!(merge(Vec::new(), 0.0, Vec::new(), 0.0, &[], &nobody()).is_empty());
+        assert!(merge(Vec::new(), 0.0, Vec::new(), 0.0, &[], nobody()).is_empty());
     }
 
     /// A voice interrupted and resuming keeps its number: identity comes from the cluster,
@@ -506,7 +506,7 @@ mod tests {
                 turn(100.0, 105.0, 1),
                 turn(200.0, 205.0, 0),
             ],
-            &nobody(),
+            nobody(),
         );
 
         let speakers: Vec<&str> = merged.iter().map(|t| t.speaker.as_str()).collect();
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn voices_that_first_speak_at_the_same_instant_are_numbered_by_cluster_id() {
         let diarized = [turn(0.0, 2.0, 1), turn(0.0, 2.0, 0)];
-        let labels = label_by_first_appearance(&diarized, &nobody());
+        let labels = label_by_first_appearance(&diarized, nobody());
         assert_eq!(labels[&0].label(), "Unknown 1");
         assert_eq!(labels[&1].label(), "Unknown 2");
     }
@@ -538,7 +538,7 @@ mod tests {
                 turn(2.0, 3.0, 0),
                 turn(3.0, 10.0, 1),
             ],
-            &nobody(),
+            nobody(),
         );
 
         assert_eq!(merged[0].speaker, "Unknown 2");
@@ -562,7 +562,7 @@ mod tests {
             ],
             0.0,
             &[turn(0.0, 1.0, 0), turn(2.0, 3.0, 1), turn(4.0, 5.0, 2)],
-            &named(&[(1, "Alice", 0.91)]),
+            Naming::nothing().with_identified(&named(&[(1, "Alice", 0.91)])),
         );
 
         let speakers: Vec<&str> = merged.iter().map(|t| t.speaker.as_str()).collect();
@@ -581,7 +581,7 @@ mod tests {
             vec![segment(0.0, 0.5, "hers"), segment(3.0, 4.0, "theirs")],
             0.0,
             &[turn(0.0, 0.5, 0), turn(3.0, 4.0, 1)],
-            &named(&[(0, "Alice", 0.87)]),
+            Naming::nothing().with_identified(&named(&[(0, "Alice", 0.87)])),
         );
 
         let confidences: Vec<(&str, Option<f32>)> = merged
@@ -608,7 +608,7 @@ mod tests {
             ],
             0.0,
             &[turn(0.0, 1.0, 0), turn(10.0, 11.0, 1), turn(20.0, 21.0, 0)],
-            &named(&[(0, "Alice", 0.8)]),
+            Naming::nothing().with_identified(&named(&[(0, "Alice", 0.8)])),
         );
 
         let speakers: Vec<&str> = merged.iter().map(|t| t.speaker.as_str()).collect();
@@ -626,7 +626,7 @@ mod tests {
             vec![segment(0.0, 1.0, "only voice")],
             0.0,
             &[turn(0.0, 1.0, 0)],
-            &named(&[(9, "Nobody Here", 0.99)]),
+            Naming::nothing().with_identified(&named(&[(9, "Nobody Here", 0.99)])),
         );
 
         assert_eq!(said(&merged), [("Unknown 1", 0.0, "only voice")]);

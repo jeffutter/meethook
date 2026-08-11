@@ -26,7 +26,7 @@ use std::f32::consts::TAU;
 use std::path::{Path, PathBuf};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
-use meethook_enroll::{Answer, Interviewer, Offer, Voice, run_enroll};
+use meethook_enroll::{Answer, Enrolment, Interviewer, Offer, Voice, run_enroll};
 use meethook_session::{
     EnrolledSpeakers, Paths, RepresentativeSegment, SessionId, SpeakerCluster, SpeakerClusters,
     Transcript,
@@ -117,7 +117,7 @@ struct AsksOnce {
 
 impl Interviewer for AsksOnce {
     fn identify(&mut self, voice: &Voice<'_>) -> Answer {
-        self.asked.push(voice.label.to_string());
+        self.asked.push(voice.attribution.label().to_string());
         // A voice a user cannot hear is a voice they cannot name, so the clip reaching the
         // prompt is part of what "enroll accepts this session" has to mean.
         assert!(
@@ -170,9 +170,15 @@ fn transcribe(paths: &Paths, id: &SessionId) {
 }
 
 /// Builds a session under `root` from one synthesised source, and returns it.
+///
+/// Six seconds rather than a token three: `FingerprintDiarizer` reports the track's own
+/// duration as the voice's talk time, and `enroll` stores a reference in `speakers.json` only
+/// for a voice above its reference floor -- which is exactly what these tests are about. A
+/// three-second source would have the name recorded against the session instead, and the
+/// assertions below would be checking a different path than the one they describe.
 fn build(root: &Paths, dir: &Path, name: &str, hz: f32) -> SessionId {
     let source = dir.join(format!("{name}.wav"));
-    write_source(&source, hz, 3.0);
+    write_source(&source, hz, 6.0);
     build_session(root, &[source], &[]).unwrap().id
 }
 
@@ -208,6 +214,7 @@ fn a_session_built_from_a_wav_file_transcribes_enrolls_and_stores_that_audio() {
         &paths,
         &[],
         Offer::default(),
+        Enrolment::default(),
         &mut interviewer,
         &mut std::io::sink(),
     )
@@ -307,6 +314,7 @@ fn building_and_transcribing_touches_only_the_root_it_was_given() {
         &paths,
         &[],
         Offer::default(),
+        Enrolment::default(),
         &mut AsksOnce {
             answer: Some("Alice".to_string()),
             asked: Vec::new(),
