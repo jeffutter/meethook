@@ -16,6 +16,12 @@
 //!   closes it;
 //! - no edge at all across a mute/unmute toggle;
 //! - this process's own pid listed and marked excluded in the debug lines.
+//!
+//! This shows the *listener* path alone. It holds a watcher and never calls
+//! `MicActivityWatcher::recheck`, so a release edge lost to a stale read shows up here as a
+//! missing `Stopped` rather than as a late one -- which is what makes it the right place to
+//! ask how often that race actually fires. The recovery re-check lives in the record loop,
+//! where there is a live session for it to protect.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};

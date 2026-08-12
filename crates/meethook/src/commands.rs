@@ -21,7 +21,7 @@ use meethook_transcribe::{
     WHISPER_MODEL, WhisperEngine, run_batch,
 };
 
-/// The three waits the record loop's behaviour depends on.
+/// The four waits the record loop's behaviour depends on.
 ///
 /// Gathered into one value so the sequencing can be exercised at millisecond scale. The live
 /// figures would make the loop's tests take half a minute, and a slow test is one nobody
@@ -41,6 +41,13 @@ struct Timing {
     /// Bounded because the failure may be permanent -- a revoked permission, a display that
     /// has gone away -- and an unbounded retry would spin for the length of the meeting.
     attempts: u32,
+    /// How often the activity level is recomputed *while a session is live*.
+    ///
+    /// A safety net rather than the detection mechanism: every edge is expected to arrive
+    /// from a listener, and this exists only because a release edge can be lost outright
+    /// when the recomputation behind a notification reads the world a moment too early. See
+    /// `MicActivityWatcher::recheck`. Nothing is polled while idle.
+    recheck: Duration,
 }
 
 impl Timing {
@@ -48,6 +55,10 @@ impl Timing {
         grace: Duration::from_secs(3),
         retry: Duration::from_secs(2),
         attempts: 5,
+        // Two seconds of re-check plus the three-second grace is the worst-case stop
+        // latency after a lost edge, against extra tail audio being harmless (see `grace`).
+        // The cost while recording is one walk of the process objects every two seconds.
+        recheck: Duration::from_secs(2),
     };
 }
 
@@ -180,7 +191,7 @@ pub fn record(paths: &Paths) -> Result<()> {
     record_loop(
         &rx,
         &mut capture,
-        &|| watcher.is_active(),
+        &|| watcher.recheck(),
         already_active,
         Timing::LIVE,
     );
@@ -194,13 +205,17 @@ fn announce_watching() {
 
 /// Sequences one session per detected call until the process is interrupted.
 ///
-/// `is_active` reports the activity *level* rather than an edge; see [`begin`] for the one
-/// place that needs it. `already_active` skips the first idle wait, because a call that was
-/// already in progress when this process started will not produce a start edge.
+/// `recheck` recomputes the activity level from the world, delivering any edge it finds
+/// onto `rx` before returning that level. It is called from two places, for two reasons:
+/// while a session is live it is the safety net for a release edge that was lost outright,
+/// and inside [`begin`] it is the level a start retry is driven by.
+///
+/// `already_active` skips the first idle wait, because a call that was already in progress
+/// when this process started will not produce a start edge.
 fn record_loop(
     rx: &Receiver<Event>,
     capture: &mut dyn Capture,
-    is_active: &dyn Fn() -> bool,
+    recheck: &dyn Fn() -> bool,
     already_active: bool,
     timing: Timing,
 ) {
@@ -215,7 +230,7 @@ fn record_loop(
         }
         already_active = false;
 
-        match begin(rx, capture, is_active, timing) {
+        match begin(rx, capture, recheck, timing) {
             Begin::Recording => {}
             Begin::Abandoned => {
                 announce_watching();
@@ -225,7 +240,7 @@ fn record_loop(
         }
 
         let interrupted = loop {
-            match rx.recv() {
+            match rx.recv_timeout(timing.recheck) {
                 Ok(Event::Stopped) => match await_end(rx, timing.grace) {
                     Outcome::CallEnded => break false,
                     Outcome::Interrupted => break true,
@@ -234,7 +249,22 @@ fn record_loop(
                 // A redundant start edge cannot happen while recording, but ignoring it is
                 // the interpretation that keeps the session whole either way.
                 Ok(Event::Started) => {}
-                Ok(Event::Interrupt) | Err(_) => break true,
+                Ok(Event::Interrupt) => break true,
+                // The safety net, and the only reason this wait has a timeout at all. A
+                // release edge can be lost outright -- the recomputation behind a
+                // notification reads a world that can move under it -- and once the machine
+                // settles no further notification is coming, so the session would run until
+                // the user killed it. Recomputing here costs a few extra seconds of tail
+                // instead.
+                //
+                // The result is dropped because it is the *edge*, not the level, that ends a
+                // session: the watcher sends the `Stopped` itself, and the next pass through
+                // this loop handles it exactly as it would a timely one.
+                Err(RecvTimeoutError::Timeout) => {
+                    let _ = recheck();
+                }
+                // Every sender is gone, so no edge can arrive again.
+                Err(RecvTimeoutError::Disconnected) => break true,
             }
         };
         println!("Stopping...");
@@ -275,7 +305,7 @@ enum Begin {
 fn begin(
     rx: &Receiver<Event>,
     capture: &mut dyn Capture,
-    is_active: &dyn Fn() -> bool,
+    recheck: &dyn Fn() -> bool,
     timing: Timing,
 ) -> Begin {
     for attempt in 1..=timing.attempts {
@@ -298,10 +328,12 @@ fn begin(
             // the reading that loses the least if it does.
             Ok(Event::Started) => {}
             Err(RecvTimeoutError::Timeout) => {
-                // The stop edge can also be missed outright -- the watcher recomputes from
-                // the world rather than from our expectations -- so the level is checked
-                // directly rather than inferred from the absence of a message.
-                if !is_active() {
+                // The stop edge can be missed outright, so the level is recomputed from the
+                // world here rather than inferred from the absence of a message. It has to
+                // be a recomputation and not a cached value: a lost edge is precisely the
+                // case where the cached level is the wrong one, and retrying against it
+                // would burn every remaining attempt on a call that is already over.
+                if !recheck() {
                     return Begin::Abandoned;
                 }
             }
@@ -676,7 +708,8 @@ fn parse_session_ids(raw: &[String]) -> Result<Vec<SessionId>> {
 /// prove only what it does with them.
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -767,10 +800,14 @@ mod tests {
     /// so a gap the loop is meant to read as "the call ended" cannot be mistaken for
     /// scheduling noise. `BLIP` is the opposite -- short enough that it must land inside the
     /// grace window.
+    ///
+    /// `recheck` is well inside `SETTLE`, so every test below also exercises a safety-net
+    /// re-check that has to stay inert.
     const LOOP_TIMING: Timing = Timing {
         grace: Duration::from_millis(120),
         retry: Duration::from_millis(30),
         attempts: 3,
+        recheck: Duration::from_millis(40),
     };
     const SETTLE: Duration = Duration::from_millis(400);
     const BLIP: Duration = Duration::from_millis(20);
@@ -784,11 +821,27 @@ mod tests {
         calls: Vec<&'static str>,
         /// How many of the next starts should fail.
         failing_starts: u32,
+        /// How many times the loop has re-checked, shared with the re-check closure.
+        rechecks: Arc<AtomicUsize>,
+        /// That counter as it stood when the first session opened.
+        ///
+        /// Snapshotted here rather than read at the end because it is the *idle* stretch
+        /// before a session exists that is meant to recompute nothing.
+        rechecks_before_the_first_session: Option<usize>,
+        /// When the first session was finalized.
+        ///
+        /// `record_loop` returns only once it is interrupted, so its own elapsed time says
+        /// nothing about *when* a session ended; this is what distinguishes a session the
+        /// loop ended on its own from one an interrupt cleaned up afterwards.
+        finished_at: Option<Instant>,
     }
 
     impl Capture for FakeCapture {
         fn start(&mut self) -> super::Result<()> {
             self.calls.push("start");
+            if self.rechecks_before_the_first_session.is_none() {
+                self.rechecks_before_the_first_session = Some(self.rechecks.load(Ordering::SeqCst));
+            }
             if self.failing_starts > 0 {
                 self.failing_starts -= 1;
                 anyhow::bail!("deliberate start failure");
@@ -798,6 +851,7 @@ mod tests {
 
         fn finish(&mut self) -> super::Result<()> {
             self.calls.push("finish");
+            self.finished_at.get_or_insert_with(Instant::now);
             Ok(())
         }
     }
@@ -944,5 +998,81 @@ mod tests {
         record_loop(&rx, &mut capture, &|| false, false, LOOP_TIMING);
 
         assert_eq!(capture.calls, ["start"]);
+    }
+
+    /// The TASK-005.03 defect: the release notification arrived, the recomputation behind
+    /// it read the world microseconds too early and answered `true`, and no further
+    /// notification was ever coming -- so the session ran for 1862.8 s until Ctrl-C.
+    ///
+    /// Nothing in this script delivers a stop edge, which is the point: only the safety-net
+    /// re-check can end this session. The interrupt is there solely to let `record_loop`
+    /// return, and *when* the session was finalized is therefore the real assertion -- an
+    /// unrecovered session would also finish, just not until the interrupt cleaned it up.
+    #[test]
+    fn a_missed_stop_edge_is_recovered_by_the_recheck() {
+        let (tx, rx) = script(vec![(BLIP, Event::Started), (SETTLE * 3, Event::Interrupt)]);
+
+        let stopped = tx.clone();
+        let calls = AtomicUsize::new(0);
+        // Two re-checks still lose the race, and the third catches up. What it does then is
+        // what the watcher does on hardware: it emits the edge itself rather than returning
+        // it, so the loop handles an ordinary `Stopped` and needs no second path.
+        let recheck = move || {
+            if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                return true;
+            }
+            let _ = stopped.send(Event::Stopped);
+            false
+        };
+
+        let mut capture = FakeCapture::default();
+        let started = Instant::now();
+        record_loop(&rx, &mut capture, &recheck, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        let finished = capture
+            .finished_at
+            .expect("the session was never finalized")
+            .duration_since(started);
+        assert!(
+            finished < SETTLE * 3,
+            "the interrupt ended this session after {finished:?}, not the recheck"
+        );
+    }
+
+    /// Nothing is recomputed until there is a session to protect.
+    ///
+    /// The re-check is a safety net for a lost *release* edge, not the detection mechanism:
+    /// start edges arrive from listeners, and polling an idle machine would cost a walk of
+    /// every audio process object every couple of seconds for nothing.
+    #[test]
+    fn the_idle_wait_never_rechecks() {
+        // `SETTLE` is ten re-check intervals, so an idle path that polled at all would be
+        // caught here several times over.
+        let (_tx, rx) = script(vec![
+            (SETTLE, Event::Started),
+            (BLIP, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        let rechecks = Arc::clone(&capture.rechecks);
+        record_loop(
+            &rx,
+            &mut capture,
+            &|| {
+                rechecks.fetch_add(1, Ordering::SeqCst);
+                true
+            },
+            false,
+            LOOP_TIMING,
+        );
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(
+            capture.rechecks_before_the_first_session,
+            Some(0),
+            "the idle wait recomputed the activity level"
+        );
     }
 }

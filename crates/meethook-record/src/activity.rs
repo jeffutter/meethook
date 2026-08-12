@@ -70,20 +70,57 @@
 //!
 //! # Shape
 //!
-//! Four listener sites all feed one recomputation, and nothing is polled on a timer:
+//! Three listener sites all feed one recomputation:
 //!
 //! | Object | Property | On notification |
 //! |---|---|---|
 //! | system | `DefaultInputDevice` | move the device listener to the new device |
 //! | current input device | `DeviceIsRunningSomewhere` | -- |
-//! | system | `ProcessObjectList` | diff the per-process listeners |
-//! | each process object | `IsRunningInput` | -- |
+//! | system | `ProcessObjectList` | -- |
 //!
 //! Recomputation is cheap and idempotent, and an edge is delivered only when the boolean
 //! actually changes. That last property is what keeps a mute toggle from splitting a
-//! session: whatever notifications a mute produces, none of them change the answer.
+//! session: whatever notifications a mute produces, none of them change the answer. It is
+//! also what makes the re-check below invisible except when it has something to report.
+//!
+//! # Why the listeners alone are not enough
+//!
+//! A notification is not trusted to say what changed; it wakes a fresh walk of the process
+//! objects. That walk reads a world which can move underneath it, and on hardware it has.
+//! In run 1 of the TASK-005.02 matrix the predicate's walk answered `true` while the debug
+//! log's walk, microseconds later, no longer contained the capturing process at all -- so
+//! the process had already released the microphone. The notification was correct and on
+//! time; the read behind it was stale, and the release edge was never emitted.
+//!
+//! Losing one edge that way is permanent. The machine has settled, so no further
+//! notification is coming, and that run kept recording for 1862.8 s until the user pressed
+//! Ctrl-C. No read can be made to win that race -- any walk reads a world that can move
+//! under it -- so the answer is not a better read but a way back from a lost one.
+//!
+//! [`MicActivityWatcher::recheck`] is that way back: it recomputes on demand and delivers
+//! an edge through `on_change` if the answer has moved. The record loop calls it every
+//! couple of seconds *while a session is live*, which turns a lost release edge into a few
+//! seconds of extra tail rather than a session that runs until the process is killed.
+//!
+//! The idle path has no timer at all, which is deliberate. Every start edge observed on
+//! hardware so far arrived from a listener, and a call already in progress at launch is
+//! covered by the level [`MicActivityWatcher::start`] returns, so polling while idle would
+//! cost a wake-up every couple of seconds and buy nothing.
+//!
+//! # The per-process listener, removed
+//!
+//! An `IsRunningInput` listener on every process object used to be attached as well, and
+//! it never delivered: its trigger appears in none of the four TASK-005.02 hardware runs,
+//! across roughly an hour of recording and several hundred notifications, even though each
+//! attach succeeded (a refusal is fatal through [`Error::CoreAudio`]). It was cost with no
+//! value, and worse, it made the design look as though it had a second chance at every
+//! edge when in fact it had exactly one. It is gone; the re-check above is the real second
+//! chance, and unlike that listener it is decidable in a test.
+//!
+//! The system-level `ProcessObjectList` listener is kept -- that one demonstrably fires,
+//! including as a meeting app's process object appears -- and after the removal it simply
+//! wakes a recomputation instead of doing listener bookkeeping first.
 
-use std::collections::HashMap;
 use std::ffi::{OsString, c_void};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -129,8 +166,9 @@ impl MicActivityWatcher {
     /// when the watcher starts, the caller should act on it immediately rather than wait
     /// for a transition that has already happened.
     ///
-    /// `on_change` is called from a private serial dispatch queue, once per real change,
-    /// while the watcher's own lock is held. It must not block: sending on an unbounded
+    /// `on_change` is called once per real change, while the watcher's own lock is held --
+    /// from a private serial dispatch queue for a listener, and on the caller's own thread
+    /// for [`MicActivityWatcher::recheck`]. It must not block: sending on an unbounded
     /// channel is the intended shape, and anything slower stalls the next notification.
     pub fn start(
         on_change: impl Fn(Activity) + Send + Sync + 'static,
@@ -139,9 +177,10 @@ impl MicActivityWatcher {
         // serialized and the listener bookkeeping needs no ordering beyond the mutex.
         let queue = DispatchQueue::new("com.meethook.activity", DispatchQueueAttr::SERIAL);
 
-        // Cyclic because a listener block must be able to install *more* listeners (the
-        // per-process ones, as processes come and go), which needs a handle back to the
-        // state it is already inside. `Weak` is what keeps that from being a leak.
+        // Cyclic because a listener block must be able to install *more* listeners -- the
+        // `DefaultInputDevice` one re-attaches the device listener as the default moves --
+        // which needs a handle back to the state it is already inside. `Weak` is what keeps
+        // that from being a leak.
         let state = Arc::new_cyclic(|weak: &Weak<Mutex<State>>| {
             Mutex::new(State {
                 weak: weak.clone(),
@@ -158,7 +197,6 @@ impl MicActivityWatcher {
                 active: false,
                 system: Vec::new(),
                 device: None,
-                processes: HashMap::new(),
             })
         });
 
@@ -172,14 +210,26 @@ impl MicActivityWatcher {
         Ok((watcher, active))
     }
 
-    /// The predicate as of the last recomputation: is some other process capturing *now*?
+    /// Recomputes the predicate now, delivering an edge if the answer has moved.
     ///
-    /// A level, not an edge -- the same value [`MicActivityWatcher::start`] returns. The
-    /// record loop needs it because a failed `Recorder::start` has to be retried while the
-    /// call is still up: the level is already true, so no further [`Activity::Started`] can
-    /// arrive until this call ends and a different one begins.
-    pub fn is_active(&self) -> bool {
-        self.lock().active
+    /// This is the recovery path for a notification whose recomputation read the world a
+    /// moment too early: a walk of the process objects can be stale, and once the machine
+    /// has settled no further notification is coming, so without this a lost edge is
+    /// permanent. See the module docs for the hardware evidence.
+    ///
+    /// Any edge is delivered through `on_change` rather than returned, so a caller that is
+    /// also the one draining `on_change` sees it as an ordinary edge and needs no second
+    /// path for it. `on_change` therefore runs on *this* thread, under the watcher's lock;
+    /// the contract that it must not block is what makes that safe.
+    ///
+    /// The returned `bool` is the *level*, for the one caller that needs it: a failed
+    /// `Recorder::start` has to be retried while the call is still up, and since the level
+    /// is already true no further [`Activity::Started`] can arrive until this call ends and
+    /// a different one begins.
+    pub fn recheck(&self) -> bool {
+        let mut state = self.lock();
+        state.notified(Trigger::Recheck);
+        state.active
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -201,8 +251,10 @@ impl Drop for MicActivityWatcher {
     }
 }
 
-/// Which listener fired. Carried only so the debug log can say what woke the recomputation
-/// and so the handler knows whether any bookkeeping is due first.
+/// What woke a recomputation. Carried only so the debug log can say which one it was, and
+/// so the handler knows whether any bookkeeping is due first.
+///
+/// Not all of these are listeners; the two that are not say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Trigger {
     /// The system's default input device changed.
@@ -211,10 +263,12 @@ enum Trigger {
     ProcessList,
     /// The current input device started or stopped running somewhere.
     DeviceRunning,
-    /// Some process started or stopped capturing input.
-    ProcessInput,
     /// Not a listener: the initial reading taken at `start`.
     Install,
+    /// Not a listener: the safety-net recomputation the record loop asks for while a
+    /// session is live. A `Recheck` line in the debug log therefore means exactly one
+    /// thing -- the net caught an edge the listeners lost.
+    Recheck,
 }
 
 impl Trigger {
@@ -224,8 +278,7 @@ impl Trigger {
             Trigger::DefaultInputDevice => "default input device",
             Trigger::ProcessList => "audio process list",
             Trigger::DeviceRunning => "input device activity",
-            Trigger::ProcessInput => "per-process input activity",
-            Trigger::Install => "activity",
+            Trigger::Install | Trigger::Recheck => "activity",
         }
     }
 }
@@ -255,7 +308,6 @@ struct State {
     active: bool,
     system: Vec<Installed>,
     device: Option<Installed>,
-    processes: HashMap<AudioObjectID, Installed>,
 }
 
 // SAFETY: the only non-`Send` members are `RcBlock`s and a `DispatchRetained`, both of
@@ -266,7 +318,7 @@ struct State {
 unsafe impl Send for State {}
 
 impl State {
-    /// Installs all four listener kinds and takes the first reading.
+    /// Installs all three listeners and takes the first reading.
     fn install(&mut self) -> Result<bool> {
         let system = kAudioObjectSystemObject as AudioObjectID;
         let default_device = self.listen(
@@ -299,7 +351,6 @@ impl State {
             }
             Err(e) => return Err(e),
         }
-        self.sync_process_listeners();
 
         self.active = self.someone_else_is_capturing();
         if self.debug {
@@ -310,25 +361,27 @@ impl State {
 
     /// Handles one notification: bookkeeping first, then a recomputation.
     fn notified(&mut self, trigger: Trigger) {
-        match trigger {
+        // Only the default-device listener has any bookkeeping left; every other trigger,
+        // including the re-check, is purely a wake-up for the recomputation below.
+        if trigger == Trigger::DefaultInputDevice {
             // A device that has gone away is a normal state to be watching from -- the
             // user unplugged a USB mic -- so this is not allowed to tear the watcher down.
-            Trigger::DefaultInputDevice => {
-                if let Err(e) = self.attach_device_listener()
-                    && self.debug
-                {
-                    eprintln!("[activity] could not follow the default input device: {e}");
-                }
+            if let Err(e) = self.attach_device_listener()
+                && self.debug
+            {
+                eprintln!("[activity] could not follow the default input device: {e}");
             }
-            Trigger::ProcessList => self.sync_process_listeners(),
-            _ => {}
         }
 
         let active = self.someone_else_is_capturing();
-        if self.debug {
+        let activity = edge(self.active, active);
+        // A re-check that changes nothing is the overwhelmingly common case and carries no
+        // information; logging every one would bury the notifications that do. A `Recheck`
+        // line therefore always means the safety net caught something.
+        if self.debug && (trigger != Trigger::Recheck || activity.is_some()) {
             self.log(trigger, active);
         }
-        let Some(activity) = edge(self.active, active) else {
+        let Some(activity) = activity else {
             return;
         };
         self.active = active;
@@ -356,43 +409,6 @@ impl State {
             eprintln!("[activity] IsRunningSomewhere listener attached to device {device}");
         }
         Ok(())
-    }
-
-    /// Adds a listener for every new process object and removes the departed ones.
-    fn sync_process_listeners(&mut self) {
-        let current = object_list(
-            kAudioObjectSystemObject as AudioObjectID,
-            kAudioHardwarePropertyProcessObjectList,
-        );
-
-        // Linear membership tests: the list is a few dozen entries on a busy machine, and
-        // a set would cost more to build than it saves.
-        let departed: Vec<AudioObjectID> = self
-            .processes
-            .keys()
-            .copied()
-            .filter(|id| !current.contains(id))
-            .collect();
-        for id in departed {
-            if let Some(listener) = self.processes.remove(&id) {
-                remove_listener(&listener, &self.queue);
-            }
-        }
-
-        for id in current {
-            if self.processes.contains_key(&id) {
-                continue;
-            }
-            // A process object can disappear between being listed and being listened to.
-            // That is a race with a normal outcome, not an error.
-            if let Ok(listener) = self.listen(
-                id,
-                kAudioProcessPropertyIsRunningInput,
-                Trigger::ProcessInput,
-            ) {
-                self.processes.insert(id, listener);
-            }
-        }
     }
 
     /// The predicate: is any process other than us and our helpers capturing input?
@@ -518,7 +534,6 @@ impl State {
     fn take_listeners(&mut self) -> Vec<Installed> {
         let mut listeners = std::mem::take(&mut self.system);
         listeners.extend(self.device.take());
-        listeners.extend(std::mem::take(&mut self.processes).into_values());
         listeners
     }
 }
@@ -594,10 +609,11 @@ fn edge(previous: bool, current: bool) -> Option<Activity> {
 
 /// Removes one listener.
 ///
-/// Also called from *inside* a listener block -- following a device change, or pruning a
-/// process that has gone away -- which is safe because the notification was dispatched to
-/// our queue asynchronously: the HAL is not holding anything while our block runs, and it
-/// does not synchronize back onto the listener queue to unregister.
+/// Also called from *inside* a listener block, when the default input device changes and
+/// the `IsRunningSomewhere` listener has to move with it. That is safe because the
+/// notification was dispatched to our queue asynchronously: the HAL is not holding anything
+/// while our block runs, and it does not synchronize back onto the listener queue to
+/// unregister.
 fn remove_listener(listener: &Installed, queue: &DispatchQueue) {
     // SAFETY: object, address, queue and block pointer are the same four values the
     // matching `AudioObjectAddPropertyListenerBlock` was given.
