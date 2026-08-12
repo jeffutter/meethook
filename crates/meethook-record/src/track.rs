@@ -12,6 +12,7 @@
 //! wrong trade.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -161,16 +162,59 @@ pub struct FirstBuffer {
     pub frames: u32,
 }
 
+/// What the callback side of a track has delivered, readable while the track is live.
+///
+/// Both fields are written from a capture callback and read from another thread, which is
+/// the whole reason this is one shared allocation rather than two: they are published
+/// together, on every buffer, from the one place every buffer passes through.
+struct Delivery {
+    first: OnceLock<FirstBuffer>,
+    /// Frames handed to the writer, not frames on disk. See [`TrackProgress::frames`].
+    frames: AtomicU64,
+}
+
+/// A reader's view of what a live track's callback side has delivered so far.
+///
+/// Exists so that "is this track still receiving audio?" can be answered *while* the track
+/// runs, rather than only from [`TrackSummary`] once it has been finished. A handle rather
+/// than accessors on [`TrackWriter`] because the type is what carries the documentation of
+/// what the number means, and because the reader is usually a different object from the one
+/// that owns the writer.
+#[derive(Clone)]
+pub struct TrackProgress(Arc<Delivery>);
+
+impl TrackProgress {
+    /// Frames **delivered to the writer**, not frames written to the file.
+    ///
+    /// The two differ transiently by whatever is queued, and permanently if the writer
+    /// thread has failed. This is therefore a liveness signal for the capture callback and
+    /// nothing else: [`TrackSummary::frames`] remains the only number that describes the
+    /// file on disk.
+    ///
+    /// Monotonic, and never resets. Zero means no buffer has been delivered yet.
+    pub fn frames(&self) -> u64 {
+        self.0.frames.load(Ordering::Relaxed)
+    }
+
+    /// The first delivered buffer, once one has arrived.
+    ///
+    /// `Some` implies [`TrackProgress::frames`] is non-zero, since both are published from
+    /// the same callback before it returns.
+    pub fn first_buffer(&self) -> Option<FirstBuffer> {
+        self.0.first.get().copied()
+    }
+}
+
 /// A cheap, cloneable handle for a capture callback to push samples through.
 #[derive(Clone)]
 pub struct TrackSink {
     tx: Sender<Message>,
-    first: Arc<OnceLock<FirstBuffer>>,
+    delivery: Arc<Delivery>,
 }
 
 impl TrackSink {
-    /// Records the first buffer's timing if this is the track's first buffer, then queues
-    /// `mono`.
+    /// Records the first buffer's timing if this is the track's first buffer, counts the
+    /// frames delivered, then queues `mono`.
     ///
     /// `delivered_ticks` should be read at the very top of the capture callback, before any
     /// sample copying, so it measures the callback's arrival rather than its duration.
@@ -183,11 +227,18 @@ impl TrackSink {
     /// real-time callback could do about it.
     pub fn push(&self, host_ticks: u64, delivered_ticks: u64, mono: Vec<f32>) {
         // Mono, so one sample is one frame.
-        let _ = self.first.set(FirstBuffer {
+        let _ = self.delivery.first.set(FirstBuffer {
             host_ticks,
             delivered_ticks,
             frames: mono.len() as u32,
         });
+        // `Relaxed` on purpose: nothing else is published through this counter, and its
+        // reader wants only a monotonic number it can compare against the last one it saw.
+        // An acquire/release pair on an audio callback would be cost for an ordering
+        // guarantee no reader uses.
+        self.delivery
+            .frames
+            .fetch_add(mono.len() as u64, Ordering::Relaxed);
         let _ = self.tx.send(Message::Samples {
             host_ticks,
             delivered_ticks,
@@ -309,7 +360,10 @@ impl TrackWriter {
             sample_rate,
             sink: TrackSink {
                 tx,
-                first: Arc::new(OnceLock::new()),
+                delivery: Arc::new(Delivery {
+                    first: OnceLock::new(),
+                    frames: AtomicU64::new(0),
+                }),
             },
             handle,
         })
@@ -318,6 +372,11 @@ impl TrackWriter {
     /// A handle to hand to a capture callback. Clone freely; they all feed one file.
     pub fn sink(&self) -> TrackSink {
         self.sink.clone()
+    }
+
+    /// A handle for reading what the callback side has delivered while the track is live.
+    pub fn progress(&self) -> TrackProgress {
+        TrackProgress(Arc::clone(&self.sink.delivery))
     }
 
     /// Drains the queue, finalizes the WAV header, and reports what was written.
@@ -332,7 +391,7 @@ impl TrackWriter {
             handle,
         } = self;
 
-        let first = Arc::clone(&sink.first);
+        let delivery = Arc::clone(&sink.delivery);
         let _ = sink.tx.send(Message::Stop);
         drop(sink);
 
@@ -346,7 +405,7 @@ impl TrackWriter {
             frames,
             // Read after the join, so any callback still in flight when `stop` was called
             // has already had its chance to set it.
-            first_buffer: first.get().copied(),
+            first_buffer: delivery.first.get().copied(),
             timing,
         })
     }
@@ -493,6 +552,50 @@ mod tests {
         // Leak deliberately: dropping would send nothing, but joining is exactly what a
         // killed process does not get to do, and that is the case under test.
         std::mem::forget(writer);
+    }
+
+    /// The counter a live liveness check reads has to move as the callback pushes, and has to
+    /// agree with the file once the writer has drained.
+    #[test]
+    fn frames_delivered_advance_as_the_callback_pushes() {
+        let (_dir, path) = temp_wav("delivered.wav");
+        let writer = TrackWriter::create(&path, 48_000).unwrap();
+        let progress = writer.progress();
+        let sink = writer.sink();
+
+        assert_eq!(progress.frames(), 0);
+        assert_eq!(progress.first_buffer(), None);
+
+        sink.push(1_000, 1_500, vec![0.25; 4096]);
+        assert_eq!(progress.frames(), 4096);
+        assert_eq!(progress.first_buffer().map(|b| b.frames), Some(4096));
+
+        sink.push(2_000, 2_500, vec![0.5; 512]);
+        assert_eq!(progress.frames(), 4608);
+        // Still the *first* buffer, not the latest.
+        assert_eq!(progress.first_buffer().map(|b| b.host_ticks), Some(1_000));
+
+        let summary = writer.finish().unwrap();
+        assert_eq!(
+            summary.frames, 4608,
+            "delivered frames disagree with the file"
+        );
+    }
+
+    /// A silent room is delivered as zeros, not as an absence of buffers. This is the property
+    /// the stall rule rests on: counting frames cannot mistake quiet for a dead engine,
+    /// because nothing in the count looks at a sample value.
+    #[test]
+    fn a_track_delivering_silence_advances_the_delivered_count() {
+        let (_dir, path) = temp_wav("silence-counts.wav");
+        let writer = TrackWriter::create(&path, 48_000).unwrap();
+        let progress = writer.progress();
+
+        writer.sink().push(1, 2, vec![0.0; 4096]);
+        assert_eq!(progress.frames(), 4096);
+
+        let summary = writer.finish().unwrap();
+        assert_eq!(summary.frames, 4096);
     }
 
     #[test]

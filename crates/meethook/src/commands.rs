@@ -44,12 +44,25 @@ struct Timing {
     /// Bounded because the failure may be permanent -- a revoked permission, a display that
     /// has gone away -- and an unbounded retry would spin for the length of the meeting.
     attempts: u32,
-    /// How often the activity level is recomputed *while a session is live*.
+    /// How often the world is re-examined *while a session is live*. Two questions are asked
+    /// on this interval, and it is the detection mechanism for only one of them.
     ///
-    /// A safety net rather than the detection mechanism: every edge is expected to arrive
-    /// from a listener, and this exists only because a release edge can be lost outright
-    /// when the recomputation behind a notification reads the world a moment too early. See
-    /// `MicActivityWatcher::recheck`. Nothing is polled while idle.
+    /// The activity level is a safety net: every edge is expected to arrive from a listener,
+    /// and the re-check exists only because a release edge can be lost outright when the
+    /// recomputation behind a notification reads the world a moment too early. See
+    /// `MicActivityWatcher::recheck`.
+    ///
+    /// The microphone's liveness has no listener at all, so this interval *is* how a dead
+    /// capture engine is found. `RunningSession::mic_stalled` declares a stall once the mic
+    /// track's frame count has stood still for its own limit -- one second at 48 kHz, longer
+    /// on a device that delivers more slowly -- and since that limit is shorter than this
+    /// interval, the effective test at 48 kHz is "not one buffer arrived across a whole
+    /// sampling interval", about 23 consecutive missed callbacks. Detection therefore lands
+    /// 0-2 s after the engine dies. The rule is expressed as a duration rather than as "one
+    /// non-advancing sample" so that it stays meaningful if this cadence changes, and so a
+    /// slow device gets its extra margin automatically.
+    ///
+    /// Nothing is polled while idle.
     recheck: Duration,
 }
 
@@ -83,7 +96,7 @@ enum Event {
 ///
 /// The loop's whole responsibility is sequencing -- when to open a session, when to hold on
 /// through a blip, when to finalize, when to give up -- and none of that needs a microphone
-/// to decide. This two-method seam is what makes it decidable in `cargo test`: the live
+/// to decide. This three-method seam is what makes it decidable in `cargo test`: the live
 /// implementation drives a [`Recorder`], and the test one records the order it was called
 /// in. Everything either of them knows about audio stays on their side of it.
 trait Capture {
@@ -91,6 +104,13 @@ trait Capture {
     fn start(&mut self) -> Result<()>;
     /// Finalizes the current session and reports what it produced.
     fn finish(&mut self) -> Result<()>;
+    /// Whether the microphone track has stopped receiving audio.
+    ///
+    /// Asked only while a session is live, once per `Timing::recheck`. The live backend
+    /// answers from the track's own delivered frame count, so it catches every way an input
+    /// tap can go quiet rather than only the ones that post a notification; nothing here
+    /// needs a microphone to decide what the answer means.
+    fn mic_stalled(&mut self) -> bool;
 }
 
 /// The live backend: one session at a time, plus the user-facing report of it.
@@ -145,6 +165,26 @@ impl Capture for SessionCapture<'_> {
             recording.paths.dir().display()
         );
         Ok(())
+    }
+
+    fn mic_stalled(&mut self) -> bool {
+        // Nothing running cannot be stalled. The loop only asks while a session is live, so
+        // defining the case away here is cheaper than a branch that can only ever be wrong --
+        // the same reading `finish` above takes.
+        let Some(session) = self.running.as_mut() else {
+            return false;
+        };
+        let stalled = session.mic_stalled();
+        if self.debug {
+            // The only evidence a hardware run will have for what the counter was doing, so
+            // it is printed on every re-check rather than only when it trips.
+            eprintln!(
+                "[activity] mic delivered {} frames{}",
+                session.mic_frames_delivered(),
+                if stalled { "  <- STALLED" } else { "" }
+            );
+        }
+        stalled
     }
 }
 
@@ -217,7 +257,12 @@ fn announce_watching() {
 /// onto `rx` before returning that level. It is called from three places, for three reasons:
 /// while a session is live it is the safety net for a release edge that was lost outright,
 /// inside [`begin`] it is the level a start retry is driven by, and after a session finalized
-/// by an input-device change it decides whether there is still a call to open a new one for.
+/// by an input-device change or a dead microphone it decides whether there is still a call to
+/// open a new one for.
+///
+/// The same timeout that drives the first of those also asks the capture whether the
+/// microphone track is still receiving audio. That question has no listener behind it, so this
+/// poll is its detection mechanism rather than a safety net; see `Timing::recheck`.
 ///
 /// `already_active` skips the first idle wait, because a call that was already in progress
 /// when this process started will not produce a start edge.
@@ -278,7 +323,22 @@ fn record_loop(
                 // The result is dropped because it is the *edge*, not the level, that ends a
                 // session: the watcher sends the `Stopped` itself, and the next pass through
                 // this loop handles it exactly as it would a timely one.
+                //
+                // The mic's liveness is asked here too, and this is the only place it is
+                // asked. Each place it is *not* asked has its own reason: `begin`'s retry has
+                // no session and no engine, `await_end`'s session is already ending so a dead
+                // engine changes nothing (the same argument its `InputDeviceChanged` arm
+                // already makes), and the idle wait has no session at all. Naming the
+                // consequence too: because the check rides on the timeout, an event arriving
+                // every couple of seconds would starve it. Events while recording are rare by
+                // construction, so that is a hazard to record rather than to engineer around.
                 Err(RecvTimeoutError::Timeout) => {
+                    // Cheapest question first, and one atomic load at that. A dead engine also
+                    // makes the activity level moot until after the finalize, which recomputes
+                    // it anyway.
+                    if capture.mic_stalled() {
+                        break Recording::MicStalled;
+                    }
                     let _ = recheck();
                 }
                 // Every sender is gone, so no edge can arrive again.
@@ -293,6 +353,12 @@ fn record_loop(
                 "The default input device changed. The microphone engine is bound to the \
                  device that went away, so this session is being finalized and a new one \
                  opened on the new device."
+            ),
+            Recording::MicStalled => println!(
+                "The microphone stopped delivering audio, so this session is being finalized \
+                 and a new one opened. (The device did not change; something reconfigured or \
+                 took the input, which stops the recording engine without any notice that it \
+                 happened.)"
             ),
             Recording::Ended | Recording::Interrupted => println!("Stopping..."),
         }
@@ -311,7 +377,13 @@ fn record_loop(
             // the restart inherits `begin`'s bounded retry and its Ctrl-C responsiveness with
             // no second start path. A false answer has already sent `Stopped`, which the idle
             // wait above consumes harmlessly.
-            Recording::DeviceChanged => {
+            //
+            // A stall takes the same arm because the answer is the same: the audio so far is
+            // on disk, and whether to open another session is a question about the call, not
+            // about what killed the engine. Two variants sharing one arm rather than a single
+            // `Restart(Reason)` carrying the message, so that exhaustiveness still forces a
+            // deliberate answer for each and the shape TASK-011 landed stays put.
+            Recording::DeviceChanged | Recording::MicStalled => {
                 if recheck() {
                     already_active = true;
                     continue;
@@ -337,6 +409,10 @@ enum Recording {
     /// The default input device moved out from under the engine: finalize, and open a new
     /// session on the new device if the call is still up.
     DeviceChanged,
+    /// The microphone track stopped receiving audio with no device change behind it -- the
+    /// device reconfigured, something took it exclusively, or the machine slept. Same
+    /// reaction as `DeviceChanged`, different sentence.
+    MicStalled,
 }
 
 /// How the attempt to open a session for the call that just started resolved.
@@ -986,6 +1062,16 @@ mod tests {
         calls: Vec<&'static str>,
         /// How many of the next starts should fail.
         failing_starts: u32,
+        /// How many of the next sessions should report a dead microphone on their first
+        /// re-check. Decremented as it is consumed, mirroring `failing_starts`.
+        stalling_sessions: u32,
+        /// How many times `mic_stalled` was asked, and what that stood at when the first
+        /// session opened.
+        ///
+        /// The second is snapshotted rather than read at the end because asking a capture with
+        /// no session is the bug shape worth catching.
+        mic_stalled_calls: usize,
+        mic_stalled_before_the_first_session: Option<usize>,
         /// How many times the loop has re-checked, shared with the re-check closure.
         rechecks: Arc<AtomicUsize>,
         /// That counter as it stood when the first session opened.
@@ -1006,6 +1092,7 @@ mod tests {
             self.calls.push("start");
             if self.rechecks_before_the_first_session.is_none() {
                 self.rechecks_before_the_first_session = Some(self.rechecks.load(Ordering::SeqCst));
+                self.mic_stalled_before_the_first_session = Some(self.mic_stalled_calls);
             }
             if self.failing_starts > 0 {
                 self.failing_starts -= 1;
@@ -1018,6 +1105,15 @@ mod tests {
             self.calls.push("finish");
             self.finished_at.get_or_insert_with(Instant::now);
             Ok(())
+        }
+
+        fn mic_stalled(&mut self) -> bool {
+            self.mic_stalled_calls += 1;
+            if self.stalling_sessions > 0 {
+                self.stalling_sessions -= 1;
+                return true;
+            }
+            false
         }
     }
 
@@ -1284,6 +1380,99 @@ mod tests {
         record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
 
         assert_eq!(capture.calls, ["start", "start", "finish"]);
+    }
+
+    /// The defect this ticket exists for: an input tap can stop delivering buffers with the
+    /// default device exactly where it was -- the device reconfigured its rate, something took
+    /// it exclusively, the machine slept -- and no notification says so. The frame count
+    /// standing still is what says so, and the answer is the same split a device change gets.
+    ///
+    /// Nothing in this script delivers a stop edge before the interrupt, which is the point:
+    /// only the stall check can end the first session, so *when* it was finalized is the real
+    /// assertion. An undetected stall would also finish, just not until the interrupt.
+    #[test]
+    fn a_stalled_microphone_splits_the_session() {
+        let (_tx, rx) = script(vec![(BLIP, Event::Started), (SETTLE * 3, Event::Interrupt)]);
+
+        let mut capture = FakeCapture {
+            stalling_sessions: 1,
+            ..FakeCapture::default()
+        };
+        let started = Instant::now();
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish", "start", "finish"]);
+        let finished = capture
+            .finished_at
+            .expect("the first session was never finalized")
+            .duration_since(started);
+        assert!(
+            finished < SETTLE * 3,
+            "the interrupt ended this session after {finished:?}, not the stall check"
+        );
+    }
+
+    /// The guard on that restart, same as the device-change one: a mic that dies in the same
+    /// breath as the call ending must not open a session for a call that is over.
+    #[test]
+    fn a_stalled_microphone_does_not_reopen_a_session_for_a_call_that_ended() {
+        let (_tx, rx) = script(vec![(BLIP, Event::Started), (SETTLE, Event::Interrupt)]);
+
+        let mut capture = FakeCapture {
+            stalling_sessions: 1,
+            ..FakeCapture::default()
+        };
+        record_loop(&rx, &mut capture, &|| false, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+    }
+
+    /// The false-positive guard at loop level: a session spanning many re-check intervals with
+    /// a live microphone is one session. A quiet stretch of a meeting looks exactly like this,
+    /// because a live tap delivers silence as samples.
+    #[test]
+    fn a_live_microphone_is_never_mistaken_for_a_stalled_one() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            // Ten re-check intervals of recording before the call ends.
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            stalling_sessions: 0,
+            ..FakeCapture::default()
+        };
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert!(
+            capture.mic_stalled_calls > 0,
+            "the stall check never ran, so this proves nothing"
+        );
+    }
+
+    /// Asking a capture with no session whether its microphone is dead is a bug shape worth a
+    /// test rather than a comment.
+    #[test]
+    fn a_stall_is_never_asked_about_while_idle() {
+        // `SETTLE` is ten re-check intervals, so an idle path that asked at all is caught here
+        // several times over.
+        let (_tx, rx) = script(vec![
+            (SETTLE, Event::Started),
+            (BLIP, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(
+            capture.mic_stalled_before_the_first_session,
+            Some(0),
+            "the idle wait asked a capture with no session whether its microphone was dead"
+        );
     }
 
     /// Nothing is recomputed until there is a session to protect.

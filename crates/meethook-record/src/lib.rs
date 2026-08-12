@@ -217,6 +217,24 @@ impl RunningSession {
         self.speaker.sample_rate()
     }
 
+    /// Whether the microphone track has stopped receiving audio.
+    ///
+    /// Cheap enough to ask on a poll the caller is already making: one relaxed atomic load
+    /// and a comparison. Answers `true` for any reason the tap stopped delivering -- a
+    /// sample-rate reconfiguration, an exclusive grab, a stream-format change, a sleep the
+    /// engine did not return from -- and needs no notification to do it. A microphone that
+    /// has not delivered its first buffer yet is never stalled; that case is a failed start,
+    /// and [`RunningSession::finish`] already reports it as [`Error::SilentTrack`].
+    pub fn mic_stalled(&mut self) -> bool {
+        self.mic.stalled(std::time::Instant::now())
+    }
+
+    /// Frames the microphone tap has delivered so far. A diagnostic for the record loop's
+    /// debug output, not the length of `mic.wav`.
+    pub fn mic_frames_delivered(&self) -> u64 {
+        self.mic.frames_delivered()
+    }
+
     /// Stops both engines, finalizes both WAV headers, and writes `session.json`.
     ///
     /// The metadata write is last and atomic, so the presence of `session.json` keeps
