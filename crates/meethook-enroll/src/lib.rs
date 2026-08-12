@@ -2842,6 +2842,14 @@ mod tests {
             ("Alice", "Alice"),
             "neither answer may cost the other: {output}"
         );
+        // The rendering the user actually reads, checked separately: the defect's visible
+        // symptom was an "Unknown N" line in transcript.md about somebody already named, and
+        // this session has only these two voices, so neither file may mention a stranger.
+        let markdown = std::fs::read_to_string(session.transcript_md()).unwrap();
+        assert!(
+            !markdown.contains("Unknown"),
+            "transcript.md still calls a named voice a stranger: {markdown}"
+        );
         let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
         assert_eq!(speakers.references("Alice"), 2, "{:?}", speakers.speakers);
     }
