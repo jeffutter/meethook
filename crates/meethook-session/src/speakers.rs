@@ -59,6 +59,11 @@ const OLDEST_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 ///   impostor headroom (0.376 -> 0.362), and a blended vector equals no cluster on disk, so it
 ///   would silently stop [`EnrolledSpeakers::forget_reference`]'s exact-equality removal from
 ///   ever firing again.
+///
+/// What makes refusing acceptable rather than merely safest is that the user can now make room
+/// deliberately: `meethook speakers` says which voices each of a person's recordings is naming, and
+/// `meethook forget` removes the one they choose after printing what that costs. So the provenance
+/// this file does not record is *derived* on demand, by whoever is in a position to decide.
 pub const MAX_REFERENCES_PER_SPEAKER: usize = 5;
 
 /// What [`EnrolledSpeakers::store_reference`] did, so a caller can say so in one line.
@@ -292,6 +297,33 @@ impl EnrolledSpeakers {
             .nth(position.checked_sub(1)?)?;
         let mut rest = self.clone();
         rest.speakers.remove(index);
+        Some(rest)
+    }
+
+    /// This database without any of `name`'s references -- which is this person removed, since a
+    /// person is every row bearing their name.
+    ///
+    /// `None` when nothing is stored under that name, the same miss [`Self::without`] reports for
+    /// a position that name does not hold, and for the same reason: the caller does one thing with
+    /// it, which is to say that what the user named is not there.
+    ///
+    /// # Why this is not [`Self::without`] with an `Option`
+    ///
+    /// Removing a person is a *different counterfactual* from removing each of their references in
+    /// turn, and the difference is not cosmetic: for a name holding two rows that both match one
+    /// voice, dropping either alone leaves the other naming it, so a per-reference diff reports no
+    /// change from either while removing the person reverts that voice. A caller wanting to know
+    /// what losing a person costs has to label against this, and cannot aggregate the other.
+    ///
+    /// Pure, like [`Self::without`], and for the same two callers: the preview that says what a
+    /// removal would cost, and the removal itself, which is
+    /// `speakers.without_person(name)?.write(paths)?`.
+    pub fn without_person(&self, name: &str) -> Option<EnrolledSpeakers> {
+        if self.references(name) == 0 {
+            return None;
+        }
+        let mut rest = self.clone();
+        rest.speakers.retain(|speaker| speaker.name != name);
         Some(rest)
     }
 
@@ -822,6 +854,86 @@ mod tests {
             "positions are 1-based"
         );
         assert!(speakers.without("Bob", 1).is_none(), "not enrolled at all");
+    }
+
+    /// Removing a person is removing every row bearing their name, and nobody else's: the other
+    /// names keep their references, in the order they were in either side of the rows that went.
+    #[test]
+    fn without_person_drops_every_row_of_that_name_and_nothing_else() {
+        let mut speakers = EnrolledSpeakers::new(Vec::new());
+        speakers.store_reference("Alice", vec![1.0, 0.0]);
+        speakers.store_reference("Bob", vec![0.0, 1.0]);
+        speakers.store_reference("Alice", vec![0.6, 0.8]);
+        speakers.store_reference("Cara", vec![0.8, -0.6]);
+        speakers.store_reference("Alice", vec![-0.6, 0.8]);
+
+        let rest = speakers.without_person("Alice").unwrap();
+
+        assert_eq!(rest.references("Alice"), 0);
+        assert_eq!(rest.enrolled_names(), ["Bob", "Cara"]);
+        let held: Vec<(&str, &[f32])> = rest
+            .speakers
+            .iter()
+            .map(|s| (s.name.as_str(), s.embedding.as_slice()))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                ("Bob", [0.0, 1.0].as_slice()),
+                ("Cara", [0.8, -0.6].as_slice()),
+            ],
+            "the survivors keep their file order"
+        );
+        // Pure, like `without`: the database it was asked of is what a preview then compares
+        // against.
+        assert_eq!(speakers.references("Alice"), 3);
+    }
+
+    /// The same miss `without` reports, for the same reason: the caller says "that is not stored"
+    /// either way. Names match exactly, so a case slip is a different person and reads as absent.
+    #[test]
+    fn without_person_who_is_not_stored_is_none() {
+        let mut speakers = EnrolledSpeakers::new(Vec::new());
+        speakers.store_reference("Alice", vec![1.0, 0.0]);
+
+        assert!(speakers.without_person("Bob").is_none(), "not enrolled");
+        assert!(
+            speakers.without_person("alice").is_none(),
+            "names match exactly, so alice is not Alice"
+        );
+        assert!(
+            EnrolledSpeakers::new(Vec::new())
+                .without_person("Alice")
+                .is_none(),
+            "nobody is enrolled at all"
+        );
+    }
+
+    /// Removing the only person leaves an empty database rather than a special state: it is
+    /// written as `"speakers": []` and read back as the empty one `read_or_empty` already
+    /// collapses an absent file into, so a removal needs no second path to "nobody is enrolled".
+    #[test]
+    fn removing_the_only_person_round_trips_as_an_empty_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let mut speakers = EnrolledSpeakers::new(Vec::new());
+        speakers.store_reference("Alice", vec![1.0, 0.0]);
+        speakers.store_reference("Alice", vec![0.0, 1.0]);
+
+        speakers
+            .without_person("Alice")
+            .unwrap()
+            .write(&paths)
+            .unwrap();
+
+        let read = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert!(read.speakers.is_empty());
+        assert!(read.enrolled_names().is_empty());
+        assert_eq!(read.schema_version, ENROLLED_SPEAKERS_SCHEMA_VERSION);
+        assert!(
+            paths.speakers_json().is_file(),
+            "the file stays, holding an empty list, rather than being deleted"
+        );
     }
 
     /// The name being stored keeps every one of its own references: somebody else's correction

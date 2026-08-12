@@ -1,6 +1,6 @@
 //! The `meethook` CLI.
 //!
-//! One binary, four subcommands. The spec describes `record` and `transcribe` as
+//! One binary, five subcommands. The spec describes `record` and `transcribe` as
 //! "two binaries" meaning they share no process, no IPC, and no state -- only the on-disk
 //! session contract. Subcommands preserve that: everything below talks to
 //! [`meethook_session`] and to nothing else.
@@ -93,6 +93,30 @@ enum Command {
     /// Takes no options on purpose: the report's whole claim is the scope it scanned, so it
     /// also prints how many sessions it read and names any it could not.
     Speakers,
+
+    /// Remove a stored recording of somebody, or remove them entirely
+    ///
+    /// With --reference, drops the one recording that number addresses in meethook speakers;
+    /// without it, drops every recording of that person, which is that person removed. Prints
+    /// what the removal costs first -- the voices that stop reading them, the ones that start
+    /// reading somebody else, and the ones that gain a name -- and writes nothing until --yes.
+    ///
+    /// A removed reference cannot be rebuilt: the audio it was made from is not consulted and
+    /// may be long deleted. The transcripts of every session whose labelling changes are brought
+    /// in line in the same run.
+    Forget {
+        /// Who to remove, exactly as meethook speakers prints the name
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        /// Remove only this one of their recordings, by the number meethook speakers gives it
+        #[arg(long, value_name = "N")]
+        reference: Option<usize>,
+
+        /// Perform the removal; without this the consequences are printed and nothing is written
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -119,6 +143,11 @@ fn main() -> Result<()> {
             force_reference,
         ),
         Command::Speakers => commands::speakers(&paths),
+        Command::Forget {
+            name,
+            reference,
+            yes,
+        } => commands::forget(&paths, &name, reference, yes),
     }
 }
 

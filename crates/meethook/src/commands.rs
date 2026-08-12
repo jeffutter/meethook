@@ -1,6 +1,6 @@
 //! Subcommand bodies.
 //!
-//! All four are thin: the rules they enforce live in `meethook-record`,
+//! All five are thin: the rules they enforce live in `meethook-record`,
 //! `meethook-transcribe` and `meethook-enroll`, where they can be tested without a terminal.
 //! What is left here is the terminal itself -- printing, prompting, and playing audio --
 //! which is exactly the part no test can decide.
@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use meethook_enroll::{
-    Answer, Enrolment, Interviewer, Offer, Voice, VoiceSelector, run_enroll, run_speakers,
-    write_clip,
+    Answer, Confirm, Enrolment, Forgotten, Interviewer, Offer, Target, Voice, VoiceSelector,
+    run_enroll, run_forget, run_speakers, write_clip,
 };
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
@@ -660,7 +660,7 @@ pub fn enroll(
 
 /// Reports who is enrolled and what each of their stored recordings is currently naming.
 ///
-/// The thinnest of the four, and read-only: everything printed comes back from one call, and
+/// The thinnest of the five, and read-only: everything printed comes back from one call, and
 /// the only decision left here is the exit status.
 pub fn speakers(paths: &Paths) -> Result<()> {
     let scan = run_speakers(paths, &mut io::stdout())?;
@@ -673,6 +673,49 @@ pub fn speakers(paths: &Paths) -> Result<()> {
         bail!(
             "{} session(s) could not be read, so this listing is incomplete",
             scan.unreadable.len()
+        );
+    }
+    Ok(())
+}
+
+/// Removes one stored recording of somebody, or all of them, having first printed what that costs.
+///
+/// Thin for the same reason `speakers` is: every line, including the one telling the user that
+/// nothing was written and how to confirm, comes back from `run_forget`, which is what makes the
+/// wording decidable in `cargo test`. The one decision left here is the exit status.
+pub fn forget(paths: &Paths, name: &str, reference: Option<usize>, yes: bool) -> Result<()> {
+    let target = Target {
+        name: name.to_string(),
+        reference,
+    };
+    // `--yes` is the only thing that lets a write happen, and it is read here rather than passed
+    // through as a bool so the library's own type says which of the two a run is.
+    let confirm = if yes {
+        Confirm::Confirmed
+    } else {
+        Confirm::Preview
+    };
+
+    let removal = match run_forget(paths, &target, confirm, &mut io::stdout())? {
+        // The detail -- the path, and what *is* stored -- has already been printed, so this only
+        // has to make the exit status say the request was not served.
+        Forgotten::NotStored => match reference {
+            Some(handle) => bail!("{name} holds no reference {handle}"),
+            None => bail!("nobody called {name} is enrolled"),
+        },
+        Forgotten::Previewed(removal) | Forgotten::Removed(removal) => removal,
+    };
+
+    // The rule `enroll`, `transcribe` and `speakers` already apply: a request that could not be
+    // fully served makes the run unsuccessful, having first printed the line saying which part it
+    // was. A removal that happened alongside an incomplete scope is not a new shape of outcome --
+    // `enroll` already exits non-zero on a failed session after writing the names it did take.
+    if !removal.unreadable.is_empty() || !removal.unwritable.is_empty() {
+        bail!(
+            "{} session(s) could not be read and {} transcript(s) could not be brought in line, \
+             so this removal is not complete",
+            removal.unreadable.len(),
+            removal.unwritable.len()
         );
     }
     Ok(())

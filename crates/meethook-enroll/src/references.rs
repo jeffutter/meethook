@@ -20,6 +20,13 @@
 //! There is no `write` on any path out of this module, which is why the listing is separable
 //! from the removal that consults it: there is no half-finished on-disk state to leave behind.
 //!
+//! That claim is worth keeping literally true, which is why [`crate::forget`] -- a write path --
+//! lives beside this module rather than in it, and reaches the derivation through
+//! [`label_sessions`], [`Labelled::labels`] and [`Labelled::moved`]. Sharing the derivation rather
+//! than copying it is what guarantees that the preview a user consents to before a removal and the
+//! listing they chose a reference from are the *same* labelling, and that neither can drift into
+//! disagreeing with what `merge` writes.
+//!
 //! # What it can and cannot speak for, said out loud
 //!
 //! A report whose whole claim is completeness has to name its own edges, or its silence gets
@@ -146,15 +153,144 @@ pub struct Unreadable {
 }
 
 /// One session as the diff needs it: everything to label it again, and what it reads now.
-struct Labelled {
-    session: SessionId,
-    clusters: SpeakerClusters,
+pub(crate) struct Labelled {
+    pub(crate) session: SessionId,
+    pub(crate) clusters: SpeakerClusters,
     /// The "Unknown N" numbering the transcript was written with. Also the key set of both
     /// labellings, so a change can always be named by the voice it happened to.
-    unknown: BTreeMap<u32, String>,
-    assigned: Vec<AssignedName>,
+    pub(crate) unknown: BTreeMap<u32, String>,
+    pub(crate) assigned: Vec<AssignedName>,
     /// What every voice reads with the database exactly as it stands on disk.
-    baseline: BTreeMap<u32, Attribution>,
+    pub(crate) baseline: BTreeMap<u32, Attribution>,
+}
+
+impl Labelled {
+    /// What every voice in this session reads with `speakers` in place of the database on disk.
+    ///
+    /// The counterfactual half of the diff. Returned as the map rather than folded into
+    /// [`Self::moved`] so a caller that is going to *act* on the result -- rewriting this
+    /// session's transcript to match -- can hand the very labelling it inspected to
+    /// [`crate::relabel`] instead of deriving it a second time and hoping the two agree.
+    pub(crate) fn labels(&self, speakers: &EnrolledSpeakers) -> BTreeMap<u32, Attribution> {
+        effective_labels(
+            &self.clusters.clusters,
+            &self.unknown,
+            speakers,
+            &self.assigned,
+        )
+    }
+
+    /// Every voice whose label differs between [`Self::baseline`] and `after`, in cluster order.
+    ///
+    /// Compared on the label rather than on the whole attribution: a voice that still reads
+    /// "Alice" through another of her recordings, at a different similarity, has not changed what
+    /// it says. Both maps are keyed by `unknown`, which is built over every cluster in the
+    /// session, so the lookups are total.
+    ///
+    /// Nothing here is ever an [`Attribution::Assigned`] voice on the removal paths that use it:
+    /// no change to the database can move a hand-given name, so a session-only name never appears
+    /// in a diff -- which is how it stays out of every report without a rule saying so.
+    pub(crate) fn moved(&self, after: &BTreeMap<u32, Attribution>) -> Vec<VoiceChange> {
+        let mut changes = Vec::new();
+        for (id, reads) in &self.baseline {
+            let Some(would_read) = after.get(id) else {
+                continue;
+            };
+            if reads.label() == would_read.label() {
+                continue;
+            }
+            changes.push(VoiceChange {
+                session: self.session.clone(),
+                voice: self.unknown[id].clone(),
+                reads: reads.label().to_string(),
+                would_read: would_read.label().to_string(),
+            });
+        }
+        changes
+    }
+}
+
+/// Every transcribed session a labelling can speak for, and the ones it cannot.
+///
+/// The scope statement and the per-session baselines together, because they are two halves of one
+/// claim: a report that printed "no voice changes" without the count it read would be silence
+/// mistaken for evidence.
+pub(crate) struct Labelling {
+    /// One entry per session actually labelled, in discovery order.
+    pub(crate) sessions: Vec<Labelled>,
+    /// Session directories under `sessions/`, whatever state each is in.
+    pub(crate) found: usize,
+    /// Those of them with a transcript, which are the only ones that have a labelling at all.
+    pub(crate) transcribed: usize,
+    /// Transcribed sessions with no opinion in them, each with its reason and remedy.
+    pub(crate) unreadable: Vec<Unreadable>,
+}
+
+/// Labels every transcribed session under the root against `speakers`, naming the ones it could
+/// not read.
+///
+/// The shared half of the derivation: [`scan`] is this plus one counterfactual per stored
+/// reference, and [`crate::forget`] is this plus one counterfactual per removal. A session that
+/// cannot be read is named in [`Labelling::unreadable`] and skipped rather than failing the run,
+/// because one session transcribed by a build too old to have recorded first appearances must not
+/// cost the report on all the others.
+pub(crate) fn label_sessions(paths: &Paths, speakers: &EnrolledSpeakers) -> Result<Labelling> {
+    let discovered = discover_sessions(paths)?;
+    let mut labelling = Labelling {
+        sessions: Vec::new(),
+        found: discovered.len(),
+        transcribed: 0,
+        unreadable: Vec::new(),
+    };
+
+    for session in &discovered {
+        if session.classification != Classification::Transcribed {
+            continue;
+        }
+        labelling.transcribed += 1;
+
+        let clusters = match SpeakerClusters::read(&session.paths.speaker_clusters_json()) {
+            Ok(clusters) => clusters,
+            // The expected instance is a file from before first appearances were recorded:
+            // without them an "Unknown 2" cannot be mapped back to a voice at all.
+            Err(e) => {
+                labelling.unreadable.push(Unreadable {
+                    session: session.id.clone(),
+                    why: format!("{e} -- re-transcribe this session with --force"),
+                });
+                continue;
+            }
+        };
+        let assigned = match SpeakerNames::read_or_empty(&session.paths, &session.id) {
+            Ok(assigned) => assigned.names,
+            // No re-transcribe recovers this one: the file holds names a person typed, so the
+            // only honest instruction is to go and look at it.
+            Err(e) => {
+                labelling.unreadable.push(Unreadable {
+                    session: session.id.clone(),
+                    why: format!("{e} -- fix or delete that file"),
+                });
+                continue;
+            }
+        };
+
+        let unknown = unknown_labels(
+            clusters
+                .clusters
+                .iter()
+                .map(|c| (c.id, c.first_spoke_seconds)),
+        );
+        let baseline = effective_labels(&clusters.clusters, &unknown, speakers, &assigned);
+        labelling.sessions.push(Labelled {
+            session: session.id.clone(),
+            clusters,
+            unknown,
+            assigned,
+            baseline,
+        });
+    }
+
+    Ok(labelling)
 }
 
 /// What every stored reference is currently naming, derived from the sessions on disk.
@@ -190,62 +326,16 @@ pub fn scan(paths: &Paths) -> Result<Scan> {
         return Ok(Scan::default());
     }
 
-    let discovered = discover_sessions(paths)?;
+    let labelling = label_sessions(paths, &speakers)?;
     let mut found = Scan {
-        sessions_found: discovered.len(),
+        sessions_found: labelling.found,
+        sessions_transcribed: labelling.transcribed,
+        // Read off the list that was built rather than subtracted from the counts, so the two
+        // cannot drift apart.
+        sessions_read: labelling.sessions.len(),
+        unreadable: labelling.unreadable,
         ..Scan::default()
     };
-
-    let mut labelled: Vec<Labelled> = Vec::new();
-    for session in &discovered {
-        if session.classification != Classification::Transcribed {
-            continue;
-        }
-        found.sessions_transcribed += 1;
-
-        let clusters = match SpeakerClusters::read(&session.paths.speaker_clusters_json()) {
-            Ok(clusters) => clusters,
-            // The expected instance is a file from before first appearances were recorded:
-            // without them an "Unknown 2" cannot be mapped back to a voice at all.
-            Err(e) => {
-                found.unreadable.push(Unreadable {
-                    session: session.id.clone(),
-                    why: format!("{e} -- re-transcribe this session with --force"),
-                });
-                continue;
-            }
-        };
-        let assigned = match SpeakerNames::read_or_empty(&session.paths, &session.id) {
-            Ok(assigned) => assigned.names,
-            // No re-transcribe recovers this one: the file holds names a person typed, so the
-            // only honest instruction is to go and look at it.
-            Err(e) => {
-                found.unreadable.push(Unreadable {
-                    session: session.id.clone(),
-                    why: format!("{e} -- fix or delete that file"),
-                });
-                continue;
-            }
-        };
-
-        let unknown = unknown_labels(
-            clusters
-                .clusters
-                .iter()
-                .map(|c| (c.id, c.first_spoke_seconds)),
-        );
-        let baseline = effective_labels(&clusters.clusters, &unknown, &speakers, &assigned);
-        labelled.push(Labelled {
-            session: session.id.clone(),
-            clusters,
-            unknown,
-            assigned,
-            baseline,
-        });
-    }
-    // Read off the list that was built rather than subtracted from the counts, so the two
-    // cannot drift apart.
-    found.sessions_read = labelled.len();
 
     for name in speakers.enrolled_names() {
         let held = speakers.references(name);
@@ -258,37 +348,11 @@ pub fn scan(paths: &Paths) -> Result<Scan> {
             };
             let mut depends = Vec::new();
             let mut elsewhere = Vec::new();
-            for session in &labelled {
-                let after = effective_labels(
-                    &session.clusters.clusters,
-                    &session.unknown,
-                    &rest,
-                    &session.assigned,
-                );
-                for (id, reads) in &session.baseline {
-                    // Compared on the label rather than on the whole attribution: a voice that
-                    // still reads "Alice" through another of her recordings, at a different
-                    // similarity, has not changed what it says. Both maps are keyed by
-                    // `unknown`, so the `get` is total and the indexing below is too.
-                    let Some(would_read) = after.get(id) else {
-                        continue;
-                    };
-                    if reads.label() == would_read.label() {
-                        continue;
-                    }
-                    let change = VoiceChange {
-                        session: session.session.clone(),
-                        voice: session.unknown[id].clone(),
-                        reads: reads.label().to_string(),
-                        would_read: would_read.label().to_string(),
-                    };
+            for session in &labelling.sessions {
+                for change in session.moved(&session.labels(&rest)) {
                     // A voice reading *this* person is what this reference is naming; anything
                     // else moving is a consequence of the removal rather than its subject.
-                    // Nothing filed under a reference is ever an `Attribution::Assigned` voice:
-                    // removing a row cannot change a hand-given name, so it never shows in a
-                    // diff, which is how a session-only name stays out of every reference's
-                    // dependents without a rule here saying so.
-                    if reads.label() == name {
+                    if change.reads == name {
                         depends.push(change);
                     } else {
                         elsewhere.push(change);
@@ -323,12 +387,7 @@ pub fn run_speakers(paths: &Paths, out: &mut dyn Write) -> Result<Scan> {
     let found = scan(paths)?;
 
     if found.people.is_empty() {
-        writeln!(
-            out,
-            "Nobody is enrolled: {} holds no references -- meethook enroll names the voices in \
-             a session",
-            paths.speakers_json().display()
-        )?;
+        write_nobody_enrolled(out, paths)?;
         return Ok(found);
     }
 
@@ -402,12 +461,28 @@ pub fn run_speakers(paths: &Paths, out: &mut dyn Write) -> Result<Scan> {
 
 /// One moved voice on one line: where it is, which voice it is, and both labels.
 ///
-/// One writer for both lists, so the two cannot end up describing the same fact differently.
-fn write_change(out: &mut dyn Write, change: &VoiceChange) -> Result<()> {
+/// One writer for both lists, so the two cannot end up describing the same fact differently --
+/// and visible to the crate for the same reason, so a voice reads identically in this listing and
+/// in the removal a user reaches from it.
+pub(crate) fn write_change(out: &mut dyn Write, change: &VoiceChange) -> Result<()> {
     writeln!(
         out,
         "      {}  {} reads {}, would read {}",
         change.session, change.voice, change.reads, change.would_read
+    )?;
+    Ok(())
+}
+
+/// Nobody is enrolled at all, said once for every command that has to say it.
+///
+/// A listing and a removal both reach this state, and two commands wording the same fact
+/// differently is what makes a user wonder whether they mean the same thing.
+pub(crate) fn write_nobody_enrolled(out: &mut dyn Write, paths: &Paths) -> Result<()> {
+    writeln!(
+        out,
+        "Nobody is enrolled: {} holds no references -- meethook enroll names the voices in a \
+         session",
+        paths.speakers_json().display()
     )?;
     Ok(())
 }
@@ -421,8 +496,8 @@ fn write_change(out: &mut dyn Write, change: &VoiceChange) -> Result<()> {
 mod tests {
     use super::*;
     use crate::tests::{
-        assigned_in, axis, enrolled, heard_at_once, make_session, named_for_its_session, nearly,
-        voice, with_embeddings,
+        assigned_in, axis, enrolled, files_under, heard_at_once, make_session,
+        named_for_its_session, nearly, voice, with_embeddings,
     };
 
     /// The scan and its listing together, since every test below wants both: a report whose
@@ -826,27 +901,5 @@ mod tests {
         // Named so the assertion above is about the files that exist rather than about a path
         // that was never written.
         assert!(session.speaker_names_json().is_file());
-    }
-
-    /// Every file under a directory, by path and by contents, so a comparison covers a file
-    /// created or removed as well as one rewritten.
-    fn files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-        fn walk(dir: &std::path::Path, into: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
-            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .collect();
-            entries.sort();
-            for path in entries {
-                if path.is_dir() {
-                    walk(&path, into);
-                } else {
-                    into.push((path.clone(), std::fs::read(&path).unwrap()));
-                }
-            }
-        }
-        let mut files = Vec::new();
-        walk(root, &mut files);
-        files
     }
 }

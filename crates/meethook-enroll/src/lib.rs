@@ -32,7 +32,7 @@
 //! with nothing left to ask about would otherwise keep calling a named colleague "Unknown 2"
 //! for good. Files that already agree are left alone, byte for byte.
 //!
-//! # This crate also *reports* on the database it writes
+//! # This crate also *reports on* and *removes from* the database it writes
 //!
 //! [`run_speakers`] answers the question the file cannot: who is enrolled, and what is each
 //! stored recording of them actually naming. It lives here rather than beside `speakers.json`
@@ -41,9 +41,16 @@
 //! the two-labelling diff `enroll_session` already performs over a single session before it
 //! honours an answer. See the `references` module for the derivation and its cost. Nothing on
 //! that path writes anything.
+//!
+//! [`run_forget`] is the removal that report exists to inform: it takes the same derivation, uses
+//! it to say what dropping a reference -- or a whole person -- would cost, and writes only once the
+//! user has confirmed. See the `forget` module for the ordering and the wording. It is the last
+//! thing in the tool that used to require a text editor.
 
+mod forget;
 mod references;
 
+pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
 pub use references::{Enrolled, Reference, Scan, Unreadable, VoiceChange, run_speakers, scan};
 
 use std::collections::BTreeMap;
@@ -966,14 +973,17 @@ fn enroll_session(
                 session.id
             )?,
             Some(Stored::AtCapacity { held }) => {
+                // Both commands, and in this order: the line cannot know which reference should
+                // go -- that is the question `speakers` exists to answer -- and naming only
+                // `forget` would send the user to pick a number blind.
                 writeln!(
                     out,
                     "{}  named {name} in this session only: {name} already holds {held} \
                      reference(s), the most meethook keeps for one person, so this recording \
-                     is not stored and does not help recognise them -- remove one from {} to \
-                     make room",
-                    session.id,
-                    paths.speakers_json().display()
+                     is not stored and does not help recognise them -- meethook speakers shows \
+                     what each of them is naming, meethook forget {name} --reference N removes \
+                     the one you pick",
+                    session.id
                 )?;
                 report.session_only += 1;
             }
@@ -1339,7 +1349,11 @@ fn cost_of(
 ///
 /// Nothing is written when nothing changed, which is what makes a skipped session leave its
 /// files byte-identical rather than merely equivalent.
-fn relabel(transcript: &mut Transcript, labels: &BTreeMap<u32, Attribution>) -> bool {
+///
+/// Visible to the crate rather than to this file because [`forget`] brings a transcript in line
+/// through exactly this too: a removal that rewrote transcripts any other way would be a second
+/// producer of the labels `merge` writes.
+pub(crate) fn relabel(transcript: &mut Transcript, labels: &BTreeMap<u32, Attribution>) -> bool {
     let mut changed = false;
     for turn in &mut transcript.turns {
         if turn.source_track != SourceTrack::Speaker {
@@ -1803,7 +1817,7 @@ mod tests {
         embedding
     }
 
-    fn transcript_of(session: &SessionPaths) -> Transcript {
+    pub(crate) fn transcript_of(session: &SessionPaths) -> Transcript {
         Transcript::read(&session.transcript_json()).unwrap()
     }
 
@@ -1813,8 +1827,34 @@ mod tests {
         SpeakerNames::read_or_empty(session, &SessionId::parse(id).unwrap()).unwrap()
     }
 
+    /// Every file under a directory, by path and by contents, so a comparison covers a file
+    /// created or removed as well as one rewritten.
+    ///
+    /// Here rather than in one test module because "wrote nothing" is a claim two commands make,
+    /// and it has to mean the same thing in both: byte-for-byte over the whole root rather than
+    /// over the files each was expected to touch.
+    pub(crate) fn files_under(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(dir: &Path, into: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, into);
+                } else {
+                    into.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(root, &mut files);
+        files
+    }
+
     /// Turns as (speaker, text, confidence), which is what a reader of the transcript sees.
-    fn said(transcript: &Transcript) -> Vec<(&str, &str, Option<f32>)> {
+    pub(crate) fn said(transcript: &Transcript) -> Vec<(&str, &str, Option<f32>)> {
         transcript
             .turns
             .iter()
@@ -3018,9 +3058,20 @@ mod tests {
             )),
             "{output}"
         );
+        // The remedy is two commands rather than a file path: this is the line that used to send
+        // people to a text editor, and both halves have to be on it -- `speakers` because the
+        // line cannot know which reference should go, `forget` because that is what removes it.
         assert!(
-            output.contains(&paths.speakers_json().display().to_string()),
-            "the line has to say where to make room: {output}"
+            output.contains("meethook speakers shows what each of them is naming"),
+            "the line has to say how to see what each recording is naming: {output}"
+        );
+        assert!(
+            output.contains("meethook forget Alice --reference N removes the one you pick"),
+            "the line has to name the command that makes room: {output}"
+        );
+        assert!(
+            !output.contains(&paths.speakers_json().display().to_string()),
+            "no remedy in this tool is a hand-edit of speakers.json any more: {output}"
         );
     }
 
