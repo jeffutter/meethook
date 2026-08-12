@@ -619,8 +619,8 @@ pub fn enroll(
     // meeting -- which is exactly what a session-scoped name does not do.
     if report.session_only > 0 {
         println!(
-            "{} of those named in their own session only, too quiet for a reference -- \
-             meethook enroll --force-reference stores one anyway",
+            "{} of those named in their own session only, with no reference stored -- \
+             each said why on its own line above",
             report.session_only
         );
     }
@@ -635,6 +635,16 @@ pub fn enroll(
         println!(
             "{} quieter voice(s) not offered -- meethook enroll --all asks about those too",
             report.held_back
+        );
+    }
+    // An answer declined because honouring it would have taken a name off another voice. Only
+    // when there were any, like the two above, and worth its own line rather than being folded
+    // into the skips: those voices are still unnamed *and* the user has already answered them,
+    // so the next step is to read the refusal lines rather than to answer again.
+    if report.refused > 0 {
+        println!(
+            "{} answer(s) refused: honouring them would have un-named another voice",
+            report.refused
         );
     }
     // Skips and pass-overs are ordinary; a request that could not be served -- a session that

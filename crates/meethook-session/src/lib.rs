@@ -49,7 +49,10 @@ pub use speaker_clusters::{
     SpeakerCluster, SpeakerClusters, unknown_labels,
 };
 pub use speaker_names::{AssignedName, SPEAKER_NAMES_SCHEMA_VERSION, SpeakerNames};
-pub use speakers::{ENROLLED_SPEAKERS_SCHEMA_VERSION, EnrolledSpeaker, EnrolledSpeakers};
+pub use speakers::{
+    Displaced, ENROLLED_SPEAKERS_SCHEMA_VERSION, EnrolledSpeaker, EnrolledSpeakers,
+    MAX_REFERENCES_PER_SPEAKER, Stored,
+};
 pub use transcript::{
     SourceTrack, TRANSCRIPT_SCHEMA_VERSION, Transcript, Turn, YOU as SPEAKER_YOU, unknown_speaker,
 };
@@ -82,6 +85,30 @@ pub enum Error {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
+    },
+
+    /// A file that parsed fine but claims a schema version this build has never heard of. In
+    /// practice that means a newer meethook wrote it and this one has been downgraded onto it.
+    ///
+    /// Distinct from [`Error::Json`] on purpose: that is "these bytes are not the shape I
+    /// expected", and a user's remedy is to look at the file. This is "these bytes are a shape
+    /// I have no rule for", and the remedy is to move the binary rather than the data -- so the
+    /// remedy is in the `Display` here rather than appended by each caller, because both
+    /// readers of `speakers.json` reach it outside any per-session loop and simply `?` it.
+    ///
+    /// The wording covers a version below the readable range as well as above it, because the
+    /// gate is a range check and a message that assumed "newer" would be a guess. `oldest` and
+    /// `newest` are the range this build reads, inclusive.
+    #[error(
+        "{path} claims schema_version {found}, which this build does not understand (it reads \
+         {oldest} through {newest}) -- upgrade meethook if a newer one wrote that file, or move \
+         it aside to start a new database"
+    )]
+    UnsupportedSchema {
+        path: PathBuf,
+        found: u32,
+        oldest: u32,
+        newest: u32,
     },
 }
 

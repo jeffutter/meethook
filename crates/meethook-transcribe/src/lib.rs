@@ -1296,6 +1296,37 @@ mod tests {
         );
     }
 
+    /// The same rule for a database this build has no rule for rather than one it cannot parse:
+    /// a `speakers.json` from a newer meethook read as though it were this one would silently
+    /// name nobody, so the batch fails by name instead. An *older* one is migrated rather than
+    /// refused -- references cannot be regenerated from audio that may be deleted -- which is
+    /// why this is the only version that stops a run.
+    #[test]
+    fn a_speakers_file_from_a_newer_meethook_fails_the_batch_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600", 0);
+        std::fs::write(
+            paths.speakers_json(),
+            b"{\"schema_version\": 99, \"speakers\": []}",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let error =
+            run_batch(&paths, &[], false, &mut || Ok(fake_engines()), &mut out).unwrap_err();
+
+        assert!(error.to_string().contains("speakers.json"), "{error}");
+        assert!(error.to_string().contains("upgrade meethook"), "{error}");
+        assert!(
+            !paths
+                .session(&SessionId::parse("20260809-052600").unwrap())
+                .transcript_json()
+                .exists(),
+            "a batch that could not read the database must not write half-named transcripts"
+        );
+    }
+
     /// Acceptance criterion #1. The derived track appears; the recording it was derived from
     /// is not touched, compared byte for byte rather than by size or mtime.
     #[test]

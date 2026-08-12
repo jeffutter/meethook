@@ -1523,14 +1523,26 @@ fn print_enrolled_distances(clusters: &[SpeakerCluster]) {
             Some(id) => println!("\n  speaker {} -> {}", cluster.id, id.name),
             None => println!("\n  speaker {} -> unidentified", cluster.id),
         }
+        // A person is every row bearing their name, so one name prints as several lines.
+        // Numbered per person, because three identical labels in a row read as one line
+        // repeated rather than as three recordings of one voice.
+        let mut nth: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         for speaker in &enrolled.speakers {
+            let held = enrolled.references(&speaker.name);
+            let index = nth.entry(speaker.name.as_str()).or_default();
+            *index += 1;
+            let label = if held == 1 {
+                speaker.name.clone()
+            } else {
+                format!("{} #{index}/{held}", speaker.name)
+            };
+
             // A reference of a different length came from a different embedding model, and
             // `best_match` skips it for that reason. Printing a truncated `zip` of the two as
             // a distance would invent evidence about an entry identification is ignoring.
             if speaker.embedding.len() != cluster.embedding.len() {
                 println!(
-                    "    {:<20} not comparable ({} dims vs the cluster's {})",
-                    speaker.name,
+                    "    {label:<20} not comparable ({} dims vs the cluster's {})",
                     speaker.embedding.len(),
                     cluster.embedding.len()
                 );
@@ -1545,10 +1557,13 @@ fn print_enrolled_distances(clusters: &[SpeakerCluster]) {
                 .zip(&cluster.embedding)
                 .map(|(a, b)| a * b)
                 .sum();
-            let accepted = matched.is_some_and(|id| id.name == speaker.name);
+            // Only the *nearest* of a person's references wins the argmax, so "accepted" is
+            // marked on that one row rather than on every row bearing the winning name --
+            // which would claim identification rested on evidence it never looked at.
+            let accepted =
+                matched.is_some_and(|id| id.name == speaker.name && id.similarity == cosine);
             println!(
-                "    {:<20} {:>7.3}  {}",
-                speaker.name,
+                "    {label:<20} {:>7.3}  {}",
                 1.0 - cosine,
                 if accepted { "accepted" } else { "rejected" }
             );
