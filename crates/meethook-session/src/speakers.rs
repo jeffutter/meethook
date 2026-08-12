@@ -172,6 +172,24 @@ impl EnrolledSpeakers {
         self.speakers.iter().filter(|s| s.name == name).count()
     }
 
+    /// Every enrolled name, deduplicated, in the order it first appears -- which is enrolment
+    /// order, since nothing here ever reorders or replaces a row.
+    ///
+    /// The counterpart to [`Self::references`], which answers "how many" for a name somebody
+    /// already has: this is what a caller with no name in hand asks first. Here rather than
+    /// derived from `speakers` at the call site for the reason the type doc gives -- a caller
+    /// iterating the rows and calling them people is counting recordings, and would list a
+    /// person once per reference they hold.
+    pub fn enrolled_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for speaker in &self.speakers {
+            if !names.contains(&speaker.name.as_str()) {
+                names.push(&speaker.name);
+            }
+        }
+        names
+    }
+
     /// Records `embedding` as another recording of `name`, reporting what that did.
     ///
     /// Nothing existing is ever modified or removed: the only outcomes are one row appended or
@@ -239,6 +257,42 @@ impl EnrolledSpeakers {
             displaced.push(Displaced { name, remaining });
         }
         displaced
+    }
+
+    /// This database without one of `name`'s references, addressed by its 1-based position
+    /// among the rows bearing that name in file order -- the same position
+    /// [`Self::enrolled_names`] and [`Self::references`] count in.
+    ///
+    /// `None` when that name does not hold that many, which covers a name that is not enrolled
+    /// at all, a position past the end, and a zero. Those are one outcome rather than three
+    /// because the caller does one thing with each: report that the reference the user named is
+    /// not there.
+    ///
+    /// # Why this returns a database rather than removing a row
+    ///
+    /// Two callers need this and only one of them is a removal. A report on what a reference is
+    /// currently naming needs the *counterfactual* -- label every session against the database
+    /// as it stands, then again without one row, and the diff is what that row is doing -- and a
+    /// mutating removal would make it clone-and-restore around every comparison. A removal is
+    /// then `speakers.without(name, handle)?.write(paths)?`, so the mapping from a printed
+    /// position back to a row exists in exactly one place: the contract between what a listing
+    /// prints and what a removal acts on.
+    ///
+    /// Nothing here knows about renumbering. The positions are of the list as it was read, so a
+    /// caller holding a stale one is removing a row the user did not choose -- which is why a
+    /// removal should echo what the chosen reference names before it writes, rather than this
+    /// trying to detect it.
+    pub fn without(&self, name: &str, position: usize) -> Option<EnrolledSpeakers> {
+        let index = self
+            .speakers
+            .iter()
+            .enumerate()
+            .filter(|(_, speaker)| speaker.name == name)
+            .map(|(index, _)| index)
+            .nth(position.checked_sub(1)?)?;
+        let mut rest = self.clone();
+        rest.speakers.remove(index);
+        Some(rest)
     }
 
     pub fn write(&self, paths: &Paths) -> Result<()> {
@@ -684,6 +738,90 @@ mod tests {
 
         assert!(speakers.forget_reference(&[1.0, 0.0], "Ryan").is_empty());
         assert_eq!(speakers.references("Nate"), 1);
+    }
+
+    /// A person is every row bearing their name, so the list of people is the list of names --
+    /// deduplicated, and in the order enrolment put them in rather than sorted.
+    #[test]
+    fn the_enrolled_names_are_deduplicated_in_first_appearance_order() {
+        let mut speakers = EnrolledSpeakers::new(Vec::new());
+        speakers.store_reference("Silas", vec![1.0, 0.0]);
+        speakers.store_reference("Alice", vec![0.0, 1.0]);
+        speakers.store_reference("Silas", vec![0.6, 0.8]);
+
+        assert_eq!(speakers.enrolled_names(), ["Silas", "Alice"]);
+    }
+
+    #[test]
+    fn an_empty_database_has_nobody_enrolled() {
+        assert!(
+            EnrolledSpeakers::new(Vec::new())
+                .enrolled_names()
+                .is_empty()
+        );
+    }
+
+    /// The handle-to-row mapping: position 2 of Alice's three is Alice's second row in file
+    /// order, and nothing else in the database moves.
+    #[test]
+    fn without_drops_the_addressed_row_and_only_that_row() {
+        let mut speakers = EnrolledSpeakers::new(Vec::new());
+        speakers.store_reference("Alice", vec![1.0, 0.0]);
+        speakers.store_reference("Bob", vec![0.0, 1.0]);
+        speakers.store_reference("Alice", vec![0.6, 0.8]);
+        speakers.store_reference("Alice", vec![0.8, -0.6]);
+
+        let rest = speakers.without("Alice", 2).unwrap();
+
+        assert_eq!(rest.references("Alice"), 2);
+        assert_eq!(rest.references("Bob"), 1);
+        let held: Vec<(&str, &[f32])> = rest
+            .speakers
+            .iter()
+            .map(|s| (s.name.as_str(), s.embedding.as_slice()))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                ("Alice", [1.0, 0.0].as_slice()),
+                ("Bob", [0.0, 1.0].as_slice()),
+                ("Alice", [0.8, -0.6].as_slice()),
+            ],
+            "file order is preserved either side of the removed row"
+        );
+        // Pure: the database it was asked of is untouched, which is what makes it usable as a
+        // counterfactual rather than only as a write.
+        assert_eq!(speakers.references("Alice"), 3);
+    }
+
+    /// Removing a name's last reference leaves that name with none, which is the case a caller
+    /// has to be able to reach: the whole point of a per-reference handle is that it also
+    /// addresses the degenerate one-row person.
+    #[test]
+    fn without_the_last_row_leaves_that_name_with_none() {
+        let mut speakers = EnrolledSpeakers::new(Vec::new());
+        speakers.store_reference("Alice", vec![1.0, 0.0]);
+
+        let rest = speakers.without("Alice", 1).unwrap();
+
+        assert_eq!(rest.references("Alice"), 0);
+        assert!(rest.enrolled_names().is_empty());
+    }
+
+    /// The three ways of naming a reference that is not there are one outcome, because the
+    /// caller says the same thing about each: that is not a reference this name holds.
+    #[test]
+    fn without_a_reference_that_is_not_there_is_none() {
+        let mut speakers = EnrolledSpeakers::new(Vec::new());
+        speakers.store_reference("Alice", vec![1.0, 0.0]);
+        speakers.store_reference("Alice", vec![0.0, 1.0]);
+
+        assert!(speakers.without("Alice", 3).is_none(), "past the end");
+        assert!(
+            speakers.without("Alice", 0).is_none(),
+            "positions are 1-based"
+        );
+        assert!(speakers.without("Bob", 1).is_none(), "not enrolled at all");
     }
 
     /// The name being stored keeps every one of its own references: somebody else's correction

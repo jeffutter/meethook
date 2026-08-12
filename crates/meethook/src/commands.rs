@@ -1,6 +1,6 @@
 //! Subcommand bodies.
 //!
-//! All three are thin: the rules they enforce live in `meethook-record`,
+//! All four are thin: the rules they enforce live in `meethook-record`,
 //! `meethook-transcribe` and `meethook-enroll`, where they can be tested without a terminal.
 //! What is left here is the terminal itself -- printing, prompting, and playing audio --
 //! which is exactly the part no test can decide.
@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use meethook_enroll::{
-    Answer, Enrolment, Interviewer, Offer, Voice, VoiceSelector, run_enroll, write_clip,
+    Answer, Enrolment, Interviewer, Offer, Voice, VoiceSelector, run_enroll, run_speakers,
+    write_clip,
 };
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
@@ -653,6 +654,26 @@ pub fn enroll(
     // the line saying which it was, so this only has to make the exit status say so too.
     if report.failed > 0 {
         bail!("{} enroll request(s) could not be served", report.failed);
+    }
+    Ok(())
+}
+
+/// Reports who is enrolled and what each of their stored recordings is currently naming.
+///
+/// The thinnest of the four, and read-only: everything printed comes back from one call, and
+/// the only decision left here is the exit status.
+pub fn speakers(paths: &Paths) -> Result<()> {
+    let scan = run_speakers(paths, &mut io::stdout())?;
+
+    // A report whose entire claim is its completeness must not exit 0 while admitting it could
+    // not read three sessions. The same rule `enroll` and `transcribe` apply to a request they
+    // could not serve, and as there, each one has already printed the line saying which it was
+    // -- above the whole listing, which is still printed.
+    if !scan.unreadable.is_empty() {
+        bail!(
+            "{} session(s) could not be read, so this listing is incomplete",
+            scan.unreadable.len()
+        );
     }
     Ok(())
 }

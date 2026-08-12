@@ -1,6 +1,6 @@
 //! The `meethook` CLI.
 //!
-//! One binary, three subcommands. The spec describes `record` and `transcribe` as
+//! One binary, four subcommands. The spec describes `record` and `transcribe` as
 //! "two binaries" meaning they share no process, no IPC, and no state -- only the on-disk
 //! session contract. Subcommands preserve that: everything below talks to
 //! [`meethook_session`] and to nothing else.
@@ -81,6 +81,18 @@ enum Command {
         #[arg(long)]
         force_reference: bool,
     },
+
+    /// Report who is enrolled and what each stored recording of them is naming
+    ///
+    /// A person can hold several recordings, and in speakers.json they are indistinguishable
+    /// from each other -- which is a problem at the point one of them has to go. For each
+    /// recording this names the voices, by session and by the label they read as, that would
+    /// stop reading that person if it were removed; one naming nothing in any session on disk
+    /// is the one to drop. Reads every transcribed session under --root and writes nothing.
+    ///
+    /// Takes no options on purpose: the report's whole claim is the scope it scanned, so it
+    /// also prints how many sessions it read and names any it could not.
+    Speakers,
 }
 
 fn main() -> Result<()> {
@@ -106,6 +118,7 @@ fn main() -> Result<()> {
             correct,
             force_reference,
         ),
+        Command::Speakers => commands::speakers(&paths),
     }
 }
 

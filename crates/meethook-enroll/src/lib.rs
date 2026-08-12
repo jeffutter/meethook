@@ -31,6 +31,20 @@
 //! before its speaker was enrolled is brought up to date on the way past, since a session
 //! with nothing left to ask about would otherwise keep calling a named colleague "Unknown 2"
 //! for good. Files that already agree are left alone, byte for byte.
+//!
+//! # This crate also *reports* on the database it writes
+//!
+//! [`run_speakers`] answers the question the file cannot: who is enrolled, and what is each
+//! stored recording of them actually naming. It lives here rather than beside `speakers.json`
+//! because the answer is not a fact about that file -- it is derived by labelling every session
+//! on disk twice, once with the database as it stands and once with one row removed, which is
+//! the two-labelling diff `enroll_session` already performs over a single session before it
+//! honours an answer. See the `references` module for the derivation and its cost. Nothing on
+//! that path writes anything.
+
+mod references;
+
+pub use references::{Enrolled, Reference, Scan, Unreadable, VoiceChange, run_speakers, scan};
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -1188,7 +1202,11 @@ fn targeted<'c>(
 /// `clusters` is what identification runs over and what `assigned` is resolved against;
 /// `unknown` is what the transcript was written with, and is the key set of the result. Those
 /// two are built from the same file, so every voice gets an entry.
-fn effective_labels(
+///
+/// Visible to the crate rather than to this file because [`references`] labels sessions through
+/// exactly this too: the claim that a reference is naming some voice is only as good as its
+/// being the same labelling the transcript is written with.
+pub(crate) fn effective_labels(
     clusters: &[SpeakerCluster],
     unknown: &BTreeMap<u32, String>,
     speakers: &EnrolledSpeakers,
@@ -1491,7 +1509,7 @@ mod tests {
 
     /// A distinct unit vector per cluster id, so enrolling one of these voices matches that
     /// cluster and nobody else's.
-    fn voice(id: u32) -> Vec<f32> {
+    pub(crate) fn voice(id: u32) -> Vec<f32> {
         let mut embedding = vec![0.0f32; 4];
         embedding[id as usize % 4] = 1.0;
         embedding
@@ -1500,7 +1518,7 @@ mod tests {
     /// A unit vector `degrees` away from cluster 0's, for the fixtures that are about how
     /// close two voices are: one person clustering split in two, or one reference that matches
     /// both halves. 0.35 of cosine distance is `IDENTIFY_DISTANCE`, so 49 degrees is the edge.
-    fn nearly(degrees: f32) -> Vec<f32> {
+    pub(crate) fn nearly(degrees: f32) -> Vec<f32> {
         let radians = degrees.to_radians();
         vec![radians.cos(), radians.sin(), 0.0, 0.0]
     }
@@ -1561,7 +1579,7 @@ mod tests {
     ///
     /// The transcript is written with the labels `transcribe` would have given it against an
     /// empty database, which is the state `enroll` is for.
-    fn make_session(paths: &Paths, id: &str) -> SessionPaths {
+    pub(crate) fn make_session(paths: &Paths, id: &str) -> SessionPaths {
         let id = SessionId::parse(id).unwrap();
         let session = paths.session(&id);
         std::fs::create_dir_all(session.dir()).unwrap();
@@ -1699,7 +1717,7 @@ mod tests {
 
     /// The database `enroll` would have written by naming these clusters, so a test can start
     /// from "the wrong person is already on this voice" without running a first pass.
-    fn enrolled(entries: &[(&str, Vec<f32>)], paths: &Paths) {
+    pub(crate) fn enrolled(entries: &[(&str, Vec<f32>)], paths: &Paths) {
         EnrolledSpeakers::new(
             entries
                 .iter()
@@ -1750,7 +1768,7 @@ mod tests {
     /// Rewrites this session's cluster embeddings, ids in order, leaving everything else as
     /// [`make_session`] wrote it. The fixture's default is one orthogonal vector per cluster;
     /// the tests about near voices are the ones that need to say otherwise.
-    fn with_embeddings(session: &SessionPaths, embeddings: &[Vec<f32>]) {
+    pub(crate) fn with_embeddings(session: &SessionPaths, embeddings: &[Vec<f32>]) {
         let mut clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
         for (cluster, embedding) in clusters.clusters.iter_mut().zip(embeddings) {
             cluster.embedding = embedding.clone();
@@ -1764,7 +1782,7 @@ mod tests {
     /// and it is what the heard-at-once veto acts on -- so it is also the one way an answer can
     /// still cost another voice its name once references accumulate rather than replace.
     /// Written on both sides, as `speaker_clusters.json` documents it.
-    fn heard_at_once(session: &SessionPaths, a: u32, b: u32) {
+    pub(crate) fn heard_at_once(session: &SessionPaths, a: u32, b: u32) {
         let mut clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
         for cluster in &mut clusters.clusters {
             if cluster.id == a {
@@ -1779,7 +1797,7 @@ mod tests {
     /// A unit vector on one axis of an `axes`-wide space: every pair of these is orthogonal, so
     /// no two of them can ever be matched to one another however many references pile up.
     /// [`voice`] is the same idea fixed at four dimensions.
-    fn axis(which: usize, axes: usize) -> Vec<f32> {
+    pub(crate) fn axis(which: usize, axes: usize) -> Vec<f32> {
         let mut embedding = vec![0.0f32; axes];
         embedding[which] = 1.0;
         embedding
@@ -1791,7 +1809,7 @@ mod tests {
 
     /// This session's hand-given names as they stand on disk, which is where an answer to a
     /// voice too quiet for a reference goes instead of into `speakers.json`.
-    fn assigned_in(session: &SessionPaths, id: &str) -> SpeakerNames {
+    pub(crate) fn assigned_in(session: &SessionPaths, id: &str) -> SpeakerNames {
         SpeakerNames::read_or_empty(session, &SessionId::parse(id).unwrap()).unwrap()
     }
 
@@ -3546,7 +3564,7 @@ mod tests {
     /// A session whose second voice is under both floors and has already been named for this
     /// session alone -- the state the tests below start from. Cluster 0 is left unresolved on
     /// purpose, so each of them can also show what happens to a voice nobody named.
-    fn named_for_its_session(paths: &Paths, id: &str) -> SessionPaths {
+    pub(crate) fn named_for_its_session(paths: &Paths, id: &str) -> SessionPaths {
         let session = make_session(paths, id);
         with_speech_seconds(&session, &[40.0, 1.5]);
 
