@@ -35,6 +35,7 @@ use webrtc_audio_processing::{Config, Processor, config::EchoCanceller};
 
 use crate::align::{self, Alignment, NotMeasurable};
 use crate::audio::TARGET_RATE;
+use crate::progress::Phase;
 
 /// AEC3's frame size is fixed at 10 ms, and feeding it any other length is a panic rather
 /// than an error, so the 16 kHz frame size is pinned here rather than left to be discovered
@@ -279,7 +280,14 @@ fn subtract(mic: &[f32], reference: &[f32]) -> (Vec<f32>, Option<f64>) {
         into[available..].fill(0.0);
     };
 
-    for start in (0..processed_len).step_by(SAMPLES_PER_FRAME) {
+    // The longest single stretch of the pre-pass: 294,000 frames through AEC3 on a 49-minute
+    // session, several minutes with nothing else to say for itself. Counted in frames rather
+    // than samples, because the phase sizes its own throttle from how many ticks to expect.
+    let frames = processed_len.div_ceil(SAMPLES_PER_FRAME);
+    let mut phase = Phase::start("cancelling echo");
+
+    for (frame, start) in (0..processed_len).step_by(SAMPLES_PER_FRAME).enumerate() {
+        phase.at(frame, frames);
         // A track whose length is not a multiple of 160 leaves a partial final frame. It is
         // zero-padded to a full frame and trimmed back afterwards; this is the one place a
         // sample could be silently gained or lost.
@@ -302,6 +310,7 @@ fn subtract(mic: &[f32], reference: &[f32]) -> (Vec<f32>, Option<f64>) {
             erle.push(db);
         }
     }
+    phase.done();
 
     cleaned.drain(..PROCESSOR_DELAY.min(cleaned.len()));
     cleaned.truncate(mic.len());

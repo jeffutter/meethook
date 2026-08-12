@@ -177,6 +177,14 @@ impl SpeechToText for WhisperEngine {
     /// tests running against a fake recogniser, and means both of a session's tracks are gated
     /// by one code path with no branch to get wrong.
     fn transcribe(&mut self, audio_16k_mono: &[f32]) -> Result<Vec<AsrSegment>> {
+        // Bracketing note rather than progress: Silero runs over the whole track before the
+        // gate can say anything about it -- a minute or so on a 49-minute session -- and it
+        // exposes no callback to tick from, so saying what is being scanned before it starts
+        // is all that is available. The `report` line below closes it with the answer.
+        eprintln!(
+            "speech gate: scanning {:.0} s for speech...",
+            audio_16k_mono.len() as f64 / f64::from(TARGET_RATE)
+        );
         let regions = self.vad.speech_regions(audio_16k_mono, self.tuning)?;
         let plan = gate::Splice::plan(&regions, audio_16k_mono.len());
         report(audio_16k_mono.len(), plan.as_ref());
@@ -251,6 +259,25 @@ impl SpeechToText for WhisperEngine {
         //    repetition artefact and this is the knob to reach for if that becomes the
         //    complaint.
         params.set_no_context(true);
+
+        // Decoding a meeting is minutes of work behind one call, so whisper.cpp's own progress
+        // hook is attached: it fires from the head of the main loop, once per 30 s decoder
+        // window, with a percentage of the spliced buffer -- ~85 calls on a 49-minute speaker
+        // track, which the phase's own throttle turns into a handful of lines.
+        //
+        // Two properties of this API are load-bearing and neither is obvious:
+        //
+        // 1. whisper-rs requires `FnMut(i32) + 'static`, so the closure cannot borrow the
+        //    engine or a caller-supplied writer. It owns its phase and prints to stderr, which
+        //    is where `report` below already puts the gate's numbers for the same reason.
+        // 2. `set_progress_callback_safe` hands the boxed closure to `Box::into_raw` and
+        //    nothing ever reclaims it -- `FullParams` has no `Drop` and clears its own safe
+        //    field. So this leaks one small box per call, two per session. That is acceptable
+        //    for a per-meeting cost, but it is deliberate rather than missed.
+        let mut phase = crate::progress::Phase::start("transcribing");
+        params.set_progress_callback_safe(move |percent: i32| {
+            phase.at(percent.max(0) as usize, 100);
+        });
 
         // Every other decoder parameter is left at whisper.cpp's default, checked rather than
         // assumed against the vendored 1.8.3: `suppress_blank` is already true (`:5946`),

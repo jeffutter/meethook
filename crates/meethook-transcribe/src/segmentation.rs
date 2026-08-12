@@ -15,6 +15,7 @@ use ort::session::Session;
 use ort::value::TensorRef;
 
 use crate::audio::TARGET_RATE;
+use crate::progress::Phase;
 use crate::{Error, Result};
 
 /// One stretch of speech by one window-local speaker, timed from the start of the track.
@@ -117,10 +118,16 @@ pub fn segment_speaker_track(samples_16k: &[f32], session: &mut Session) -> Resu
     let mut window = vec![0.0f32; WINDOW_SAMPLES];
     let mut turns = Vec::new();
 
+    // Diarization is the one phase of a session that used to print nothing whatsoever, and it
+    // is one graph inference per ten seconds of meeting -- 294 of them on a 49-minute session.
+    let windows = samples_16k.len().div_ceil(WINDOW_STEP_SAMPLES);
+    let mut phase = Phase::start("diarize: segmenting");
+
     for (index, offset) in (0..samples_16k.len())
         .step_by(WINDOW_STEP_SAMPLES)
         .enumerate()
     {
+        phase.at(index, windows);
         let present = &samples_16k[offset..samples_16k.len().min(offset + WINDOW_SAMPLES)];
         window[..present.len()].copy_from_slice(present);
         window[present.len()..].fill(0.0);
@@ -145,6 +152,7 @@ pub fn segment_speaker_track(samples_16k: &[f32], session: &mut Session) -> Resu
             &mut turns,
         );
     }
+    phase.done();
 
     // The last window was padded with silence, and silence produces no turns -- but a turn
     // that was still open when the real audio ran out would otherwise be reported as

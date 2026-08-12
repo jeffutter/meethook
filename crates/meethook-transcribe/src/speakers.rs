@@ -26,6 +26,7 @@ use ort::value::TensorRef;
 
 use crate::audio::TARGET_RATE;
 use crate::fbank::{Fbank, MEL_BINS};
+use crate::progress::Phase;
 use crate::segmentation::LocalTurn;
 use crate::{Error, Result};
 
@@ -299,7 +300,11 @@ pub fn cluster_speaker_turns(
     let mut embeddings = Vec::new();
     let mut sources = Vec::new();
     let mut seconds = Vec::new();
+    // One filterbank pass and one embedding inference per turn, and a long meeting has
+    // hundreds of turns -- the second half of the diarization stretch that used to be silent.
+    let mut phase = Phase::start("diarize: embedding voices");
     for (index, turn) in turns.iter().enumerate() {
+        phase.at(index, turns.len());
         if turn.end_s - turn.start_s < MIN_EMBEDDABLE_SECONDS {
             continue;
         }
@@ -310,6 +315,7 @@ pub fn cluster_speaker_turns(
         sources.push(index);
         seconds.push(turn.end_s - turn.start_s);
     }
+    phase.done();
 
     let constraints: Vec<(usize, usize)> = sources
         .iter()
@@ -511,7 +517,15 @@ fn agglomerate(embeddings: &[Vec<f32>], constraints: &[(usize, usize)]) -> Vec<V
         "a seed held a cannot-link pair, which one key per turn makes impossible"
     );
 
+    // Every pass looks at every surviving pair, and each pass merges at most one of them, so
+    // the work is quadratic in seeds -- a silent minute of its own on a meeting with a
+    // four-figure turn count. One merge is the natural tick, and the seed count is the most
+    // merges that can ever happen.
+    let seeded = groups.len();
+    let mut phase = Phase::start("diarize: clustering voices");
+
     loop {
+        phase.at(seeded - groups.len(), seeded);
         let mut best = None;
         for a in 0..groups.len() {
             for b in 0..a {
@@ -527,6 +541,7 @@ fn agglomerate(embeddings: &[Vec<f32>], constraints: &[(usize, usize)]) -> Vec<V
         groups[b].extend(merged);
         groups[b].sort_unstable();
     }
+    phase.done();
     groups
 }
 

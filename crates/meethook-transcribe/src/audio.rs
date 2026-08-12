@@ -11,6 +11,7 @@ use hound::{SampleFormat, WavReader, WavSpec};
 use meethook_session::write_atomic_with;
 use rubato::{FftFixedIn, Resampler};
 
+use crate::progress::Phase;
 use crate::{Error, Result};
 
 /// The sample rate whisper.cpp requires. Not configurable: it is a property of the model.
@@ -60,19 +61,41 @@ pub fn read_track_16k_mono(path: &Path) -> Result<Vec<f32>> {
     }
 
     let frames = reader.len() as usize;
+    // Half a gigabyte of 48 kHz audio takes a minute or so to read and resample a sample at a
+    // time, and this is the first thing `transcribe` does, so it is also the first stretch of
+    // silence a user would have to guess about. Named after the file, because a session reads
+    // two of these back to back.
+    let mut phase = Phase::start(format!("reading {}", file_name(path)));
+
     if spec.sample_rate == TARGET_RATE {
         let mut samples = Vec::with_capacity(frames);
         for sample in reader.into_samples::<f32>() {
+            phase.at(samples.len(), frames);
             samples.push(sample.map_err(|e| Error::wav(path, e))?);
         }
+        phase.done();
         return Ok(samples);
     }
 
     let mut resample = Resample::new(spec.sample_rate, frames)?;
-    for sample in reader.into_samples::<f32>() {
+    for (read, sample) in reader.into_samples::<f32>().enumerate() {
+        phase.at(read, frames);
         resample.push(sample.map_err(|e| Error::wav(path, e))?)?;
     }
-    resample.finish()
+    let samples = resample.finish();
+    phase.done();
+    samples
+}
+
+/// A path's file name for a progress label, falling back to the whole path.
+///
+/// Lossy rather than fallible: this decides what a heartbeat line says, and a track whose name
+/// is not UTF-8 is still a track worth reporting progress over.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Converts audio already held in memory to [`TARGET_RATE`].
@@ -104,12 +127,19 @@ pub(crate) fn write_track_16k_mono(path: &Path, audio: &[f32]) -> Result<()> {
         // channel mask says front-centre instead of hound's front-left.
         let mut writer = meethook_session::wav::new(std::io::BufWriter::new(file), TRACK_SPEC)
             .map_err(|e| Error::wav(path, e))?;
-        for sample in audio {
+        // Usually finishes inside the reporting interval and therefore usually says nothing --
+        // but it is 47 million `write_sample` calls on a long session, on a disk that may not
+        // be fast, and covering it costs a masked counter.
+        let mut phase = Phase::start(format!("writing {}", file_name(path)));
+        for (written, sample) in audio.iter().enumerate() {
+            phase.at(written, audio.len());
             writer
                 .write_sample(*sample)
                 .map_err(|e| Error::wav(path, e))?;
         }
-        writer.finalize().map_err(|e| Error::wav(path, e))
+        let finalized = writer.finalize().map_err(|e| Error::wav(path, e));
+        phase.done();
+        finalized
     })
 }
 

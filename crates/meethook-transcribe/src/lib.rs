@@ -25,6 +25,7 @@ mod import;
 mod levels;
 mod merge;
 mod onnx;
+mod progress;
 mod reference;
 mod segmentation;
 mod speakers;
@@ -1371,6 +1372,34 @@ mod tests {
         );
         let progress = String::from_utf8(progress).unwrap();
         assert!(progress.contains("no echo cancellation"), "{progress}");
+    }
+
+    /// The per-session record is exactly one line about the pre-pass, and nothing else may be
+    /// routed into it. Every phase heartbeat goes to stderr instead -- see [`progress`] -- so
+    /// this asserts the *absence* of that output as well as the presence of the cleaning line:
+    /// a later change that pointed a phase at this writer would put percentages into the
+    /// greppable batch log, and that is what this test exists to fail on.
+    #[test]
+    fn the_per_session_record_carries_the_cleaning_line_and_no_progress_reporting() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_bleeding_session(&paths, "20260809-052600");
+
+        let mut progress = Vec::new();
+        transcribe_session(
+            &session,
+            &mut FakeAsr::default(),
+            &mut FakeDiarizer::default(),
+            &nobody_enrolled(),
+            &mut progress,
+        )
+        .unwrap();
+
+        let progress = String::from_utf8(progress).unwrap();
+        let lines: Vec<&str> = progress.lines().collect();
+        assert_eq!(lines.len(), 1, "{progress}");
+        assert!(lines[0].contains("speaker bleed cancelled"), "{progress}");
+        assert!(!progress.contains('%'), "{progress}");
     }
 
     #[test]

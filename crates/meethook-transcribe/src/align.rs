@@ -55,6 +55,7 @@ use realfft::num_complex::Complex32;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 use crate::audio::TARGET_RATE;
+use crate::progress::Phase;
 
 /// Both tracks are expected at Whisper's rate, which is the rate the rest of this crate
 /// already works in.
@@ -215,8 +216,14 @@ pub fn measure_reference_lag(
     let starts = select_windows(speaker_16k, first_start, last_start, window);
     let correlator = Correlator::new((capture + window).next_power_of_two());
 
+    // Reported separately from the scan above rather than as one continuous phase: the two
+    // halves are different work over different counts -- a walk over the whole track, then at
+    // most `MAX_WINDOWS` FFT correlations -- and a percentage that jumped back to zero halfway
+    // would read as a bug. Both are usually quick, in which case neither says anything.
+    let mut phase = Phase::start("aligning: correlating windows");
     let mut lags: Vec<i64> = Vec::with_capacity(starts.len());
-    for start in &starts {
+    for (measured, start) in starts.iter().enumerate() {
+        phase.at(measured, starts.len());
         let reference = &speaker_16k[*start as usize..*start as usize + window];
         let heard_from = (start + lo_lag) as usize;
         let heard = &mic_16k[heard_from..heard_from + capture];
@@ -224,6 +231,7 @@ pub fn measure_reference_lag(
             lags.push(lo_lag + offset);
         }
     }
+    phase.done();
 
     aggregate(lags, starts.len())
 }
@@ -239,9 +247,18 @@ fn select_windows(speaker: &[f32], first_start: i64, last_start: i64, window: us
     // over the track in total, which is cheaper than it looks and needs no prefix-sum array
     // the size of an hour of audio.
     let block = window / 4;
+    // Four passes over an hour of audio, summing squares, is the expensive half of alignment
+    // and the half that has no natural loop counter of its own -- so the candidate count is
+    // derived up front purely to have a total to report against.
+    let candidates_total = ((last_start - first_start).max(0) / block as i64) as usize + 1;
+    let mut phase = Phase::start("aligning: scanning for reference windows");
+
     let mut candidates: Vec<(f64, i64)> = Vec::new();
+    let mut scanned = 0usize;
     let mut start = first_start;
     while start <= last_start {
+        phase.at(scanned, candidates_total);
+        scanned += 1;
         let slice = &speaker[start as usize..start as usize + window];
         let energy: f64 = slice.iter().map(|s| f64::from(*s) * f64::from(*s)).sum();
         if energy > 0.0 {
@@ -249,6 +266,7 @@ fn select_windows(speaker: &[f32], first_start: i64, last_start: i64, window: us
         }
         start += block as i64;
     }
+    phase.done();
 
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut chosen: Vec<i64> = Vec::with_capacity(MAX_WINDOWS);
