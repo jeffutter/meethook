@@ -185,6 +185,39 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Where a voice sits in the questions this run has for one session: "the 2nd of 9".
+///
+/// Reads as `2/9`. The point of it is that an interview otherwise has no visible end -- the
+/// count printed on the session line has scrolled away behind the snippets and the clips by
+/// the second or third question -- so every prompt carries the same number back.
+///
+/// Two things it deliberately is not:
+///
+/// - `of` counts the voices this run *offered for this session*, which is the number the
+///   session line already printed. It is not a run-wide total, because that would mean reading
+///   every session up front, and it does not include the voices held back under
+///   `PROMPT_FLOOR_SECONDS`, which are reported on their own clause and are not questions this
+///   run will ask.
+/// - `nth` is the voice's place in that queue, not a tally of the questions actually asked. An
+///   answer can name a voice further down the queue -- clustering splitting one person in two
+///   -- and that voice is then passed over, so a number can be skipped: 1/4, 2/4, 4/4. The gap
+///   is the honest reading, because it means `of - nth` is a true upper bound on the questions
+///   left rather than a promise of more questions than the run will ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    /// 1-based place in the queue this run offered for this session. Never greater than `of`.
+    pub nth: usize,
+    /// How many voices this run offered for this session.
+    pub of: usize,
+}
+
+impl std::fmt::Display for Position {
+    /// One place decides the form, so no two [`Interviewer`]s can disagree about it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.nth, self.of)
+    }
+}
+
 /// One voice being asked about, and everything needed to ask.
 ///
 /// Usually a voice nothing in the database matched, which is what `enroll` exists for. Under
@@ -196,6 +229,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// would have to be made in is exactly the sort of thing a seam should not be leaking.
 pub struct Voice<'a> {
     pub session: &'a SessionId,
+
+    /// Which of this session's questions this is, and how many there are.
+    ///
+    /// Carried across the seam rather than counted on the far side, because an [`Interviewer`]
+    /// counting its own calls would be counting a different thing -- the questions asked, not
+    /// the queue -- and could not know the total at all. Restarts at 1 for each session of a
+    /// run; `session` above says which one.
+    pub position: Position,
 
     /// What this voice is currently called, and on what basis.
     ///
@@ -658,7 +699,11 @@ fn enroll_session(
     // legitimately be one the database had already named.
     let baseline = shown.clone();
 
-    for cluster in offered {
+    // The total every prompt below carries. Read off the same list the session line counted
+    // one call ago, so the two cannot drift apart.
+    let of = offered.len();
+
+    for (index, cluster) in offered.into_iter().enumerate() {
         // A voice an answer given earlier in this run has already put a name to: clustering
         // that split one person in two must not ask about them twice. Only an in-run answer
         // can have moved a label since `baseline` was taken, so "named, and not the name it
@@ -666,6 +711,10 @@ fn enroll_session(
         // half matters as much: an in-run answer can also *un*-name a voice -- re-anchoring a
         // reference to another cluster drops this one back to its "Unknown N" -- and that is a
         // question this run created and has not answered.
+        //
+        // This `continue` is the one place a [`Position`] skips a number, and it is skipped
+        // rather than compressed on purpose: the voice really was in the queue and really is
+        // now answered, so the gap says work disappeared and the end came closer.
         if shown[&cluster.id].is_named() && shown[&cluster.id] != baseline[&cluster.id] {
             continue;
         }
@@ -690,6 +739,7 @@ fn enroll_session(
 
             interviewer.identify(&Voice {
                 session: &session.id,
+                position: Position { nth: index + 1, of },
                 attribution,
                 speech_seconds: cluster.speech_seconds,
                 snippets,
@@ -896,6 +946,10 @@ fn queue<'c>(
 
     // "Unresolved" is false under `--correct`, where most of the queue is resolved and the
     // point is to review it. The default wording is left exactly as it was.
+    //
+    // `offered.len()` here is the same number every prompt below carries as its [`Position`]
+    // total, because both read this list. Anything that computes this count independently
+    // breaks that.
     let counted = if offer.named {
         let already = offered.iter().filter(|c| shown[&c.id].is_named()).count();
         format!(
@@ -957,6 +1011,7 @@ fn targeted<'c>(
 
     match matched.len() {
         1 => {
+            // The literal 1 is this run's whole queue, so the one prompt below reads `1/1`.
             writeln!(
                 out,
                 "{}  1 voice selected: {}",
@@ -1154,6 +1209,9 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct Shown {
         session: String,
+        /// Which of this session's questions this was, and how many there were, exactly as the
+        /// prompt was handed it.
+        position: Position,
         /// What the prompt was told this voice is called and on what basis -- which is the only
         /// way a test can check that a correction prompt asked "is this right" rather than
         /// "who is this", and that a voice named for one session says so.
@@ -1193,12 +1251,19 @@ mod tests {
         fn labels(&self) -> Vec<&str> {
             self.seen.iter().map(Shown::label).collect()
         }
+
+        /// The positions as the user reads them, through [`Display`] rather than as a pair, so
+        /// an assertion covers the form on the screen and not only the two numbers.
+        fn positions(&self) -> Vec<String> {
+            self.seen.iter().map(|v| v.position.to_string()).collect()
+        }
     }
 
     impl Interviewer for Scripted {
         fn identify(&mut self, voice: &Voice<'_>) -> Answer {
             self.seen.push(Shown {
                 session: voice.session.to_string(),
+                position: voice.position,
                 attribution: voice.attribution.clone(),
                 speech_seconds: voice.speech_seconds,
                 snippets: voice.snippets.iter().map(|s| s.to_string()).collect(),
@@ -1811,6 +1876,82 @@ mod tests {
                 session.dir().display()
             );
         }
+    }
+
+    /// TASK-026 acceptance criteria #1 and #2: every prompt says which voice it is of how
+    /// many, and that total is the number the session line printed just above the questions.
+    /// Asserted together, because the whole value of the number is that it agrees with what
+    /// the user was told a moment ago.
+    #[test]
+    fn every_prompt_says_which_voice_it_is_of_how_many() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::default();
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(interviewer.positions(), ["1/2", "2/2"], "{output}");
+        assert!(output.contains("2 unresolved voice(s)"), "{output}");
+    }
+
+    /// TASK-026 acceptance criteria #4 and #6: a run over several sessions counts each session
+    /// separately, and the session on the same prompt says which one a position belongs to.
+    ///
+    /// The second session's total is 1 rather than 2 because Alice is identified out of its
+    /// queue before any question is asked -- which is acceptance criterion #2 from the other
+    /// direction: the total is whatever that session actually offered.
+    #[test]
+    fn positions_restart_in_each_session_of_a_run() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        make_session(&paths, "20260809-052700");
+
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        let sessions: Vec<&str> = interviewer
+            .seen
+            .iter()
+            .map(|v| v.session.as_str())
+            .collect();
+        assert_eq!(
+            sessions,
+            ["20260809-052600", "20260809-052600", "20260809-052700"],
+            "{output}"
+        );
+        assert_eq!(interviewer.positions(), ["1/2", "2/2", "1/1"], "{output}");
+        assert!(
+            output.contains("20260809-052700  1 unresolved voice(s)"),
+            "{output}"
+        );
+    }
+
+    /// TASK-026 acceptance criterion #3, and the decision behind it made assertable: a voice an
+    /// earlier answer in the same run named is passed over, and its number goes with it. The
+    /// positions read 1/4, 2/4, 4/4 -- a gap in the middle and a total that does not shrink --
+    /// because the total is what the session line promised and the gap is a question that
+    /// answered itself.
+    #[test]
+    fn a_voice_an_earlier_answer_named_leaves_a_gap_in_the_positions() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_fragmented_session(&paths, "20260809-052600");
+        // Clusters 0 and 2 are one person that clustering split in two, so naming the first
+        // names the third on the way past.
+        with_embeddings(&session, &[nearly(0.0), voice(1), nearly(20.0), voice(3)]);
+
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (_, output) = run_asking(&paths, &[], ALL, &mut interviewer);
+
+        assert_eq!(
+            interviewer.labels(),
+            ["Unknown 1", "Unknown 2", "Unknown 4"],
+            "Unknown 3 is Alice, already named by the first answer: {output}"
+        );
+        assert_eq!(interviewer.positions(), ["1/4", "2/4", "4/4"], "{output}");
+        assert!(output.contains("4 unresolved voice(s)"), "{output}");
     }
 
     /// Acceptance criterion #8: nothing to ask about is passed over silently rather than
@@ -2768,6 +2909,11 @@ mod tests {
 
         assert_eq!(interviewer.labels(), ["Unknown 2"], "{output}");
         assert_eq!(report.named, 1, "{output}");
+        // TASK-026: a targeted run says `1/1` rather than suppressing the position. It is true,
+        // and it says the useful thing -- this is the only question, the run ends after this
+        // answer. Suppressing it would put a rule about when a position is worth showing inside
+        // the terminal, where no test can see what the user was shown.
+        assert_eq!(interviewer.positions(), ["1/1"], "{output}");
         assert_eq!(
             said(&transcript_of(&session))
                 .iter()
@@ -2829,10 +2975,16 @@ mod tests {
         assert!(!output.contains("not offered"), "{output}");
     }
 
-    /// Acceptance criterion #4, written as the comparison it actually is rather than as
-    /// literal expectations: the prompt a targeted voice gets is the prompt that voice gets in
-    /// a full run -- same header, same snippets, same clip -- because it is produced by the
+    /// TASK-025 acceptance criterion #4, written as the comparison it actually is rather than
+    /// as literal expectations: the prompt a targeted voice gets is the prompt that voice gets
+    /// in a full run -- same header, same snippets, same clip -- because it is produced by the
     /// same code from the same cluster.
+    ///
+    /// Everything but the position, which is a fact about the *run* rather than about the
+    /// voice, and a run aimed at one voice genuinely is a different run: it has one question in
+    /// it. Destructured exhaustively, no `..`, so that a field added to [`Voice`] later cannot
+    /// quietly fall out of this comparison -- the compiler makes the author name it and say
+    /// which side of the line it is on.
     #[test]
     fn a_targeted_prompt_is_what_the_full_run_would_have_shown() {
         let id = "20260809-052600";
@@ -2851,7 +3003,26 @@ mod tests {
         let (_, output) = run_targeting(&targeted_paths, &[id], "2", &mut aimed);
 
         assert_eq!(aimed.seen.len(), 1, "{output}");
-        assert_eq!(aimed.seen[0], queued.seen[1]);
+        let Shown {
+            session,
+            position,
+            attribution,
+            speech_seconds,
+            snippets,
+            clip_samples,
+        } = &aimed.seen[0];
+        let queued = &queued.seen[1];
+        assert_eq!(session, &queued.session);
+        assert_eq!(attribution, &queued.attribution);
+        assert_eq!(speech_seconds, &queued.speech_seconds);
+        assert_eq!(snippets, &queued.snippets);
+        assert_eq!(clip_samples, &queued.clip_samples);
+        assert_eq!(
+            (position.to_string(), queued.position.to_string()),
+            ("1/1".to_string(), "2/2".to_string()),
+            "the position is the one thing that differs, because it counts the run's questions \
+             and the targeted run has one"
+        );
     }
 
     /// Acceptance criterion #5: reaching a voice differently does not write differently. A

@@ -631,27 +631,29 @@ impl Interviewer for Terminal {
     fn identify(&mut self, voice: &Voice<'_>) -> Answer {
         // An already-named voice is a different question -- "is this right", not "who is
         // this" -- and asking the second one with a name already on the screen invites the
-        // user to type that name straight back in. Both lines say which question it is.
-        match voice.attribution {
-            Attribution::Identified { name, similarity } => println!(
-                "\n{}  {name} -- {} of speech, identified at {similarity:.2} confidence",
-                voice.session,
-                speech(voice.speech_seconds)
+        // user to type that name straight back in. The basis clause says which question it is.
+        let (label, basis) = match voice.attribution {
+            Attribution::Identified { name, similarity } => (
+                name.as_str(),
+                format!(", identified at {similarity:.2} confidence"),
             ),
             // No confidence to print, and saying so matters: this name is here because
             // somebody typed it, and it is recorded against this session rather than as a
             // reference, so it will not follow the person into the next meeting.
-            Attribution::Assigned { name } => println!(
-                "\n{}  {name} -- {} of speech, named for this session",
-                voice.session,
-                speech(voice.speech_seconds)
-            ),
-            Attribution::Unknown(label) => println!(
-                "\n{}  {label} -- {} of speech",
-                voice.session,
-                speech(voice.speech_seconds)
-            ),
-        }
+            Attribution::Assigned { name } => {
+                (name.as_str(), ", named for this session".to_string())
+            }
+            Attribution::Unknown(label) => (label.as_str(), String::new()),
+        };
+        // The position sits right after the session id, at a fixed column: what it is for is
+        // being findable by eye on every header, which a suffix after a variable-length speech
+        // time would not be.
+        println!(
+            "\n{}  {}  {label} -- {} of speech{basis}",
+            voice.session,
+            voice.position,
+            speech(voice.speech_seconds)
+        );
         if voice.snippets.is_empty() {
             println!("    (nothing was transcribed for this voice)");
         }
