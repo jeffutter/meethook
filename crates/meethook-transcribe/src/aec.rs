@@ -74,6 +74,23 @@ const PROCESSOR_DELAY: usize = 128;
 /// that is a few milliseconds optimistic still lands on the working side of zero.
 const RENDER_HEADROOM: i64 = TARGET_RATE as i64 * 20 / 1000;
 
+/// How many frames pass between readings of AEC3's echo-return-loss figure: one a second.
+///
+/// The figure is only ever used for a median across the whole track, and a median does not
+/// need 294,000 samples of anything. At this stride a 49-minute session still contributes
+/// ~2,900 readings, which is far more than enough to place one, while the loop stops making
+/// 294,000 FFI calls into C++ and stops accumulating a 2.35 MB `Vec<f64>` to produce a single
+/// number.
+///
+/// What a stride actually samples is worth knowing, because it is not what the loop looks
+/// like it does. The APM hands stats over a queue that holds exactly one entry
+/// (`ApmStatsReporter` in `audio_processing_impl.cc`: `stats_message_queue_(1)`, whose
+/// `Insert` discards when full). A read therefore returns what the *first frame after the
+/// previous read* produced, with everything in between dropped. So this is a uniform
+/// subsample of the per-frame series at a fixed phase -- exactly what a median wants, and
+/// neither a smoothed value nor a final one.
+const FRAMES_PER_STATS_READ: usize = 100;
+
 /// A mic track with the speaker bleed taken out of it, and an account of what happened.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cleaned {
@@ -184,7 +201,7 @@ pub fn cancel_bleed(mic_16k: &[f32], speaker_16k: &[f32], metadata_offset_s: f64
     };
 
     let reference = shift_reference(speaker_16k, lag - RENDER_HEADROOM, mic_16k.len());
-    let (audio, erle_db) = subtract(mic_16k, &reference);
+    let (audio, erle_db) = subtract(mic_16k, &reference, FRAMES_PER_STATS_READ);
 
     Cleaned {
         audio,
@@ -237,8 +254,14 @@ fn shift_reference(speaker: &[f32], lag: i64, mic_len: usize) -> Vec<f32> {
 /// measured range reaches negative -- and what is left is a known-positive [`RENDER_HEADROOM`]
 /// plus the acoustic path itself, which is exactly what AEC3's internal delay estimator and
 /// adaptive filter exist to track.
-fn subtract(mic: &[f32], reference: &[f32]) -> (Vec<f32>, Option<f64>) {
+///
+/// `stats_every` is how many frames pass between readings of the echo-return-loss figure, and
+/// must be at least 1. Every caller outside the tests passes [`FRAMES_PER_STATS_READ`]; it is
+/// a parameter only so a test can show that the reported median does not move when the figure
+/// is read less often.
+fn subtract(mic: &[f32], reference: &[f32], stats_every: usize) -> (Vec<f32>, Option<f64>) {
     debug_assert_eq!(mic.len(), reference.len());
+    debug_assert!(stats_every >= 1);
 
     let processor = match Processor::new(TARGET_RATE) {
         Ok(processor) => processor,
@@ -267,7 +290,6 @@ fn subtract(mic: &[f32], reference: &[f32]) -> (Vec<f32>, Option<f64>) {
     // two moves put the output back on the input's own timeline.
     let processed_len = mic.len() + PROCESSOR_DELAY;
     let mut cleaned: Vec<f32> = Vec::with_capacity(processed_len);
-    let mut erle: Vec<f64> = Vec::new();
     // Reused across frames so an hour of audio is two allocations, not two per 10 ms.
     let mut render_frame = vec![vec![0.0f32; SAMPLES_PER_FRAME]];
     let mut capture_frame = vec![vec![0.0f32; SAMPLES_PER_FRAME]];
@@ -284,6 +306,7 @@ fn subtract(mic: &[f32], reference: &[f32]) -> (Vec<f32>, Option<f64>) {
     // session, several minutes with nothing else to say for itself. Counted in frames rather
     // than samples, because the phase sizes its own throttle from how many ticks to expect.
     let frames = processed_len.div_ceil(SAMPLES_PER_FRAME);
+    let mut erle: Vec<f64> = Vec::with_capacity(frames.div_ceil(stats_every));
     let mut phase = Phase::start("cancelling echo");
 
     for (frame, start) in (0..processed_len).step_by(SAMPLES_PER_FRAME).enumerate() {
@@ -306,8 +329,9 @@ fn subtract(mic: &[f32], reference: &[f32]) -> (Vec<f32>, Option<f64>) {
         }
 
         cleaned.extend_from_slice(&capture_frame[0][..taken]);
-        if let Some(db) = processor.get_stats().echo_return_loss_enhancement {
-            erle.push(db);
+        // `Option` iterates over its contents, so this is "record it if there was one".
+        if frame % stats_every == 0 {
+            erle.extend(processor.get_stats().echo_return_loss_enhancement);
         }
     }
     phase.done();
@@ -573,6 +597,40 @@ mod tests {
                 best.1
             );
         }
+    }
+
+    /// Acceptance criterion #4. Reading AEC3's echo-return-loss figure once a second instead
+    /// of once per 10 ms frame has to leave the reported number saying the same thing, and it
+    /// has to leave the audio alone: draining the APM's one-entry stats queue at a different
+    /// rate must not perturb the processor, or the saving would have been bought with the
+    /// cleaned track.
+    #[test]
+    fn the_reported_echo_reduction_does_not_move_when_the_stat_is_read_less_often() {
+        let lag = (RATE as i64) * 120 / 1000;
+        let fixture = bleed_fixture(lag);
+        let reference = shift_reference(&fixture.speaker, lag - RENDER_HEADROOM, fixture.mic.len());
+
+        let (per_frame_audio, per_frame_erle) = subtract(&fixture.mic, &reference, 1);
+        let (strided_audio, strided_erle) =
+            subtract(&fixture.mic, &reference, FRAMES_PER_STATS_READ);
+
+        let dense = per_frame_erle.expect("AEC3 reported no echo reduction reading every frame");
+        let sparse = strided_erle
+            .unwrap_or_else(|| panic!("AEC3 reported none reading every {FRAMES_PER_STATS_READ}"));
+        assert!(
+            (dense - sparse).abs() <= 1.0,
+            "the median moved from {dense:.2} dB to {sparse:.2} dB when the stat was read \
+             every {FRAMES_PER_STATS_READ} frames instead of every one"
+        );
+
+        assert!(
+            per_frame_audio == strided_audio,
+            "the cleaned tracks differ, first at sample {:?}",
+            per_frame_audio
+                .iter()
+                .zip(&strided_audio)
+                .position(|(dense, sparse)| dense != sparse)
+        );
     }
 
     /// Pins the measured capture-path delay the code compensates for. If a library update

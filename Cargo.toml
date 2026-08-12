@@ -14,6 +14,28 @@ edition = "2024"
 rust-version = "1.85"
 publish = false
 
+# A `cargo run` has to be usable on a real session, and at opt-level 0 it is not: the
+# transcribe pre-pass is scalar float DSP over ~141 M samples per track -- rubato's
+# resampler and the per-sample push loop in meethook-transcribe::audio, the GCC-PHAT
+# correlator in ::align, the fbank extractor, the clustering -- which is the shape an
+# unoptimized build punishes hardest. Unoptimized, the 49-minute session used to size this
+# spent 4m24s before printing its first useful line; at opt-level 2 it spends 22s.
+#
+# `[profile.dev]` rather than a documented `--release` workflow, deliberately:
+#
+# - It covers dependencies as well as workspace members, so rubato and the realfft/rustfft
+#   under GCC-PHAT are optimized alongside this workspace's own loops. (The mirror image,
+#   `[profile.dev.package."*"]`, would reach only the dependencies -- and the hot code here
+#   is ours.)
+# - `debug-assertions` and `overflow-checks` stay on, so `subtract`'s `debug_assert_eq!` and
+#   every other in-tree net keeps firing. `--release` silently drops both, which would mean
+#   the build a developer runs is no longer the build the tests gate.
+# - `cargo test` inherits from dev, so the 60-second AEC3 fixtures, the clustering and the
+#   fbank tests speed up too. That is where the extra codegen time is paid back, since
+#   `lefthook run pre-push` runs the whole workspace's tests.
+[profile.dev]
+opt-level = 2
+
 [workspace.dependencies]
 meethook-enroll = { path = "crates/meethook-enroll" }
 meethook-models = { path = "crates/meethook-models" }
