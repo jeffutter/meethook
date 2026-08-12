@@ -17,6 +17,18 @@
 //! - no edge at all across a mute/unmute toggle;
 //! - this process's own pid listed and marked excluded in the debug lines.
 //!
+//! And, with the input device swapped while it runs -- System Settings > Sound > Input,
+//! unplugging a USB interface, AirPods going away:
+//!
+//! - exactly one `InputDeviceChanged` per real swap, including the swap to *no* device at all,
+//!   and none at startup or across the repeat `DefaultInputDevice` notifications macOS emits;
+//! - the `IsRunningSomewhere listener attached to device N` debug line naming the new device.
+//!
+//! That edge is what `meethook record` finalizes a session on, so this is where to check that
+//! the notification arrives at all and arrives once. What this example cannot show is the other
+//! half -- that `AVAudioEngine` really has stopped delivering buffers by then -- because it
+//! opens no device; that needs a live session (TASK-011.01).
+//!
 //! This shows the *listener* path alone. It holds a watcher and never calls
 //! `MicActivityWatcher::recheck`, so a release edge lost to a stale read shows up here as a
 //! missing `Stopped` rather than as a late one -- which is what makes it the right place to

@@ -74,9 +74,18 @@
 //!
 //! | Object | Property | On notification |
 //! |---|---|---|
-//! | system | `DefaultInputDevice` | move the device listener to the new device |
+//! | system | `DefaultInputDevice` | move the device listener, and report a device that moved |
 //! | current input device | `DeviceIsRunningSomewhere` | -- |
 //! | system | `ProcessObjectList` | -- |
+//!
+//! The first of those three carries a second report of its own, and it is the only thing this
+//! module says that is not about the predicate: [`Activity::InputDeviceChanged`], whenever the
+//! default input device genuinely moves. A capture's `AVAudioEngine` tap is bound to the device
+//! that was default when it started, so a swap mid-session -- unplugged AirPods, a USB
+//! interface dropping, System Settings > Sound > Input -- leaves it attached to a device that
+//! is gone and delivering nothing. Reporting it here rather than from a second listener is what
+//! keeps "one enum, one channel" true for the record loop; the de-duplication the device
+//! listener already does is what keeps it from firing on notifications where nothing moved.
 //!
 //! Recomputation is cheap and idempotent, and an edge is delivered only when the boolean
 //! actually changes. That last property is what keeps a mute toggle from splitting a
@@ -142,11 +151,28 @@ use objc2_core_foundation::{CFRetained, CFString};
 
 use crate::{Error, Result};
 
-/// The transitions of "some other process is capturing from an input device".
+/// What the microphone world did.
+///
+/// [`Activity::Started`] and [`Activity::Stopped`] are the transitions of "some other process
+/// is capturing from an input device" -- the predicate this module computes, and the trigger
+/// the auto start/stop loop runs on.
+///
+/// [`Activity::InputDeviceChanged`] is not a transition of that predicate at all. It reports
+/// which *device* the microphone world is pointing at, because an `AVAudioEngine` input tap is
+/// bound to whatever device was default when it started: once that device is gone, or is no
+/// longer the one in use, the tap delivers no further buffers, and a live recording that is
+/// not told would be silently truncated for the rest of the meeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activity {
     Started,
     Stopped,
+    /// The system's default input device moved while the watcher was running.
+    ///
+    /// Never emitted for the first device seen at [`MicActivityWatcher::start`]: nothing was
+    /// bound to anything before that. Emitted when the default moves from one device to
+    /// another, and when the last input device disappears entirely -- an unplugged USB
+    /// interface, which is the case a live capture most needs to hear about.
+    InputDeviceChanged,
 }
 
 /// A live set of CoreAudio property listeners reporting microphone activity.
@@ -170,6 +196,11 @@ impl MicActivityWatcher {
     /// from a private serial dispatch queue for a listener, and on the caller's own thread
     /// for [`MicActivityWatcher::recheck`]. It must not block: sending on an unbounded
     /// channel is the intended shape, and anything slower stalls the next notification.
+    ///
+    /// "Real change" covers both kinds of [`Activity`]: an edge of the capture predicate, and
+    /// the default input device moving. When one notification does both -- unplugging the
+    /// device a call was using -- [`Activity::InputDeviceChanged`] is delivered first, because
+    /// the device bookkeeping runs before the predicate is recomputed.
     pub fn start(
         on_change: impl Fn(Activity) + Send + Sync + 'static,
     ) -> Result<(MicActivityWatcher, bool)> {
@@ -388,18 +419,50 @@ impl State {
         (self.on_change)(activity);
     }
 
-    /// Points the `IsRunningSomewhere` listener at the current default input device.
+    /// Points the `IsRunningSomewhere` listener at the current default input device, and
+    /// reports a device that actually moved through `on_change`.
     ///
     /// A no-op when the device has not actually changed, so the frequent
-    /// `DefaultInputDevice` notifications macOS emits do not churn listeners.
+    /// `DefaultInputDevice` notifications macOS emits neither churn listeners nor split a
+    /// session. [`device_changed`] is the rule for which of them is a real move.
+    ///
+    /// Still `Err(Error::NoInputDevice)` when there is no device to listen to, because
+    /// [`State::install`] distinguishes that from a listener the HAL refused. The difference
+    /// from before is that the state is updated and the edge emitted on the way out, rather
+    /// than returning early and leaving a listener attached to a device that is gone.
     fn attach_device_listener(&mut self) -> Result<()> {
-        let device = default_input_device().ok_or(Error::NoInputDevice)?;
-        if self.device.as_ref().is_some_and(|d| d.object == device) {
+        let previous = self.device.as_ref().map(|installed| installed.object);
+        let current = default_input_device();
+        let changed = device_changed(previous, current);
+
+        // No device at all is a normal state to keep watching from -- the user unplugged a USB
+        // mic -- and the `DefaultInputDevice` listener is on the system object rather than on
+        // the device, so it still fires when one appears. The stale listener goes anyway: it is
+        // attached to a device that is gone, and leaving it there is what used to make an
+        // unplugged microphone the one device change nothing could hear.
+        let Some(device) = current else {
+            if let Some(previous) = self.device.take() {
+                remove_listener(&previous, &self.queue);
+            }
+            if changed {
+                (self.on_change)(Activity::InputDeviceChanged);
+            }
+            return Err(Error::NoInputDevice);
+        };
+        if previous == Some(device) {
             return Ok(());
         }
         if let Some(previous) = self.device.take() {
             remove_listener(&previous, &self.queue);
         }
+
+        // Emitted before the new listener is installed, so that a HAL which refuses that
+        // listener -- fatal from `install`, logged and retried from `notified` -- still cannot
+        // leave a live capture bound to the device that went away without being told.
+        if changed {
+            (self.on_change)(Activity::InputDeviceChanged);
+        }
+
         self.device = Some(self.listen(
             device,
             kAudioDevicePropertyDeviceIsRunningSomewhere,
@@ -607,6 +670,25 @@ fn edge(previous: bool, current: bool) -> Option<Activity> {
     }
 }
 
+/// Whether moving from `previous` to `current` is a change a live capture has to be told
+/// about.
+///
+/// Pure for the same reason [`bearing`] and [`edge`] are: the sandbox this is developed in has
+/// no audio device at all, so the rule the whole reaction turns on has to be decidable without
+/// one.
+///
+/// The first attach is not a change -- there was no engine bound to anything before it, so
+/// starting the watcher must not look like a device swap. Losing the last input device *is*
+/// one: whatever a live tap is bound to has gone away, which is exactly the truncation this
+/// reports.
+fn device_changed(previous: Option<AudioObjectID>, current: Option<AudioObjectID>) -> bool {
+    match (previous, current) {
+        (None, _) => false,
+        (Some(previous), Some(current)) => previous != current,
+        (Some(_), None) => true,
+    }
+}
+
 /// Removes one listener.
 ///
 /// Also called from *inside* a listener block, when the default input device changes and
@@ -787,7 +869,7 @@ fn process_executable(pid: i32) -> Option<PathBuf> {
 mod tests {
     use std::path::Path;
 
-    use super::{Activity, Bearing, bearing, edge, process_executable};
+    use super::{Activity, Bearing, bearing, device_changed, edge, process_executable};
 
     const OUR_PID: i32 = 500;
 
@@ -956,5 +1038,34 @@ mod tests {
     fn a_changed_predicate_emits_the_transition() {
         assert_eq!(edge(false, true), Some(Activity::Started));
         assert_eq!(edge(true, false), Some(Activity::Stopped));
+    }
+
+    #[test]
+    fn the_first_device_attach_is_not_a_change() {
+        // Installing the watcher must not look like a device swap: nothing is recording yet,
+        // and a `record` that split a session at startup would be worse than the bug.
+        assert!(!device_changed(None, Some(1)));
+        // Nor is starting with no input device at all, which is a state the watcher is
+        // explicitly allowed to run in.
+        assert!(!device_changed(None, None));
+    }
+
+    #[test]
+    fn moving_to_a_different_device_is_a_change() {
+        assert!(device_changed(Some(1), Some(2)));
+        // The de-dupe macOS's frequent `DefaultInputDevice` notifications depend on: the same
+        // device reported again is not a swap, and must not split a session.
+        assert!(!device_changed(Some(1), Some(1)));
+    }
+
+    #[test]
+    fn losing_the_only_input_device_is_a_change() {
+        // Unplugging the USB mic a call is being recorded through. The engine is bound to a
+        // device that no longer exists, so this is the case a live capture most needs to hear
+        // about -- and the one that used to return early before the state was touched, leaving
+        // the microphone track to truncate in silence.
+        assert!(device_changed(Some(1), None));
+        // Repeat notifications with still no device are not further changes.
+        assert!(!device_changed(None, None));
     }
 }

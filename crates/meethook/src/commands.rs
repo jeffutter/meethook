@@ -71,6 +71,10 @@ impl Timing {
 enum Event {
     Started,
     Stopped,
+    /// The default input device moved. Not an edge of the activity predicate: it says the
+    /// microphone engine is now bound to the wrong device, which every wait below has to have
+    /// a deliberate answer for.
+    InputDeviceChanged,
     Interrupt,
 }
 
@@ -176,6 +180,7 @@ pub fn record(paths: &Paths) -> Result<()> {
         let _ = activity_tx.send(match activity {
             Activity::Started => Event::Started,
             Activity::Stopped => Event::Stopped,
+            Activity::InputDeviceChanged => Event::InputDeviceChanged,
         });
     })?;
 
@@ -208,9 +213,10 @@ fn announce_watching() {
 /// Sequences one session per detected call until the process is interrupted.
 ///
 /// `recheck` recomputes the activity level from the world, delivering any edge it finds
-/// onto `rx` before returning that level. It is called from two places, for two reasons:
+/// onto `rx` before returning that level. It is called from three places, for three reasons:
 /// while a session is live it is the safety net for a release edge that was lost outright,
-/// and inside [`begin`] it is the level a start retry is driven by.
+/// inside [`begin`] it is the level a start retry is driven by, and after a session finalized
+/// by an input-device change it decides whether there is still a call to open a new one for.
 ///
 /// `already_active` skips the first idle wait, because a call that was already in progress
 /// when this process started will not produce a start edge.
@@ -227,6 +233,11 @@ fn record_loop(
             match rx.recv() {
                 Ok(Event::Started) => {}
                 Ok(Event::Stopped) => continue,
+                // A swap between calls is nothing to do: the next session opens the input
+                // device afresh, so it already records from the new one. It emphatically must
+                // not fall through to the arm below, which would end the recorder outright
+                // because somebody unplugged their headphones.
+                Ok(Event::InputDeviceChanged) => continue,
                 Ok(Event::Interrupt) | Err(_) => break,
             }
         }
@@ -241,17 +252,21 @@ fn record_loop(
             Begin::Interrupted => break,
         }
 
-        let interrupted = loop {
+        let outcome = loop {
             match rx.recv_timeout(timing.recheck) {
                 Ok(Event::Stopped) => match await_end(rx, timing.grace) {
-                    Outcome::CallEnded => break false,
-                    Outcome::Interrupted => break true,
+                    Outcome::CallEnded => break Recording::Ended,
+                    Outcome::Interrupted => break Recording::Interrupted,
                     Outcome::Continue => {}
                 },
                 // A redundant start edge cannot happen while recording, but ignoring it is
                 // the interpretation that keeps the session whole either way.
                 Ok(Event::Started) => {}
-                Ok(Event::Interrupt) => break true,
+                // The engine is bound to the device that was default when it started, so it
+                // is now delivering nothing. Everything worth keeping is already on disk;
+                // finalize it and open a new session on the new device.
+                Ok(Event::InputDeviceChanged) => break Recording::DeviceChanged,
+                Ok(Event::Interrupt) => break Recording::Interrupted,
                 // The safety net, and the only reason this wait has a timeout at all. A
                 // release edge can be lost outright -- the recomputation behind a
                 // notification reads a world that can move under it -- and once the machine
@@ -266,20 +281,61 @@ fn record_loop(
                     let _ = recheck();
                 }
                 // Every sender is gone, so no edge can arrive again.
-                Err(RecvTimeoutError::Disconnected) => break true,
+                Err(RecvTimeoutError::Disconnected) => break Recording::Interrupted,
             }
         };
-        println!("Stopping...");
+
+        // Said before the finish line rather than after it, so the two session reports the
+        // user is about to see read as a consequence of the swap rather than as a fault.
+        match outcome {
+            Recording::DeviceChanged => println!(
+                "The default input device changed. The microphone engine is bound to the \
+                 device that went away, so this session is being finalized and a new one \
+                 opened on the new device."
+            ),
+            Recording::Ended | Recording::Interrupted => println!("Stopping..."),
+        }
 
         if let Err(e) = capture.finish() {
             eprintln!("This session did not produce a usable recording: {e}");
         }
 
-        if interrupted {
-            break;
+        match outcome {
+            Recording::Interrupted => break,
+            Recording::Ended => announce_watching(),
+            // The level, recomputed from the world, is what keeps a swap that coincides with
+            // the call ending from opening a session for a call that is already over. When it
+            // is still up, `already_active` is exactly the "record without waiting for a start
+            // edge that has already happened" case the top of this loop already handles, so
+            // the restart inherits `begin`'s bounded retry and its Ctrl-C responsiveness with
+            // no second start path. A false answer has already sent `Stopped`, which the idle
+            // wait above consumes harmlessly.
+            Recording::DeviceChanged => {
+                if recheck() {
+                    already_active = true;
+                    continue;
+                }
+                println!("That call has ended as well, so no new session was opened.");
+                announce_watching();
+            }
         }
-        announce_watching();
     }
+}
+
+/// How the inner recording loop ended.
+///
+/// An enum rather than the `interrupted` boolean it replaced, so that the one finalize point
+/// after the loop stays the only one: three ways out of a recording, three answers to "what
+/// happens after `finish`", and a single place where the audio is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recording {
+    /// The microphone went idle for the whole grace period: finalize and go back to watching.
+    Ended,
+    /// Ctrl-C, or every sender gone: finalize and exit.
+    Interrupted,
+    /// The default input device moved out from under the engine: finalize, and open a new
+    /// session on the new device if the call is still up.
+    DeviceChanged,
 }
 
 /// How the attempt to open a session for the call that just started resolved.
@@ -329,6 +385,10 @@ fn begin(
             // Cannot normally arrive, since the level was already true. Retrying at once is
             // the reading that loses the least if it does.
             Ok(Event::Started) => {}
+            // A device caught mid-swap is one of the transient failures this retry exists for,
+            // and the next attempt opens the input device afresh -- so the useful answer is to
+            // retry immediately rather than wait out the interval against the old device.
+            Ok(Event::InputDeviceChanged) => {}
             Err(RecvTimeoutError::Timeout) => {
                 // The stop edge can be missed outright, so the level is recomputed from the
                 // world here rather than inferred from the absence of a message. It has to
@@ -380,6 +440,10 @@ fn await_end(rx: &Receiver<Event>, grace: Duration) -> Outcome {
             // Edges alternate, so a second stop should not be possible; wait out the
             // remainder rather than treating an unexpected message as the answer.
             Ok(Event::Stopped) => {}
+            // Wait out the remainder too. This session is already ending and its engine is
+            // already dead, so there is nothing left for a new device to capture into it --
+            // returning `Continue` would rescue a session that has no audio coming.
+            Ok(Event::InputDeviceChanged) => {}
             Err(RecvTimeoutError::Timeout) => return Outcome::CallEnded,
             // Every sender is gone, so nothing can resume this session. Finalizing is the
             // only outcome that does not lose the audio already captured.
@@ -786,6 +850,21 @@ mod tests {
         assert_eq!(await_end(&rx, GRACE), Outcome::CallEnded);
     }
 
+    /// A device swap during the grace period must not rescue a session that is ending. The
+    /// engine is dead either way, so "continue" would keep a session open with no audio
+    /// arriving -- the same silent truncation the device change is reported to prevent.
+    #[test]
+    fn a_device_change_during_the_grace_period_does_not_rescue_the_session() {
+        let (_tx, rx) = feed(GRACE / 6, Event::InputDeviceChanged);
+
+        let started = Instant::now();
+        assert_eq!(await_end(&rx, GRACE), Outcome::CallEnded);
+        assert!(
+            started.elapsed() >= GRACE,
+            "the device change cut the wait short"
+        );
+    }
+
     #[test]
     fn a_stray_stop_does_not_shorten_or_resolve_the_wait() {
         let (_tx, rx) = feed(GRACE / 6, Event::Stopped);
@@ -1050,6 +1129,87 @@ mod tests {
             finished < SETTLE * 3,
             "the interrupt ended this session after {finished:?}, not the recheck"
         );
+    }
+
+    /// The defect this ticket exists for: `AVAudioEngine` binds its input node to whatever
+    /// device was default at start, so a swap mid-session leaves the microphone track silently
+    /// receiving nothing for the rest of the meeting. Two sessions is the answer -- each with
+    /// its own sample rate in its own WAV header, and its own mic/speaker lag for `transcribe`
+    /// to measure.
+    #[test]
+    fn a_device_change_while_recording_splits_the_session() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::InputDeviceChanged),
+            (BLIP, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish", "start", "finish"]);
+    }
+
+    /// The guard on that restart: a swap in the same breath as the call ending must not open a
+    /// session for a call that is over. The level, recomputed from the world, is what decides.
+    #[test]
+    fn a_device_change_does_not_reopen_a_session_for_a_call_that_ended() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::InputDeviceChanged),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        record_loop(&rx, &mut capture, &|| false, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+    }
+
+    /// A swap between calls is nothing to do -- the next session opens the input device afresh
+    /// -- and above all it must not end the recorder, which is what unplugging a pair of
+    /// headphones would cost if this event fell into the idle wait's interrupt arm.
+    #[test]
+    fn a_device_change_while_idle_does_not_start_a_session() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::InputDeviceChanged),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        let started = Instant::now();
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        assert!(capture.calls.is_empty(), "{:?}", capture.calls);
+        // "Returned early" and "returned on the interrupt" are indistinguishable from an empty
+        // call log alone, and the first of those is the recorder exiting on a device swap.
+        assert!(
+            started.elapsed() >= SETTLE,
+            "the loop returned on the device change, not on the interrupt"
+        );
+    }
+
+    /// A device caught mid-swap is one of the transient failures the start retry exists for, so
+    /// the change arriving during it is a reason to try again at once rather than to give up.
+    #[test]
+    fn a_device_change_during_a_start_retry_keeps_retrying() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            // Queued immediately, so it is waiting when the first failed start reaches the
+            // retry wait; a delay near `retry` would race the timeout instead.
+            (Duration::ZERO, Event::InputDeviceChanged),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            failing_starts: 1,
+            ..FakeCapture::default()
+        };
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+
+        assert_eq!(capture.calls, ["start", "start", "finish"]);
     }
 
     /// Nothing is recomputed until there is a session to protect.
