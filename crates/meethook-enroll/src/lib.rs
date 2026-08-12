@@ -84,7 +84,7 @@ const SNIPPET_CHARS: usize = 100;
 /// Below it the tail arrives fast: 9 voices at a 4 s floor, 15 at 3 s, 21 at 2 s, which is the
 /// 48-question prompt again with a smaller number on it.
 ///
-/// # Not [`meethook_transcribe::SPEAKER_FLOOR_SECONDS`], and not TASK-019's write-side floor
+/// # Not [`meethook_transcribe::SPEAKER_FLOOR_SECONDS`], and not [`REFERENCE_FLOOR_SECONDS`]
 ///
 /// Same units, three different questions, and they do not imply one another:
 ///
@@ -94,9 +94,11 @@ const SNIPPET_CHARS: usize = 100;
 ///   would not be asked about at all.
 /// - This one decides **which voices are worth asking about**. Getting it wrong costs a
 ///   question, in one direction or the other, and nothing else.
-/// - The write-side floor TASK-019 still owns decides **which answers become references in
+/// - [`REFERENCE_FLOOR_SECONDS`] decides **which answers become references in
 ///   `speakers.json`**. Naming somebody who spoke 8 s is right; storing a reference built from
-///   8 s of audio is what that ticket measured going wrong. This ticket does not add it.
+///   8 s of audio is what TASK-019 measured going wrong. It landed on the same 5.0 s this one
+///   sits on, which is why both state the same boundary convention below: a value offered here
+///   and then refused there would be a question asked for nothing.
 ///
 /// The comparison is `speech_seconds >= PROMPT_FLOOR_SECONDS`, the same convention
 /// `SPEAKER_FLOOR_SECONDS` states: a cluster sitting exactly on the floor is offered. Two
