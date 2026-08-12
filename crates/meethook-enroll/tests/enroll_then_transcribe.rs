@@ -201,6 +201,7 @@ fn enroll_offering(paths: &Paths, offer: Offer, interviewer: &mut dyn Interviewe
     run_enroll(
         paths,
         &[],
+        None,
         offer,
         Enrolment::default(),
         interviewer,

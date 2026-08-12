@@ -19,7 +19,10 @@
 //! matched and passed over, with no cross-session comparison of unnamed voices anywhere: the
 //! deduplication is enrollment itself. The one exception is [`Offer::named`], which asks about
 //! resolved voices too so that an identification the database got wrong can be answered --
-//! without it a false accept would be permanent short of hand-editing `speakers.json`.
+//! without it a false accept would be permanent short of hand-editing `speakers.json`. A
+//! [`VoiceSelector`] is the same exception aimed at one voice: it overrides both [`Offer`]
+//! filters for the voice it names, on the reading that somebody naming a specific voice has
+//! already made the judgement those filters make on their behalf.
 //!
 //! A rewritten transcript is exactly what `transcribe --force` would now produce. That is the
 //! invariant everything below is implemented against, because it is what stops `enroll` and
@@ -36,7 +39,7 @@ use std::path::{Path, PathBuf};
 use meethook_session::{
     AssignedName, Classification, DiscoveredSession, EnrolledSpeaker, EnrolledSpeakers, Paths,
     SessionId, SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Transcript,
-    discover_sessions, unknown_labels,
+    discover_sessions, unknown_labels, unknown_speaker,
 };
 use meethook_transcribe::{
     Attribution, Naming, TARGET_RATE, attributions, identify_clusters, read_track_16k_mono,
@@ -242,6 +245,75 @@ pub trait Interviewer {
     fn identify(&mut self, voice: &Voice<'_>) -> Answer;
 }
 
+/// Which one voice a run is about, when it is about one voice.
+///
+/// `--voice`. The queue is the right shape for "I have not named anybody here yet" and the
+/// wrong one for the commonest follow-up -- one voice the user can now place, or one name
+/// that is wrong -- where reaching it means pressing Enter past everybody else, and every one
+/// of those presses is a chance to type a name onto the wrong person.
+///
+/// # What it selects
+///
+/// One selector matched two ways, so the user does not have to know which kind of thing they
+/// are holding:
+///
+/// - **A number** is the number in "Unknown 3", not the cluster id. The cluster id appears in
+///   `transcript.json` and nowhere a person reads, while the "Unknown N" is on every prompt
+///   header and every unnamed line of the transcript -- so accepting both would be two
+///   numbering systems on one flag, silently targeting the wrong voice whenever they disagree.
+///   The number comes from [`unknown_labels`], which ranks *every* voice by first appearance
+///   whether or not it has a name, so it is defined for named voices too and does not move
+///   when one of them is named.
+/// - **A name** is what the voice currently reads as: the enrolled name that matched it, the
+///   name somebody gave it for this session, or its own "Unknown 3" written out.
+///
+/// Matching is exact after trimming -- `alice` and `Alice` are two people here as everywhere
+/// else in this file. A miss costs one retry, because it prints what the session does contain.
+///
+/// # What it overrides
+///
+/// Both [`Offer`] filters, for its one voice: a targeted voice is asked about whether it is
+/// under `PROMPT_FLOOR_SECONDS` and whether the database has already named it. Naming somebody
+/// specific is exactly the judgement those two gates make on the user's behalf when they have
+/// not made it themselves. It does not touch [`Enrolment`], which is the other axis: what an
+/// answer *writes* is the same however the question came to be asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceSelector(String);
+
+impl VoiceSelector {
+    /// Whether this selector means this voice, given the "Unknown N" it was transcribed with
+    /// and what it currently reads as.
+    ///
+    /// Both arms, so that a number keeps pointing at the same voice after that voice has been
+    /// named, and a name reaches a voice whose number the user never saw.
+    fn matches(&self, unknown: &str, shown: &Attribution) -> bool {
+        self.0 == unknown || self.0 == shown.label()
+    }
+}
+
+impl From<&str> for VoiceSelector {
+    /// Normalises to a label, so `3` and `Unknown 3` are the same selector from here on.
+    ///
+    /// Infallible: everything that is not a number is a name, and a name that matches nothing
+    /// is reported against the session's actual voices rather than refused at the edge, where
+    /// there is nothing to compare it to yet.
+    fn from(raw: &str) -> VoiceSelector {
+        let trimmed = raw.trim();
+        match trimmed.parse::<usize>() {
+            Ok(number) => VoiceSelector(unknown_speaker(number)),
+            Err(_) => VoiceSelector(trimmed.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for VoiceSelector {
+    /// The normalised form, which is what was matched against: a user who passed `3` and
+    /// missed is told that "Unknown 3" is what was looked for, beside the labels that exist.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Which voices a run offers beyond the ones it offers by default.
 ///
 /// Two orthogonal questions -- how quiet a voice may be, and whether the database has already
@@ -249,6 +321,8 @@ pub trait Interviewer {
 /// who wants to correct one identification is not asking to be shown the two-second fragments
 /// as well. The two filters compose: the floor decides whether a voice is worth a question
 /// whatever put it in the list.
+///
+/// Both filters are overridden, for one voice, by a [`VoiceSelector`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Offer {
     /// `--all`: voices below `PROMPT_FLOOR_SECONDS`, which are normally held back.
@@ -283,13 +357,16 @@ pub enum Enrolment {
     Always,
 }
 
-/// How a run is configured: which voices it offers, and what an answer to one writes.
+/// How a run is configured: which voice or voices it offers, and what an answer to one writes.
 ///
-/// Private, and a bundle rather than two parameters, because it is threaded through the walk
-/// over sessions unchanged and every function on that path would otherwise carry both. The two
-/// axes stay separate in the public signature, where a caller has to say which is which.
+/// Private, and a bundle rather than three parameters, because it is threaded through the walk
+/// over sessions unchanged and every function on that path would otherwise carry all of them.
+/// The axes stay separate in the public signature, where a caller has to say which is which.
 #[derive(Debug, Clone, Copy, Default)]
-struct Rules {
+struct Rules<'a> {
+    /// `Some` replaces the queue with one voice; `None` is the queue. Not a fourth flag on
+    /// [`Offer`], because it does not widen the queue -- it stands in for it.
+    selector: Option<&'a VoiceSelector>,
     offer: Offer,
     enrolment: Enrolment,
 }
@@ -297,12 +374,17 @@ struct Rules {
 /// What a run did, so the caller can pick an exit status without re-deriving it.
 ///
 /// `named`, `skipped`, `kept` and `held_back` count *voices*; `passed_over` counts *sessions*
-/// that were never asked about at all; `failed` counts sessions that could not be read, plus
-/// ids that were requested and are not on disk.
+/// that were never asked about at all; `failed` counts requests that could not be served.
+///
+/// `failed` is every request this run could not serve: a session it could not read, an id that
+/// is not on disk, and a [`VoiceSelector`] that matched no voice or more than one. They are one
+/// count because the caller does one thing with them -- exit non-zero -- and each has already
+/// printed its own line saying which of them it was.
 ///
 /// `held_back` is unresolved voices that sat under `PROMPT_FLOOR_SECONDS` and so were never
 /// asked about. Reported rather than merely not-counted, because a run that asked seven
-/// questions about a meeting of fifty-six voices should say what it did not ask about.
+/// questions about a meeting of fifty-six voices should say what it did not ask about. A
+/// targeted run holds nothing back: it was aimed at one voice rather than filtered down to it.
 ///
 /// `kept` is already-named voices the user left as they were -- an answer, and the common one
 /// under [`Offer::named`]. Counted apart from `skipped` because they write the same nothing
@@ -343,6 +425,12 @@ enum Outcome {
 /// copy of a person somebody was just named in the first one a match rather than a second
 /// prompt.
 ///
+/// A [`VoiceSelector`] replaces the queue with exactly one voice of one session, and needs
+/// exactly one session id to be meaningful: a voice number says nothing across sessions, and a
+/// name would fan out over every recording on disk. It overrides both [`Offer`] filters for
+/// that voice, so passing `--all` or `--correct` beside it changes nothing rather than
+/// conflicting with it.
+///
 /// [`Offer`] widens which voices get asked about -- the quiet ones, the already-named ones, or
 /// both. It changes which questions get asked and nothing else: the same answers write the
 /// same files however a voice came to be offered. [`Enrolment`] is the other axis, and the
@@ -353,13 +441,29 @@ enum Outcome {
 pub fn run_enroll(
     paths: &Paths,
     requested: &[SessionId],
+    voice: Option<&VoiceSelector>,
     offer: Offer,
     enrolment: Enrolment,
     interviewer: &mut dyn Interviewer,
     out: &mut dyn Write,
 ) -> Result<EnrollReport> {
-    let discovered = discover_sessions(paths)?;
     let mut report = EnrollReport::default();
+
+    // Enforced here rather than in the CLI's argument parser, because this is where the sibling
+    // rule already lives -- a requested id that is not on disk is printed and counted below --
+    // and because one enforcement point cannot disagree with itself. Refused before anything is
+    // discovered: a run that cannot say which session it is about has nothing to read.
+    if voice.is_some() && requested.len() != 1 {
+        writeln!(
+            out,
+            "--voice needs exactly one session id: a voice belongs to one session, so its \
+             number and its name mean nothing across several"
+        )?;
+        report.failed += 1;
+        return Ok(report);
+    }
+
+    let discovered = discover_sessions(paths)?;
 
     for id in requested {
         if !discovered.iter().any(|session| &session.id == id) {
@@ -387,7 +491,11 @@ pub fn run_enroll(
     }
 
     let mut speakers = EnrolledSpeakers::read_or_empty(paths)?;
-    let rules = Rules { offer, enrolment };
+    let rules = Rules {
+        selector: voice,
+        offer,
+        enrolment,
+    };
 
     for session in selected {
         match enroll_session(
@@ -421,13 +529,12 @@ pub fn run_enroll(
 fn enroll_session(
     paths: &Paths,
     session: &DiscoveredSession,
-    rules: Rules,
+    rules: Rules<'_>,
     speakers: &mut EnrolledSpeakers,
     interviewer: &mut dyn Interviewer,
     out: &mut dyn Write,
     report: &mut EnrollReport,
 ) -> Result<Outcome> {
-    let offer = rules.offer;
     match session.classification {
         Classification::Orphaned => {
             writeln!(
@@ -529,81 +636,17 @@ fn enroll_session(
             .then(a.id.cmp(&b.id))
     });
 
-    // The one place "already named" is decided. Everything below -- the floor, the in-run
-    // guard, the prompt -- treats a voice the same however it got into this list, which is
-    // what lets `--all` and `--correct` compose without either knowing about the other.
-    let candidates: Vec<&SpeakerCluster> = order
-        .into_iter()
-        .filter(|c| offer.named || !shown[&c.id].is_named())
-        .collect();
-    if candidates.is_empty() {
-        // A session whose voices are all identified is exactly where somebody stands when one
-        // of those identifications is wrong, and this line is the only thing it prints -- so
-        // it names the escape, the way the held-back line already names `--all`.
-        let named = shown.values().filter(|label| label.is_named()).count();
-        if named == 0 {
-            writeln!(out, "{}  passed over: nothing unresolved", session.id)?;
-        } else {
-            writeln!(
-                out,
-                "{}  passed over: nothing unresolved ({named} named voice(s) -- \
-                 meethook enroll --correct)",
-                session.id
-            )?;
-        }
-        report.passed_over += 1;
+    // Which voices this run is about: one the user named, or the queue. The only thing a
+    // selector changes -- everything from here down runs on whichever list comes back, so a
+    // targeted prompt is not a second implementation of a prompt, it is the same one asked
+    // about a shorter list. `None` is a session that is finished and has said why.
+    let offered = match rules.selector {
+        Some(selector) => targeted(selector, &order, &unknown, &shown, session, out, report)?,
+        None => queue(&order, &shown, rules.offer, session, out, report)?,
+    };
+    let Some(offered) = offered else {
         return Ok(Outcome::Finished);
-    }
-
-    let queued = candidates.len();
-
-    // Only the voices worth a question, unless the user asked for the rest. Clustering emits a
-    // long tail of one- and two-second fragments it cannot place -- 48 unresolved clusters for
-    // a meeting of seven people, measured on `20260810-093047` -- and asking about each of
-    // them is how a five-minute job becomes an hour. Filtering preserves first-appearance
-    // order, which is what the user reads the transcript in.
-    let mut offered: Vec<&SpeakerCluster> = if offer.quiet {
-        candidates.clone()
-    } else {
-        candidates
-            .iter()
-            .copied()
-            .filter(|c| c.speech_seconds >= PROMPT_FLOOR_SECONDS)
-            .collect()
     };
-    // A floor that hides every voice in a session is not a floor, it is a command that does
-    // nothing. A short recording where nobody clears it -- the three-second fixtures the
-    // end-to-end tests are built on, and any real meeting that ran for a minute -- offers
-    // everybody instead. Decided here rather than defended against, because the alternative is
-    // `enroll` reporting "nothing to do" on a session with unnamed people in it.
-    if offered.is_empty() {
-        offered = candidates;
-    }
-    let held_back = queued - offered.len();
-    report.held_back += held_back;
-
-    // "Unresolved" is false under `--correct`, where most of the queue is resolved and the
-    // point is to review it. The default wording is left exactly as it was.
-    let counted = if offer.named {
-        let already = offered.iter().filter(|c| shown[&c.id].is_named()).count();
-        format!(
-            "{} voice(s) to review, {already} of them already named",
-            offered.len()
-        )
-    } else {
-        format!("{} unresolved voice(s)", offered.len())
-    };
-    if held_back == 0 {
-        writeln!(out, "{}  {counted}", session.id)?;
-    } else {
-        // Naming the escape rather than only the count: a voice nobody is told about is not
-        // reachable, which is what AC #3 asks for.
-        writeln!(
-            out,
-            "{}  {counted}, {held_back} quieter voice(s) not offered -- meethook enroll --all",
-            session.id
-        )?;
-    }
 
     // Read after that check, so a session with nothing to ask about never resamples an hour
     // of audio in order to then ask nothing. Unreadable is empty rather than fatal: a voice
@@ -781,6 +824,188 @@ fn enroll_session(
     }
 
     Ok(Outcome::Finished)
+}
+
+/// The voices one session's run will ask about, in first-appearance order, and the line
+/// saying so -- or `None` for a session with nothing to ask about, which has been reported
+/// and counted.
+///
+/// Separated from the asking so that the one decision a [`VoiceSelector`] changes is made in
+/// one place: [`targeted`] is the sibling of this, and everything downstream of both is shared.
+fn queue<'c>(
+    order: &[&'c SpeakerCluster],
+    shown: &BTreeMap<u32, Attribution>,
+    offer: Offer,
+    session: &DiscoveredSession,
+    out: &mut dyn Write,
+    report: &mut EnrollReport,
+) -> Result<Option<Vec<&'c SpeakerCluster>>> {
+    // The one place "already named" is decided. Everything below -- the floor, the in-run
+    // guard, the prompt -- treats a voice the same however it got into this list, which is
+    // what lets `--all` and `--correct` compose without either knowing about the other.
+    let candidates: Vec<&SpeakerCluster> = order
+        .iter()
+        .copied()
+        .filter(|c| offer.named || !shown[&c.id].is_named())
+        .collect();
+    if candidates.is_empty() {
+        // A session whose voices are all identified is exactly where somebody stands when one
+        // of those identifications is wrong, and this line is the only thing it prints -- so
+        // it names the escape, the way the held-back line already names `--all`.
+        let named = shown.values().filter(|label| label.is_named()).count();
+        if named == 0 {
+            writeln!(out, "{}  passed over: nothing unresolved", session.id)?;
+        } else {
+            writeln!(
+                out,
+                "{}  passed over: nothing unresolved ({named} named voice(s) -- \
+                 meethook enroll --correct)",
+                session.id
+            )?;
+        }
+        report.passed_over += 1;
+        return Ok(None);
+    }
+
+    let queued = candidates.len();
+
+    // Only the voices worth a question, unless the user asked for the rest. Clustering emits a
+    // long tail of one- and two-second fragments it cannot place -- 48 unresolved clusters for
+    // a meeting of seven people, measured on `20260810-093047` -- and asking about each of
+    // them is how a five-minute job becomes an hour. Filtering preserves first-appearance
+    // order, which is what the user reads the transcript in.
+    let mut offered: Vec<&SpeakerCluster> = if offer.quiet {
+        candidates.clone()
+    } else {
+        candidates
+            .iter()
+            .copied()
+            .filter(|c| c.speech_seconds >= PROMPT_FLOOR_SECONDS)
+            .collect()
+    };
+    // A floor that hides every voice in a session is not a floor, it is a command that does
+    // nothing. A short recording where nobody clears it -- the three-second fixtures the
+    // end-to-end tests are built on, and any real meeting that ran for a minute -- offers
+    // everybody instead. Decided here rather than defended against, because the alternative is
+    // `enroll` reporting "nothing to do" on a session with unnamed people in it.
+    if offered.is_empty() {
+        offered = candidates;
+    }
+    let held_back = queued - offered.len();
+    report.held_back += held_back;
+
+    // "Unresolved" is false under `--correct`, where most of the queue is resolved and the
+    // point is to review it. The default wording is left exactly as it was.
+    let counted = if offer.named {
+        let already = offered.iter().filter(|c| shown[&c.id].is_named()).count();
+        format!(
+            "{} voice(s) to review, {already} of them already named",
+            offered.len()
+        )
+    } else {
+        format!("{} unresolved voice(s)", offered.len())
+    };
+    if held_back == 0 {
+        writeln!(out, "{}  {counted}", session.id)?;
+    } else {
+        // Naming the escape rather than only the count: a voice nobody is told about is not
+        // reachable, which is what AC #3 asks for.
+        writeln!(
+            out,
+            "{}  {counted}, {held_back} quieter voice(s) not offered -- meethook enroll --all",
+            session.id
+        )?;
+    }
+
+    Ok(Some(offered))
+}
+
+/// The one voice a [`VoiceSelector`] names, or `None` when it named none or several -- which
+/// is reported and counted as a request that could not be served.
+///
+/// No floor, no `--correct` gate and no "nothing unresolved" pass-over: a user who named a
+/// voice has already decided it is worth a question, and a session where everybody is already
+/// named is exactly where `--voice "Alice"` gets used. Nothing is counted as held back either;
+/// this run was aimed at one voice rather than filtered down to it, so a summary line offering
+/// `--all` would be answering a question nobody asked.
+fn targeted<'c>(
+    selector: &VoiceSelector,
+    order: &[&'c SpeakerCluster],
+    unknown: &BTreeMap<u32, String>,
+    shown: &BTreeMap<u32, Attribution>,
+    session: &DiscoveredSession,
+    out: &mut dyn Write,
+    report: &mut EnrollReport,
+) -> Result<Option<Vec<&'c SpeakerCluster>>> {
+    let matched: Vec<&SpeakerCluster> = order
+        .iter()
+        .copied()
+        .filter(|c| selector.matches(&unknown[&c.id], &shown[&c.id]))
+        .collect();
+
+    // How one voice reads in a message about several: the number it is reachable by, plus the
+    // name it currently carries when that is not the number itself.
+    let describe = |c: &SpeakerCluster| {
+        let number = &unknown[&c.id];
+        let label = shown[&c.id].label();
+        if label == number {
+            format!("{number} ({:.1} s)", c.speech_seconds)
+        } else {
+            format!("{number} -- {label} ({:.1} s)", c.speech_seconds)
+        }
+    };
+
+    match matched.len() {
+        1 => {
+            writeln!(
+                out,
+                "{}  1 voice selected: {}",
+                session.id,
+                describe(matched[0])
+            )?;
+            Ok(Some(matched))
+        }
+        0 => {
+            // The voices are listed rather than merely counted, quiet ones included, because a
+            // miss is usually a number off by one or a name spelled as the user remembers it
+            // rather than as the transcript has it -- and the quiet voices are exactly what
+            // somebody is reaching for when they miss. Fifty-odd lines on a real session is
+            // still far cheaper than fifty-odd prompts.
+            writeln!(
+                out,
+                "{}  no voice matched {selector} -- this session has {}:",
+                session.id,
+                order.len()
+            )?;
+            for cluster in order {
+                writeln!(out, "    {}", describe(cluster))?;
+            }
+            report.failed += 1;
+            Ok(None)
+        }
+        _ => {
+            // Two voices under one enrolled name is the false accept `--correct` exists to
+            // fix, so the message has to hand back the thing that tells them apart, which is
+            // the number. Quoted as a whole label rather than as a bare digit so it can be
+            // pasted straight back: both forms are accepted, and only one of them survives
+            // being read off a line that also contains a name.
+            let voices: Vec<String> = matched.iter().map(|c| describe(c)).collect();
+            let numbers: Vec<String> = matched
+                .iter()
+                .map(|c| format!("--voice \"{}\"", unknown[&c.id]))
+                .collect();
+            writeln!(
+                out,
+                "{}  {selector} matches {} voices: {} -- pass one of {}",
+                session.id,
+                matched.len(),
+                voices.join(", "),
+                numbers.join(" or ")
+            )?;
+            report.failed += 1;
+            Ok(None)
+        }
+    }
 }
 
 /// What each voice is called given the database and this session's hand-given names as they
@@ -1149,11 +1374,49 @@ mod tests {
         enrolment: Enrolment,
         interviewer: &mut Scripted,
     ) -> (EnrollReport, String) {
+        run_over(paths, ids, None, offer, enrolment, interviewer)
+    }
+
+    /// `run`, aimed at one voice. One helper per axis, like the two above, so that the tests
+    /// that do not target a voice keep their short signature -- and a default [`Offer`], since
+    /// the point of a selector is that it needs no flags to reach a voice.
+    fn run_targeting(
+        paths: &Paths,
+        ids: &[&str],
+        voice: &str,
+        interviewer: &mut Scripted,
+    ) -> (EnrollReport, String) {
+        run_over(
+            paths,
+            ids,
+            Some(VoiceSelector::from(voice)),
+            Offer::default(),
+            Enrolment::default(),
+            interviewer,
+        )
+    }
+
+    fn run_over(
+        paths: &Paths,
+        ids: &[&str],
+        voice: Option<VoiceSelector>,
+        offer: Offer,
+        enrolment: Enrolment,
+        interviewer: &mut Scripted,
+    ) -> (EnrollReport, String) {
         let requested: Vec<SessionId> =
             ids.iter().map(|id| SessionId::parse(id).unwrap()).collect();
         let mut out = Vec::new();
-        let report =
-            run_enroll(paths, &requested, offer, enrolment, interviewer, &mut out).unwrap();
+        let report = run_enroll(
+            paths,
+            &requested,
+            voice.as_ref(),
+            offer,
+            enrolment,
+            interviewer,
+            &mut out,
+        )
+        .unwrap();
         (report, String::from_utf8(out).unwrap())
     }
 
@@ -2490,6 +2753,271 @@ mod tests {
 
         assert_eq!(report, EnrollReport::default());
         assert!(output.contains("No sessions found"), "{output}");
+    }
+
+    /// TASK-025 acceptance criterion #1: `--voice` asks about the voice it names and about
+    /// nobody else, in both the forms the number can be written in.
+    #[test]
+    fn a_voice_selected_by_number_is_the_only_one_asked_about() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::answering(vec![named("Bob")]);
+        let (report, output) = run_targeting(&paths, &["20260809-052600"], "2", &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Unknown 2"], "{output}");
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(
+            said(&transcript_of(&session))
+                .iter()
+                .map(|(speaker, _, _)| *speaker)
+                .collect::<Vec<_>>(),
+            ["Unknown 1", "You", "Bob", "Unknown 1"],
+            "the voice that was not asked about must be left exactly as it was"
+        );
+
+        // The written-out label is the same selector: a user reading "Unknown 1" off a prompt
+        // header should not have to work out which part of it to type.
+        let mut spelled_out = Scripted::default();
+        let (_, output) =
+            run_targeting(&paths, &["20260809-052600"], "Unknown 1", &mut spelled_out);
+        assert_eq!(spelled_out.labels(), ["Unknown 1"], "{output}");
+    }
+
+    /// Acceptance criteria #2 and #3: a voice the database has already named is reachable by
+    /// that name, with no `--correct` -- which is the state somebody is in when the name is
+    /// the thing that is wrong.
+    #[test]
+    fn a_voice_can_be_selected_by_the_name_it_currently_reads_as() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        enrolled(&[("Bob", voice(1))], &paths);
+
+        let mut interviewer = Scripted::answering(vec![named("Robert Chen")]);
+        let (report, output) = run_targeting(&paths, &["20260809-052600"], "Bob", &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Bob"], "{output}");
+        assert_eq!(
+            interviewer.seen[0].attribution,
+            Attribution::Identified {
+                name: "Bob".to_string(),
+                similarity: 1.0
+            },
+            "the prompt has to ask whether this identification is right, not who this is"
+        );
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(transcript_of(&session).turns[2].speaker, "Robert Chen");
+    }
+
+    /// Acceptance criterion #3 for the other filter, and the reason `held_back` stays at zero:
+    /// a run aimed at one voice is not holding anything back, so it must not end on a line
+    /// offering `--all`.
+    #[test]
+    fn a_targeted_voice_under_the_prompt_floor_is_asked_about_without_all() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_speech_seconds(&session, &[40.0, 1.5]);
+
+        let mut interviewer = Scripted::default();
+        let (report, output) = run_targeting(&paths, &["20260809-052600"], "2", &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Unknown 2"], "{output}");
+        assert_eq!(report.held_back, 0, "{output}");
+        assert!(!output.contains("not offered"), "{output}");
+    }
+
+    /// Acceptance criterion #4, written as the comparison it actually is rather than as
+    /// literal expectations: the prompt a targeted voice gets is the prompt that voice gets in
+    /// a full run -- same header, same snippets, same clip -- because it is produced by the
+    /// same code from the same cluster.
+    #[test]
+    fn a_targeted_prompt_is_what_the_full_run_would_have_shown() {
+        let id = "20260809-052600";
+
+        let queued_root = tempfile::tempdir().unwrap();
+        let queued_paths = Paths::new(queued_root.path());
+        make_session(&queued_paths, id);
+        let mut queued = Scripted::default();
+        let (_, output) = run_asking(&queued_paths, &[], ALL_AND_CORRECT, &mut queued);
+        assert_eq!(queued.labels(), ["Unknown 1", "Unknown 2"], "{output}");
+
+        let targeted_root = tempfile::tempdir().unwrap();
+        let targeted_paths = Paths::new(targeted_root.path());
+        make_session(&targeted_paths, id);
+        let mut aimed = Scripted::default();
+        let (_, output) = run_targeting(&targeted_paths, &[id], "2", &mut aimed);
+
+        assert_eq!(aimed.seen.len(), 1, "{output}");
+        assert_eq!(aimed.seen[0], queued.seen[1]);
+    }
+
+    /// Acceptance criterion #5: reaching a voice differently does not write differently. A
+    /// targeted answer about a 1.5 s voice takes the same session-only path, and the same
+    /// `--force-reference` override lifts it.
+    #[test]
+    fn naming_a_targeted_quiet_voice_still_writes_only_a_session_name() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_speech_seconds(&session, &[40.0, 1.5]);
+        // Somebody unrelated is already enrolled, so "unchanged" is a claim about a real file.
+        enrolled(&[("Bob", voice(3))], &paths);
+        let before = std::fs::read(paths.speakers_json()).unwrap();
+
+        let mut interviewer = Scripted::answering(vec![named("Silas")]);
+        let (report, output) = run_targeting(&paths, &["20260809-052600"], "2", &mut interviewer);
+
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(report.session_only, 1, "{output}");
+        assert_eq!(
+            std::fs::read(paths.speakers_json()).unwrap(),
+            before,
+            "a targeted answer about a voice this quiet must not touch the database either"
+        );
+        assert_eq!(
+            assigned_in(&session, "20260809-052600")
+                .names
+                .iter()
+                .map(|row| (row.cluster, row.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "Silas")]
+        );
+        assert!(
+            output.contains("named Silas in this session only"),
+            "{output}"
+        );
+
+        // And the override composes with a selector exactly as it does with the queue: it is
+        // the other axis, and the targeted path never touches it.
+        let forced_root = tempfile::tempdir().unwrap();
+        let forced_paths = Paths::new(forced_root.path());
+        let forced = make_session(&forced_paths, "20260809-052600");
+        with_speech_seconds(&forced, &[40.0, 1.5]);
+
+        let mut forcing = Scripted::answering(vec![named("Silas")]);
+        let (report, output) = run_over(
+            &forced_paths,
+            &["20260809-052600"],
+            Some(VoiceSelector::from("2")),
+            Offer::default(),
+            Enrolment::Always,
+            &mut forcing,
+        );
+
+        assert_eq!(report.session_only, 0, "{output}");
+        let speakers = EnrolledSpeakers::read_or_empty(&forced_paths).unwrap();
+        assert_eq!(speakers.speakers.len(), 1);
+        assert_eq!(speakers.speakers[0].name, "Silas");
+        assert_eq!(speakers.speakers[0].embedding, voice(1));
+    }
+
+    /// Acceptance criterion #6, the miss half: a selector that names nobody asks nothing, says
+    /// so, and lists what the session does have -- quiet voices included, since those are what
+    /// somebody is reaching for when they miss. `failed` is what turns that into a non-zero
+    /// exit at the CLI.
+    #[test]
+    fn a_selector_matching_nothing_reports_what_the_session_has_and_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_fragmented_session(&paths, "20260809-052600");
+
+        for missed in ["Nobody", "9"] {
+            let mut interviewer = Scripted::default();
+            let (report, output) =
+                run_targeting(&paths, &["20260809-052600"], missed, &mut interviewer);
+
+            assert!(interviewer.seen.is_empty(), "{missed}: {output}");
+            assert_eq!(report.failed, 1, "{missed}: {output}");
+            assert!(output.contains("no voice matched"), "{missed}: {output}");
+            for label in ["Unknown 1", "Unknown 2", "Unknown 3", "Unknown 4"] {
+                assert!(
+                    output.contains(label),
+                    "a miss has to say what the session contains, including the voices under \
+                     the floor -- {label} missing from: {output}"
+                );
+            }
+        }
+    }
+
+    /// Acceptance criterion #6, the ambiguous half. Two clusters under one enrolled name is
+    /// exactly the false accept `--correct` exists to fix, so the message has to hand back the
+    /// thing that tells them apart rather than picking one of them.
+    #[test]
+    fn an_ambiguous_selector_names_both_voices_and_the_numbers_that_split_them() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
+        enrolled(&[("Alice", nearly(0.0))], &paths);
+
+        let mut interviewer = Scripted::answering(vec![named("Someone")]);
+        let (report, output) =
+            run_targeting(&paths, &["20260809-052600"], "Alice", &mut interviewer);
+
+        assert!(interviewer.seen.is_empty(), "{output}");
+        assert_eq!(report.failed, 1, "{output}");
+        assert!(output.contains("matches 2 voices"), "{output}");
+        assert!(output.contains("Unknown 1"), "{output}");
+        assert!(output.contains("Unknown 2"), "{output}");
+
+        // ...and the number it handed back does reach one of them.
+        let mut disambiguated = Scripted::answering(vec![named("Someone")]);
+        let (report, output) = run_targeting(&paths, &["20260809-052600"], "2", &mut disambiguated);
+        assert_eq!(disambiguated.labels(), ["Alice"], "{output}");
+        assert_eq!(report.named, 1, "{output}");
+    }
+
+    /// A voice number means nothing across sessions and a name would fan out over every
+    /// recording on disk, so a selector without exactly one session id is refused before
+    /// anything is read -- and refused loudly, since the alternative is a run that asks about
+    /// somebody else's Unknown 2.
+    #[test]
+    fn a_selector_without_exactly_one_session_id_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        make_session(&paths, "20260809-052700");
+
+        for ids in [&[][..], &["20260809-052600", "20260809-052700"][..]] {
+            let mut interviewer = Scripted::default();
+            let (report, output) = run_targeting(&paths, ids, "2", &mut interviewer);
+
+            assert!(interviewer.seen.is_empty(), "{ids:?}: {output}");
+            assert_eq!(report.failed, 1, "{ids:?}: {output}");
+            assert!(
+                output.contains("--voice needs exactly one session id"),
+                "{ids:?}: {output}"
+            );
+        }
+    }
+
+    /// Why the number is the "Unknown N" and not the cluster id, at the level a user meets it:
+    /// naming a voice does not renumber anybody, so the number that reached it still reaches
+    /// it afterwards -- and the second visit is a correction.
+    #[test]
+    fn a_number_keeps_pointing_at_a_voice_after_it_has_been_named() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+
+        let mut first = Scripted::answering(vec![named("Bob")]);
+        let (report, output) = run_targeting(&paths, &["20260809-052600"], "2", &mut first);
+        assert_eq!(first.labels(), ["Unknown 2"], "{output}");
+        assert_eq!(report.named, 1, "{output}");
+
+        let mut again = Scripted::answering(vec![named("Robert Chen")]);
+        let (report, output) = run_targeting(&paths, &["20260809-052600"], "2", &mut again);
+
+        assert_eq!(
+            again.labels(),
+            ["Bob"],
+            "the same number must reach the same voice, now under its name: {output}"
+        );
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(transcript_of(&session).turns[2].speaker, "Robert Chen");
     }
 
     /// A long line is cut to something that fits a prompt, on a character boundary rather

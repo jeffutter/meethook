@@ -12,7 +12,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use meethook_enroll::{Answer, Enrolment, Interviewer, Offer, Voice, run_enroll, write_clip};
+use meethook_enroll::{
+    Answer, Enrolment, Interviewer, Offer, Voice, VoiceSelector, run_enroll, write_clip,
+};
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
 use meethook_session::{Paths, SessionId};
@@ -509,12 +511,17 @@ impl DownloadProgress {
 pub fn enroll(
     paths: &Paths,
     session_ids: &[String],
+    voice: Option<&str>,
     all: bool,
     correct: bool,
     force_reference: bool,
 ) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
     let mut terminal = Terminal::default();
+    // Unlike a session id there is nothing to validate here: a selector that matches nothing is
+    // answered against the session's actual voices, which is a better message than anything
+    // this edge could produce without having read them.
+    let selector = voice.map(VoiceSelector::from);
     // Named at the one production call site, so which flag answers which question is readable
     // here rather than positional.
     let offer = Offer {
@@ -531,6 +538,7 @@ pub fn enroll(
     let report = run_enroll(
         paths,
         &requested,
+        selector.as_ref(),
         offer,
         enrolment,
         &mut terminal,
@@ -565,10 +573,12 @@ pub fn enroll(
             report.held_back
         );
     }
-    // Skips and pass-overs are ordinary; a session that could not be read is what makes the
-    // run unsuccessful, exactly as in `transcribe`.
+    // Skips and pass-overs are ordinary; a request that could not be served -- a session that
+    // could not be read, an id that is not on disk, a `--voice` matching no voice or several --
+    // is what makes the run unsuccessful, exactly as in `transcribe`. Each has already printed
+    // the line saying which it was, so this only has to make the exit status say so too.
     if report.failed > 0 {
-        bail!("{} session(s) could not be enrolled", report.failed);
+        bail!("{} enroll request(s) could not be served", report.failed);
     }
     Ok(())
 }

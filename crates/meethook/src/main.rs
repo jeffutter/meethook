@@ -59,6 +59,15 @@ enum Command {
         #[arg(value_name = "SESSION_ID")]
         session_ids: Vec<String>,
 
+        /// Ask about one voice and nothing else
+        ///
+        /// Either the number in "Unknown 3" -- not the cluster id, which nothing else shows
+        /// you -- or the name that voice currently reads as. Needs exactly one session id,
+        /// since a voice belongs to one session. Reaches a voice that is too quiet to be
+        /// offered or that already has a name, so --all and --correct add nothing to it.
+        #[arg(long, value_name = "VOICE")]
+        voice: Option<String>,
+
         /// Ask about every unresolved voice, including ones too quiet to be offered by default
         #[arg(long)]
         all: bool,
@@ -85,10 +94,18 @@ fn main() -> Result<()> {
         }
         Command::Enroll {
             session_ids,
+            voice,
             all,
             correct,
             force_reference,
-        } => commands::enroll(&paths, &session_ids, all, correct, force_reference),
+        } => commands::enroll(
+            &paths,
+            &session_ids,
+            voice.as_deref(),
+            all,
+            correct,
+            force_reference,
+        ),
     }
 }
 

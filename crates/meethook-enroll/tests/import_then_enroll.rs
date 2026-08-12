@@ -213,6 +213,7 @@ fn a_session_built_from_a_wav_file_transcribes_enrolls_and_stores_that_audio() {
     let report = run_enroll(
         &paths,
         &[],
+        None,
         Offer::default(),
         Enrolment::default(),
         &mut interviewer,
@@ -313,6 +314,7 @@ fn building_and_transcribing_touches_only_the_root_it_was_given() {
     run_enroll(
         &paths,
         &[],
+        None,
         Offer::default(),
         Enrolment::default(),
         &mut AsksOnce {
