@@ -59,7 +59,11 @@ pub use speakers::{
     ADOPTION_DISTANCE, Clustering, GroupDistance, MERGE_DISTANCE, SPEAKER_FLOOR_SECONDS,
     cluster_speaker_turns, group_distance,
 };
-pub use trials::{EqualError, Spread, Trial, TrialReport, ZeroFalseAccept, score_trials};
+pub use trials::{
+    ArmReport, ClosedSet, EqualError, Misattribution, PolicyItem, PolicyReport, PolicySweep,
+    PolicyVerdict, ReferencePolicy, Spread, Trial, TrialReport, ZeroFalseAccept, policy_references,
+    policy_sweep, score_trials, wilson_interval,
+};
 pub use vad::{SileroVad, SpeechRegion, VadTuning};
 
 use meethook_models::ModelSpec;
