@@ -8,8 +8,8 @@ use std::path::Path;
 
 use jiff::Timestamp;
 use meethook_session::{
-    Classification, Paths, SESSION_SCHEMA_VERSION, SessionId, SessionMetadata, SessionPaths,
-    TrackSync, create_session_dir, discover_sessions, write_atomic,
+    Attendee, AttendeeStatus, Classification, Meeting, Paths, SESSION_SCHEMA_VERSION, SessionId,
+    SessionMetadata, SessionPaths, TrackSync, create_session_dir, discover_sessions, write_atomic,
 };
 use tempfile::TempDir;
 
@@ -143,6 +143,128 @@ fn metadata_never_duplicates_wav_header_fields() {
         assert!(
             !json.contains(banned),
             "session.json must not duplicate {banned}; it belongs to the WAV header"
+        );
+    }
+}
+
+// --- the meeting field, and its compatibility in both directions ---------------------
+
+fn sample_meeting() -> Meeting {
+    Meeting {
+        title: "Incident review".to_owned(),
+        start: "2026-08-09T05:00:00Z".parse().unwrap(),
+        end: "2026-08-09T06:00:00Z".parse().unwrap(),
+        calendar: "Work".to_owned(),
+        organizer: Some(Attendee {
+            name: Some("Ada Lovelace".to_owned()),
+            email: Some("ada@example.com".to_owned()),
+            status: AttendeeStatus::Accepted,
+            is_you: false,
+        }),
+        attendees: vec![Attendee {
+            name: Some("Grace Hopper".to_owned()),
+            email: Some("grace@example.com".to_owned()),
+            status: AttendeeStatus::Tentative,
+            is_you: true,
+        }],
+        url: Some("https://example.com/j/12345".to_owned()),
+        event_id: "EVENT-ABC".to_owned(),
+    }
+}
+
+/// The old-file/new-build direction, written as a literal rather than as a
+/// re-serialization: a re-serialization would track the struct through every future change
+/// and so could never fail, which is the opposite of what this asserts.
+#[test]
+fn session_json_written_before_meetings_still_reads() {
+    let (_tmp, paths) = temp_root();
+    let session = make_session(&paths, "20260809-052607", &[]);
+    let before = r#"{
+      "session_id": "20260809-052607",
+      "schema_version": 1,
+      "start_time": "2026-08-09T05:26:00Z",
+      "mic": { "host_ticks": 9007199254740993, "timebase_numer": 125, "timebase_denom": 3 },
+      "speaker": { "host_ticks": 9007199254740995, "timebase_numer": 125, "timebase_denom": 3 }
+    }"#;
+    fs::write(session.session_json(), before).unwrap();
+
+    let decoded = SessionMetadata::read(&session.session_json()).unwrap();
+
+    assert_eq!(decoded, sample_metadata("20260809-052607"));
+    assert!(decoded.meeting.is_none());
+}
+
+/// The new-file/old-build direction: `OldMetadata` is a build predating this field,
+/// reproduced. Serde ignores members it does not know, so a `session.json` carrying a
+/// meeting must still parse as a whole session for a downgraded binary.
+#[test]
+fn session_json_with_a_meeting_still_reads_on_a_build_without_one() {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OldMetadata {
+        session_id: String,
+        schema_version: u32,
+        start_time: String,
+        mic: serde_json::Value,
+        speaker: serde_json::Value,
+    }
+
+    let json = serde_json::to_string(
+        &sample_metadata("20260809-052607").with_meeting(Some(sample_meeting())),
+    )
+    .unwrap();
+
+    let old: OldMetadata = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(old.session_id, "20260809-052607");
+    assert_eq!(old.schema_version, SESSION_SCHEMA_VERSION);
+}
+
+/// A session recorded outside any meeting must write exactly the bytes it wrote before this
+/// field existed -- that equivalence is why `SESSION_SCHEMA_VERSION` did not move.
+#[test]
+fn a_session_with_no_meeting_writes_no_meeting_key() {
+    let json = serde_json::to_string(&sample_metadata("20260809-052607")).unwrap();
+    assert!(
+        !json.contains("meeting"),
+        "an absent meeting must be absent, not null: {json}"
+    );
+}
+
+#[test]
+fn a_meeting_round_trips_with_its_attendees() {
+    let metadata = sample_metadata("20260809-052607").with_meeting(Some(sample_meeting()));
+    let json = serde_json::to_string(&metadata).unwrap();
+    let decoded: SessionMetadata = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(decoded, metadata);
+    let meeting = decoded.meeting.unwrap();
+    assert_eq!(meeting.title, "Incident review");
+    assert_eq!(meeting.calendar, "Work");
+    assert_eq!(meeting.event_id, "EVENT-ABC");
+    assert_eq!(meeting.attendees.len(), 1);
+    assert!(meeting.attendees[0].is_you);
+    assert_eq!(meeting.attendees[0].status, AttendeeStatus::Tentative);
+    assert_eq!(
+        meeting.organizer.as_ref().unwrap().email.as_deref(),
+        Some("ada@example.com")
+    );
+}
+
+/// Meeting bodies carry dial-in numbers and one-time passcodes, so the absence of a notes
+/// field is a security property rather than an oversight. Asserted on the serialized form,
+/// which is what actually reaches disk.
+#[test]
+fn meeting_metadata_never_stores_notes() {
+    let json = serde_json::to_string(
+        &sample_metadata("20260809-052607").with_meeting(Some(sample_meeting())),
+    )
+    .unwrap();
+    for banned in ["notes", "body", "description", "agenda"] {
+        assert!(
+            !json.contains(banned),
+            "session.json must not store the meeting's {banned}: it routinely carries \
+             dial-in PINs and passcodes"
         );
     }
 }

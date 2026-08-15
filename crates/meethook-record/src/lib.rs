@@ -21,6 +21,7 @@
 //! offset arithmetic is `transcribe`'s job.
 
 mod activity;
+mod calendar;
 mod clock;
 mod exception;
 mod mic;
@@ -297,12 +298,19 @@ impl RunningSession {
 
         report_first_buffer_timing(&mic_summary, &speaker_summary);
 
+        // Asked here, after the silent-track checks, for two reasons. A session that is not
+        // going to be written should not wake the calendar daemon at all; and the question is
+        // asked against `start_time` rather than now, because the moment a recording began is
+        // what identifies the meeting it belongs to. The lookup cannot fail -- see
+        // `calendar` for why a missing grant, no match and a framework raise all arrive here
+        // as `None`, and why losing a recording over the calendar would be the wrong trade.
         let metadata = SessionMetadata::new(
             id.clone(),
             start_time,
             clock::track_sync(mic_ticks),
             clock::track_sync(speaker_ticks),
-        );
+        )
+        .with_meeting(calendar::meeting_at(start_time));
         metadata.write(&paths.session_json())?;
 
         Ok(Recording {

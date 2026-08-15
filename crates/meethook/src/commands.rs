@@ -164,6 +164,13 @@ impl Capture for SessionCapture<'_> {
             recording.speaker.seconds(),
             recording.paths.dir().display()
         );
+        // The title only, and only when there is one. It is the sole user-visible evidence
+        // that the calendar lookup worked, and the one field of a meeting that is safe to
+        // put on a terminal: attendee names and addresses are written to session.json for
+        // speaker identification and are deliberately never printed.
+        if let Some(meeting) = &recording.metadata.meeting {
+            println!("  meeting   {}", meeting.title);
+        }
         Ok(())
     }
 

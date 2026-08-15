@@ -126,6 +126,22 @@ objc2-core-audio-types = "0.3"
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
 objc2-core-media = "0.3"
+# EventKit, for naming a finished session after the meeting it was recorded during.
+# `default-features = false` is load-bearing, not cosmetic: the default feature set pulls
+# objc2-app-kit, objc2-core-location and objc2-map-kit, none of which are in this tree and
+# one of which is enormous. With the list below the only crate this line adds to the build
+# graph is objc2-event-kit itself -- objc2, objc2-foundation and block2 are already here.
+objc2-event-kit = { version = "0.3", default-features = false, features = [
+  "EKCalendar",
+  "EKCalendarItem",
+  "EKEvent",
+  "EKEventStore",
+  "EKObject",
+  "EKParticipant",
+  "EKTypes",
+  "block2",
+  "std",
+] }
 objc2-foundation = "0.3"
 # Only for `MTLCreateSystemDefaultDevice`, the pre-flight probe in meethook-transcribe::gpu.
 # `default-features = false` is load-bearing: the default feature set is an enormous list
