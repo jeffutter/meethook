@@ -113,7 +113,12 @@ webrtc-audio-processing = "~2.1"
 # `#[link(kind = "framework")]`, which the flake's apple-sdk_26 already satisfies.
 block2 = "0.6"
 dispatch2 = "0.3"
-objc2 = "0.6"
+# `exception` is for `objc2::exception::catch`. Apple's audio frameworks report some failures
+# by raising an `NSException`, and one that unwinds into Rust aborts the process outright --
+# see meethook-record::exception for what that cost. Deliberately not `catch-all`, which would
+# wrap every `msg_send!` in the workspace in a `@try` to guard the handful of calls that can
+# actually raise; the wrapping is done at those call sites instead, where it is visible.
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-av-foundation = "0.3"
 objc2-avf-audio = "0.3"
 objc2-core-audio = "0.3"

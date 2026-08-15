@@ -22,6 +22,7 @@
 
 mod activity;
 mod clock;
+mod exception;
 mod mic;
 mod preflight;
 mod speaker;
@@ -69,6 +70,15 @@ pub enum Error {
 
     #[error("AVAudioEngine failed to start: {0}")]
     AudioEngine(String),
+
+    /// An Apple framework raised an Objective-C exception instead of returning an error.
+    ///
+    /// Transient by nature: the calls that raise do so when the hardware moved out from under
+    /// them mid-call, which is precisely what a dock being plugged in does. Reported as an
+    /// ordinary error so the record loop's existing retry treats it as one -- see the
+    /// `exception` module for why an uncaught one used to kill the process instead.
+    #[error("{api} raised an Objective-C exception: {message}")]
+    Framework { api: &'static str, message: String },
 
     /// Fatal at startup only: without listeners there is no trigger, so the recorder would
     /// sit there watching nothing while the user believes it is armed.
@@ -154,8 +164,10 @@ impl Recorder {
     /// Creates a session directory and starts both capture engines.
     ///
     /// Everything that can fail without touching the filesystem -- resolving the display to
-    /// capture, reading the input device's format -- happens before the directory is
-    /// created, so a failed start leaves nothing behind to clean up.
+    /// capture, finding a usable input device -- happens before the directory is created, so
+    /// most failed starts never reach it. The two that can, because they are what bringing an
+    /// engine up costs, discard the directory on their way out: a failed start leaves nothing
+    /// behind either way.
     pub fn start(&self, paths: &Paths, now: &Zoned) -> Result<RunningSession> {
         // Resolved per session rather than cached on the Recorder: displays and input
         // devices change between meetings, and a stale handle would fail confusingly.
@@ -164,13 +176,29 @@ impl Recorder {
 
         let (id, session_paths) = meethook_session::create_session_dir(paths, now)?;
 
-        let speaker = speaker::SpeakerCapture::start(&display, &session_paths.speaker_wav())?;
-        let mic = match input.start(&session_paths.mic_wav()) {
-            Ok(mic) => mic,
+        // Both engines are brought up inside a closure so that every failure past the
+        // directory creation leaves by one path, and that path discards the directory. The
+        // failures here are the transient ones a device swap produces, so the caller retries --
+        // five times, in `begin` -- and without the discard each attempt would leave behind a
+        // directory holding two empty WAV headers and no `session.json`, which at a glance
+        // reads like a recording that went wrong rather than one that never started.
+        let started = (|| {
+            let speaker = speaker::SpeakerCapture::start(&display, &session_paths.speaker_wav())?;
+            match input.start(&session_paths.mic_wav()) {
+                Ok(mic) => Ok((speaker, mic)),
+                Err(e) => {
+                    // The speaker stream is already live; stop it so a failed start does not
+                    // leave a capture running against a session nobody will finish.
+                    drop(speaker.stop());
+                    Err(e)
+                }
+            }
+        })();
+
+        let (speaker, mic) = match started {
+            Ok(engines) => engines,
             Err(e) => {
-                // The speaker stream is already live; stop it so a failed start does not
-                // leave a capture running against a session nobody will finish.
-                drop(speaker.stop());
+                meethook_session::discard_session_dir(&session_paths);
                 return Err(e);
             }
         };

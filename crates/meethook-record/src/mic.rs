@@ -149,58 +149,82 @@ impl MicLiveness {
     }
 }
 
+/// The rate and channel count a format describes, or [`Error::UnusableInputFormat`] if it
+/// describes no usable device at all.
+///
+/// A zero-ish format is exactly what a missing input device or a revoked microphone grant
+/// looks like. Installing a tap on one yields a silent, empty file -- the silent failure this
+/// recorder exists to eliminate -- so it is refused rather than recorded.
+///
+/// Asked twice per session, once when the device is opened and again when the tap is about to
+/// go on, because the device behind the input node can be replaced between the two.
+fn usable_format(format: &AVAudioFormat) -> Result<(u32, u32)> {
+    // SAFETY: plain property reads on a live format object.
+    let sample_rate = unsafe { format.sampleRate() };
+    let channels = unsafe { format.channelCount() };
+
+    if sample_rate.is_nan() || sample_rate <= 0.0 || channels == 0 {
+        return Err(Error::UnusableInputFormat {
+            sample_rate,
+            channels,
+        });
+    }
+    Ok((sample_rate as u32, channels))
+}
+
 /// The default input device, opened and validated but not yet tapped.
 ///
 /// Splitting this from [`MicCapture`] is what lets [`crate::Recorder::start`] discover an
-/// unusable input *before* it creates a session directory.
+/// unusable input *before* it creates a session directory. It deliberately carries no format:
+/// what `open` validated is a fact about the moment it ran, and [`InputDevice::start`] re-reads
+/// rather than trusting it -- see there for why.
 pub struct InputDevice {
     engine: Retained<AVAudioEngine>,
     input: Retained<AVAudioInputNode>,
-    format: Retained<AVAudioFormat>,
-    sample_rate: u32,
-    channels: u32,
 }
 
 impl InputDevice {
     pub fn open() -> Result<InputDevice> {
-        let engine = unsafe { AVAudioEngine::new() };
-        // SAFETY: `inputNode` is a plain property read; on macOS it is always present, and
-        // its *format* is what reveals whether a usable device is actually behind it.
-        let input = unsafe { engine.inputNode() };
-        let format = unsafe { input.outputFormatForBus(0) };
+        // All three calls under one `catching` because they are one question -- "is there a
+        // usable input device?" -- that the framework happens to answer in three. `inputNode`
+        // raises rather than returns when no input can be produced, and reading a format off a
+        // node whose device is mid-reconfiguration raises as well; both are what a device
+        // arriving or leaving provokes, and either would abort the process uncaught.
+        // SAFETY: `inputNode` is a plain property read; on macOS it is always present, and its
+        // *format* is what reveals whether a usable device is actually behind it.
+        let (engine, input, format) =
+            crate::exception::catching("AVAudioEngine.inputNode", || unsafe {
+                let engine = AVAudioEngine::new();
+                let input = engine.inputNode();
+                let format = input.outputFormatForBus(0);
+                (engine, input, format)
+            })?;
 
-        // SAFETY: plain property reads on a live format object.
-        let sample_rate = unsafe { format.sampleRate() };
-        let channels = unsafe { format.channelCount() };
+        usable_format(&format)?;
 
-        // A zero format is exactly what a missing input device or a revoked microphone grant
-        // looks like. Installing a tap on it yields a silent, empty file, which is the silent
-        // failure this recorder exists to eliminate -- so refuse here instead.
-        if sample_rate.is_nan() || sample_rate <= 0.0 || channels == 0 {
-            return Err(Error::UnusableInputFormat {
-                sample_rate,
-                channels,
-            });
-        }
-
-        Ok(InputDevice {
-            engine,
-            input,
-            format,
-            sample_rate: sample_rate as u32,
-            channels,
-        })
+        Ok(InputDevice { engine, input })
     }
 
     /// Installs the tap and starts the engine, writing to `path`.
     pub fn start(self, path: &Path) -> Result<MicCapture> {
-        let InputDevice {
-            engine,
-            input,
-            format,
-            sample_rate,
-            channels,
-        } = self;
+        let InputDevice { engine, input } = self;
+
+        // Re-read rather than reuse the format `open` validated, because the hardware is free
+        // to move in between. Everything separating the two runs against the world -- resolving
+        // the display to capture, creating the session directory, bringing the ScreenCaptureKit
+        // stream up -- and on the run that motivated this, a dock enumerating stretched that
+        // gap to 6.5 seconds, across which the default input changed rate underneath a format
+        // that had already been read.
+        //
+        // That matters because `installTapOnBus` *raises* when the format it is handed no
+        // longer matches the input node's current hardware format, and an uncaught raise
+        // aborted the process. Reading here narrows the window from that gap to the few
+        // instructions below; `catching` covers what is left, since no re-read can close it.
+        let format =
+            crate::exception::catching("AVAudioInputNode.outputFormatForBus", || unsafe {
+                input.outputFormatForBus(0)
+            })?;
+        let (sample_rate, channels) = usable_format(&format)?;
 
         let writer = TrackWriter::create(path, sample_rate)?;
         let sink = writer.sink();
@@ -255,9 +279,11 @@ impl InputDevice {
             },
         );
 
+        // The raise this whole path is arranged around: a format that stopped matching the
+        // node's hardware format between the read above and this call. See `catching`.
         // SAFETY: the tap block is retained by the framework and kept alive by the `RcBlock`
         // stored in the returned struct, which lives until `removeTapOnBus`.
-        unsafe {
+        let installed = crate::exception::catching("AVAudioInputNode.installTapOnBus", || unsafe {
             let block: AVAudioNodeTapBlock = (&*tap as *const block2::DynBlock<_>).cast_mut();
             input.installTapOnBus_bufferSize_format_block(
                 0,
@@ -265,15 +291,36 @@ impl InputDevice {
                 Some(&format),
                 block,
             );
+        });
+        if let Err(e) = installed {
+            let _ = writer.finish();
+            return Err(e);
         }
 
+        // `startAndReturnError` reports most failures by returning one, but raises for a graph
+        // it considers malformed -- which is one of the ways a device that moved since the tap
+        // went on presents. The two answers mean the same thing to this function, so they are
+        // flattened into one before either is acted on.
         // SAFETY: the graph is a bare input tap, which needs no output connection on macOS.
-        unsafe { engine.prepare() };
-        if let Err(e) = unsafe { engine.startAndReturnError() } {
+        let started = crate::exception::catching("AVAudioEngine.start", || unsafe {
+            engine.prepare();
+            engine.startAndReturnError()
+        });
+        let started = match started {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(Error::AudioEngine(e.localizedDescription().to_string())),
+            Err(raised) => Err(raised),
+        };
+        if let Err(e) = started {
+            // Also `catching`: tearing down a tap on a node whose device has gone is itself one
+            // of the calls that raises, and a raise here would abort while cleaning up after a
+            // failure that was about to be reported and retried.
             // SAFETY: `input` is the node the tap was just installed on.
-            unsafe { input.removeTapOnBus(0) };
+            let _ = crate::exception::catching("AVAudioInputNode.removeTapOnBus", || unsafe {
+                input.removeTapOnBus(0)
+            });
             let _ = writer.finish();
-            return Err(Error::AudioEngine(e.localizedDescription().to_string()));
+            return Err(e);
         }
 
         Ok(MicCapture {
@@ -339,11 +386,18 @@ impl MicCapture {
 
         // Stop first, then remove the tap: the reverse order leaves a window in which a
         // callback can fire into a torn-down writer.
+        //
+        // A raise here is swallowed rather than returned, which is the opposite of what `start`
+        // does with the same calls, and deliberately so. This runs on the finalize path: the
+        // audio is already on disk and `writer.finish` is the only thing between it and a valid
+        // WAV. An engine whose device has disappeared is exactly what provokes a raise on the
+        // way down -- and that is exactly the situation this recorder finalizes *in response
+        // to*, so letting it cost the recording would invert the point of finalizing at all.
         // SAFETY: both are live objects owned by this struct.
-        unsafe {
+        let _ = crate::exception::catching("AVAudioEngine.stop", || unsafe {
             engine.stop();
             input.removeTapOnBus(0);
-        }
+        });
 
         writer.finish()
     }

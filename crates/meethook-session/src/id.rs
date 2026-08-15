@@ -108,6 +108,30 @@ pub fn create_session_dir(paths: &Paths, now: &Zoned) -> Result<(SessionId, Sess
     })
 }
 
+/// Removes a session directory that never became a session.
+///
+/// The inverse of [`create_session_dir`], for the window between that call and the point where
+/// a recorder has both of its capture engines live. A start that fails inside that window
+/// leaves two WAV headers and no `session.json` behind, and since such a start is retried,
+/// it leaves one such directory per attempt -- on-disk litter that reads exactly like a
+/// recording that went wrong rather than one that never began.
+///
+/// Deliberately narrow, and deliberately infallible:
+///
+/// - Only the two track files a start can have created are removed, by name, and the directory
+///   goes with `remove_dir` rather than `remove_dir_all`. Anything else inside means this is
+///   not the directory this function believes it is, and `remove_dir` refuses a non-empty one,
+///   so the surprising case leaves the data alone instead of deleting it.
+/// - Nothing is reported, because there is nothing a caller could do with it. The error that
+///   prompted the discard is the one worth surfacing; returning a `Result` here would only
+///   invite a failure to tidy up to shadow the failure that mattered.
+pub fn discard_session_dir(paths: &SessionPaths) {
+    for track in [paths.mic_wav(), paths.speaker_wav()] {
+        let _ = fs::remove_file(track);
+    }
+    let _ = fs::remove_dir(paths.dir());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +172,65 @@ mod tests {
                 "expected {garbage:?} to be rejected"
             );
         }
+    }
+
+    /// The ordinary case: a start that brought both writers up and then failed leaves the two
+    /// WAV headers, and the discard takes the whole directory with them.
+    #[test]
+    fn discarding_removes_a_directory_holding_only_the_two_track_headers() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let now: Zoned = "2026-08-14T16:45:31-05:00[America/Chicago]"
+            .parse()
+            .unwrap();
+        let (_id, session) = create_session_dir(&paths, &now).unwrap();
+        fs::write(session.mic_wav(), b"RIFF").unwrap();
+        fs::write(session.speaker_wav(), b"RIFF").unwrap();
+
+        discard_session_dir(&session);
+
+        assert!(
+            !session.dir().exists(),
+            "the directory outlived the discard"
+        );
+    }
+
+    /// A start that failed before either writer existed leaves an empty directory, and the
+    /// discard has to cope with the files it is asked to remove not being there.
+    #[test]
+    fn discarding_removes_an_empty_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let now: Zoned = "2026-08-14T16:45:31-05:00[America/Chicago]"
+            .parse()
+            .unwrap();
+        let (_id, session) = create_session_dir(&paths, &now).unwrap();
+
+        discard_session_dir(&session);
+
+        assert!(!session.dir().exists());
+    }
+
+    /// The guard that matters. Anything beyond the two track files means this is not the
+    /// directory the discard believes it is, and the safe answer is to leave it alone -- so
+    /// `remove_dir` rather than `remove_dir_all`, checked here rather than assumed.
+    #[test]
+    fn discarding_leaves_a_directory_holding_anything_else() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let now: Zoned = "2026-08-14T16:45:31-05:00[America/Chicago]"
+            .parse()
+            .unwrap();
+        let (_id, session) = create_session_dir(&paths, &now).unwrap();
+        fs::write(session.mic_wav(), b"RIFF").unwrap();
+        fs::write(session.session_json(), b"{}").unwrap();
+
+        discard_session_dir(&session);
+
+        assert!(
+            session.dir().exists(),
+            "a directory holding session.json was deleted"
+        );
+        assert!(session.session_json().exists());
     }
 }
