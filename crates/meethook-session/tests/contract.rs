@@ -168,6 +168,8 @@ fn sample_meeting() -> Meeting {
             is_you: true,
         }],
         url: Some("https://example.com/j/12345".to_owned()),
+        location: Some("Babbage Room".to_owned()),
+        notes: Some("Agenda: the pager, then the fix".to_owned()),
         event_id: "EVENT-ABC".to_owned(),
     }
 }
@@ -251,22 +253,40 @@ fn a_meeting_round_trips_with_its_attendees() {
     );
 }
 
-/// Meeting bodies carry dial-in numbers and one-time passcodes, so the absence of a notes
-/// field is a security property rather than an oversight. Asserted on the serialized form,
-/// which is what actually reaches disk.
+/// The invite body reaches disk verbatim -- it is the agenda, and the best answer a stored
+/// session has to "what was this meeting about". Asserted on the serialized form, which is
+/// what actually reaches disk.
+///
+/// This replaces an earlier test asserting the exact opposite. Storing the body was once
+/// ruled out because it routinely carries dial-in PINs; the field is now stored deliberately,
+/// and the security property that survived the reversal is narrower: notes go to
+/// `session.json` and to no log line. That half lives where the rendering does, in
+/// `meethook-record`'s `the_debug_line_counts_attendees_without_naming_them`.
 #[test]
-fn meeting_metadata_never_stores_notes() {
+fn meeting_metadata_stores_the_invite_body_and_location() {
     let json = serde_json::to_string(
         &sample_metadata("20260809-052607").with_meeting(Some(sample_meeting())),
     )
     .unwrap();
-    for banned in ["notes", "body", "description", "agenda"] {
-        assert!(
-            !json.contains(banned),
-            "session.json must not store the meeting's {banned}: it routinely carries \
-             dial-in PINs and passcodes"
-        );
-    }
+
+    assert!(json.contains("Agenda: the pager, then the fix"), "{json}");
+    assert!(json.contains("Babbage Room"), "{json}");
+}
+
+/// An event with no body writes no key, rather than `"notes": null` or `"notes": ""`: absent
+/// and empty mean different things to anything reading these files later.
+#[test]
+fn a_meeting_without_notes_writes_no_notes_key() {
+    let bare = Meeting {
+        notes: None,
+        location: None,
+        ..sample_meeting()
+    };
+    let json = serde_json::to_string(&sample_metadata("20260809-052607").with_meeting(Some(bare)))
+        .unwrap();
+
+    assert!(!json.contains("notes"), "{json}");
+    assert!(!json.contains("location"), "{json}");
 }
 
 #[test]

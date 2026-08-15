@@ -218,6 +218,12 @@ unsafe fn candidate(event: &EKEvent) -> Option<Candidate> {
                     .URL()
                     .and_then(|url| url.absoluteString())
                     .map(|url| url.to_string()),
+                // Both are absent-or-present, never present-and-empty: EventKit hands back an
+                // empty string for a field the organizer left blank in some accounts and nil
+                // in others, and `"notes": ""` in `session.json` would read as "the agenda
+                // was empty" rather than "there was no agenda".
+                location: text(event.location()),
+                notes: text(event.notes()),
                 // `eventIdentifier` is nil only for an event not yet saved to a store, which
                 // one fetched *from* a store cannot be. The fallback is the calendar item's
                 // own identifier rather than an empty string so that the field keeps its
@@ -254,6 +260,13 @@ unsafe fn attendee(participant: &EKParticipant) -> Attendee {
             is_you: participant.isCurrentUser(),
         }
     }
+}
+
+/// An optional framework string as owned Rust, with the empty one treated as absent.
+fn text(value: Option<objc2::rc::Retained<objc2_foundation::NSString>>) -> Option<String> {
+    value
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// The bare address behind a participant URL, or `None` for a participant that is not a
@@ -382,12 +395,17 @@ fn debug(message: &str) {
     }
 }
 
-/// Renders a candidate for [`debug`] with its attendees *counted*, never named.
+/// Renders a candidate for [`debug`] with its attendees *counted*, never named, and its
+/// notes and location omitted entirely.
 ///
 /// Attendee names and addresses go to `session.json` because speaker identification needs
-/// them; they do not go to a terminal, a log file, or anywhere a screen share or a pasted
-/// error report can carry them. Keeping the rendering in one tested function is what makes
-/// that a property of the code rather than a promise -- see the test below.
+/// them; the invite body goes there because it is the meeting's agenda. Neither goes to a
+/// terminal, a log file, or anywhere a screen share or a pasted error report can carry them
+/// -- an invite body is the single most likely field here to contain a dial-in PIN. What is
+/// left is what someone debugging "why did my session get no meeting?" actually needs: the
+/// times, the title, the calendar and the two disqualifying flags. Keeping the rendering in
+/// one tested function is what makes that a property of the code rather than a promise --
+/// see the test below.
 fn summarize(candidate: &Candidate) -> String {
     let mut line = String::new();
     let _ = write!(
@@ -439,6 +457,8 @@ mod tests {
                 organizer: None,
                 attendees: Vec::new(),
                 url: None,
+                location: None,
+                notes: None,
                 event_id: id.to_owned(),
             },
             all_day: false,
@@ -578,10 +598,12 @@ mod tests {
     }
 
     /// AC #5, in the only place a meeting is ever rendered for a human: attendee names and
-    /// addresses reach `session.json` and nothing else.
+    /// addresses, the invite body and the location reach `session.json` and nothing else.
     #[test]
     fn the_debug_line_counts_attendees_without_naming_them() {
         let mut candidate = candidate("standup", "2026-08-15T09:55:00Z", "2026-08-15T10:25:00Z");
+        candidate.meeting.notes = Some("Dial-in 555-0100, passcode 481516".to_owned());
+        candidate.meeting.location = Some("Babbage Room, 12 Ada Street".to_owned());
         candidate.meeting.attendees = vec![
             Attendee {
                 name: Some("Grace Hopper".to_owned()),
@@ -624,6 +646,13 @@ mod tests {
             "Turing",
             "alan@example.com",
             "@",
+            // The invite body and the location, which are why this test matters most.
+            "Dial-in",
+            "555-0100",
+            "passcode",
+            "481516",
+            "Babbage",
+            "12 Ada Street",
         ] {
             assert!(
                 !line.contains(secret),
@@ -739,6 +768,10 @@ mod tests {
                 event.setEndDate(Some(&NSDate::dateWithTimeIntervalSince1970(
                     at("2026-08-15T10:25:00Z").as_duration().as_secs_f64(),
                 )));
+                event.setNotes(Some(&NSString::from_str("Agenda: the pager, then the fix")));
+                // Blank rather than unset, which is how some accounts spell "no location":
+                // it must convert to absent, not to `Some("")`.
+                event.setLocation(Some(&NSString::from_str("")));
 
                 super::candidate(&event)
             }
@@ -750,6 +783,14 @@ mod tests {
         assert_eq!(converted.meeting.start, at("2026-08-15T09:55:00Z"));
         assert_eq!(converted.meeting.end, at("2026-08-15T10:25:00Z"));
         assert_eq!(converted.meeting.calendar, "Work");
+        assert_eq!(
+            converted.meeting.notes.as_deref(),
+            Some("Agenda: the pager, then the fix")
+        );
+        assert_eq!(
+            converted.meeting.location, None,
+            "an empty location is none"
+        );
         assert!(!converted.all_day);
         assert!(!converted.declined);
         // An unsaved event has no invitation behind it, so these are empty rather than wrong.

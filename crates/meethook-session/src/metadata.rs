@@ -68,11 +68,16 @@ pub struct Attendee {
 /// set of people who could plausibly be speaking, which is what a speaker-identification
 /// pass needs to avoid matching a voice against every person ever enrolled.
 ///
-/// There is deliberately no `notes` field, and adding one would be a security regression,
-/// not a feature. Meeting bodies routinely carry dial-in numbers, conference PINs and
-/// one-time passcodes; `session.json` is an unencrypted file in a directory the user shares
-/// around, and none of that belongs in it. Everything stored here is either already visible
-/// in the meeting's title bar or needed to identify a speaker.
+/// `notes` is the invite body, stored because it is the field most likely to answer "what
+/// was this meeting about" for a transcript that has outlived anyone's memory of it. It is
+/// also the least predictable thing here: meeting bodies routinely carry dial-in numbers,
+/// conference PINs and one-time passcodes, and every other field on this struct is short and
+/// structural by comparison. Two rules follow from that and are enforced elsewhere:
+///
+/// - It reaches `session.json` and nothing else -- no log line, no terminal, no error report.
+///   `meethook-record`'s calendar debug output renders a meeting without it, under test.
+/// - `session.json` is therefore a file with meeting *content* in it, not just metadata
+///   about a recording. That matters wherever a session directory gets synced or shared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meeting {
     pub title: String,
@@ -87,6 +92,15 @@ pub struct Meeting {
     /// The event's own URL, which for most video-conferencing invites is the join link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Where the meeting is: a room name, a street address, or a join URL, depending
+    /// entirely on who wrote the invite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// The invite body, verbatim and unparsed -- the agenda, and whatever else the organizer
+    /// put there. Absent rather than empty when the event has none. See this struct's own
+    /// documentation for what may and may not be done with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     /// `EKEvent.eventIdentifier`, stored so a later pass can re-resolve the event against
     /// the live calendar rather than trusting this snapshot of it.
     pub event_id: String,
