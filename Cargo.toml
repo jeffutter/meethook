@@ -131,6 +131,16 @@ objc2-core-media = "0.3"
 # objc2-app-kit, objc2-core-location and objc2-map-kit, none of which are in this tree and
 # one of which is enormous. With the list below the only crate this line adds to the build
 # graph is objc2-event-kit itself -- objc2, objc2-foundation and block2 are already here.
+#
+# `EKSource` is here for the diagnostic in crates/meethook-record/examples/calendar-access.rs
+# and for nothing in `src/`. It is what distinguishes "the work meetings are in an Exchange
+# account synced into Calendar.app" from "there are accounts configured and none of them is
+# the work one" -- `EKCalendar::type()` alone answers CalDAV/Exchange/Local but not *which*
+# account, and this machine has three. Measured rather than assumed, by diffing
+# `cargo tree -p meethook-record` and `Cargo.lock` across the change: it adds no crate and
+# does not move the lock file. Its only effect beyond compiling `EKSource.rs` is turning on
+# `objc2-foundation/NSSet` and `objc2-foundation/NSString`, and objc2-foundation is already
+# in the tree with default features, so both were already on.
 objc2-event-kit = { version = "0.3", default-features = false, features = [
   "EKCalendar",
   "EKCalendarItem",
@@ -138,6 +148,7 @@ objc2-event-kit = { version = "0.3", default-features = false, features = [
   "EKEventStore",
   "EKObject",
   "EKParticipant",
+  "EKSource",
   "EKTypes",
   "block2",
   "std",
