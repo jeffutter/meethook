@@ -64,14 +64,34 @@
         # which is how webrtc-audio-processing-sys finds the library at all.
         nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
 
-        # Developer tooling, not build inputs: neither is linked against nor invoked by
-        # any crate's build script, so `packages` is the right list for both.
+        # Developer tooling, not build inputs: none is linked against or invoked by any
+        # crate's build script, so `packages` is the right list for all three.
         #
         # lefthook runs the gates in lefthook.yml; the shellHook below installs its git
         # hooks, so entering the shell is the only setup step a fresh clone needs.
         #
         # cargo-audit backs the pre-push advisory scan.
-        packages = [ rustToolchain pkgs.lefthook pkgs.cargo-audit ];
+        #
+        # cargo-outdated backs the periodic dependency sweep. Its Project/Compat/Latest
+        # columns are the distinction that matters here, because Cargo.toml's requirements
+        # are mostly loose carets: `cargo update` moves the lock without ever saying which
+        # *requirement* has fallen behind.
+        #
+        # Read its output with one caveat, measured rather than assumed (0.19.0, on a
+        # scratch workspace with one inherited and one literal dependency, both a major
+        # version behind): it does not see requirements inherited from
+        # `[workspace.dependencies]`. Its "latest" pass rewrites member manifests, and this
+        # workspace's members all say `foo = { workspace = true }`, so there is nothing in
+        # them to rewrite and every crate here is invisible to it. It printed "All
+        # dependencies are up to date, yay!" while mach2 and sha2 were each a major behind.
+        # `cargo update --dry-run --verbose` is what actually lists them -- its "Unchanged
+        # <crate> (available: <ver>)" lines are the real report -- so run both.
+        #
+        # Deliberately not wired into lefthook.yml: being behind on a dependency is not a
+        # push-blocking condition, and unlike cargo-audit there is no advisory to fail on,
+        # so making every push depend on the crates.io index being reachable would buy
+        # nothing.
+        packages = [ rustToolchain pkgs.lefthook pkgs.cargo-audit pkgs.cargo-outdated ];
 
         env = {
           # bindgen (via whisper-rs-sys) loads libclang at build time rather than linking

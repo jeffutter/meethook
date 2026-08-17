@@ -55,7 +55,7 @@ jiff = "0.2"
 # executable behind a capturing pid. Already in the tree transitively, so this adds no
 # crate to the build graph.
 libc = "0.2"
-mach2 = "0.5"
+mach2 = "0.6"
 # The template engine behind `transcript.md`. Templates are read from a path at runtime --
 # `<root>/transcript.md.jinja`, or whatever `--template` names -- so a compile-time engine
 # such as askama cannot express this at all.
@@ -79,15 +79,28 @@ mach2 = "0.5"
 minijinja = { version = "2" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+# The sha256 behind `ModelSpec::sha256` and `stream_and_hash`. `meethook-models` is its only
+# consumer -- nothing else in the graph pulls sha2 -- which is what makes the 0.11 requirement
+# safe to state here rather than a duplicate-version hazard.
+#
+# 0.11 is a whole-stack RustCrypto bump (digest 0.10 -> 0.11, crypto-common 0.1 -> 0.2,
+# block-buffer 0.10 -> 0.12), and its visible change is that `Output<Self>` is a
+# `hybrid_array::Array` instead of a `generic_array::GenericArray`. Both deref to `[u8]`, so
+# the call sites are untouched. Worth recording because the swap is not the graph growth it
+# looks like: measured across the bump, `generic-array` and its `version_check` build-dep leave
+# and `hybrid-array` and `const-oid` arrive, for a net of zero crates.
+sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
 # Blocking and rustls-backed: one plain GET per model file wants neither an async runtime
 # nor a native OpenSSL dependency in the flake.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
-# The classic (pre-1.0) rubato API. 1.0+ routes all I/O through the `audioadapter` traits,
-# which buy nothing for one fixed-ratio mono conversion.
+# The classic (pre-1.0) rubato API. Every release from 1.0 onward -- 5.0 is the current one --
+# routes all I/O through the `audioadapter` traits, which buy nothing for one fixed-ratio mono
+# conversion. This is the workspace's one deliberately-behind dependency -- the only crate
+# `cargo update --dry-run --verbose` still reports as "Unchanged ... (available: ...)" -- and
+# staying here is the answer, not an oversight.
 rubato = "0.16"
 
 # Real-input FFT, for the GCC-PHAT delay estimate in meethook-transcribe::align. It wraps
