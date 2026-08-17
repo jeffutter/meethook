@@ -11,7 +11,10 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+# 1.88 rather than 1.85 because `ropus` declares that floor, so a 1.85 toolchain can no longer
+# build this workspace and saying otherwise would be a false claim rather than a conservative
+# one. The devShell pins 1.97, so nothing observable changes here.
+rust-version = "1.88"
 publish = false
 
 # A `cargo run` has to be usable on a real session, and at opt-level 0 it is not: the
@@ -92,6 +95,33 @@ rubato = "0.16"
 # implementation -- and a real-input transform is half the work of pretending audio is
 # complex.
 realfft = "3.5"
+
+# The Opus encoder behind `meeting.opus`, and the Ogg container it is wrapped in. Two crates
+# because they are two concerns: Opus is a packet codec with no notion of a file, and Ogg is a
+# framing format with no notion of audio. Keeping them separate is what the RFC 7845 mapping
+# assumes, and it is why swapping either half later touches only one line here.
+#
+# ropus is the pure-Rust port of xiph's fixed-point reference, bit-exact against it, and it
+# encodes as well as decodes -- verified by building against it rather than by reading the
+# description: `Encoder::builder(rate, channels, Application)` with `encode_float`, plus
+# `Signal::Voice`, VBR and complexity. That is the whole reason it is here instead of
+# `audiopus`/`opus`, both of which are bindings to libopus and would put a C library in the
+# flake for the sake of one artefact.
+#
+# Its `build.rs` does declare a `cc` build-dependency, and that is worth knowing rather than
+# glossing over: the script compiles a small C driver that bakes xiph's neural weight tables
+# into the *decoder*. It looks for those tables at `../reference/dnn/`, i.e. one level above
+# the crate, which exists only in ropus's own git checkout. Consumed from the registry the
+# path is absent, so the script takes its early-out branch, writes a zero-byte blob and
+# invokes no compiler at all. Nothing here decodes in anger, so the disabled neural
+# packet-loss concealment costs nothing either. `flake.nix` is unchanged by this dependency,
+# which is the observable form of that claim.
+#
+# ropus declares `rust-version = "1.88"`, which is why this workspace's floor moved up to
+# match. Six pure-Rust crates enter the graph in total: these two plus `wide`, `safe_arch`,
+# `bytemuck` and `byteorder`.
+ropus = "0.12"
+ogg = "0.9"
 
 # whisper.cpp bindings. `metal` pulls in `_gpu`, which is what makes `use_gpu` default to
 # true; see the assertion in meethook-transcribe::asr that keeps that honest.

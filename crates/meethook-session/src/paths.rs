@@ -11,6 +11,7 @@ use crate::SessionId;
 const MIC_WAV: &str = "mic.wav";
 const MIC_CLEANED_WAV: &str = "mic.cleaned.wav";
 const SPEAKER_WAV: &str = "speaker.wav";
+const MEETING_OPUS: &str = "meeting.opus";
 const SESSION_JSON: &str = "session.json";
 const SPEAKER_CLUSTERS_JSON: &str = "speaker_clusters.json";
 const SPEAKER_NAMES_JSON: &str = "speaker_names.json";
@@ -99,6 +100,18 @@ impl SessionPaths {
 
     pub fn speaker_wav(&self) -> PathBuf {
         self.dir.join(SPEAKER_WAV)
+    }
+
+    /// Both tracks mixed to one compressed stereo file, for listening back to the meeting.
+    ///
+    /// The `.opus` extension rather than `.ogg`: the contents are an Ogg stream either way,
+    /// but every player that matters keys on `.opus` for an Opus-in-Ogg file, and it says
+    /// which of the two Ogg payloads this is without opening it.
+    ///
+    /// Written by `transcribe`, and derived rather than authoritative -- deleting it costs a
+    /// re-transcribe, not a recording. Nothing classifies a session by it.
+    pub fn meeting_opus(&self) -> PathBuf {
+        self.dir.join(MEETING_OPUS)
     }
 
     /// Presence marks the session as valid/complete.

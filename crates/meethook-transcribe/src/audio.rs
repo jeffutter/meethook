@@ -91,7 +91,7 @@ pub fn read_track_16k_mono(path: &Path) -> Result<Vec<f32>> {
 ///
 /// Lossy rather than fallible: this decides what a heartbeat line says, and a track whose name
 /// is not UTF-8 is still a track worth reporting progress over.
-fn file_name(path: &Path) -> String {
+pub(crate) fn file_name(path: &Path) -> String {
     path.file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy()

@@ -21,7 +21,11 @@ objc2-metal = { workspace = true }
 # A normal dependency, not a dev one: the diarization and speaker-embedding graphs run on
 # the real transcribe path.
 ort = { workspace = true }
+# The Ogg container and the Opus codec behind `meeting.opus`. Normal dependencies, not dev
+# ones: the mixdown is written on the real transcribe path, next to `mic.cleaned.wav`.
+ogg = { workspace = true }
 realfft = { workspace = true }
+ropus = { workspace = true }
 rubato = { workspace = true }
 thiserror = { workspace = true }
 

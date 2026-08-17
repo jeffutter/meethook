@@ -322,7 +322,7 @@ mod tests {
                 // Bursts of a formant-ish pair, gated on and off twice a second.
                 let voiced = (t * 240.0 * std::f32::consts::TAU).sin() * 0.4
                     + (t * 1_700.0 * std::f32::consts::TAU).sin() * 0.2;
-                if (t * 2.0) as u32 % 2 == 0 {
+                if ((t * 2.0) as u32).is_multiple_of(2) {
                     voiced
                 } else {
                     0.0

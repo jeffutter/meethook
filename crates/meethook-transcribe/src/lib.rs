@@ -24,6 +24,15 @@ mod identify;
 mod import;
 mod levels;
 mod merge;
+// Public, unlike every other module here, for the same reason `meethook_session::wav` is: its
+// two functions are called `mix` and `write`, and those names carry their meaning only next to
+// the module's own.
+//
+// A plain comment rather than a doc comment deliberately: an outer doc comment on a `mod` item
+// merges with that module's inner `//!` block and makes rustdoc resolve the whole thing in
+// *this* scope, where `mix` is not a name -- so the module's own docs would fail
+// `-D rustdoc::broken-intra-doc-links` for links that are correct where they are written.
+pub mod mixdown;
 mod onnx;
 mod progress;
 mod reference;
@@ -180,6 +189,13 @@ pub enum Error {
     #[error("{path} is not a track this tool can read: {detail}")]
     UnsupportedAudio { path: PathBuf, detail: String },
 
+    /// Anything that goes wrong producing `meeting.opus`: the Opus encoder, the Ogg framing
+    /// around it, or the write underneath both. A `String` rather than a `#[source]` because
+    /// the three failures arrive as three unrelated error types and the only thing a reader
+    /// wants from any of them is the sentence they print.
+    #[error("could not write {path}: {detail}")]
+    Mixdown { path: PathBuf, detail: String },
+
     /// Audio that cannot produce a turn, a cluster or an embedding: a wav whose data chunk
     /// holds nothing, or no source files at all. Raised by [`build_session`] rather than
     /// tolerated, because a session assembled from it would be indistinguishable from a
@@ -254,6 +270,13 @@ impl Error {
             source,
         }
     }
+
+    fn mixdown(path: impl Into<PathBuf>, detail: impl Into<String>) -> Self {
+        Error::Mixdown {
+            path: path.into(),
+            detail: detail.into(),
+        }
+    }
 }
 
 /// Everything transcription needs a model for, opened together.
@@ -325,6 +348,8 @@ pub fn transcribe_session(
         mic_minus_speaker_seconds(&metadata)?,
         progress,
     )?;
+
+    write_mixdown(session, &mic_track, &speaker_track, &metadata)?;
 
     let mic_segments = asr.transcribe(&mic_track)?;
 
@@ -517,14 +542,67 @@ fn clean_mic_track(
     Ok(cleaned.audio)
 }
 
+/// Writes `meeting.opus`: both tracks on the transcript's own timeline, panned apart, as one
+/// compressed file any player opens.
+///
+/// Three things are decided by where this is called from rather than by anything inside it.
+///
+/// *The cleaned mic track, not the raw one.* Both are in memory here, and the raw one still
+/// carries the far end bleeding back in through the microphone, delayed by the acoustic path.
+/// Summing that into a partly-panned mix is comb filtering and audible echo. The cleaned track
+/// is also what the transcript heard, so the recording and the text tell the same story.
+///
+/// *The 16 kHz tracks already in memory, not a second read at the native rate.* Both are
+/// already loaded and resampled by this point, so the mixdown costs one pass over memory and
+/// no file I/O; re-reading the originals for a 48 kHz mix would cost another ~460 MB of
+/// reading for a band a far end already through a conferencing codec may not even have.
+///
+/// *Before recognition, not after.* An hour of Whisper interrupted halfway still leaves a
+/// listenable recording behind, which is the same argument that puts `mic.cleaned.wav` where
+/// it is.
+///
+/// The offsets are the ones `merge` puts into the transcript, taken from the recorded host
+/// ticks, so "the audio agrees with the timeline the transcript states" is true by
+/// construction rather than by two call sites happening to agree.
+fn write_mixdown(
+    session: &DiscoveredSession,
+    mic: &[f32],
+    speaker: &[f32],
+    metadata: &SessionMetadata,
+) -> Result<()> {
+    let sources = [
+        mixdown::Source {
+            samples: mic,
+            offset_s: mic_offset_seconds(metadata)?,
+            pan: -mixdown::PAN_POSITION,
+        },
+        mixdown::Source {
+            samples: speaker,
+            offset_s: speaker_offset_seconds(metadata)?,
+            pan: mixdown::PAN_POSITION,
+        },
+    ];
+
+    mixdown::write(
+        &session.paths.meeting_opus(),
+        &mixdown::mix(&sources, TARGET_RATE),
+        TARGET_RATE,
+        mixdown::BITRATE_BPS,
+    )
+}
+
 /// Seconds from session start to the microphone track's first sample.
+///
+/// Public alongside [`speaker_offset_seconds`] so that a diagnostic can put the two tracks on
+/// the timeline the transcript uses without re-deriving the tick arithmetic from
+/// `session.json` -- see `examples/session-mixdown.rs`.
 ///
 /// Session start is the earlier of the two tracks' first samples, not `session.json`'s
 /// `start_time`: that field is a wall-clock instant captured when the directory was created,
 /// with no recorded pairing to mach tick space, so it cannot be compared to either track's
 /// `host_ticks`. Using the earliest track instead keeps every turn non-negative once
 /// speaker-track turns join the same timeline.
-fn mic_offset_seconds(metadata: &SessionMetadata) -> Result<f64> {
+pub fn mic_offset_seconds(metadata: &SessionMetadata) -> Result<f64> {
     Ok(mic_minus_speaker_seconds(metadata)?.max(0.0))
 }
 
@@ -538,7 +616,7 @@ fn mic_offset_seconds(metadata: &SessionMetadata) -> Result<f64> {
 /// with when the far end actually spoke. Applying it here would shift every participant turn
 /// late by up to a few hundred milliseconds. The tick delta is honest to well under the
 /// accuracy merge ordering needs.
-fn speaker_offset_seconds(metadata: &SessionMetadata) -> Result<f64> {
+pub fn speaker_offset_seconds(metadata: &SessionMetadata) -> Result<f64> {
     Ok((-mic_minus_speaker_seconds(metadata)?).max(0.0))
 }
 
@@ -1407,6 +1485,52 @@ mod tests {
             std::fs::read(session.paths.mic_wav()).unwrap(),
             before,
             "mic.wav must survive transcription unmodified"
+        );
+    }
+
+    /// The mixdown appears, and it costs the recording nothing: all three tracks a session
+    /// holds are still there and byte for byte what they were.
+    ///
+    /// The sizes are the other half of the point. `meeting.opus` carries *both* tracks and is
+    /// still an order of magnitude smaller than either WAV alone, which is the entire reason
+    /// it exists.
+    #[test]
+    fn transcribing_adds_a_compressed_mixdown_and_leaves_every_source_track_intact() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_bleeding_session(&paths, "20260809-052600");
+
+        // Transcribed once so `mic.cleaned.wav` exists to be compared across the second run.
+        let mut asr = FakeAsr::default();
+        mic_only(&session, &mut asr).unwrap();
+
+        let tracks = [
+            session.paths.mic_wav(),
+            session.paths.speaker_wav(),
+            session.paths.mic_cleaned_wav(),
+        ];
+        let before: Vec<Vec<u8>> = tracks.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+        let mut asr = FakeAsr::default();
+        mic_only(&session, &mut asr).unwrap();
+
+        let opus = session.paths.meeting_opus();
+        assert!(opus.is_file(), "transcribing must leave a meeting.opus");
+        for (track, before) in tracks.iter().zip(&before) {
+            assert_eq!(
+                &std::fs::read(track).unwrap(),
+                before,
+                "{} must survive transcription unmodified",
+                track.display()
+            );
+        }
+
+        let compressed = std::fs::metadata(&opus).unwrap().len();
+        let mic = std::fs::metadata(session.paths.mic_wav()).unwrap().len();
+        assert!(
+            compressed * 10 < mic,
+            "meeting.opus is {compressed} bytes against mic.wav's {mic}; \
+             it holds both tracks and should still be far smaller than either"
         );
     }
 
