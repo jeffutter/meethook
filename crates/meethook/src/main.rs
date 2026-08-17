@@ -10,8 +10,8 @@ mod commands;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use meethook_session::Paths;
+use clap::{Args, Parser, Subcommand};
+use meethook_session::{Paths, TranscriptTime};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -64,33 +64,7 @@ enum Command {
     /// Name speakers that transcription could not identify
     ///
     /// With no session ids, every session with unresolved speakers is considered.
-    Enroll {
-        /// Session ids to enroll speakers for; omit to consider all sessions
-        #[arg(value_name = "SESSION_ID")]
-        session_ids: Vec<String>,
-
-        /// Ask about one voice and nothing else
-        ///
-        /// Either the number in "Unknown 3" -- not the cluster id, which nothing else shows
-        /// you -- or the name that voice currently reads as. Needs exactly one session id,
-        /// since a voice belongs to one session. Reaches a voice that is too quiet to be
-        /// offered or that already has a name, so --all and --correct add nothing to it.
-        #[arg(long, value_name = "VOICE")]
-        voice: Option<String>,
-
-        /// Ask about every unresolved voice, including ones too quiet to be offered by default
-        #[arg(long)]
-        all: bool,
-
-        /// Also ask about voices already named, so a wrong identification can be corrected
-        #[arg(long)]
-        correct: bool,
-
-        /// Store a reference for every name given, even from a voice too short to make a
-        /// reliable one; without this a quiet voice is named in its own session only
-        #[arg(long)]
-        force_reference: bool,
-    },
+    Enroll(EnrollArgs),
 
     /// Report who is enrolled and what each stored recording of them is naming
     ///
@@ -129,6 +103,59 @@ enum Command {
     },
 }
 
+/// `enroll`'s options.
+///
+/// A struct rather than fields on the variant because there are seven of them and three are
+/// bools: named at the one call site below, they cannot be transposed, which two adjacent
+/// `Option<String>`s passed positionally certainly could be.
+#[derive(Debug, Args)]
+pub struct EnrollArgs {
+    /// Session ids to enroll speakers for; omit to consider all sessions
+    #[arg(value_name = "SESSION_ID")]
+    session_ids: Vec<String>,
+
+    /// Ask about one voice and nothing else
+    ///
+    /// Either the number in "Unknown 3" -- not the cluster id, which nothing else shows
+    /// you -- or the name that voice currently reads as. Needs exactly one session id,
+    /// since a voice belongs to one session. Reaches a voice that is too quiet to be
+    /// offered or that already has a name, so --all and --correct add nothing to it.
+    #[arg(long, value_name = "VOICE")]
+    voice: Option<String>,
+
+    /// Ask about whoever was speaking at this moment of the session, and nothing else
+    ///
+    /// A timestamp exactly as transcript.md prints it -- MM:SS, minutes not wrapped at 60, so
+    /// 90:05 is an hour and a half in -- for naming somebody you can see in the transcript
+    /// without working out which "Unknown N" they are. Names the whole voice and not just that
+    /// turn, and says how much it renamed. Needs exactly one session id, like --voice, which it
+    /// is the alternative to rather than a companion of.
+    #[arg(long, value_name = "MM:SS", conflicts_with = "voice")]
+    at: Option<TranscriptTime>,
+
+    /// Answer with this name instead of prompting
+    ///
+    /// Needs --at or --voice: a name given up front is never shown the voice it lands on, so
+    /// there has to be exactly one voice, chosen by you. Everything it writes -- the reference,
+    /// the session-scoped name, the transcript -- is what typing the same name at the prompt
+    /// would have written.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
+    /// Ask about every unresolved voice, including ones too quiet to be offered by default
+    #[arg(long)]
+    all: bool,
+
+    /// Also ask about voices already named, so a wrong identification can be corrected
+    #[arg(long)]
+    correct: bool,
+
+    /// Store a reference for every name given, even from a voice too short to make a
+    /// reliable one; without this a quiet voice is named in its own session only
+    #[arg(long)]
+    force_reference: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::new(resolve_root(cli.root)?);
@@ -139,21 +166,7 @@ fn main() -> Result<()> {
         Command::Transcribe { session_ids, force } => {
             commands::transcribe(&paths, &session_ids, force, template)
         }
-        Command::Enroll {
-            session_ids,
-            voice,
-            all,
-            correct,
-            force_reference,
-        } => commands::enroll(
-            &paths,
-            &session_ids,
-            voice.as_deref(),
-            all,
-            correct,
-            force_reference,
-            template,
-        ),
+        Command::Enroll(args) => commands::enroll(&paths, &args, template),
         Command::Speakers => commands::speakers(&paths),
         Command::Forget {
             name,

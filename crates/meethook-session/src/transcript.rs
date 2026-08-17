@@ -238,22 +238,7 @@ impl Transcript {
     pub fn voice_at(&self, at: TranscriptTime) -> VoiceAt {
         let instant = at.seconds();
 
-        // Half-open containment, so a turn's end instant belongs to whatever follows rather
-        // than to two turns at once.
-        let chosen = preferred(
-            self.turns
-                .iter()
-                .filter(|turn| TranscriptTime::of(turn.start) == at),
-        )
-        .or_else(|| {
-            preferred(
-                self.turns
-                    .iter()
-                    .filter(|turn| turn.start <= instant && instant < turn.end),
-            )
-        });
-
-        if let Some(turn) = chosen {
+        if let Some(turn) = preferred(self.candidates_at(at).into_iter()) {
             return match (turn.source_track, turn.cluster) {
                 (SourceTrack::Mic, _) => VoiceAt::LocalSpeaker,
                 (SourceTrack::Speaker, Some(cluster)) => VoiceAt::Cluster(cluster),
@@ -270,6 +255,57 @@ impl Transcript {
         } else {
             VoiceAt::Silence
         }
+    }
+
+    /// Every voice a timestamp could have meant: the distinct clusters among the turns
+    /// [`voice_at`](Self::voice_at) chose between, in transcript order.
+    ///
+    /// `voice_at` answers with one of these. **More than one means the timestamp does not name a
+    /// single voice** -- two turns a fraction of a second apart print the same `MM:SS`, and a
+    /// caller about to rename somebody cannot pick between them on the user's behalf. Empty
+    /// wherever `voice_at` did not resolve to a cluster at all.
+    ///
+    /// A separate method rather than a sixth [`VoiceAt`] arm because ambiguity is not a
+    /// different *answer* -- it is a fact about the candidates behind the answer, which only a
+    /// caller that has to act on the answer needs. Both read the same candidate set, so neither
+    /// can drift from the other's idea of which turns a timestamp reaches.
+    pub fn clusters_at(&self, at: TranscriptTime) -> Vec<u32> {
+        let mut voices = Vec::new();
+        for turn in self.candidates_at(at) {
+            if turn.source_track != SourceTrack::Speaker {
+                continue;
+            }
+            if let Some(cluster) = turn.cluster
+                && !voices.contains(&cluster)
+            {
+                voices.push(cluster);
+            }
+        }
+        voices
+    }
+
+    /// The turns a timestamp reaches, before any preference between them is applied: the ones
+    /// whose *printed* label is `at`, or -- when no turn prints it -- the ones covering the
+    /// instant.
+    ///
+    /// The one statement of what a timestamp reaches, so that the voice a lookup answers with
+    /// and the voices a caller is told it chose between cannot disagree. Containment is
+    /// half-open, so a turn's end instant belongs to whatever follows rather than to two turns
+    /// at once.
+    fn candidates_at(&self, at: TranscriptTime) -> Vec<&Turn> {
+        let labelled: Vec<&Turn> = self
+            .turns
+            .iter()
+            .filter(|turn| TranscriptTime::of(turn.start) == at)
+            .collect();
+        if !labelled.is_empty() {
+            return labelled;
+        }
+        let instant = at.seconds();
+        self.turns
+            .iter()
+            .filter(|turn| turn.start <= instant && instant < turn.end)
+            .collect()
     }
 }
 
@@ -1249,5 +1285,45 @@ mod tests {
         );
         assert_eq!(transcript.voice_at(at("00:10")), VoiceAt::Cluster(2));
         assert_eq!(transcript.voice_at(at("00:20")), VoiceAt::Cluster(4));
+    }
+
+    /// Two voices can print the same label, and then the timestamp names neither of them on its
+    /// own. `voice_at` still answers -- it has to answer something -- so the fact that it was
+    /// choosing is what `clusters_at` exists to report.
+    #[test]
+    fn a_label_two_voices_share_lists_both_of_them() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![
+                mic_turn(754.0, 754.2, "me"),
+                speaker_turn(754.1, 754.5, Some(3)),
+                speaker_turn(754.6, 758.0, Some(7)),
+            ],
+        );
+
+        assert_eq!(transcript.voice_at(at("12:34")), VoiceAt::Cluster(3));
+        assert_eq!(transcript.clusters_at(at("12:34")), [3, 7]);
+    }
+
+    /// The unambiguous cases: one voice is one voice, and a timestamp that names no voice at all
+    /// names no voices at all.
+    #[test]
+    fn a_timestamp_that_names_one_voice_or_none_says_so() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![
+                mic_turn(0.0, 1.0, "me"),
+                speaker_turn(10.0, 11.0, None),
+                speaker_turn(20.0, 21.0, Some(4)),
+            ],
+        );
+
+        assert_eq!(transcript.clusters_at(at("00:20")), [4]);
+        for nothing in ["00:00", "00:05", "00:10", "00:30"] {
+            assert!(
+                transcript.clusters_at(at(nothing)).is_empty(),
+                "{nothing} reaches no voice"
+            );
+        }
     }
 }

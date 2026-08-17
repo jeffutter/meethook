@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use meethook_enroll::{
-    Answer, Confirm, EnrollRules, Enrolment, Forgotten, Interviewer, Offer, Target, Voice,
-    VoiceSelector, run_enroll, run_forget, run_speakers, write_clip,
+    Answer, Confirm, EnrollRules, Enrolment, Forgotten, GivenName, Interviewer, Offer, Selection,
+    Target, Voice, VoiceSelector, run_enroll, run_forget, run_speakers, speech, write_clip,
 };
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
 use meethook_session::{Paths, SessionId, TranscriptTemplate};
+
+use crate::EnrollArgs;
 use meethook_transcribe::{
     Attribution, EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, SILERO_VAD_MODEL,
     WHISPER_MODEL, WhisperEngine, run_batch,
@@ -663,39 +665,43 @@ impl DownloadProgress {
     }
 }
 
-pub fn enroll(
-    paths: &Paths,
-    session_ids: &[String],
-    voice: Option<&str>,
-    all: bool,
-    correct: bool,
-    force_reference: bool,
-    template: Option<&Path>,
-) -> Result<()> {
-    let requested = parse_session_ids(session_ids)?;
+pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Result<()> {
+    let requested = parse_session_ids(&args.session_ids)?;
     let template = TranscriptTemplate::resolve(paths, template)?;
+    // Which of the two answerers this run has. `--name` is refused without a selector by
+    // `run_enroll`, which is where both halves of that rule are in hand.
     let mut terminal = Terminal::default();
-    // Unlike a session id there is nothing to validate here: a selector that matches nothing is
-    // answered against the session's actual voices, which is a better message than anything
-    // this edge could produce without having read them.
-    let selector = voice.map(VoiceSelector::from);
+    let mut given = args.name.as_deref().map(GivenName::new);
+    let interviewer: &mut dyn Interviewer = match &mut given {
+        Some(given) => given,
+        None => &mut terminal,
+    };
+    // Unlike a session id there is nothing to validate about a `--voice`: a selector that matches
+    // nothing is answered against the session's actual voices, which is a better message than
+    // anything this edge could produce without having read them. `--at` is the other way round --
+    // a malformed timestamp has nothing to be compared against -- so clap has already parsed it.
+    let selector = args.voice.as_deref().map(VoiceSelector::from);
     let rules = EnrollRules {
-        selector: selector.as_ref(),
+        selector: match (&selector, args.at) {
+            (Some(selector), _) => Some(Selection::Voice(selector)),
+            (None, Some(at)) => Some(Selection::At(at)),
+            (None, None) => None,
+        },
         // Which flag answers which question, readable here rather than positional.
         offer: Offer {
-            quiet: all,
-            named: correct,
+            quiet: args.all,
+            named: args.correct,
         },
         // A separate axis from `offer`: that one decides which voices are asked about, this
         // one what an answer to a quiet voice writes.
-        enrolment: if force_reference {
+        enrolment: if args.force_reference {
             Enrolment::Always
         } else {
             Enrolment::AboveTheFloor
         },
         template: &template,
     };
-    let report = run_enroll(paths, &requested, rules, &mut terminal, &mut io::stdout())?;
+    let report = run_enroll(paths, &requested, rules, interviewer, &mut io::stdout())?;
 
     println!(
         "\n{} named, {} skipped, {} session(s) passed over",
@@ -918,15 +924,6 @@ impl Interviewer for Terminal {
             Ok(_) if line.trim().is_empty() => Answer::Skip,
             Ok(_) => Answer::Named(line.trim().to_string()),
         }
-    }
-}
-
-/// How much this voice said, in the units a person would say it in.
-fn speech(seconds: f64) -> String {
-    let seconds = seconds.round() as u64;
-    match seconds / 60 {
-        0 => format!("{seconds}s"),
-        minutes => format!("{minutes}m {:02}s", seconds % 60),
     }
 }
 

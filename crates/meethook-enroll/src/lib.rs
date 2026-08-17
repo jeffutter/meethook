@@ -60,7 +60,8 @@ use std::path::{Path, PathBuf};
 use meethook_session::{
     AssignedName, Classification, DiscoveredSession, EnrolledSpeakers, Paths, SessionId,
     SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Stored, Transcript,
-    TranscriptContext, TranscriptTemplate, discover_sessions, unknown_labels, unknown_speaker,
+    TranscriptContext, TranscriptTemplate, TranscriptTime, VoiceAt, discover_sessions,
+    unknown_labels, unknown_speaker,
 };
 use meethook_transcribe::{
     Attribution, Naming, TARGET_RATE, attributions, identify_clusters, read_track_16k_mono,
@@ -305,6 +306,52 @@ pub enum Answer {
 /// sequencing, which is the one place this design keeps them out of.
 pub trait Interviewer {
     fn identify(&mut self, voice: &Voice<'_>) -> Answer;
+
+    /// Whether this answerer requires the run to have been narrowed to one voice already.
+    ///
+    /// `false` for anyone a person is behind: a terminal is shown each voice before it answers
+    /// about it, so a queue of nine is nine questions and not nine copies of one answer. It is
+    /// [`GivenName`] that needs the guarantee -- an answer supplied up front never sees the
+    /// voice it lands on -- and [`run_enroll`] refuses to start such a run without a
+    /// [`Selection`], which is the only thing that makes "the voice this answer is about" a
+    /// voice the user picked.
+    ///
+    /// A method on this trait rather than a flag beside it because the requirement belongs to
+    /// the answerer: the caller cannot be trusted to remember which of the two it passed, and
+    /// [`run_enroll`] is where the answerer and the selection are both in hand.
+    fn needs_one_voice(&self) -> bool {
+        false
+    }
+}
+
+/// A name decided before the run started, for the one voice a [`Selection`] picked out.
+///
+/// The other half of naming a voice by pointing at a timestamp: `--at` says *which* voice and
+/// this says *who*, and together they make the whole operation one non-interactive command --
+/// which is the point, since a user who can already see who spoke at 12:34 has nothing to be
+/// asked.
+///
+/// In the library rather than in the CLI, unlike [`Interviewer`]'s terminal implementation,
+/// because there is nothing here that needs a person in front of it: what it answers, and that
+/// it is only ever asked once, are decidable in `cargo test`.
+pub struct GivenName(String);
+
+impl GivenName {
+    /// Trimmed on the way in, so this and a typed answer are normalised the same way -- a name
+    /// of nothing but spaces is a skip on both paths rather than an entry called "".
+    pub fn new(name: &str) -> GivenName {
+        GivenName(name.trim().to_string())
+    }
+}
+
+impl Interviewer for GivenName {
+    fn identify(&mut self, _voice: &Voice<'_>) -> Answer {
+        Answer::Named(self.0.clone())
+    }
+
+    fn needs_one_voice(&self) -> bool {
+        true
+    }
 }
 
 /// Which one voice a run is about, when it is about one voice.
@@ -376,6 +423,56 @@ impl std::fmt::Display for VoiceSelector {
     }
 }
 
+/// How a run that is about one voice arrived at that voice.
+///
+/// Two ways in, because there are two things a user is looking at when they want to name
+/// somebody. [`Voice`](Self::Voice) is the prompt queue's own vocabulary -- "Unknown 3", or the
+/// name a voice currently reads as -- and is right while the queue is on screen.
+/// [`At`](Self::At) is the transcript's: a moment in the session, for the far commoner case of
+/// somebody reading `transcript.md`, seeing that whoever spoke at 12:34 is Alice, and neither
+/// knowing nor caring which Unknown number that voice ended up as.
+///
+/// One enum rather than two fields beside each other, so that "one voice, selected one way" is a
+/// property of the type instead of a rule two `Option`s have to be checked against. What each
+/// arm resolves *through* is different -- a label is compared against the session's voices, a
+/// timestamp is looked up in its transcript -- but everything downstream of the resolution is
+/// the same one voice, which is why this changes nothing about what an answer writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection<'a> {
+    /// `--voice`: the label the voice reads as. See [`VoiceSelector`].
+    Voice(&'a VoiceSelector),
+
+    /// `--at`: the moment the voice was speaking at, in the `MM:SS` spelling `transcript.md`
+    /// prints. Resolved through [`meethook_session::Transcript::voice_at`], which owns the rule
+    /// for turning a printed label back into a turn.
+    At(TranscriptTime),
+}
+
+impl Selection<'_> {
+    /// The flag this arrived on, so a message about the request names what the user typed.
+    fn flag(&self) -> &'static str {
+        match self {
+            Selection::Voice(_) => "--voice",
+            Selection::At(_) => "--at",
+        }
+    }
+
+    /// Why one session id and not several. Two different reasons, and a user who passed one flag
+    /// is not helped by the other's.
+    fn why_one_session(&self) -> &'static str {
+        match self {
+            Selection::Voice(_) => {
+                "a voice belongs to one session, so its number and its name mean nothing across \
+                 several"
+            }
+            Selection::At(_) => {
+                "a timestamp is an offset into one recording, so it lands somewhere different in \
+                 each of several"
+            }
+        }
+    }
+}
+
 /// Which voices a run offers beyond the ones it offers by default.
 ///
 /// Two orthogonal questions -- how quiet a voice may be, and whether the database has already
@@ -431,9 +528,10 @@ pub enum Enrolment {
 /// fallible read of the root rather than a constant.
 #[derive(Debug, Clone, Copy)]
 pub struct EnrollRules<'a> {
-    /// `Some` replaces the queue with one voice; `None` is the queue. Not a fourth flag on
-    /// [`Offer`], because it does not widen the queue -- it stands in for it.
-    pub selector: Option<&'a VoiceSelector>,
+    /// `Some` replaces the queue with one voice, however the user pointed at it; `None` is the
+    /// queue. Not a fourth flag on [`Offer`], because it does not widen the queue -- it stands
+    /// in for it.
+    pub selector: Option<Selection<'a>>,
 
     /// Which voices get asked about. Changes the questions and nothing else: the same answers
     /// write the same files however a voice came to be offered.
@@ -538,11 +636,28 @@ pub fn run_enroll(
     // rule already lives -- a requested id that is not on disk is printed and counted below --
     // and because one enforcement point cannot disagree with itself. Refused before anything is
     // discovered: a run that cannot say which session it is about has nothing to read.
-    if rules.selector.is_some() && requested.len() != 1 {
+    if let Some(selection) = rules.selector
+        && requested.len() != 1
+    {
         writeln!(
             out,
-            "--voice needs exactly one session id: a voice belongs to one session, so its \
-             number and its name mean nothing across several"
+            "{} needs exactly one session id: {}",
+            selection.flag(),
+            selection.why_one_session()
+        )?;
+        report.failed += 1;
+        return Ok(report);
+    }
+
+    // An answer supplied up front is never shown the voice it lands on, so a queue would put one
+    // name on everybody in it. Refused here, beside the guard above, for the same reason: this is
+    // the one place that can see both the answerer and the selection, and a library caller
+    // wiring up a [`GivenName`] gets the same protection the CLI does.
+    if rules.selector.is_none() && interviewer.needs_one_voice() {
+        writeln!(
+            out,
+            "--name needs a voice to put that name on: pass --at <MM:SS> or --voice <VOICE>, \
+             since a name given up front is never shown the voice it is answering about"
         )?;
         report.failed += 1;
         return Ok(report);
@@ -741,7 +856,19 @@ fn enroll_session(
     // targeted prompt is not a second implementation of a prompt, it is the same one asked
     // about a shorter list. `None` is a session that is finished and has said why.
     let offered = match rules.selector {
-        Some(selector) => targeted(selector, &order, &unknown, &shown, session, out, report)?,
+        Some(Selection::Voice(selector)) => {
+            targeted(selector, &order, &unknown, &shown, session, out, report)?
+        }
+        Some(Selection::At(at)) => at_timestamp(
+            at,
+            &transcript,
+            &order,
+            &unknown,
+            &shown,
+            session,
+            out,
+            report,
+        )?,
         None => queue(&order, &shown, rules.offer, session, out, report)?,
     };
     let Some(offered) = offered else {
@@ -1041,6 +1168,13 @@ fn enroll_session(
                 &TranscriptContext::now(&metadata),
             )?;
         }
+        // Only on the timestamp path. A user who pointed at a moment did not choose the voice,
+        // so how far the rename reached is the one thing they cannot infer -- whereas the queue
+        // and `--voice` both showed them the voice first, and several tests pin their output
+        // exactly as it is.
+        if matches!(rules.selector, Some(Selection::At(_))) {
+            report_rename(&transcript, &shown, &now, name, session, out)?;
+        }
         shown = now;
     }
 
@@ -1168,17 +1302,7 @@ fn targeted<'c>(
         .filter(|c| selector.matches(&unknown[&c.id], &shown[&c.id]))
         .collect();
 
-    // How one voice reads in a message about several: the number it is reachable by, plus the
-    // name it currently carries when that is not the number itself.
-    let describe = |c: &SpeakerCluster| {
-        let number = &unknown[&c.id];
-        let label = shown[&c.id].label();
-        if label == number {
-            format!("{number} ({:.1} s)", c.speech_seconds)
-        } else {
-            format!("{number} -- {label} ({:.1} s)", c.speech_seconds)
-        }
-    };
+    let describe = |c: &SpeakerCluster| describe(c, unknown, shown);
 
     match matched.len() {
         1 => {
@@ -1231,6 +1355,237 @@ fn targeted<'c>(
             report.failed += 1;
             Ok(None)
         }
+    }
+}
+
+/// How one voice reads in a message about several: the number it is reachable by, plus the name
+/// it currently carries when that is not the number itself.
+///
+/// Shared by both selectors so that a list of candidates reads the same however the user missed:
+/// the number is what the message hands back, and it has to be the same number in both.
+fn describe(
+    cluster: &SpeakerCluster,
+    unknown: &BTreeMap<u32, String>,
+    shown: &BTreeMap<u32, Attribution>,
+) -> String {
+    let number = &unknown[&cluster.id];
+    let label = shown[&cluster.id].label();
+    if label == number {
+        format!("{number} ({:.1} s)", cluster.speech_seconds)
+    } else {
+        format!("{number} -- {label} ({:.1} s)", cluster.speech_seconds)
+    }
+}
+
+/// The one voice speaking at a moment of this session, or `None` when that moment names no voice
+/// -- which is reported and counted as a request that could not be served.
+///
+/// The third sibling of [`queue`] and [`targeted`], and deliberately nothing more than that:
+/// it produces the same one-element list they do, so a timestamp is a way of *arriving* at a
+/// voice rather than a second way of enrolling one. Everything downstream -- the prompt, the
+/// pre-flight, the refusal, the three writes -- is shared, which is what makes the reference
+/// floor, the already-enrolled safeguards and the two transcript files behave here exactly as
+/// they do everywhere else.
+///
+/// No floor, no `--correct` gate and no pass-over, for the reason [`targeted`] gives: pointing at
+/// a moment is already the judgement those gates make on the user's behalf.
+///
+/// Every refusal names the timestamp back in the spelling it was given, so the line can be read
+/// beside the transcript the user copied it from.
+#[allow(clippy::too_many_arguments)]
+fn at_timestamp<'c>(
+    at: TranscriptTime,
+    transcript: &Transcript,
+    order: &[&'c SpeakerCluster],
+    unknown: &BTreeMap<u32, String>,
+    shown: &BTreeMap<u32, Attribution>,
+    session: &DiscoveredSession,
+    out: &mut dyn Write,
+    report: &mut EnrollReport,
+) -> Result<Option<Vec<&'c SpeakerCluster>>> {
+    // Each non-answer says which of them it was and what to do about it: they are four
+    // different situations, and only one of them is the user's mistake.
+    let voice = match transcript.voice_at(at) {
+        VoiceAt::Cluster(id) => id,
+        VoiceAt::LocalSpeaker => {
+            writeln!(
+                out,
+                "{}  {at} is on the microphone track: that is you, and enroll names the voices \
+                 it heard rather than the person holding the machine",
+                session.id
+            )?;
+            report.failed += 1;
+            return Ok(None);
+        }
+        VoiceAt::NoCluster => {
+            writeln!(
+                out,
+                "{}  the turn at {at} records no voice: diarization found no speakers in this \
+                 session, so its turns have nothing to hang a name on -- re-transcribe this \
+                 session with --force",
+                session.id
+            )?;
+            report.failed += 1;
+            return Ok(None);
+        }
+        VoiceAt::Silence => {
+            // A miss here is usually a second or two off, and the user is holding the file with
+            // the right timestamp in it, so the nearest turn is worth more than the refusal.
+            let nearest = transcript
+                .turns
+                .iter()
+                .min_by(|a, b| gap_to(a, at).total_cmp(&gap_to(b, at)));
+            match nearest {
+                Some(turn) => writeln!(
+                    out,
+                    "{}  nobody was speaking at {at}: the nearest turn is {} at {}",
+                    session.id,
+                    turn.speaker,
+                    TranscriptTime::of(turn.start)
+                )?,
+                None => writeln!(out, "{}  nobody was speaking at {at}", session.id)?,
+            }
+            report.failed += 1;
+            return Ok(None);
+        }
+        VoiceAt::PastEnd { last } => {
+            writeln!(
+                out,
+                "{}  {at} is past the end of this session, which ends at {}",
+                session.id,
+                TranscriptTime::of(last)
+            )?;
+            report.failed += 1;
+            return Ok(None);
+        }
+    };
+
+    // Two voices can print the same label -- turns a fraction of a second apart round to the
+    // same second -- and then the timestamp names neither of them on its own. That is a question
+    // this command cannot answer for the user, so it hands back the thing that tells them apart,
+    // exactly as an ambiguous `--voice` does.
+    let candidates = transcript.clusters_at(at);
+    if candidates.len() > 1 {
+        let voices: Vec<String> = candidates
+            .iter()
+            .filter_map(|id| order.iter().find(|c| c.id == *id))
+            .map(|c| describe(c, unknown, shown))
+            .collect();
+        let numbers: Vec<String> = candidates
+            .iter()
+            .filter_map(|id| unknown.get(id))
+            .map(|number| format!("--voice \"{number}\""))
+            .collect();
+        writeln!(
+            out,
+            "{}  {at} is the label of {} turns, by different voices: {} -- pass one of {}",
+            session.id,
+            candidates.len(),
+            voices.join(", "),
+            numbers.join(" or ")
+        )?;
+        report.failed += 1;
+        return Ok(None);
+    }
+
+    // A voice the transcript names and the clusters file does not is the stale-file failure the
+    // rest of this crate already has wording for, reached from the other side.
+    let Some(cluster) = order.iter().copied().find(|c| c.id == voice) else {
+        writeln!(
+            out,
+            "{}  failed: the turn at {at} came from a voice speaker_clusters.json does not have \
+             -- re-transcribe this session with --force",
+            session.id
+        )?;
+        report.failed += 1;
+        return Ok(None);
+    };
+
+    // The same line [`targeted`] prints, plus the moment it was reached by: the user named a
+    // timestamp and gets told which voice that turned out to be, which is the one thing they
+    // did not already know.
+    writeln!(
+        out,
+        "{}  1 voice selected at {at}: {}",
+        session.id,
+        describe(cluster, unknown, shown)
+    )?;
+    Ok(Some(vec![cluster]))
+}
+
+/// How far a turn is from an instant: zero while the instant is inside it.
+fn gap_to(turn: &meethook_session::Turn, at: TranscriptTime) -> f64 {
+    let instant = at.seconds();
+    if instant < turn.start {
+        turn.start - instant
+    } else {
+        (instant - turn.end).max(0.0)
+    }
+}
+
+/// Says how much of the transcript naming one voice just rewrote.
+///
+/// Only the timestamp path prints this, and the reason is what it is measured from: the
+/// difference between what every voice read *before* the answer and what it reads *after*, not
+/// the voice that was selected. Naming one cluster can name a second when clustering split that
+/// person in two, so the selection is not the blast radius -- the label diff is.
+///
+/// The turns are counted and their durations summed rather than the clusters'
+/// `speech_seconds` taken: the claim is about the lines this command rewrote in the file the
+/// user is reading, and those are two different quantities.
+fn report_rename(
+    transcript: &Transcript,
+    before: &BTreeMap<u32, Attribution>,
+    after: &BTreeMap<u32, Attribution>,
+    name: &str,
+    session: &DiscoveredSession,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let mut renamed: Vec<u32> = Vec::new();
+    for (id, label) in after {
+        if before.get(id) != Some(label) {
+            renamed.push(*id);
+        }
+    }
+    let (turns, seconds) = transcript
+        .turns
+        .iter()
+        .filter(|turn| {
+            turn.source_track == SourceTrack::Speaker
+                && turn.cluster.is_some_and(|id| renamed.contains(&id))
+        })
+        .fold((0usize, 0.0f64), |(count, total), turn| {
+            (count + 1, total + (turn.end - turn.start))
+        });
+
+    if turns == 0 {
+        // Not "0 turn(s)", which reads as a failure. The ordinary way to get here is answering
+        // a voice with the name it already reads as.
+        writeln!(
+            out,
+            "{}  no turns changed: that voice already read as {name}",
+            session.id
+        )?;
+    } else {
+        writeln!(
+            out,
+            "{}  renamed {turns} turn(s), {} of speech, to {name}",
+            session.id,
+            speech(seconds)
+        )?;
+    }
+    Ok(())
+}
+
+/// How much somebody said, in the units a person would say it in.
+///
+/// Public because the prompt in the CLI and the rename line above both print a duration, and one
+/// tool printing a duration two ways is a defect rather than a style.
+pub fn speech(seconds: f64) -> String {
+    let seconds = seconds.round() as u64;
+    match seconds / 60 {
+        0 => format!("{seconds}s"),
+        minutes => format!("{minutes}m {:02}s", seconds % 60),
     }
 }
 
@@ -1775,23 +2130,48 @@ mod tests {
         voice: &str,
         interviewer: &mut Scripted,
     ) -> (EnrollReport, String) {
+        let selector = VoiceSelector::from(voice);
         run_over(
             paths,
             ids,
-            Some(VoiceSelector::from(voice)),
+            Some(Selection::Voice(&selector)),
             Offer::default(),
             Enrolment::default(),
             interviewer,
         )
     }
 
+    /// `run_targeting`'s sibling, aimed at whoever was speaking at one moment. `at` is written
+    /// exactly as a user would copy it off `transcript.md`, so the tests exercise the spelling
+    /// as well as the lookup.
+    fn run_at(
+        paths: &Paths,
+        ids: &[&str],
+        at: &str,
+        interviewer: &mut dyn Interviewer,
+    ) -> (EnrollReport, String) {
+        run_over(
+            paths,
+            ids,
+            Some(Selection::At(at.parse().unwrap())),
+            Offer::default(),
+            Enrolment::default(),
+            interviewer,
+        )
+    }
+
+    /// The whole non-interactive command: a moment, and the name of whoever was speaking then.
+    fn run_naming_at(paths: &Paths, ids: &[&str], at: &str, name: &str) -> (EnrollReport, String) {
+        run_at(paths, ids, at, &mut GivenName::new(name))
+    }
+
     fn run_over(
         paths: &Paths,
         ids: &[&str],
-        voice: Option<VoiceSelector>,
+        selection: Option<Selection<'_>>,
         offer: Offer,
         enrolment: Enrolment,
-        interviewer: &mut Scripted,
+        interviewer: &mut dyn Interviewer,
     ) -> (EnrollReport, String) {
         let requested: Vec<SessionId> =
             ids.iter().map(|id| SessionId::parse(id).unwrap()).collect();
@@ -1800,7 +2180,7 @@ mod tests {
             paths,
             &requested,
             EnrollRules {
-                selector: voice.as_ref(),
+                selector: selection,
                 offer,
                 enrolment,
                 // Resolved from the root, exactly as the CLI does, so a test that puts a
@@ -1862,6 +2242,22 @@ mod tests {
             cluster.speech_seconds = *seconds;
         }
         clusters.write(session).unwrap();
+    }
+
+    /// Rewrites this session's transcript, leaving its clusters and its metadata as
+    /// [`make_session`] wrote them. Both files, through the same template `transcribe` uses, so
+    /// the timestamps a test then points at are the ones `transcript.md` actually prints.
+    ///
+    /// The timestamp tests are the ones that need a timeline other than the fixture's four turns
+    /// in its first five seconds.
+    fn with_turns(paths: &Paths, session: &SessionPaths, id: &str, turns: Vec<Turn>) {
+        let parsed = SessionId::parse(id).unwrap();
+        write_transcript(
+            &Transcript::new(parsed.clone(), turns),
+            paths,
+            session,
+            &session_metadata(&parsed),
+        );
     }
 
     /// Rewrites this session's cluster embeddings, ids in order, leaving everything else as
@@ -4128,10 +4524,11 @@ mod tests {
         with_speech_seconds(&forced, &[40.0, 1.5]);
 
         let mut forcing = Scripted::answering(vec![named("Silas")]);
+        let second = VoiceSelector::from("2");
         let (report, output) = run_over(
             &forced_paths,
             &["20260809-052600"],
-            Some(VoiceSelector::from("2")),
+            Some(Selection::Voice(&second)),
             Offer::default(),
             Enrolment::Always,
             &mut forcing,
@@ -4248,6 +4645,351 @@ mod tests {
         );
         assert_eq!(report.named, 1, "{output}");
         assert_eq!(transcript_of(&session).turns[2].speaker, "Robert Chen");
+    }
+
+    /// TASK-033 acceptance criteria #1 and #7: a session id, a timestamp and a name are the
+    /// whole command. Nothing is prompted -- [`GivenName`] has no terminal to prompt with --
+    /// and both transcript files come out of it reading the new name.
+    #[test]
+    fn a_timestamp_and_a_name_name_the_voice_speaking_then() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+
+        let (report, output) = run_naming_at(&paths, &["20260809-052600"], "00:03", "Alice");
+
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(report.failed, 0, "{output}");
+        assert!(output.contains("1 voice selected at 00:03"), "{output}");
+
+        // 00:03 is cluster 1's turn, and it is that whole voice that gets enrolled.
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(speakers.speakers.len(), 1);
+        assert_eq!(speakers.speakers[0].name, "Alice");
+        assert_eq!(speakers.speakers[0].embedding, voice(1));
+
+        assert_eq!(
+            said(&transcript_of(&session)),
+            [
+                ("Unknown 1", "  hi there  ", None),
+                ("You", "morning", None),
+                ("Alice", "and from me", Some(1.0)),
+                ("Unknown 1", "let us start", None),
+            ]
+        );
+        let md = std::fs::read_to_string(session.transcript_md()).unwrap();
+        assert!(md.contains("**[00:03] Alice:** and from me"), "{md}");
+        assert!(!md.contains("Unknown 2"), "{md}");
+    }
+
+    /// Acceptance criterion #2. Minutes are not wrapped at 60 on the way out, so `90:05` is what
+    /// the user has in front of them for a turn an hour and a half in -- and it has to be what
+    /// reaches that turn.
+    #[test]
+    fn a_timestamp_past_fifty_nine_minutes_reaches_its_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_turns(
+            &paths,
+            &session,
+            "20260809-052600",
+            vec![
+                speaker_turn(0.0, 0, "Unknown 1", "hi there"),
+                speaker_turn(5405.0, 1, "Unknown 2", "still here"),
+            ],
+        );
+        // The label that turn prints, which is what the user copies.
+        let md = std::fs::read_to_string(session.transcript_md()).unwrap();
+        assert!(md.contains("**[90:05] Unknown 2:**"), "{md}");
+
+        let (report, output) = run_naming_at(&paths, &["20260809-052600"], "90:05", "Alice");
+
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(said(&transcript_of(&session))[1].0, "Alice", "{output}");
+    }
+
+    /// Acceptance criterion #3. Naming a voice renames every turn it spoke, which is what naming
+    /// a voice means everywhere else in this tool -- so the command says how far that reached
+    /// rather than leaving a user who pointed at one line to infer it.
+    #[test]
+    fn renaming_through_a_timestamp_reports_the_turns_and_the_speech_it_covered() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        // Cluster 0 speaks twice, a second each, and the moment pointed at is only one of them.
+        let (report, output) = run_naming_at(&paths, &["20260809-052600"], "00:00", "Alice");
+        assert_eq!(report.named, 1, "{output}");
+        assert!(
+            output.contains("renamed 2 turn(s), 2s of speech, to Alice"),
+            "{output}"
+        );
+
+        // And when clustering split one person in two, the count covers both halves: the claim
+        // is about what changed, not about the voice that was selected.
+        let split_root = tempfile::tempdir().unwrap();
+        let split_paths = Paths::new(split_root.path());
+        let split = make_session(&split_paths, "20260809-052600");
+        with_embeddings(&split, &[nearly(0.0), nearly(20.0)]);
+
+        let (report, output) = run_naming_at(&split_paths, &["20260809-052600"], "00:00", "Alice");
+        assert_eq!(report.named, 1, "{output}");
+        assert!(
+            output.contains("renamed 3 turn(s), 3s of speech, to Alice"),
+            "naming one half of a split voice renames both: {output}"
+        );
+
+        // Answering a voice with the name it already reads as changes nothing, and says that
+        // rather than reporting zero turns.
+        let (report, output) = run_naming_at(&split_paths, &["20260809-052600"], "00:00", "Alice");
+        assert_eq!(report.failed, 0, "{output}");
+        assert!(
+            output.contains("no turns changed: that voice already read as Alice"),
+            "{output}"
+        );
+    }
+
+    /// Acceptance criterion #4. Four ways a timestamp lands on nothing nameable, and each one
+    /// says which it was: only one of them is the user's mistake, and the others each suggest a
+    /// different next move.
+    #[test]
+    fn a_timestamp_that_lands_on_nothing_nameable_says_which_of_the_four_it_was() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        // The fixture's turns are 0-1 and 3-5 on the speaker track with the mic at 1-2, so it
+        // already has a hole and an end.
+        for (at, expected) in [
+            ("00:01", "is on the microphone track"),
+            ("00:02", "nobody was speaking at 00:02"),
+            (
+                "00:30",
+                "is past the end of this session, which ends at 00:05",
+            ),
+        ] {
+            let (report, output) = run_naming_at(&paths, &["20260809-052600"], at, "Alice");
+            assert_eq!(report.failed, 1, "{at}: {output}");
+            assert_eq!(report.named, 0, "{at}: {output}");
+            assert!(output.contains(expected), "{at}: {output}");
+        }
+        // The silence line hands back the nearest turn, because a miss here is usually a second
+        // or two off and the right timestamp is on the page the user is reading.
+        let (_, output) = run_naming_at(&paths, &["20260809-052600"], "00:02", "Alice");
+        assert!(
+            output.contains("the nearest turn is You at 00:01"),
+            "{output}"
+        );
+
+        // The fourth: a transcript whose speech belongs to no cluster at all, which is what
+        // diarization finding no voices leaves behind.
+        let bare_root = tempfile::tempdir().unwrap();
+        let bare_paths = Paths::new(bare_root.path());
+        let bare = make_session(&bare_paths, "20260809-052600");
+        with_turns(
+            &bare_paths,
+            &bare,
+            "20260809-052600",
+            vec![Turn {
+                speaker: unknown_speaker(1),
+                start: 0.0,
+                end: 4.0,
+                text: "hi there".to_string(),
+                source_track: SourceTrack::Speaker,
+                cluster: None,
+                speaker_id_confidence: None,
+            }],
+        );
+
+        let (report, output) = run_naming_at(&bare_paths, &["20260809-052600"], "00:00", "Alice");
+        assert_eq!(report.failed, 1, "{output}");
+        assert!(
+            output.contains("the turn at 00:00 records no voice"),
+            "{output}"
+        );
+    }
+
+    /// Acceptance criterion #5. What an answer writes is the other axis entirely, and pointing
+    /// at a timestamp does not touch it: the reference floor applies exactly as it does to the
+    /// queue, and `--force-reference` overrides it exactly as it does there.
+    #[test]
+    fn a_timestamp_follows_the_same_reference_floor_and_the_same_override() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_speech_seconds(&session, &[40.0, 1.5]);
+
+        let (report, output) = run_naming_at(&paths, &["20260809-052600"], "00:03", "Silas");
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(report.session_only, 1, "{output}");
+        assert!(
+            EnrolledSpeakers::read_or_empty(&paths)
+                .unwrap()
+                .speakers
+                .is_empty(),
+            "a voice this quiet must not reach the database however it was selected: {output}"
+        );
+        assert_eq!(
+            assigned_in(&session, "20260809-052600")
+                .names
+                .iter()
+                .map(|row| (row.cluster, row.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "Silas")]
+        );
+
+        // ... and the override the line above advertises writes the reference the floor withheld.
+        let forced_root = tempfile::tempdir().unwrap();
+        let forced_paths = Paths::new(forced_root.path());
+        let forced = make_session(&forced_paths, "20260809-052600");
+        with_speech_seconds(&forced, &[40.0, 1.5]);
+
+        let (report, output) = run_over(
+            &forced_paths,
+            &["20260809-052600"],
+            Some(Selection::At("00:03".parse().unwrap())),
+            Offer::default(),
+            Enrolment::Always,
+            &mut GivenName::new("Silas"),
+        );
+
+        assert_eq!(report.session_only, 0, "{output}");
+        let speakers = EnrolledSpeakers::read_or_empty(&forced_paths).unwrap();
+        assert_eq!(speakers.speakers.len(), 1);
+        assert_eq!(speakers.speakers[0].name, "Silas");
+        assert_eq!(speakers.speakers[0].embedding, voice(1));
+        assert!(!forced.speaker_names_json().exists(), "{output}");
+    }
+
+    /// Acceptance criterion #6, both halves: naming somebody already enrolled adds a recording
+    /// of them rather than replacing one, and an answer that would take a name off a voice the
+    /// user was not pointing at is refused. The safeguards are downstream of the selection, so a
+    /// timestamp reaches exactly the same ones.
+    #[test]
+    fn a_name_that_already_exists_is_reused_and_never_taken_off_another_voice() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        // Alice, enrolled from a voice that matches neither cluster here.
+        enrolled(&[("Alice", voice(3))], &paths);
+
+        let (report, output) = run_naming_at(&paths, &["20260809-052600"], "00:03", "Alice");
+
+        assert_eq!(report.named, 1, "{output}");
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(
+            speakers
+                .speakers
+                .iter()
+                .map(|s| (s.name.as_str(), s.embedding.as_slice()))
+                .collect::<Vec<_>>(),
+            [
+                ("Alice", voice(3).as_slice()),
+                ("Alice", voice(1).as_slice())
+            ],
+            "the first recording must survive the second: {output}"
+        );
+
+        // The refusal: cluster 1 reads Bob, and naming its near neighbour Alice would move that
+        // name off it. Nothing is written and the voice keeps what it read.
+        let taken_root = tempfile::tempdir().unwrap();
+        let taken_paths = Paths::new(taken_root.path());
+        let taken = make_session(&taken_paths, "20260809-052600");
+        with_embeddings(&taken, &[nearly(0.0), nearly(20.0)]);
+        enrolled(&[("Bob", nearly(60.0))], &taken_paths);
+        let before = std::fs::read(taken_paths.speakers_json()).unwrap();
+
+        let (report, output) = run_naming_at(&taken_paths, &["20260809-052600"], "00:00", "Alice");
+
+        assert_eq!(report.refused, 1, "{output}");
+        assert_eq!(report.named, 0, "{output}");
+        assert!(
+            output.contains("refused Alice for Unknown 1: it would take Bob off Unknown 2"),
+            "{output}"
+        );
+        assert_eq!(
+            std::fs::read(taken_paths.speakers_json()).unwrap(),
+            before,
+            "a refused answer writes nothing"
+        );
+        assert_eq!(said(&transcript_of(&taken))[2].0, "Bob", "{output}");
+    }
+
+    /// Two turns a fraction of a second apart print the same label, and then the timestamp names
+    /// neither voice on its own. That is a question this command cannot answer for the user, so
+    /// it hands back what tells them apart -- exactly as an ambiguous `--voice` does.
+    #[test]
+    fn a_label_two_voices_share_is_refused_with_the_numbers_that_split_them() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_turns(
+            &paths,
+            &session,
+            "20260809-052600",
+            vec![
+                speaker_turn(10.1, 0, "Unknown 1", "one word"),
+                speaker_turn(10.6, 1, "Unknown 2", "another"),
+            ],
+        );
+
+        let (report, output) = run_naming_at(&paths, &["20260809-052600"], "00:10", "Alice");
+
+        assert_eq!(report.failed, 1, "{output}");
+        assert_eq!(report.named, 0, "{output}");
+        assert!(output.contains("is the label of 2 turns"), "{output}");
+        assert!(output.contains("--voice \"Unknown 1\""), "{output}");
+        assert!(output.contains("--voice \"Unknown 2\""), "{output}");
+    }
+
+    /// A timestamp is an offset into one recording, so it lands somewhere different in each of
+    /// several -- refused before anything is read, like `--voice`, and with the reason that
+    /// belongs to the flag that was passed.
+    #[test]
+    fn a_timestamp_without_exactly_one_session_id_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        make_session(&paths, "20260809-052700");
+
+        for ids in [&[][..], &["20260809-052600", "20260809-052700"][..]] {
+            let (report, output) = run_naming_at(&paths, ids, "00:03", "Alice");
+            assert_eq!(report.failed, 1, "{ids:?}: {output}");
+            assert!(
+                output.contains("--at needs exactly one session id"),
+                "{ids:?}: {output}"
+            );
+            assert!(
+                output.contains("offset into one recording"),
+                "the reason has to be the one that belongs to --at: {ids:?}: {output}"
+            );
+        }
+    }
+
+    /// A name supplied up front is never shown the voice it lands on, so a queue would put one
+    /// name on everybody in it. Refused in the library, which is the only place that can see both
+    /// the answerer and the selection.
+    #[test]
+    fn a_name_given_up_front_without_a_selector_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        let before = files_under(root.path());
+
+        let (report, output) = run_over(
+            &paths,
+            &["20260809-052600"],
+            None,
+            Offer::default(),
+            Enrolment::default(),
+            &mut GivenName::new("Alice"),
+        );
+
+        assert_eq!(report.failed, 1, "{output}");
+        assert_eq!(report.named, 0, "{output}");
+        assert!(output.contains("--name needs a voice"), "{output}");
+        assert_eq!(files_under(root.path()), before, "{output}");
     }
 
     /// A long line is cut to something that fits a prompt, on a character boundary rather
