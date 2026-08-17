@@ -57,8 +57,8 @@ pub use speakers::{
     MAX_REFERENCES_PER_SPEAKER, Stored,
 };
 pub use transcript::{
-    SourceTrack, TRANSCRIPT_SCHEMA_VERSION, Transcript, TranscriptContext, TranscriptTemplate,
-    Turn, YOU as SPEAKER_YOU, unknown_speaker,
+    SourceTrack, TRANSCRIPT_SCHEMA_VERSION, TimestampError, Transcript, TranscriptContext,
+    TranscriptTemplate, TranscriptTime, Turn, VoiceAt, YOU as SPEAKER_YOU, unknown_speaker,
 };
 
 use std::path::PathBuf;

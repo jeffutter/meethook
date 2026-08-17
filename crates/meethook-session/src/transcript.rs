@@ -1,4 +1,6 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use jiff::Timestamp;
 use minijinja::{Environment, UndefinedBehavior, Value};
@@ -170,10 +172,8 @@ impl Transcript {
     /// output shape became the user's to choose; the template is resolved from the root
     /// rather than recorded per session precisely so that this stayed true.
     ///
-    /// Minutes in `turn.time` are not wrapped at 60, so a 90-minute meeting renders
-    /// `[90:05]`. A single unambiguous format beats an `HH:MM:SS`/`MM:SS` switch that a
-    /// reader has to detect, and computing it here rather than in the template means no
-    /// template does clock arithmetic.
+    /// `turn.time` is a [`TranscriptTime`], which owns that format; computing it here rather
+    /// than in the template means no template does clock arithmetic.
     pub fn render_markdown(
         &self,
         template: &TranscriptTemplate,
@@ -212,6 +212,198 @@ impl Transcript {
         let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
         serde_json::from_slice(&bytes).map_err(|e| Error::json(path, e))
     }
+
+    /// Which voice was speaking at `at`, for a timestamp a user read off `transcript.md`.
+    ///
+    /// This is the inverse of the label [`TranscriptTime`] prints, and it lives here rather
+    /// than in the command that asks because the timeline is this crate's: a caller holding a
+    /// cluster id can look up a name, but only the transcript knows which turn an instant
+    /// belongs to.
+    ///
+    /// Two rules, both about matching what the user is looking at rather than what the
+    /// numbers literally say:
+    ///
+    /// - **A printed label wins over containment.** `[12:34]` is printed by a turn starting at
+    ///   754.3 s, and `12:34` parsed back is 754.0 -- an instant that turn does not contain.
+    ///   Resolving by containment alone would refuse the exact line the user copied, so a turn
+    ///   whose *printed* label equals `at` is preferred over one that merely covers it.
+    /// - **A speaker-track turn wins over a mic-track one.** The two tracks are recorded
+    ///   simultaneously and merged onto one timeline, so an instant can sit inside both. The
+    ///   mic track is never a nameable voice, so preferring it would answer "you" to a
+    ///   question that has a real answer.
+    ///
+    /// Ties beyond those are broken by the earlier `start`. The turns are scanned linearly and
+    /// are not assumed to be sorted: `Transcript` is a deserialized file, and a meeting's worth
+    /// of turns is a trivial scan.
+    pub fn voice_at(&self, at: TranscriptTime) -> VoiceAt {
+        let instant = at.seconds();
+
+        // Half-open containment, so a turn's end instant belongs to whatever follows rather
+        // than to two turns at once.
+        let chosen = preferred(
+            self.turns
+                .iter()
+                .filter(|turn| TranscriptTime::of(turn.start) == at),
+        )
+        .or_else(|| {
+            preferred(
+                self.turns
+                    .iter()
+                    .filter(|turn| turn.start <= instant && instant < turn.end),
+            )
+        });
+
+        if let Some(turn) = chosen {
+            return match (turn.source_track, turn.cluster) {
+                (SourceTrack::Mic, _) => VoiceAt::LocalSpeaker,
+                (SourceTrack::Speaker, Some(cluster)) => VoiceAt::Cluster(cluster),
+                (SourceTrack::Speaker, None) => VoiceAt::NoCluster,
+            };
+        }
+
+        // Checked after the two lookups above so a turn that both covers `at` and ends the
+        // session still resolves to that turn. An empty transcript lands here with `last` 0.0,
+        // which reads correctly: there is no session after which anything was said.
+        let last = self.turns.iter().map(|turn| turn.end).fold(0.0, f64::max);
+        if instant >= last {
+            VoiceAt::PastEnd { last }
+        } else {
+            VoiceAt::Silence
+        }
+    }
+}
+
+/// Picks the turn a timestamp should resolve to out of the candidates that matched: the
+/// speaker-track one before the mic-track one, then the earliest `start`.
+fn preferred<'t>(turns: impl Iterator<Item = &'t Turn>) -> Option<&'t Turn> {
+    // Speaker before mic. `min_by` keeps the first of equal elements, so transcript order is
+    // the final tiebreak after `start`.
+    let rank = |track| match track {
+        SourceTrack::Speaker => 0u8,
+        SourceTrack::Mic => 1,
+    };
+    turns.min_by(|a, b| {
+        rank(a.source_track)
+            .cmp(&rank(b.source_track))
+            .then(a.start.total_cmp(&b.start))
+    })
+}
+
+/// A whole second from session start, in the `MM:SS` spelling every `transcript.md` prints.
+///
+/// The one owner of that format: it both writes the label a transcript shows and reads a label
+/// back off one, so the string a user copies out of a transcript and the string a command
+/// accepts cannot drift apart. A parser written anywhere else would be a second statement of
+/// the same format, and a second statement is the thing that goes stale.
+///
+/// **Minutes are not wrapped at 60**, so a 90-minute meeting prints `[90:05]` rather than
+/// `[01:30:05]`. One unambiguous format beats an `HH:MM:SS`/`MM:SS` switch that a reader has to
+/// detect -- and it is why parsing refuses both a third field and a bare integer, either of
+/// which would reintroduce exactly the ambiguity that decision exists to avoid.
+///
+/// Whole seconds, because that is the resolution a transcript prints at: a turn starting at
+/// 754.3 s is labelled `[12:34]`, and 754.3 is not recoverable from what the user read. Turning
+/// the label back into a turn is [`Transcript::voice_at`], which knows about that truncation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TranscriptTime(u64);
+
+impl TranscriptTime {
+    /// The label a turn starting at `seconds` from session start is printed with.
+    ///
+    /// Floors to the whole second and clamps a negative to zero; nothing before session start
+    /// is representable, and a turn cannot begin there.
+    pub fn of(seconds: f64) -> Self {
+        TranscriptTime(seconds.max(0.0).floor() as u64)
+    }
+
+    /// The instant this label names, in seconds from session start.
+    pub fn seconds(&self) -> f64 {
+        self.0 as f64
+    }
+}
+
+impl fmt::Display for TranscriptTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let minutes = self.0 / 60;
+        let seconds = self.0 % 60;
+        write!(f, "{minutes:02}:{seconds:02}")
+    }
+}
+
+impl FromStr for TranscriptTime {
+    type Err = TimestampError;
+
+    /// Reads a label back off a transcript.
+    ///
+    /// Accepts what a transcript line actually contains, brackets and surrounding whitespace
+    /// included, so `[12:34]` pasted straight out of `transcript.md` works as well as `12:34`.
+    /// Any number of minute digits (`90:05`, `120:00`), and seconds as two digits in `00..=59`.
+    ///
+    /// Refuses anything no transcript prints -- a third field, a bare integer, one-digit
+    /// seconds -- rather than guessing: see the type's documentation for why an `HH:MM:SS`
+    /// reading must not be available here.
+    fn from_str(s: &str) -> std::result::Result<Self, TimestampError> {
+        let malformed = || TimestampError(s.to_string());
+
+        let trimmed = s.trim();
+        let inner = match (trimmed.strip_prefix('['), trimmed.strip_suffix(']')) {
+            (Some(_), Some(_)) => trimmed[1..trimmed.len() - 1].trim(),
+            (None, None) => trimmed,
+            // One bracket without the other is a truncated paste, not a spelling.
+            _ => return Err(malformed()),
+        };
+
+        let (minutes, seconds) = inner.split_once(':').ok_or_else(malformed)?;
+        let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        if !digits(minutes) || seconds.len() != 2 || !digits(seconds) {
+            return Err(malformed());
+        }
+
+        let minutes: u64 = minutes.parse().map_err(|_| malformed())?;
+        let seconds: u64 = seconds.parse().map_err(|_| malformed())?;
+        if seconds > 59 {
+            return Err(malformed());
+        }
+        minutes
+            .checked_mul(60)
+            .and_then(|m| m.checked_add(seconds))
+            .map(TranscriptTime)
+            .ok_or_else(malformed)
+    }
+}
+
+/// A string that is not a timestamp any transcript prints.
+///
+/// Its own type rather than a variant of [`Error`], which is about session *files*: this is a
+/// user typing at a command edge, and answering it needs no session to compare against.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "malformed timestamp {0:?}: expected MM:SS as a transcript prints it, such as 12:34 or 90:05"
+)]
+pub struct TimestampError(String);
+
+/// Who was speaking at a given instant -- or, when nobody nameable was, which of the four ways
+/// that happened.
+///
+/// Deliberately not an `Option<u32>`. All four non-answers mean "no cluster id", but they are
+/// four different things to tell a user: only one of them is a mistake on their part, and each
+/// of the others suggests a different next move. Collapsing them here would leave every caller
+/// able to say nothing but "no".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VoiceAt {
+    /// A speaker-track turn attributed to a voice. The one answer that names something.
+    Cluster(u32),
+    /// A mic-track turn: the machine's own user, [`YOU`] by construction and belonging to no
+    /// cluster, so there is nothing here to rename.
+    LocalSpeaker,
+    /// A speaker-track turn whose `cluster` is null -- diarization found no voices in this
+    /// session, so its turns have no provenance to hang a name on.
+    NoCluster,
+    /// Inside the session, but between turns: nobody was speaking at that instant.
+    Silence,
+    /// At or after the end of every turn. `last` is when the last one ended, which is what
+    /// lets a caller say how far past the end the timestamp was.
+    PastEnd { last: f64 },
 }
 
 /// The template `transcript.md` is rendered through when the user has supplied none.
@@ -431,7 +623,7 @@ impl<'a> RenderContext<'a> {
 
 #[derive(Serialize)]
 struct RenderTurn<'a> {
-    /// `MM:SS` from session start, minutes unwrapped past 60.
+    /// The turn's start as [`TranscriptTime`] spells it.
     time: String,
     speaker: &'a str,
     text: &'a str,
@@ -444,11 +636,10 @@ struct RenderTurn<'a> {
 
 impl<'a> RenderTurn<'a> {
     fn new(turn: &'a Turn) -> Self {
-        let total = turn.start.max(0.0);
-        let minutes = (total / 60.0).floor() as u64;
-        let seconds = (total - (minutes as f64) * 60.0).floor() as u64;
         RenderTurn {
-            time: format!("{minutes:02}:{seconds:02}"),
+            // The only place a transcript's timestamps are written, and it goes through the
+            // type that also reads them back. See `TranscriptTime`.
+            time: TranscriptTime::of(turn.start).to_string(),
             speaker: &turn.speaker,
             text: &turn.text,
             start: turn.start,
@@ -884,5 +1075,179 @@ mod tests {
         let (lines, body) = frontmatter(&rendered);
         assert_eq!(lines.len(), 2, "{rendered:?}");
         assert_eq!(body, "\n", "{rendered:?}");
+    }
+
+    fn speaker_turn(start: f64, end: f64, cluster: Option<u32>) -> Turn {
+        Turn {
+            speaker: unknown_speaker(cluster.unwrap_or(1) as usize),
+            start,
+            end,
+            text: "words".to_string(),
+            source_track: SourceTrack::Speaker,
+            cluster,
+            speaker_id_confidence: None,
+        }
+    }
+
+    fn at(s: &str) -> TranscriptTime {
+        s.parse().unwrap()
+    }
+
+    /// The point of giving the format one owner: whatever a transcript prints, this reads back
+    /// to the second it named. Asserted as a round trip rather than as two hand-written
+    /// literals agreeing, because two literals only pin today's behaviour of both sides at once
+    /// and would keep agreeing if the pair drifted together.
+    ///
+    /// The print side is also pinned independently, against `[90:05]` in
+    /// `the_default_template_renders_one_line_per_turn_under_frontmatter`.
+    #[test]
+    fn a_printed_timestamp_parses_back_to_the_second_it_names() {
+        for seconds in [0.0, 12.34, 59.9, 60.0, 754.3, 3600.0, 5405.0, 7205.0] {
+            let printed = TranscriptTime::of(seconds);
+            let parsed: TranscriptTime = printed.to_string().parse().unwrap();
+            assert_eq!(parsed, printed, "{seconds} printed as {printed}");
+            assert_eq!(parsed.seconds(), seconds.floor(), "{printed}");
+        }
+    }
+
+    /// Minutes past 60 are not wrapped on the way out, so they must not be on the way back in.
+    #[test]
+    fn minutes_past_an_hour_are_read_unwrapped() {
+        assert_eq!(TranscriptTime::of(5405.0).to_string(), "90:05");
+        assert_eq!(at("90:05").seconds(), 5405.0);
+        assert_eq!(at("120:00").seconds(), 7200.0);
+        // A single-digit minute, which is not a spelling any transcript prints but is one a
+        // user types.
+        assert_eq!(at("1:05").seconds(), 65.0);
+    }
+
+    /// A label copied straight off a transcript line brings its brackets with it.
+    #[test]
+    fn a_bracketed_label_parses() {
+        assert_eq!(at("[12:34]"), at("12:34"));
+        assert_eq!(at("  [12:34] "), at("12:34"));
+    }
+
+    /// Refused at parse time, with a message about the spelling and without a session to
+    /// compare against. `12:34:56` and `12` are refused specifically: reading either would
+    /// reintroduce the `HH:MM:SS` ambiguity that unwrapped minutes exist to avoid.
+    #[test]
+    fn a_malformed_timestamp_is_refused_with_the_spelling() {
+        for bad in [
+            "", "12", "12:5", "12:345", "12:60", "12:99", "12:34:56", "12x34", "-1:00", ":34",
+            "12:", "ab:cd", "[12:34", "12:34]",
+        ] {
+            let error = bad.parse::<TranscriptTime>().unwrap_err().to_string();
+            assert!(error.contains("MM:SS"), "{bad:?} gave {error}");
+            assert!(error.contains(bad), "{bad:?} gave {error}");
+        }
+    }
+
+    /// The truncated-label case, which containment alone gets wrong: this turn *prints*
+    /// `[12:34]`, but 754.0 is a fraction of a second before it starts.
+    #[test]
+    fn a_timestamp_resolves_to_the_turn_whose_printed_label_it_is() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![
+                speaker_turn(750.0, 754.0, Some(1)),
+                speaker_turn(754.3, 758.0, Some(7)),
+            ],
+        );
+        assert_eq!(transcript.voice_at(at("12:34")), VoiceAt::Cluster(7));
+        // And containment still answers for an instant no label names.
+        assert_eq!(transcript.voice_at(at("12:35")), VoiceAt::Cluster(7));
+    }
+
+    /// Both tracks are recorded at once and merged onto one timeline, so an instant can sit
+    /// inside a turn from each. The mic track is never nameable, so preferring it would refuse
+    /// a question that has an answer.
+    #[test]
+    fn an_instant_in_both_tracks_resolves_to_the_speaker_track() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![
+                mic_turn(100.0, 105.0, "me talking over them"),
+                speaker_turn(102.0, 104.0, Some(3)),
+            ],
+        );
+        assert_eq!(transcript.voice_at(at("01:43")), VoiceAt::Cluster(3));
+        // Outside the speaker turn, the mic turn is the honest answer.
+        assert_eq!(transcript.voice_at(at("01:41")), VoiceAt::LocalSpeaker);
+    }
+
+    /// The preference also applies to the label match, not just to containment: two turns can
+    /// start within the same second.
+    #[test]
+    fn a_label_shared_by_both_tracks_resolves_to_the_speaker_track() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![
+                mic_turn(60.0, 62.0, "me"),
+                speaker_turn(60.4, 61.0, Some(2)),
+            ],
+        );
+        assert_eq!(transcript.voice_at(at("01:00")), VoiceAt::Cluster(2));
+    }
+
+    /// The four non-answers, each distinguishable from the others rather than collapsed into
+    /// one word.
+    #[test]
+    fn the_four_non_answers_are_distinguishable() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![
+                mic_turn(0.0, 1.0, "me"),
+                speaker_turn(10.0, 11.0, None),
+                speaker_turn(20.0, 21.0, Some(4)),
+            ],
+        );
+
+        assert_eq!(transcript.voice_at(at("00:00")), VoiceAt::LocalSpeaker);
+        assert_eq!(transcript.voice_at(at("00:10")), VoiceAt::NoCluster);
+        assert_eq!(transcript.voice_at(at("00:05")), VoiceAt::Silence);
+        assert_eq!(
+            transcript.voice_at(at("00:30")),
+            VoiceAt::PastEnd { last: 21.0 }
+        );
+        // ... and the answer that names something, so the five are five.
+        assert_eq!(transcript.voice_at(at("00:20")), VoiceAt::Cluster(4));
+    }
+
+    /// The end instant belongs to whatever follows rather than to two turns at once, and the
+    /// end of the last turn is already past the end of the session.
+    #[test]
+    fn a_turns_end_instant_belongs_to_what_follows() {
+        let transcript = Transcript::new(session_id(), vec![speaker_turn(0.0, 5.0, Some(1))]);
+        assert_eq!(transcript.voice_at(at("00:04")), VoiceAt::Cluster(1));
+        assert_eq!(
+            transcript.voice_at(at("00:05")),
+            VoiceAt::PastEnd { last: 5.0 }
+        );
+    }
+
+    /// A transcript with no turns has no instant anybody spoke at, and "past the end of
+    /// nothing" is the reading that does not claim a silence inside a session.
+    #[test]
+    fn an_empty_transcript_is_past_its_end_everywhere() {
+        let transcript = Transcript::new(session_id(), Vec::new());
+        assert_eq!(
+            transcript.voice_at(at("00:00")),
+            VoiceAt::PastEnd { last: 0.0 }
+        );
+    }
+
+    /// `Transcript` is a deserialized file, so the lookup must not lean on merge's sorting.
+    #[test]
+    fn the_lookup_does_not_assume_the_turns_are_sorted() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![
+                speaker_turn(20.0, 21.0, Some(4)),
+                speaker_turn(10.0, 11.0, Some(2)),
+            ],
+        );
+        assert_eq!(transcript.voice_at(at("00:10")), VoiceAt::Cluster(2));
+        assert_eq!(transcript.voice_at(at("00:20")), VoiceAt::Cluster(4));
     }
 }
