@@ -10,6 +10,7 @@
 //! ```text
 //! <root>/
 //!   speakers.json                 enrolled-speaker embedding DB
+//!   transcript.md.jinja           optional template every transcript.md is rendered through
 //!   models/                       lazily fetched model weights
 //!   sessions/
 //!     <YYYYMMDD-HHMMSS>[-N]/      local-time id, numeric suffix on same-second collision
@@ -56,7 +57,8 @@ pub use speakers::{
     MAX_REFERENCES_PER_SPEAKER, Stored,
 };
 pub use transcript::{
-    SourceTrack, TRANSCRIPT_SCHEMA_VERSION, Transcript, Turn, YOU as SPEAKER_YOU, unknown_speaker,
+    SourceTrack, TRANSCRIPT_SCHEMA_VERSION, Transcript, TranscriptContext, TranscriptTemplate,
+    Turn, YOU as SPEAKER_YOU, unknown_speaker,
 };
 
 use std::path::PathBuf;
@@ -87,6 +89,24 @@ pub enum Error {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
+    },
+
+    /// A `transcript.md` template that would not compile, or that failed while rendering.
+    ///
+    /// A *missing* or unreadable template file is [`Error::Io`], which already names the path
+    /// and the reason; this is the file that was read and then could not be used.
+    ///
+    /// The `{source}` here must stay a plain `{}` and must never become `{:#}`, and nothing may
+    /// call `minijinja::Error::display_debug_info`. minijinja's alternate form dumps the
+    /// template's variables, and those include `Meeting::notes` -- the verbatim invite body,
+    /// which that field's own documentation commits to never leaving `session.json`. The plain
+    /// form is a syntax or undefined-value diagnosis with a line number and nothing else, which
+    /// is all a user needs to fix a template.
+    #[error("could not use the transcript template at {path}: {source}")]
+    Template {
+        path: PathBuf,
+        #[source]
+        source: minijinja::Error,
     },
 
     /// A file that parsed fine but claims a schema version this build has never heard of. In
@@ -126,6 +146,13 @@ impl Error {
 
     pub(crate) fn json(path: impl Into<PathBuf>, source: serde_json::Error) -> Self {
         Error::Json {
+            path: path.into(),
+            source,
+        }
+    }
+
+    pub(crate) fn template(path: impl Into<PathBuf>, source: minijinja::Error) -> Self {
+        Error::Template {
             path: path.into(),
             source,
         }

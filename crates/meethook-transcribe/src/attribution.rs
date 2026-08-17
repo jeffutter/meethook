@@ -507,10 +507,7 @@ mod tests {
             Naming::new(
                 &clusters,
                 &NOBODY,
-                &[
-                    assignment(1, "Alex"),
-                    assignment(0, "Alex"),
-                ],
+                &[assignment(1, "Alex"), assignment(0, "Alex")],
             ),
         );
 
@@ -535,17 +532,11 @@ mod tests {
             Naming::new(
                 &clusters,
                 &NOBODY,
-                &[
-                    assignment(0, "Alex"),
-                    assignment(1, "Alex"),
-                ],
+                &[assignment(0, "Alex"), assignment(1, "Alex")],
             ),
         );
 
-        assert!(
-            map.values().all(|a| a.label() == "Alex"),
-            "{map:?}"
-        );
+        assert!(map.values().all(|a| a.label() == "Alex"), "{map:?}");
     }
 
     /// The cross-kind case: a match to somebody the user has already put on a voice this one

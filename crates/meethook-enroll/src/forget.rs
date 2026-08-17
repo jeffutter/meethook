@@ -49,7 +49,10 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use meethook_session::{EnrolledSpeakers, Paths, SessionId, SessionPaths, Transcript};
+use meethook_session::{
+    EnrolledSpeakers, Paths, SessionId, SessionMetadata, SessionPaths, Transcript,
+    TranscriptContext, TranscriptTemplate,
+};
 use meethook_transcribe::Attribution;
 
 use crate::references::{
@@ -157,6 +160,10 @@ struct Pending {
     /// [`relabel`] rather than derived a second time, so what was previewed is what is written.
     labels: BTreeMap<u32, Attribution>,
     transcript: Transcript,
+    /// What re-rendering the markdown needs beyond the turns. Read during the preview beside
+    /// the transcript, and for the same reason: a session whose `session.json` cannot be read
+    /// is named before the database moves rather than after.
+    metadata: SessionMetadata,
 }
 
 /// Derives what a removal would do, prints it, and -- only with [`Confirm::Confirmed`] -- performs
@@ -192,6 +199,7 @@ pub fn run_forget(
     paths: &Paths,
     target: &Target,
     confirm: Confirm,
+    template: &TranscriptTemplate,
     out: &mut dyn Write,
 ) -> Result<Forgotten> {
     let speakers = EnrolledSpeakers::read_or_empty(paths)?;
@@ -243,16 +251,28 @@ pub fn run_forget(
         // one `enroll_session` gives for this same file, so two commands do not hand out
         // different instructions for one problem.
         let session_paths = paths.session(&session.session);
-        match Transcript::read(&session_paths.transcript_json()) {
-            Ok(transcript) => pending.push(Pending {
+        // Both files the rewrite needs, read now and on the same terms, before anything is
+        // written: an unreadable one is named in the preview rather than discovered once the
+        // database has already moved. Each carries the remedy `enroll_session` gives for that
+        // same file, so two commands do not hand out different instructions for one problem.
+        let readable = Transcript::read(&session_paths.transcript_json())
+            .map_err(|e| format!("{e} -- re-transcribe this session with --force"))
+            .and_then(|transcript| {
+                SessionMetadata::read(&session_paths.session_json())
+                    .map(|metadata| (transcript, metadata))
+                    .map_err(|e| format!("{e} -- fix that file"))
+            });
+        match readable {
+            Ok((transcript, metadata)) => pending.push(Pending {
                 paths: session_paths,
                 session: session.session.clone(),
                 labels: after,
                 transcript,
+                metadata,
             }),
-            Err(e) => removal.unwritable.push(Unreadable {
+            Err(why) => removal.unwritable.push(Unreadable {
                 session: session.session.clone(),
-                why: format!("{e} -- re-transcribe this session with --force"),
+                why,
             }),
         }
     }
@@ -265,7 +285,11 @@ pub fn run_forget(
             rest.write(paths)?;
             for entry in &mut pending {
                 if relabel(&mut entry.transcript, &entry.labels) {
-                    entry.transcript.write(&entry.paths)?;
+                    entry.transcript.write(
+                        &entry.paths,
+                        template,
+                        &TranscriptContext::now(&entry.metadata),
+                    )?;
                     writeln!(out, "{}  transcript brought in line", entry.session)?;
                 } else {
                     // The labelling moved but no turn was attributed to the voice that moved --
@@ -462,7 +486,7 @@ mod tests {
     use crate::references::scan;
     use crate::tests::{
         axis, enrolled, files_under, heard_at_once, make_session, named_for_its_session, nearly,
-        said, transcript_of, voice, with_embeddings,
+        said, session_metadata, transcript_of, voice, with_embeddings, write_transcript,
     };
 
     /// One removal and everything it printed, since a report whose wording is half its value
@@ -478,7 +502,15 @@ mod tests {
             reference,
         };
         let mut out = Vec::new();
-        let forgotten = run_forget(paths, &target, confirm, &mut out).unwrap();
+        let forgotten = run_forget(
+            paths,
+            &target,
+            confirm,
+            // Resolved from the root, exactly as the CLI does.
+            &TranscriptTemplate::resolve(paths, None).unwrap(),
+            &mut out,
+        )
+        .unwrap();
         (forgotten, String::from_utf8(out).unwrap())
     }
 
@@ -519,7 +551,12 @@ mod tests {
             let session_paths = paths.session(&session.session);
             let mut transcript = Transcript::read(&session_paths.transcript_json()).unwrap();
             if relabel(&mut transcript, &session.baseline) {
-                transcript.write(&session_paths).unwrap();
+                write_transcript(
+                    &transcript,
+                    paths,
+                    &session_paths,
+                    &session_metadata(&session.session),
+                );
             }
         }
     }

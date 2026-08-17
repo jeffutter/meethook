@@ -463,6 +463,13 @@ fn paths_are_derived_from_the_root_alone() {
         paths.speakers_json(),
         Path::new("/tmp/meethook-root/speakers.json")
     );
+    // Root-level, not per-session, and that is the contract rather than a convenience: it is
+    // what lets `enroll` and `forget` re-render a transcript through the same template
+    // `transcribe` wrote it with.
+    assert_eq!(
+        paths.transcript_template(),
+        Path::new("/tmp/meethook-root/transcript.md.jinja")
+    );
     assert_eq!(
         session.dir(),
         Path::new("/tmp/meethook-root/sessions/20260809-052607")

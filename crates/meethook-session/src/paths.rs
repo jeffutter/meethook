@@ -17,6 +17,10 @@ const SPEAKER_NAMES_JSON: &str = "speaker_names.json";
 const TRANSCRIPT_JSON: &str = "transcript.json";
 const TRANSCRIPT_MD: &str = "transcript.md";
 
+/// The optional user template `transcript.md` is rendered through. Root-level, not
+/// per-session: see [`Paths::transcript_template`].
+const TRANSCRIPT_TEMPLATE: &str = "transcript.md.jinja";
+
 /// The meethook data directory and everything directly under it.
 ///
 /// Construct one from the resolved root (`--root`, `$MEETHOOK_ROOT`, or `~/meethook`) and
@@ -47,6 +51,20 @@ impl Paths {
     /// The enrolled-speaker embedding database.
     pub fn speakers_json(&self) -> PathBuf {
         self.root.join("speakers.json")
+    }
+
+    /// The template every session's `transcript.md` is rendered through, when it exists.
+    ///
+    /// One file for the whole root rather than one per session, and that is the point rather
+    /// than a convenience: `enroll` and `forget` re-render transcripts they did not write, and
+    /// both reach a `Paths`. Resolving the template from the root is what makes them re-render
+    /// through the same template `transcribe` used without anything having been recorded in the
+    /// session directory -- and therefore without a rename ever being able to revert a
+    /// transcript to the built-in default.
+    ///
+    /// Absent is the normal case: with no file here the built-in default is used.
+    pub fn transcript_template(&self) -> PathBuf {
+        self.root.join(TRANSCRIPT_TEMPLATE)
     }
 
     pub fn session(&self, id: &SessionId) -> SessionPaths {

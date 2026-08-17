@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 use meethook_session::{
     AssignedName, Classification, DiscoveredSession, EnrolledSpeakers, Paths, SessionId,
     SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Stored, Transcript,
-    discover_sessions, unknown_labels, unknown_speaker,
+    TranscriptContext, TranscriptTemplate, discover_sessions, unknown_labels, unknown_speaker,
 };
 use meethook_transcribe::{
     Attribution, Naming, TARGET_RATE, attributions, identify_clusters, read_track_16k_mono,
@@ -421,16 +421,33 @@ pub enum Enrolment {
 
 /// How a run is configured: which voice or voices it offers, and what an answer to one writes.
 ///
-/// Private, and a bundle rather than three parameters, because it is threaded through the walk
-/// over sessions unchanged and every function on that path would otherwise carry all of them.
-/// The axes stay separate in the public signature, where a caller has to say which is which.
-#[derive(Debug, Clone, Copy, Default)]
-struct Rules<'a> {
+/// A bundle rather than four parameters, because it is threaded through the walk over sessions
+/// unchanged and every function on that path would otherwise carry all of them. It is the
+/// caller's parameter too: four axes named at the call site read better than four in a row of
+/// eight positional arguments, and a caller adding one of them cannot then transpose the rest.
+///
+/// There is no `Default`: [`template`](Self::template) has no sensible one. What a caller with
+/// no opinion wants is [`TranscriptTemplate::resolve`] with no explicit path, which is a
+/// fallible read of the root rather than a constant.
+#[derive(Debug, Clone, Copy)]
+pub struct EnrollRules<'a> {
     /// `Some` replaces the queue with one voice; `None` is the queue. Not a fourth flag on
     /// [`Offer`], because it does not widen the queue -- it stands in for it.
-    selector: Option<&'a VoiceSelector>,
-    offer: Offer,
-    enrolment: Enrolment,
+    pub selector: Option<&'a VoiceSelector>,
+
+    /// Which voices get asked about. Changes the questions and nothing else: the same answers
+    /// write the same files however a voice came to be offered.
+    pub offer: Offer,
+
+    /// What an accepted name writes -- the other axis, and the only one that changes that.
+    pub enrolment: Enrolment,
+
+    /// What a rewritten `transcript.md` is rendered through, handed in already compiled.
+    ///
+    /// Naming a voice must not be able to change the shape of a transcript it did not write,
+    /// so this belongs to the run rather than to a session: it is resolved once, from the same
+    /// root `transcribe` resolved it from, and every session rewritten here goes through it.
+    pub template: &'a TranscriptTemplate,
 }
 
 /// What a run did, so the caller can pick an exit status without re-deriving it.
@@ -495,7 +512,7 @@ enum Outcome {
 /// copy of a person somebody was just named in the first one a match rather than a second
 /// prompt.
 ///
-/// A [`VoiceSelector`] replaces the queue with exactly one voice of one session, and needs
+/// [`EnrollRules::selector`] replaces the queue with exactly one voice of one session, and needs
 /// exactly one session id to be meaningful: a voice number says nothing across sessions, and a
 /// name would fan out over every recording on disk. It overrides both [`Offer`] filters for
 /// that voice, so passing `--all` or `--correct` beside it changes nothing rather than
@@ -505,15 +522,13 @@ enum Outcome {
 /// both. It changes which questions get asked and nothing else: the same answers write the
 /// same files however a voice came to be offered. [`Enrolment`] is the other axis, and the
 /// only one that changes *what an answer writes* -- which is exactly why the override is a
-/// parameter of its own instead of a third field on `Offer`. There are three files an answer
+/// field of its own instead of a third flag on `Offer`. There are three files an answer
 /// can land in now (`speakers.json`, a session's `speaker_names.json`, and its transcript),
 /// and which of the first two it is depends on the voice's duration and on this.
 pub fn run_enroll(
     paths: &Paths,
     requested: &[SessionId],
-    voice: Option<&VoiceSelector>,
-    offer: Offer,
-    enrolment: Enrolment,
+    rules: EnrollRules<'_>,
     interviewer: &mut dyn Interviewer,
     out: &mut dyn Write,
 ) -> Result<EnrollReport> {
@@ -523,7 +538,7 @@ pub fn run_enroll(
     // rule already lives -- a requested id that is not on disk is printed and counted below --
     // and because one enforcement point cannot disagree with itself. Refused before anything is
     // discovered: a run that cannot say which session it is about has nothing to read.
-    if voice.is_some() && requested.len() != 1 {
+    if rules.selector.is_some() && requested.len() != 1 {
         writeln!(
             out,
             "--voice needs exactly one session id: a voice belongs to one session, so its \
@@ -561,11 +576,6 @@ pub fn run_enroll(
     }
 
     let mut speakers = EnrolledSpeakers::read_or_empty(paths)?;
-    let rules = Rules {
-        selector: voice,
-        offer,
-        enrolment,
-    };
 
     for session in selected {
         match enroll_session(
@@ -599,7 +609,7 @@ pub fn run_enroll(
 fn enroll_session(
     paths: &Paths,
     session: &DiscoveredSession,
-    rules: Rules<'_>,
+    rules: EnrollRules<'_>,
     speakers: &mut EnrolledSpeakers,
     interviewer: &mut dyn Interviewer,
     out: &mut dyn Write,
@@ -634,6 +644,22 @@ fn enroll_session(
                 "{}  failed: {e} -- re-transcribe this session with --force",
                 session.id
             )?;
+            report.failed += 1;
+            return Ok(Outcome::Finished);
+        }
+    };
+    // What a re-rendered `transcript.md` needs beyond the turns: the session's start time and
+    // the meeting it was recorded during. Read here, beside the clusters, so a session whose
+    // `session.json` has gone bad is reported and skipped like every other unreadable one
+    // rather than ending the queue -- and so nothing is read inside the naming loop below,
+    // where a failure would arrive after names had already been written.
+    let metadata = match session.load_metadata() {
+        Ok(metadata) => metadata,
+        // No re-transcribe recovers this: `session.json` is the recorder's own output and the
+        // marker that this directory is a session at all, so the only honest instruction is to
+        // go and look at it.
+        Err(e) => {
+            writeln!(out, "{}  failed: {e} -- fix that file", session.id)?;
             report.failed += 1;
             return Ok(Outcome::Finished);
         }
@@ -692,7 +718,11 @@ fn enroll_session(
     // forever, since it would be passed over on every later run too. Nothing is written when
     // nothing differs.
     if relabel(&mut transcript, &shown) {
-        transcript.write(&session.paths)?;
+        transcript.write(
+            &session.paths,
+            rules.template,
+            &TranscriptContext::now(&metadata),
+        )?;
         writeln!(out, "{}  transcript brought up to date", session.id)?;
     }
 
@@ -1005,7 +1035,11 @@ fn enroll_session(
         // two, and a `--force` re-transcribe would name both.
         let now = effective_labels(&clusters.clusters, &unknown, speakers, &assigned.names);
         if relabel(&mut transcript, &now) {
-            transcript.write(&session.paths)?;
+            transcript.write(
+                &session.paths,
+                rules.template,
+                &TranscriptContext::now(&metadata),
+            )?;
         }
         shown = now;
     }
@@ -1443,7 +1477,7 @@ mod tests {
 
     use meethook_session::{
         EnrolledSpeaker, MAX_REFERENCES_PER_SPEAKER, RepresentativeSegment, SPEAKER_YOU,
-        SessionPaths, TRANSCRIPT_SCHEMA_VERSION, Turn,
+        SessionMetadata, SessionPaths, TRANSCRIPT_SCHEMA_VERSION, TrackSync, Turn,
     };
 
     use super::*;
@@ -1593,12 +1627,52 @@ mod tests {
     ///
     /// The transcript is written with the labels `transcribe` would have given it against an
     /// empty database, which is the state `enroll` is for.
+    /// The `session.json` a fixture session carries.
+    ///
+    /// A real one rather than the `{}` placeholder this used to be: classification still only
+    /// checks the file's presence, but re-rendering a `transcript.md` reads the session's start
+    /// time and its meeting out of it.
+    pub(crate) fn session_metadata(id: &SessionId) -> SessionMetadata {
+        let sync = TrackSync {
+            host_ticks: 1,
+            timebase_numer: 125,
+            timebase_denom: 3,
+        };
+        SessionMetadata::new(
+            id.clone(),
+            "2026-08-09T05:26:00Z".parse().unwrap(),
+            sync,
+            sync,
+        )
+    }
+
+    /// Writes both transcript files the way `transcribe` does: through whatever template the
+    /// root resolves to.
+    ///
+    /// Going through [`TranscriptTemplate::resolve`] rather than always taking the built-in is
+    /// what lets a test drop a `transcript.md.jinja` into the root and have the fixture itself
+    /// honour it, exactly as the CLI does.
+    pub(crate) fn write_transcript(
+        transcript: &Transcript,
+        paths: &Paths,
+        session: &SessionPaths,
+        metadata: &SessionMetadata,
+    ) {
+        transcript
+            .write(
+                session,
+                &TranscriptTemplate::resolve(paths, None).unwrap(),
+                &TranscriptContext::now(metadata),
+            )
+            .unwrap();
+    }
+
     pub(crate) fn make_session(paths: &Paths, id: &str) -> SessionPaths {
         let id = SessionId::parse(id).unwrap();
         let session = paths.session(&id);
         std::fs::create_dir_all(session.dir()).unwrap();
-        // Only its presence is read here; classification never parses it.
-        std::fs::write(session.session_json(), b"{}").unwrap();
+        let metadata = session_metadata(&id);
+        metadata.write(&session.session_json()).unwrap();
         write_speaker_wav(&session.speaker_wav());
 
         SpeakerClusters::new(
@@ -1608,17 +1682,20 @@ mod tests {
         .write(&session)
         .unwrap();
 
-        Transcript::new(
-            id,
-            vec![
-                speaker_turn(0.0, 0, "Unknown 1", "  hi there  "),
-                mic_turn(1.0, "morning"),
-                speaker_turn(3.0, 1, "Unknown 2", "and from me"),
-                speaker_turn(4.0, 0, "Unknown 1", "let us start"),
-            ],
-        )
-        .write(&session)
-        .unwrap();
+        write_transcript(
+            &Transcript::new(
+                id,
+                vec![
+                    speaker_turn(0.0, 0, "Unknown 1", "  hi there  "),
+                    mic_turn(1.0, "morning"),
+                    speaker_turn(3.0, 1, "Unknown 2", "and from me"),
+                    speaker_turn(4.0, 0, "Unknown 1", "let us start"),
+                ],
+            ),
+            paths,
+            &session,
+            &metadata,
+        );
 
         session
     }
@@ -1643,18 +1720,21 @@ mod tests {
             .write(&session)
             .unwrap();
 
-        Transcript::new(
-            parsed,
-            vec![
-                speaker_turn(0.0, 0, "Unknown 1", "hi there"),
-                mic_turn(1.0, "morning"),
-                speaker_turn(3.0, 1, "Unknown 2", "and from me"),
-                speaker_turn(3.5, 2, "Unknown 3", "mm"),
-                speaker_turn(4.5, 3, "Unknown 4", "yes"),
-            ],
-        )
-        .write(&session)
-        .unwrap();
+        write_transcript(
+            &Transcript::new(
+                parsed.clone(),
+                vec![
+                    speaker_turn(0.0, 0, "Unknown 1", "hi there"),
+                    mic_turn(1.0, "morning"),
+                    speaker_turn(3.0, 1, "Unknown 2", "and from me"),
+                    speaker_turn(3.5, 2, "Unknown 3", "mm"),
+                    speaker_turn(4.5, 3, "Unknown 4", "yes"),
+                ],
+            ),
+            paths,
+            &session,
+            &session_metadata(&parsed),
+        );
 
         session
     }
@@ -1719,9 +1799,14 @@ mod tests {
         let report = run_enroll(
             paths,
             &requested,
-            voice.as_ref(),
-            offer,
-            enrolment,
+            EnrollRules {
+                selector: voice.as_ref(),
+                offer,
+                enrolment,
+                // Resolved from the root, exactly as the CLI does, so a test that puts a
+                // template there is testing the path a user takes.
+                template: &TranscriptTemplate::resolve(paths, None).unwrap(),
+            },
             interviewer,
             &mut out,
         )
@@ -1879,10 +1964,17 @@ mod tests {
 
     /// Acceptance criteria #5 and #6, at the level a user meets them: one answer puts a
     /// person in the database and their name on their own turns, and on nobody else's.
+    ///
+    /// It also pins the thing a rename must never do, which is change the *shape* of a
+    /// transcript it did not write. The root carries a template here, in place before the
+    /// session is, so the rewrite below has something other than the built-in default to revert
+    /// to if it ever resolved the template from anywhere but the root.
     #[test]
     fn naming_a_voice_enrolls_them_and_rewrites_that_sessions_transcript() {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path());
+        std::fs::create_dir_all(paths.root()).unwrap();
+        std::fs::write(paths.transcript_template(), USER_TEMPLATE).unwrap();
         let session = make_session(&paths, "20260809-052600");
 
         let mut interviewer = Scripted::answering(vec![named("Alice")]);
@@ -1905,10 +1997,34 @@ mod tests {
         );
         // The rendering is rewritten from the turns, not patched line by line.
         let markdown = std::fs::read_to_string(session.transcript_md()).unwrap();
-        assert_eq!(markdown, transcript_of(&session).render_markdown());
+        assert_eq!(
+            markdown,
+            transcript_of(&session)
+                .render_markdown(
+                    &TranscriptTemplate::resolve(&paths, None).unwrap(),
+                    &TranscriptContext::now(&session_metadata(
+                        &SessionId::parse("20260809-052600").unwrap()
+                    )),
+                )
+                .unwrap()
+        );
         assert!(markdown.contains("Alice"), "{markdown}");
         assert!(!markdown.contains("Unknown 1"), "{markdown}");
+        // Acceptance criterion #5: the rewrite went through the root's template, not the
+        // built-in default. Both marks, because either alone would pass on a default rendering
+        // that happened to be a prefix or a suffix of this one.
+        assert!(
+            markdown.starts_with("---\nvault: mine\n---\n"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("Alice> let us start\n"), "{markdown}");
+        assert!(!markdown.contains("**["), "{markdown}");
     }
+
+    /// A template that is nothing like the built-in default in either half: different
+    /// frontmatter, and a body line no default rendering could produce.
+    const USER_TEMPLATE: &str = "---\nvault: mine\n---\n\
+        {% for turn in turns %}{{ turn.speaker }}> {{ turn.text }}\n{% endfor %}";
 
     /// Acceptance criterion #6's actual claim, which the assertion above only illustrates:
     /// the rewritten transcript is what `transcribe --force` would now produce. Checked by
@@ -3283,9 +3399,12 @@ mod tests {
         let error = run_enroll(
             &paths,
             &[],
-            None,
-            Offer::default(),
-            Enrolment::default(),
+            EnrollRules {
+                selector: None,
+                offer: Offer::default(),
+                enrolment: Enrolment::default(),
+                template: &TranscriptTemplate::builtin(),
+            },
             &mut interviewer,
             &mut out,
         )
@@ -3444,11 +3563,7 @@ mod tests {
         let mut interviewer = Scripted::default();
         let (_, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
 
-        assert_eq!(
-            interviewer.labels(),
-            ["Andrew", "Andrew"],
-            "{output}"
-        );
+        assert_eq!(interviewer.labels(), ["Andrew", "Andrew"], "{output}");
         assert_eq!(interviewer.seen[0].snippets, ["hi there", "let us start"]);
         assert_eq!(interviewer.seen[1].snippets, ["and from me"]);
     }

@@ -26,10 +26,10 @@ use std::f32::consts::TAU;
 use std::path::{Path, PathBuf};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
-use meethook_enroll::{Answer, Enrolment, Interviewer, Offer, Voice, run_enroll};
+use meethook_enroll::{Answer, EnrollRules, Enrolment, Interviewer, Offer, Voice, run_enroll};
 use meethook_session::{
     EnrolledSpeakers, Paths, RepresentativeSegment, SessionId, SpeakerCluster, SpeakerClusters,
-    Transcript,
+    Transcript, TranscriptTemplate,
 };
 use meethook_transcribe::{
     AsrSegment, Diarization, Diarize, Engines, Result, SpeakerTurn, SpeechToText, TARGET_RATE,
@@ -161,6 +161,7 @@ fn transcribe(paths: &Paths, id: &SessionId) {
         paths,
         std::slice::from_ref(id),
         false,
+        &TranscriptTemplate::resolve(paths, None).unwrap(),
         &mut factory,
         &mut std::io::sink(),
     )
@@ -213,9 +214,12 @@ fn a_session_built_from_a_wav_file_transcribes_enrolls_and_stores_that_audio() {
     let report = run_enroll(
         &paths,
         &[],
-        None,
-        Offer::default(),
-        Enrolment::default(),
+        EnrollRules {
+            selector: None,
+            offer: Offer::default(),
+            enrolment: Enrolment::default(),
+            template: &TranscriptTemplate::resolve(&paths, None).unwrap(),
+        },
         &mut interviewer,
         &mut std::io::sink(),
     )
@@ -314,9 +318,12 @@ fn building_and_transcribing_touches_only_the_root_it_was_given() {
     run_enroll(
         &paths,
         &[],
-        None,
-        Offer::default(),
-        Enrolment::default(),
+        EnrollRules {
+            selector: None,
+            offer: Offer::default(),
+            enrolment: Enrolment::default(),
+            template: &TranscriptTemplate::resolve(&paths, None).unwrap(),
+        },
         &mut AsksOnce {
             answer: Some("Alice".to_string()),
             asked: Vec::new(),

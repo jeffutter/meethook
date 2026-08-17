@@ -6,19 +6,19 @@
 //! which is exactly the part no test can decide.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use meethook_enroll::{
-    Answer, Confirm, Enrolment, Forgotten, Interviewer, Offer, Target, Voice, VoiceSelector,
-    run_enroll, run_forget, run_speakers, write_clip,
+    Answer, Confirm, EnrollRules, Enrolment, Forgotten, Interviewer, Offer, Target, Voice,
+    VoiceSelector, run_enroll, run_forget, run_speakers, write_clip,
 };
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
-use meethook_session::{Paths, SessionId};
+use meethook_session::{Paths, SessionId, TranscriptTemplate};
 use meethook_transcribe::{
     Attribution, EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, SILERO_VAD_MODEL,
     WHISPER_MODEL, WhisperEngine, run_batch,
@@ -541,8 +541,14 @@ fn await_end(rx: &Receiver<Event>, grace: Duration) -> Outcome {
 /// Fully non-interactive, deliberately: this is meant to be aimed at a directory of
 /// meetings and left alone. All four models are acquired lazily through the one factory
 /// below, so a run that turns out to have nothing to do never pays for a download.
-pub fn transcribe(paths: &Paths, session_ids: &[String], force: bool) -> Result<()> {
+pub fn transcribe(
+    paths: &Paths,
+    session_ids: &[String],
+    force: bool,
+    template: Option<&Path>,
+) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
+    let template = TranscriptTemplate::resolve(paths, template)?;
 
     let models_dir = paths.models_dir();
     let mut open_engine =
@@ -583,6 +589,7 @@ pub fn transcribe(paths: &Paths, session_ids: &[String], force: bool) -> Result<
         paths,
         &requested,
         force,
+        &template,
         &mut open_engine,
         &mut stdout.lock(),
     )?;
@@ -663,35 +670,32 @@ pub fn enroll(
     all: bool,
     correct: bool,
     force_reference: bool,
+    template: Option<&Path>,
 ) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
+    let template = TranscriptTemplate::resolve(paths, template)?;
     let mut terminal = Terminal::default();
     // Unlike a session id there is nothing to validate here: a selector that matches nothing is
     // answered against the session's actual voices, which is a better message than anything
     // this edge could produce without having read them.
     let selector = voice.map(VoiceSelector::from);
-    // Named at the one production call site, so which flag answers which question is readable
-    // here rather than positional.
-    let offer = Offer {
-        quiet: all,
-        named: correct,
+    let rules = EnrollRules {
+        selector: selector.as_ref(),
+        // Which flag answers which question, readable here rather than positional.
+        offer: Offer {
+            quiet: all,
+            named: correct,
+        },
+        // A separate axis from `offer`: that one decides which voices are asked about, this
+        // one what an answer to a quiet voice writes.
+        enrolment: if force_reference {
+            Enrolment::Always
+        } else {
+            Enrolment::AboveTheFloor
+        },
+        template: &template,
     };
-    // A separate axis from `offer`: that one decides which voices are asked about, this one
-    // what an answer to a quiet voice writes.
-    let enrolment = if force_reference {
-        Enrolment::Always
-    } else {
-        Enrolment::AboveTheFloor
-    };
-    let report = run_enroll(
-        paths,
-        &requested,
-        selector.as_ref(),
-        offer,
-        enrolment,
-        &mut terminal,
-        &mut io::stdout(),
-    )?;
+    let report = run_enroll(paths, &requested, rules, &mut terminal, &mut io::stdout())?;
 
     println!(
         "\n{} named, {} skipped, {} session(s) passed over",
@@ -766,7 +770,14 @@ pub fn speakers(paths: &Paths) -> Result<()> {
 /// Thin for the same reason `speakers` is: every line, including the one telling the user that
 /// nothing was written and how to confirm, comes back from `run_forget`, which is what makes the
 /// wording decidable in `cargo test`. The one decision left here is the exit status.
-pub fn forget(paths: &Paths, name: &str, reference: Option<usize>, yes: bool) -> Result<()> {
+pub fn forget(
+    paths: &Paths,
+    name: &str,
+    reference: Option<usize>,
+    yes: bool,
+    template: Option<&Path>,
+) -> Result<()> {
+    let template = TranscriptTemplate::resolve(paths, template)?;
     let target = Target {
         name: name.to_string(),
         reference,
@@ -779,7 +790,7 @@ pub fn forget(paths: &Paths, name: &str, reference: Option<usize>, yes: bool) ->
         Confirm::Preview
     };
 
-    let removal = match run_forget(paths, &target, confirm, &mut io::stdout())? {
+    let removal = match run_forget(paths, &target, confirm, &template, &mut io::stdout())? {
         // The detail -- the path, and what *is* stored -- has already been printed, so this only
         // has to make the exit status say the request was not served.
         Forgotten::NotStored => match reference {

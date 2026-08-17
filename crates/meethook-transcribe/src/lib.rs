@@ -69,7 +69,8 @@ pub use vad::{SileroVad, SpeechRegion, VadTuning};
 use meethook_models::ModelSpec;
 use meethook_session::{
     Classification, DiscoveredSession, EnrolledSpeakers, Paths, SessionId, SessionMetadata,
-    SpeakerClusters, SpeakerNames, Transcript, discover_sessions,
+    SpeakerClusters, SpeakerNames, Transcript, TranscriptContext, TranscriptTemplate,
+    discover_sessions,
 };
 
 /// The Whisper checkpoint this tool transcribes with.
@@ -371,10 +372,15 @@ pub fn transcribe_session(
 /// `open_engine` is called at most once, and only when there is real work -- a rerun over an
 /// already-transcribed directory must not trigger a multi-gigabyte model download in order
 /// to then do nothing.
+///
+/// `template` is handed in already compiled rather than resolved here, so a template with a
+/// syntax error costs the caller a millisecond at start-up instead of an hour of recognition
+/// followed by a batch that can write nothing.
 pub fn run_batch(
     paths: &Paths,
     requested: &[SessionId],
     force: bool,
+    template: &TranscriptTemplate,
     open_engine: &mut EngineFactory<'_>,
     out: &mut dyn Write,
 ) -> Result<BatchReport> {
@@ -447,7 +453,7 @@ pub fn run_batch(
 
     for session in work {
         writeln!(out, "{}  transcribing...", session.id)?;
-        match transcribe_and_write(session, &mut engines, &speakers, out) {
+        match transcribe_and_write(session, &mut engines, &speakers, template, out) {
             Ok(turns) => {
                 writeln!(out, "{}  {turns} turn(s)", session.id)?;
                 report.transcribed += 1;
@@ -467,6 +473,7 @@ fn transcribe_and_write(
     session: &DiscoveredSession,
     engines: &mut Engines,
     speakers: &EnrolledSpeakers,
+    template: &TranscriptTemplate,
     progress: &mut dyn Write,
 ) -> Result<usize> {
     let transcript = transcribe_session(
@@ -476,7 +483,11 @@ fn transcribe_and_write(
         speakers,
         progress,
     )?;
-    transcript.write(&session.paths)?;
+    // Re-read rather than returned from `transcribe_session`, which stays a function of the
+    // audio and returns only the transcript. One small JSON read beside a Whisper pass over a
+    // whole meeting is not a cost worth widening that signature for.
+    let metadata = session.load_metadata()?;
+    transcript.write(&session.paths, template, &TranscriptContext::now(&metadata))?;
     Ok(transcript.turns.len())
 }
 
@@ -569,6 +580,28 @@ mod tests {
     };
 
     use super::*;
+
+    /// Writes both transcript files the way `transcribe` does, through the built-in template.
+    ///
+    /// The render instant is pinned rather than taken from the clock. `updated:` in the
+    /// frontmatter is the one input to a rendering that is deliberately *not* a function of the
+    /// session, so fixing it is what keeps "re-running produces the same file" a byte-for-byte
+    /// claim about everything else -- the labels, the numbering, the tie-breaks -- rather than a
+    /// claim weakened to "identical apart from one line".
+    fn write_transcript(transcript: &Transcript, session: &DiscoveredSession) {
+        let metadata = session.load_metadata().unwrap();
+        transcript
+            .write(
+                &session.paths,
+                &TranscriptTemplate::builtin(),
+                &TranscriptContext::at(&metadata, rendered_at()),
+            )
+            .unwrap();
+    }
+
+    fn rendered_at() -> Timestamp {
+        "2026-08-09T07:00:00Z".parse().unwrap()
+    }
 
     /// Apple Silicon's timebase. 125/3 rather than Intel's 1/1 is exactly the ratio that
     /// makes an unscaled tick count look plausible while being 41x wrong.
@@ -838,7 +871,15 @@ mod tests {
                 opened += 1;
                 Ok(fake_engines())
             };
-            run_batch(paths, &requested, force, &mut factory, &mut out).unwrap()
+            run_batch(
+                paths,
+                &requested,
+                force,
+                &TranscriptTemplate::builtin(),
+                &mut factory,
+                &mut out,
+            )
+            .unwrap()
         };
         (report, opened, String::from_utf8(out).unwrap())
     }
@@ -936,7 +977,7 @@ mod tests {
         let transcript = mic_only(&session, &mut asr).unwrap();
         assert!(transcript.turns.is_empty());
 
-        transcript.write(&session.paths).unwrap();
+        write_transcript(&transcript, &session);
         assert!(session.paths.transcript_json().is_file());
         assert!(session.paths.transcript_md().is_file());
     }
@@ -1042,12 +1083,20 @@ mod tests {
             "diarization must be run on the speaker track and on nothing else"
         );
 
-        // AC #9: one line per turn, in transcript order.
-        let markdown = transcript.render_markdown();
-        assert_eq!(markdown.lines().count(), transcript.turns.len());
+        // AC #9: one line per turn, in transcript order. Read out of the rendered file below
+        // its frontmatter, which is the template's business rather than this test's.
+        let metadata = session.load_metadata().unwrap();
+        let rendered = transcript
+            .render_markdown(
+                &TranscriptTemplate::builtin(),
+                &TranscriptContext::at(&metadata, rendered_at()),
+            )
+            .unwrap();
+        let body = rendered.split_once("\n---\n").unwrap().1.trim_start();
+        assert_eq!(body.lines().count(), transcript.turns.len(), "{rendered}");
         assert!(
-            markdown.starts_with("**[00:00] Unknown 1:** hi there\n"),
-            "{markdown}"
+            body.starts_with("**[00:00] Unknown 1:** hi there\n"),
+            "{rendered}"
         );
     }
 
@@ -1133,7 +1182,7 @@ mod tests {
             let transcript =
                 transcribe_session(&session, &mut asr, &mut diarizer, speakers, &mut quiet())
                     .unwrap();
-            transcript.write(&session.paths).unwrap();
+            write_transcript(&transcript, &session);
             (
                 std::fs::read(session.paths.transcript_json()).unwrap(),
                 std::fs::read(session.paths.transcript_md()).unwrap(),
@@ -1283,8 +1332,15 @@ mod tests {
         std::fs::write(paths.speakers_json(), b"{ not json at all").unwrap();
 
         let mut out = Vec::new();
-        let error =
-            run_batch(&paths, &[], false, &mut || Ok(fake_engines()), &mut out).unwrap_err();
+        let error = run_batch(
+            &paths,
+            &[],
+            false,
+            &TranscriptTemplate::builtin(),
+            &mut || Ok(fake_engines()),
+            &mut out,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("speakers.json"), "{error}");
         assert!(
@@ -1313,8 +1369,15 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        let error =
-            run_batch(&paths, &[], false, &mut || Ok(fake_engines()), &mut out).unwrap_err();
+        let error = run_batch(
+            &paths,
+            &[],
+            false,
+            &TranscriptTemplate::builtin(),
+            &mut || Ok(fake_engines()),
+            &mut out,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("speakers.json"), "{error}");
         assert!(error.to_string().contains("upgrade meethook"), "{error}");

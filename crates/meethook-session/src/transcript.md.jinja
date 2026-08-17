@@ -1,0 +1,16 @@
+---
+created: {{ created }}
+updated: {{ updated }}
+{%- if meeting %}
+{%- if meeting.title %}
+meeting_title: {{ meeting.title | yaml }}
+{%- endif %}
+{%- if meeting.notes %}
+meeting_description: {{ meeting.notes | yaml }}
+{%- endif %}
+{%- endif %}
+---
+
+{% for turn in turns -%}
+**[{{ turn.time }}] {{ turn.speaker }}:** {{ turn.text }}
+{% endfor -%}

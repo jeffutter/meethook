@@ -19,11 +19,11 @@
 //! rather than about this code. It is TASK-014, and it needs a microphone.
 
 use meethook_enroll::{
-    Answer, EnrollReport, Enrolment, Interviewer, Offer, Voice, run_enroll, write_clip,
+    Answer, EnrollReport, EnrollRules, Enrolment, Interviewer, Offer, Voice, run_enroll, write_clip,
 };
 use meethook_session::{
     Paths, RepresentativeSegment, SessionId, SessionMetadata, SpeakerCluster, SpeakerNames,
-    TrackSync, Transcript,
+    TrackSync, Transcript, TranscriptTemplate,
 };
 use meethook_transcribe::{
     AsrSegment, BatchReport, Diarization, Diarize, Engines, Result, SpeakerTurn, SpeechToText,
@@ -151,6 +151,7 @@ fn transcribe_speaking(
         paths,
         std::slice::from_ref(id),
         force,
+        &TranscriptTemplate::resolve(paths, None).unwrap(),
         &mut factory,
         &mut std::io::sink(),
     )
@@ -201,9 +202,12 @@ fn enroll_offering(paths: &Paths, offer: Offer, interviewer: &mut dyn Interviewe
     run_enroll(
         paths,
         &[],
-        None,
-        offer,
-        Enrolment::default(),
+        EnrollRules {
+            selector: None,
+            offer,
+            enrolment: Enrolment::default(),
+            template: &TranscriptTemplate::resolve(paths, None).unwrap(),
+        },
         interviewer,
         &mut std::io::sink(),
     )
@@ -348,11 +352,7 @@ fn a_name_given_to_one_session_does_not_name_that_voice_in_the_next() {
     let february = make_session(&paths, "20260209-090000");
 
     transcribe_speaking(&paths, &january, 0, 2.0, false);
-    enroll_offering(
-        &paths,
-        QUIET,
-        &mut AsksOnce::answering(Some("Alex")),
-    );
+    enroll_offering(&paths, QUIET, &mut AsksOnce::answering(Some("Alex")));
 
     transcribe_speaking(&paths, &february, 0, 2.0, false);
 
@@ -377,11 +377,7 @@ fn a_name_recorded_against_a_clustering_that_changed_is_ignored() {
     let january = make_session(&paths, "20260105-090000");
 
     transcribe_speaking(&paths, &january, 0, 2.0, false);
-    enroll_offering(
-        &paths,
-        QUIET,
-        &mut AsksOnce::answering(Some("Alex")),
-    );
+    enroll_offering(&paths, QUIET, &mut AsksOnce::answering(Some("Alex")));
     assert!(speakers_in(&paths, &january).contains(&"Alex".to_string()));
 
     // One element of the recorded centroid moved, which is what a re-clustering that redrew

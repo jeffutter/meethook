@@ -53,6 +53,27 @@ jiff = "0.2"
 # crate to the build graph.
 libc = "0.2"
 mach2 = "0.5"
+# The template engine behind `transcript.md`. Templates are read from a path at runtime --
+# `<root>/transcript.md.jinja`, or whatever `--template` names -- so a compile-time engine
+# such as askama cannot express this at all.
+#
+# minijinja over tera, the other pure-Rust candidate, for three reasons. Its default feature
+# set adds only `memo-map` to this tree (serde is already here), where tera's pulls
+# `globset`, `walkdir`, `ahash` and `unicode-segmentation` to support a directory-glob
+# loader that one template loaded from one known path has no use for. It declares an MSRV
+# (1.70, under this workspace's 1.85), where tera declares none. And its `Error`'s plain
+# `Display` is a syntax/undefined diagnosis on its own, with the template's variables only
+# reachable through the alternate `{:#}` form -- which is what lets `Error::Template` name
+# what is wrong without risking the invite body reaching a terminal (see `Meeting::notes`).
+#
+# Default features only. The `json` feature was considered for its `tojson` filter, which is
+# what the default template would escape meeting values into YAML frontmatter with, and
+# rejected: `tojson` is HTML-safe, so it renders "Design & Review" as "Design & Review".
+# That is valid YAML and unreadable frontmatter, and meeting titles containing `&` are not an
+# edge case. `meethook-session` registers its own `yaml` filter instead -- see
+# `transcript::yaml_filter`. Pure Rust either way: no build script, no C, so `flake.nix` needs
+# nothing.
+minijinja = { version = "2" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

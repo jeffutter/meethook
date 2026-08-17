@@ -26,6 +26,16 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH", env = "MEETHOOK_ROOT")]
     root: Option<PathBuf>,
 
+    /// Template every transcript.md is rendered through
+    /// (default: transcript.md.jinja in the data directory, else meethook's built-in one)
+    ///
+    /// Global rather than an option of `transcribe`, deliberately: `enroll` and `forget`
+    /// rewrite transcripts they did not write, and a per-command flag would let one of them
+    /// silently revert a transcript to the built-in shape. A template named here that is
+    /// missing or malformed is an error; it never falls back.
+    #[arg(long, global = true, value_name = "PATH", env = "MEETHOOK_TEMPLATE")]
+    template: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -122,11 +132,12 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::new(resolve_root(cli.root)?);
+    let template = cli.template.as_deref();
 
     match cli.command {
         Command::Record => commands::record(&paths),
         Command::Transcribe { session_ids, force } => {
-            commands::transcribe(&paths, &session_ids, force)
+            commands::transcribe(&paths, &session_ids, force, template)
         }
         Command::Enroll {
             session_ids,
@@ -141,13 +152,14 @@ fn main() -> Result<()> {
             all,
             correct,
             force_reference,
+            template,
         ),
         Command::Speakers => commands::speakers(&paths),
         Command::Forget {
             name,
             reference,
             yes,
-        } => commands::forget(&paths, &name, reference, yes),
+        } => commands::forget(&paths, &name, reference, yes, template),
     }
 }
 
