@@ -56,6 +56,48 @@ pub const PAN_POSITION: f32 = 0.3;
 /// 14 MB an hour against the ~690 MB an hour the two source WAVs occupy.
 pub const BITRATE_BPS: u32 = 32_000;
 
+/// The narrowest and widest bitrates Opus itself accepts (RFC 6716 §2.1.1).
+///
+/// Here so that a caller taking this from a user can refuse a bad value where it was typed and
+/// name the range in the refusal, rather than letting the encoder fail partway through a run.
+pub const BITRATE_MIN_BPS: u32 = 6_000;
+pub const BITRATE_MAX_BPS: u32 = 510_000;
+
+/// The range a pan position may occupy, as a distance from centre.
+///
+/// The constant-power panning below clamps rather than refusing, which is right for a value
+/// computed inside this module and wrong for one a user typed: a clamp turns `--pan 30` into
+/// a hard pan and says nothing about it.
+pub const PAN_MIN: f32 = 0.0;
+pub const PAN_MAX: f32 = 1.0;
+
+/// The two mixdown settings a listener can reasonably disagree about.
+///
+/// One struct rather than two loose numbers because they travel together through four call
+/// layers, and a bare `(u32, f32)` that far from here is a pair of arguments waiting to be
+/// swapped. [`Default`] is the pair TASK-032.01 settled by listening, so the values stay
+/// written down once, in the two constants above.
+///
+/// The source rate is deliberately absent. It is not a taste setting: the mix reuses the
+/// tracks `transcribe` already holds in memory, and any other rate means reading the session's
+/// WAVs a second time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Settings {
+    /// Target bitrate in bits per second.
+    pub bitrate_bps: u32,
+    /// How far from centre each source sits. See [`PAN_POSITION`].
+    pub pan: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            bitrate_bps: BITRATE_BPS,
+            pan: PAN_POSITION,
+        }
+    }
+}
+
 /// Encoder complexity, 0-10.
 ///
 /// 10, the maximum, because the cost is irrelevant here: an hour of meeting encodes in about

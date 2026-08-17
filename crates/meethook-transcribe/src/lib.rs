@@ -334,6 +334,7 @@ pub fn transcribe_session(
     asr: &mut dyn SpeechToText,
     diarizer: &mut dyn Diarize,
     speakers: &EnrolledSpeakers,
+    mixdown_settings: mixdown::Settings,
     progress: &mut dyn Write,
 ) -> Result<Transcript> {
     let metadata = session.load_metadata()?;
@@ -349,7 +350,13 @@ pub fn transcribe_session(
         progress,
     )?;
 
-    write_mixdown(session, &mic_track, &speaker_track, &metadata)?;
+    write_mixdown(
+        session,
+        &mic_track,
+        &speaker_track,
+        &metadata,
+        mixdown_settings,
+    )?;
 
     let mic_segments = asr.transcribe(&mic_track)?;
 
@@ -401,11 +408,15 @@ pub fn transcribe_session(
 /// `template` is handed in already compiled rather than resolved here, so a template with a
 /// syntax error costs the caller a millisecond at start-up instead of an hour of recognition
 /// followed by a batch that can write nothing.
+///
+/// `mixdown_settings` is validated by the same argument: a bitrate or pan the encoder would
+/// reject is refused where the user typed it, not partway through the batch.
 pub fn run_batch(
     paths: &Paths,
     requested: &[SessionId],
     force: bool,
     template: &TranscriptTemplate,
+    mixdown_settings: mixdown::Settings,
     open_engine: &mut EngineFactory<'_>,
     out: &mut dyn Write,
 ) -> Result<BatchReport> {
@@ -478,7 +489,14 @@ pub fn run_batch(
 
     for session in work {
         writeln!(out, "{}  transcribing...", session.id)?;
-        match transcribe_and_write(session, &mut engines, &speakers, template, out) {
+        match transcribe_and_write(
+            session,
+            &mut engines,
+            &speakers,
+            template,
+            mixdown_settings,
+            out,
+        ) {
             Ok(turns) => {
                 writeln!(out, "{}  {turns} turn(s)", session.id)?;
                 report.transcribed += 1;
@@ -499,6 +517,7 @@ fn transcribe_and_write(
     engines: &mut Engines,
     speakers: &EnrolledSpeakers,
     template: &TranscriptTemplate,
+    mixdown_settings: mixdown::Settings,
     progress: &mut dyn Write,
 ) -> Result<usize> {
     let transcript = transcribe_session(
@@ -506,6 +525,7 @@ fn transcribe_and_write(
         engines.asr.as_mut(),
         engines.diarizer.as_mut(),
         speakers,
+        mixdown_settings,
         progress,
     )?;
     // Re-read rather than returned from `transcribe_session`, which stays a function of the
@@ -569,17 +589,18 @@ fn write_mixdown(
     mic: &[f32],
     speaker: &[f32],
     metadata: &SessionMetadata,
+    settings: mixdown::Settings,
 ) -> Result<()> {
     let sources = [
         mixdown::Source {
             samples: mic,
             offset_s: mic_offset_seconds(metadata)?,
-            pan: -mixdown::PAN_POSITION,
+            pan: -settings.pan,
         },
         mixdown::Source {
             samples: speaker,
             offset_s: speaker_offset_seconds(metadata)?,
-            pan: mixdown::PAN_POSITION,
+            pan: settings.pan,
         },
     ];
 
@@ -587,7 +608,7 @@ fn write_mixdown(
         &session.paths.meeting_opus(),
         &mixdown::mix(&sources, TARGET_RATE),
         TARGET_RATE,
-        mixdown::BITRATE_BPS,
+        settings.bitrate_bps,
     )
 }
 
@@ -954,6 +975,7 @@ mod tests {
                 &requested,
                 force,
                 &TranscriptTemplate::builtin(),
+                mixdown::Settings::default(),
                 &mut factory,
                 &mut out,
             )
@@ -970,6 +992,7 @@ mod tests {
             asr,
             &mut FakeDiarizer::default(),
             &nobody_enrolled(),
+            mixdown::Settings::default(),
             &mut quiet(),
         )
     }
@@ -1116,6 +1139,7 @@ mod tests {
             &mut asr,
             &mut diarizer,
             &nobody_enrolled(),
+            mixdown::Settings::default(),
             &mut quiet(),
         )
         .unwrap();
@@ -1192,6 +1216,7 @@ mod tests {
             &mut asr,
             &mut diarizer,
             &nobody_enrolled(),
+            mixdown::Settings::default(),
             &mut quiet(),
         )
         .unwrap();
@@ -1257,9 +1282,15 @@ mod tests {
 
         let transcribe = |id: &str, speakers: &EnrolledSpeakers| {
             let (session, mut asr, mut diarizer) = two_party(&paths, id);
-            let transcript =
-                transcribe_session(&session, &mut asr, &mut diarizer, speakers, &mut quiet())
-                    .unwrap();
+            let transcript = transcribe_session(
+                &session,
+                &mut asr,
+                &mut diarizer,
+                speakers,
+                mixdown::Settings::default(),
+                &mut quiet(),
+            )
+            .unwrap();
             write_transcript(&transcript, &session);
             (
                 std::fs::read(session.paths.transcript_json()).unwrap(),
@@ -1294,6 +1325,7 @@ mod tests {
             &mut asr,
             &mut diarizer,
             &enrolled(&[("Alice", 0)]),
+            mixdown::Settings::default(),
             &mut quiet(),
         )
         .unwrap();
@@ -1329,6 +1361,7 @@ mod tests {
             &mut asr,
             &mut diarizer,
             &enrolled(&[("Alice", 0)]),
+            mixdown::Settings::default(),
             &mut quiet(),
         )
         .unwrap();
@@ -1415,6 +1448,7 @@ mod tests {
             &[],
             false,
             &TranscriptTemplate::builtin(),
+            mixdown::Settings::default(),
             &mut || Ok(fake_engines()),
             &mut out,
         )
@@ -1452,6 +1486,7 @@ mod tests {
             &[],
             false,
             &TranscriptTemplate::builtin(),
+            mixdown::Settings::default(),
             &mut || Ok(fake_engines()),
             &mut out,
         )
@@ -1573,6 +1608,7 @@ mod tests {
             &mut asr,
             &mut diarizer,
             &nobody_enrolled(),
+            mixdown::Settings::default(),
             &mut progress,
         )
         .unwrap();
@@ -1613,6 +1649,7 @@ mod tests {
             &mut FakeAsr::default(),
             &mut FakeDiarizer::default(),
             &nobody_enrolled(),
+            mixdown::Settings::default(),
             &mut progress,
         )
         .unwrap();

@@ -152,6 +152,7 @@ fn transcribe_speaking(
         std::slice::from_ref(id),
         force,
         &TranscriptTemplate::resolve(paths, None).unwrap(),
+        meethook_transcribe::mixdown::Settings::default(),
         &mut factory,
         &mut std::io::sink(),
     )

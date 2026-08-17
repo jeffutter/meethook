@@ -162,6 +162,7 @@ fn transcribe(paths: &Paths, id: &SessionId) {
         std::slice::from_ref(id),
         false,
         &TranscriptTemplate::resolve(paths, None).unwrap(),
+        meethook_transcribe::mixdown::Settings::default(),
         &mut factory,
         &mut std::io::sink(),
     )

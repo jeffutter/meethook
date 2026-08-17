@@ -12,6 +12,27 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use meethook_session::{Paths, TranscriptTime};
+use meethook_transcribe::mixdown;
+
+/// Parses a pan width, refusing one outside the range rather than clamping it.
+///
+/// The mixdown's constant-power panning clamps internally, which is right for a value that
+/// crate computed and wrong for one a user typed: clamping turns `--pan 30` into a hard pan
+/// and says nothing about having done so. NaN falls out as a refusal too, because a range
+/// never contains it.
+fn parse_pan(value: &str) -> Result<f32, String> {
+    let pan: f32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a number"))?;
+    if !(mixdown::PAN_MIN..=mixdown::PAN_MAX).contains(&pan) {
+        return Err(format!(
+            "`{value}` is outside {}..={}",
+            mixdown::PAN_MIN,
+            mixdown::PAN_MAX
+        ));
+    }
+    Ok(pan)
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,6 +72,11 @@ enum Command {
     /// Transcribe recorded sessions
     ///
     /// With no session ids, every discovered session is considered.
+    // Negative numbers reach the value parsers rather than clap's argument scanner, so that
+    // `--pan -0.1` is refused by the range check and names the range, instead of being
+    // reported as an unexpected argument `-0`. Safe here because no option takes a value that
+    // could be confused with a flag, and session ids never begin with a hyphen.
+    #[command(allow_negative_numbers = true)]
     Transcribe {
         /// Session ids to transcribe; omit to consider all discovered sessions
         #[arg(value_name = "SESSION_ID")]
@@ -59,6 +85,35 @@ enum Command {
         /// Re-transcribe sessions that already have a transcript
         #[arg(long)]
         force: bool,
+
+        /// Bitrate of the meeting.opus mixdown, in bits per second
+        ///
+        /// The default was settled by listening to a real meeting rather than taken from a
+        /// table: the step below it was already clean, and this sits one above for margin.
+        ///
+        /// An option of `transcribe` rather than a global one, unlike --template: nothing
+        /// re-writes meeting.opus after the fact, so there is no second command that could
+        /// silently disagree with the one that produced it.
+        #[arg(
+            long,
+            value_name = "BPS",
+            default_value_t = mixdown::BITRATE_BPS,
+            value_parser = clap::value_parser!(u32)
+                .range(i64::from(mixdown::BITRATE_MIN_BPS)..=i64::from(mixdown::BITRATE_MAX_BPS)),
+        )]
+        bitrate: u32,
+
+        /// How far from centre each track is panned: 0.0 is mono, 1.0 is hard left and right
+        ///
+        /// Also settled by listening. Wide enough to tell the two sides apart, narrow enough
+        /// that neither ear is ever doing the listening alone over an hour.
+        #[arg(
+            long,
+            value_name = "WIDTH",
+            default_value_t = mixdown::PAN_POSITION,
+            value_parser = parse_pan,
+        )]
+        pan: f32,
     },
 
     /// Name speakers that transcription could not identify
@@ -163,9 +218,21 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Record => commands::record(&paths),
-        Command::Transcribe { session_ids, force } => {
-            commands::transcribe(&paths, &session_ids, force, template)
-        }
+        Command::Transcribe {
+            session_ids,
+            force,
+            bitrate,
+            pan,
+        } => commands::transcribe(
+            &paths,
+            &session_ids,
+            force,
+            template,
+            mixdown::Settings {
+                bitrate_bps: bitrate,
+                pan,
+            },
+        ),
         Command::Enroll(args) => commands::enroll(&paths, &args, template),
         Command::Speakers => commands::speakers(&paths),
         Command::Forget {
@@ -188,4 +255,74 @@ fn resolve_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
     let home =
         std::env::home_dir().context("could not determine the home directory; pass --root")?;
     Ok(home.join("meethook"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bitrate and pan `meethook transcribe` would run with, given these arguments.
+    fn transcribe_mixdown(args: &[&str]) -> (u32, f32) {
+        match Cli::try_parse_from(args).expect("should parse").command {
+            Command::Transcribe { bitrate, pan, .. } => (bitrate, pan),
+            other => panic!("expected a transcribe command, got {other:?}"),
+        }
+    }
+
+    /// Asserts the refusal happened at the edge, and mentions the offending value.
+    fn refused(args: &[&str]) -> String {
+        let error = Cli::try_parse_from(args).expect_err("should have been refused");
+        error.to_string()
+    }
+
+    #[test]
+    fn the_mixdown_defaults_are_the_constants_the_listening_run_settled() {
+        // Compared against the constants rather than against `32000` and `0.3`, so that
+        // changing a value settled by listening stays a one-line edit in `mixdown.rs` and
+        // does not need this test edited to match. This is also what pins "omitting both
+        // flags encodes exactly what the previous build encoded".
+        assert_eq!(
+            transcribe_mixdown(&["meethook", "transcribe"]),
+            (mixdown::BITRATE_BPS, mixdown::PAN_POSITION)
+        );
+    }
+
+    #[test]
+    fn both_settings_are_overridable() {
+        let (bitrate, pan) = transcribe_mixdown(&[
+            "meethook",
+            "transcribe",
+            "--bitrate",
+            "48000",
+            "--pan",
+            "0.5",
+        ]);
+        assert_eq!(bitrate, 48_000);
+        assert!((pan - 0.5).abs() < f32::EPSILON, "{pan}");
+    }
+
+    #[test]
+    fn a_bitrate_outside_what_opus_accepts_is_refused_at_the_edge() {
+        // Both ends, because a range check that only guards one is the usual way this is got
+        // wrong -- and being refused here is the whole point: the alternative is the encoder
+        // failing partway through a batch that has already spent an hour on recognition.
+        let under = mixdown::BITRATE_MIN_BPS - 1;
+        let over = mixdown::BITRATE_MAX_BPS + 1;
+        assert!(
+            refused(&["meethook", "transcribe", "--bitrate", &under.to_string()]).contains("6000")
+        );
+        assert!(
+            refused(&["meethook", "transcribe", "--bitrate", &over.to_string()]).contains("510000")
+        );
+    }
+
+    #[test]
+    fn a_pan_outside_the_range_is_refused_rather_than_clamped() {
+        // `constant_power` would happily clamp all three of these into a legal pan, which is
+        // exactly the silence this refusal exists to break.
+        for value in ["1.5", "-0.1", "NaN"] {
+            let message = refused(&["meethook", "transcribe", "--pan", value]);
+            assert!(message.contains(value), "{value} not named in: {message}");
+        }
+    }
 }

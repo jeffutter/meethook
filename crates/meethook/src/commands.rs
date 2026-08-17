@@ -548,6 +548,7 @@ pub fn transcribe(
     session_ids: &[String],
     force: bool,
     template: Option<&Path>,
+    mixdown_settings: meethook_transcribe::mixdown::Settings,
 ) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
     let template = TranscriptTemplate::resolve(paths, template)?;
@@ -592,6 +593,7 @@ pub fn transcribe(
         &requested,
         force,
         &template,
+        mixdown_settings,
         &mut open_engine,
         &mut stdout.lock(),
     )?;
