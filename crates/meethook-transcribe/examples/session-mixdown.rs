@@ -28,8 +28,32 @@
 //!   the originals. Written only when both source files are already at a rate Opus accepts and
 //!   agree on it; when they do not, that is said and the arm is skipped rather than resampled
 //!   here, because a resampler this file invented would be the thing under test.
+//! - **normalization** (`normalized-...` against `unnormalized-...`, and the two `.wav`s) --
+//!   whether bringing both tracks to a common loudness is an improvement or a flattening. The
+//!   WAV pair is the one to trust: it is the only comparison here where the encoder is not
+//!   also varying. Match your listening volume between the two before deciding, because the
+//!   unnormalized mix is generally the quieter one and louder wins A/Bs on its own.
+//! - **target** (`targetmNNlufs-...`) -- the loudness both tracks are brought to. `m` is the
+//!   minus sign, so `targetm23lufs` is -23 LUFS: EBU R128 at one end of the sweep, the podcast
+//!   convention of -16 at the other, so the two live conventions bracket whatever wins.
+//! - **boost** (`boostNNdb-...`) -- the ceiling on how far a quiet track may be turned *up*.
+//!
+//! Those last two are only comparisons on a session where their value actually changes
+//! something, and each can collapse: a track far enough under the target that every cap in the
+//! boost sweep binds hears the same mix at all five targets, and a session where no track is
+//! quiet enough for any cap to bind hears the same mix at all four caps. The report below says
+//! which arms this session can answer, and an arm with nothing to compare is skipped with a
+//! note rather than written out as a row of identical files.
+//!
 //! - **`mix-16k.wav`** -- the encoder's own input, uncompressed. Every judgement above is
-//!   against this, not against memory of the meeting.
+//!   against this, not against memory of the meeting. `mix-16k-unnormalized.wav` is its twin
+//!   for the normalization arm.
+//!
+//! Before anything is encoded the run prints what it measured: each source track's integrated
+//! loudness, the correction the shipping normalization asks for, the gain it actually got, and
+//! whether the boost cap bound. That report is a few passes of two biquads over each track,
+//! which makes pointing this at several sessions a reasonable way to find one where the arms
+//! you care about are worth rendering, before committing to a listening run.
 //!
 //! Both offsets come from `meethook_transcribe`'s own accessors, so every file here sits on
 //! the timeline `transcript.md` describes.
@@ -41,9 +65,9 @@ use std::path::{Path, PathBuf};
 
 use hound::{SampleFormat, WavReader, WavSpec};
 use meethook_session::{SessionMetadata, SessionPaths};
-use meethook_transcribe::mixdown::{self, Source};
+use meethook_transcribe::mixdown::{self, Normalization, Source};
 use meethook_transcribe::{
-    TARGET_RATE, mic_offset_seconds, read_track_16k_mono, speaker_offset_seconds,
+    TARGET_RATE, integrated_lufs, mic_offset_seconds, read_track_16k_mono, speaker_offset_seconds,
 };
 
 /// The bitrates worth hearing, in kbps. Spans the usual speech range and a step past it in
@@ -51,10 +75,22 @@ use meethook_transcribe::{
 const BITRATES_KBPS: [u32; 5] = [16, 24, 32, 48, 64];
 
 /// Pan positions, as hundredths, for the placement judgement. 0 is centre, 100 is hard.
-const PANS: [u32; 3] = [0, 30, 100];
+///
+/// Weighted above what ships rather than around it: levelling the two tracks removed the volume
+/// difference that was doing part of the work of telling them apart, so the open question is
+/// whether 0.3 still separates them, and that is answered by the positions wider than it.
+const PANS: [u32; 5] = [0, 30, 45, 60, 100];
 
-/// The bitrate the pan, source and rate arms are all rendered at, so those comparisons vary
-/// one thing.
+/// Loudness targets, in LUFS. -23 is EBU R128 and -16 is the podcast convention; both are in
+/// the sweep so the answer is bracketed by the two standards people actually cite.
+const TARGETS_LUFS: [f64; 5] = [-23.0, -20.0, -18.0, -16.0, -14.0];
+
+/// Boost caps, in dB, ascending. The first is the one the report tests against: if no track
+/// wants more boost than the smallest cap, every file in the arm is the same file.
+const BOOST_CAPS_DB: [f64; 4] = [6.0, 12.0, 18.0, 24.0];
+
+/// The bitrate the pan, source, rate, normalization, target and boost arms are all rendered at,
+/// so those comparisons vary one thing.
 const REFERENCE_KBPS: u32 = 32;
 
 fn main() {
@@ -96,22 +132,56 @@ fn main() {
     };
     let speaker = read_track_16k_mono(&paths.speaker_wav()).unwrap_or_default();
 
-    let cleaned = |pan: f32| -> Vec<f32> {
-        mixdown::mix(
+    // Everything measurable about the levelling, before a single file exists -- so that a run
+    // that turns out not to be worth listening to costs one pass over the tracks rather than a
+    // full grid.
+    let varies = report(&[
+        ("mic", cleaned_mic.as_slice()),
+        ("speaker", speaker.as_slice()),
+    ]);
+
+    let mixed = |pan: f32, normalization: Option<Normalization>| -> Vec<f32> {
+        mixdown::mix_with(
             &sources(&cleaned_mic, mic_offset, &speaker, speaker_offset, pan),
             TARGET_RATE,
+            normalization,
         )
     };
+    let cleaned = |pan: f32| mixed(pan, Some(Normalization::default()));
 
     // The encoder's input, so every judgement below has something uncompressed to be a
     // judgement against.
+    println!("\n-- reference --");
     let reference = cleaned(mixdown::PAN_POSITION);
     write_wav(&out.join("mix-16k.wav"), &reference, TARGET_RATE);
 
+    // The normalization A/B. Both halves are written under their own names even though the
+    // normalized opus is byte-identical to `cleaned-16k-32kbps-pan30.opus` from the bitrate
+    // arm: a pair you can name is a pair you can compare, and the encode costs seconds.
+    println!("\n-- normalization (match your listening volume between the two) --");
+    let flat = mixed(mixdown::PAN_POSITION, None);
+    write_wav(&out.join("mix-16k-unnormalized.wav"), &flat, TARGET_RATE);
+    encode(
+        &out,
+        "normalized-16k-32kbps-pan30.opus",
+        TARGET_RATE,
+        REFERENCE_KBPS,
+        &reference,
+    );
+    encode(
+        &out,
+        "unnormalized-16k-32kbps-pan30.opus",
+        TARGET_RATE,
+        REFERENCE_KBPS,
+        &flat,
+    );
+
+    println!("\n-- bitrate --");
     for kbps in BITRATES_KBPS {
         emit(&out, "cleaned", TARGET_RATE, kbps, 30, &reference);
     }
 
+    println!("\n-- pan --");
     for pan in PANS {
         if pan == 30 {
             continue; // already written by the bitrate arm
@@ -120,6 +190,44 @@ fn main() {
         emit(&out, "cleaned", TARGET_RATE, REFERENCE_KBPS, pan, &mix);
     }
 
+    println!("\n-- loudness target --");
+    if varies.target {
+        for target_lufs in TARGETS_LUFS {
+            let mix = mixed(
+                mixdown::PAN_POSITION,
+                Some(Normalization {
+                    target_lufs,
+                    ..Normalization::default()
+                }),
+            );
+            let name = format!(
+                "targetm{:.0}lufs-16k-{REFERENCE_KBPS}kbps-pan30.opus",
+                -target_lufs
+            );
+            encode(&out, &name, TARGET_RATE, REFERENCE_KBPS, &mix);
+        }
+    } else {
+        println!("skipped: see the report above -- every value gives the same mix here");
+    }
+
+    println!("\n-- boost cap --");
+    if varies.boost {
+        for max_boost_db in BOOST_CAPS_DB {
+            let mix = mixed(
+                mixdown::PAN_POSITION,
+                Some(Normalization {
+                    max_boost_db,
+                    ..Normalization::default()
+                }),
+            );
+            let name = format!("boost{max_boost_db:02.0}db-16k-{REFERENCE_KBPS}kbps-pan30.opus");
+            encode(&out, &name, TARGET_RATE, REFERENCE_KBPS, &mix);
+        }
+    } else {
+        println!("skipped: see the report above -- every value gives the same mix here");
+    }
+
+    println!("\n-- source --");
     let raw = mixdown::mix(
         &sources(
             &raw_mic,
@@ -132,6 +240,7 @@ fn main() {
     );
     emit(&out, "raw", TARGET_RATE, REFERENCE_KBPS, 30, &raw);
 
+    println!("\n-- rate --");
     match native_rate(&paths) {
         Ok(rate) => {
             let mic = read_native(&paths.mic_wav());
@@ -184,17 +293,122 @@ fn sources<'a>(
     ]
 }
 
+/// Which of the two levelling sweeps is a comparison on this session rather than a row of
+/// identical files.
+///
+/// Both arms can collapse, and for the same reason: a swept value only produces a different mix
+/// when it changes some track's gain, and the boost cap and the loudness target each stop
+/// mattering once the other one is doing all the work. A session whose quiet track wants more
+/// boost than every cap in the sweep renders one file five times over in the target arm; a
+/// session where no track is far enough under the target for any cap to bind renders one file
+/// four times over in the boost arm.
+struct Varies {
+    /// Whether [`TARGETS_LUFS`] contains two values that mix differently.
+    target: bool,
+    /// Whether [`BOOST_CAPS_DB`] contains two values that mix differently.
+    boost: bool,
+}
+
+/// What the shipping normalization measures on this session, printed before anything is
+/// encoded, and which of the two levelling arms is worth rendering because of it.
+///
+/// Each track is measured for display and then again inside [`Normalization::gain`] for every
+/// swept value, so that every number printed here is one the module will actually apply rather
+/// than this file's restatement of how it is derived. A measurement is two biquads and a sum
+/// over the track; the whole report costs less than one arm of the grid it decides about, which
+/// is what makes running this against several sessions a reasonable way to find one worth
+/// listening to.
+fn report(tracks: &[(&str, &[f32])]) -> Varies {
+    let shipping = Normalization::default();
+    println!(
+        "\n-- levels (target {:.0} LUFS, boost capped at {:.0} dB) --",
+        mixdown::TARGET_LUFS,
+        mixdown::MAX_BOOST_DB
+    );
+
+    for (name, samples) in tracks {
+        let Some(lufs) = integrated_lufs(samples, TARGET_RATE) else {
+            println!("{name:<8}  no measurable speech; passes through at unity");
+            continue;
+        };
+        let wanted_db = mixdown::TARGET_LUFS - lufs;
+        let applied_db = 20.0 * f64::from(shipping.gain(samples, TARGET_RATE)).log10();
+        println!(
+            "{name:<8} {lufs:>7.1} LUFS  wants {wanted_db:>+6.1} dB  gets {applied_db:>+6.1} dB  {}",
+            if wanted_db > mixdown::MAX_BOOST_DB {
+                "cap bound"
+            } else {
+                "uncapped"
+            }
+        );
+    }
+
+    let targets: Vec<Normalization> = TARGETS_LUFS
+        .iter()
+        .map(|&target_lufs| Normalization {
+            target_lufs,
+            ..Normalization::default()
+        })
+        .collect();
+    let caps: Vec<Normalization> = BOOST_CAPS_DB
+        .iter()
+        .map(|&max_boost_db| Normalization {
+            max_boost_db,
+            ..Normalization::default()
+        })
+        .collect();
+    let (target, boost) = (distinct(tracks, &targets), distinct(tracks, &caps));
+    println!(
+        "target arm: {target} of {} values mix differently here",
+        targets.len()
+    );
+    println!(
+        "boost arm:  {boost} of {} values mix differently here",
+        caps.len()
+    );
+
+    Varies {
+        target: target > 1,
+        boost: boost > 1,
+    }
+}
+
+/// How many of `sweep` produce a mix unlike the others'.
+///
+/// The gains are the whole difference between two settings -- everything downstream of them,
+/// pan and sum and peak ceiling, is identical -- so counting distinct gain vectors counts
+/// distinct files without encoding any. One means the arm has nothing to compare.
+fn distinct(tracks: &[(&str, &[f32])], sweep: &[Normalization]) -> usize {
+    let mut gains: Vec<Vec<u32>> = sweep
+        .iter()
+        .map(|normalization| {
+            tracks
+                .iter()
+                .map(|(_, samples)| normalization.gain(samples, TARGET_RATE).to_bits())
+                .collect()
+        })
+        .collect();
+    gains.sort();
+    gains.dedup();
+    gains.len()
+}
+
 /// Encodes one cell of the grid, naming the file after the settings that produced it and
 /// printing what it cost.
 fn emit(out: &Path, source: &str, rate: u32, kbps: u32, pan: u32, mix: &[f32]) {
     let name = format!("{source}-{}k-{kbps}kbps-pan{pan:02}.opus", rate / 1000);
-    let path = out.join(&name);
+    encode(out, &name, rate, kbps, mix);
+}
+
+/// [`emit`] for the arms whose name is not `source`/rate/bitrate/pan, which build their own.
+fn encode(out: &Path, name: &str, rate: u32, kbps: u32, mix: &[f32]) {
+    let path = out.join(name);
     mixdown::write(&path, mix, rate, kbps * 1000).unwrap();
 
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let seconds = mix.len() as f64 / 2.0 / f64::from(rate);
     println!(
-        "{name:<34} {:>8.1} MB  {:>6.1} MB/hour",
+        "{name:<40} {:>8.1} MB  {:>6.1} MB/hour",
         bytes as f64 / 1e6,
         bytes as f64 / 1e6 * 3600.0 / seconds.max(1e-9),
     );
@@ -255,5 +469,6 @@ fn write_wav(path: &Path, stereo: &[f32], rate: u32) {
         writer.write_sample(*sample).unwrap();
     }
     writer.finalize().unwrap();
-    println!("{:<34} (the encoder's input)", "mix-16k.wav");
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    println!("{name:<40} (uncompressed)");
 }

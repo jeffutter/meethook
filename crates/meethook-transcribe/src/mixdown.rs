@@ -151,9 +151,13 @@ const PEAK_CEILING: f32 = 0.99;
 /// -16 LUFS is the podcast and streaming convention rather than EBU R 128's -23, because the
 /// reader here is a person on headphones or a laptop speaker rather than a broadcast chain,
 /// and -23 arrives too quiet on both. Speech crest factor normally leaves room under
-/// [`PEAK_CEILING`] at this level; when it does not, the peak scale below pulls the whole mix
-/// down uniformly and the balance between the tracks survives it.
-const TARGET_LUFS: f64 = -16.0;
+/// this module's peak ceiling at this level; when it does not, the peak scale below pulls the
+/// whole mix down uniformly and the balance between the tracks survives it.
+///
+/// Provisional pending a listening confirmation, and public for the same reason
+/// [`PAN_POSITION`] is: a listening run has to be able to name the value it is arguing about,
+/// and `examples/session-mixdown.rs` sweeps around it.
+pub const TARGET_LUFS: f64 = -16.0;
 
 /// The most a single source may be turned up, in dB.
 ///
@@ -173,7 +177,61 @@ const TARGET_LUFS: f64 = -16.0;
 /// 11.5 they started at. Whether the remaining 4 dB is worth that mic's noise floor is exactly
 /// the question a person with headphones has to answer, and it is why this number is not
 /// simply larger.
-const MAX_BOOST_DB: f64 = 12.0;
+///
+/// Public alongside [`TARGET_LUFS`], and for the same reason.
+pub const MAX_BOOST_DB: f64 = 12.0;
+
+/// How each source is brought to a common loudness before the two are summed.
+///
+/// Deliberately *not* part of [`Settings`]. `Settings` is the pair a listener can reasonably
+/// disagree about and that `meethook transcribe` therefore exposes as `--bitrate` and `--pan`;
+/// these two are decisions this module makes on the listener's behalf, and the outcome of
+/// arguing about them is an edit to [`TARGET_LUFS`] or [`MAX_BOOST_DB`] rather than a new flag.
+/// Nothing on the shipping path constructs one of these -- [`mix`] uses [`Default`] and the CLI
+/// has no way to say otherwise -- so please do not add a flag for them by symmetry with the
+/// other two.
+///
+/// It exists as a struct at all so that `examples/session-mixdown.rs` can sweep the two values
+/// and print the gain each track is about to receive, without restating the formula.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Normalization {
+    /// The loudness each source is brought to, in LUFS. See [`TARGET_LUFS`].
+    pub target_lufs: f64,
+    /// The most a single source may be turned up, in dB. See [`MAX_BOOST_DB`].
+    pub max_boost_db: f64,
+}
+
+impl Default for Normalization {
+    fn default() -> Self {
+        Normalization {
+            target_lufs: TARGET_LUFS,
+            max_boost_db: MAX_BOOST_DB,
+        }
+    }
+}
+
+impl Normalization {
+    /// The static gain that brings one source to [`Self::target_lufs`], capped at
+    /// [`Self::max_boost_db`].
+    ///
+    /// Unity when there is no speech to measure. That is the whole handling of the empty case:
+    /// an imported session has a silent mic track, and the answer for it is "leave it alone"
+    /// rather than either an error to propagate or an unbounded boost of nothing.
+    ///
+    /// The cap is on the upward direction only, so a hot track is still pulled all the way down
+    /// to the target however far above it started.
+    ///
+    /// `rate` is the rate `samples` are already at; nothing here resamples.
+    pub fn gain(&self, samples: &[f32], rate: u32) -> f32 {
+        match loudness::integrated_lufs(samples, rate) {
+            None => 1.0,
+            Some(lufs) => {
+                let correction_db = (self.target_lufs - lufs).min(self.max_boost_db);
+                10.0f64.powf(correction_db / 20.0) as f32
+            }
+        }
+    }
+}
 
 /// The logical stream's serial number.
 ///
@@ -209,11 +267,31 @@ pub struct Source<'a> {
 ///
 /// A source with no measurable speech in it -- silence, or a track shorter than one 400 ms
 /// measurement block -- passes through untouched rather than being boosted on the strength of
-/// its own noise floor. See `normalizing_gain` below.
+/// its own noise floor. See [`Normalization::gain`].
 ///
 /// `rate` turns offsets into sample counts and is the rate the loudness measurement runs at,
 /// so it must be the rate the samples are already at; nothing here resamples.
 pub fn mix(sources: &[Source<'_>], rate: u32) -> Vec<f32> {
+    mix_with(sources, rate, Some(Normalization::default()))
+}
+
+/// [`mix`], with the levelling step made answerable.
+///
+/// `Some(normalization)` is [`mix`]'s behaviour with the two constants replaced. `None` skips
+/// the per-source gain entirely, leaving each track at the level it arrived at -- pan, sum, and
+/// then the peak ceiling, which still applies, because a mix that clips is not a comparison of
+/// anything.
+///
+/// This exists for one diagnostic: the normalized/unnormalized A/B in
+/// `examples/session-mixdown.rs`, which is how the levelling's own value gets confirmed by ear.
+/// It is not a configuration point. [`mix`] is the entry point for anything real, and it is the
+/// only one the pipeline calls, so the shipping path never sees this `Option` and never has to
+/// have an opinion about it.
+pub fn mix_with(
+    sources: &[Source<'_>],
+    rate: u32,
+    normalization: Option<Normalization>,
+) -> Vec<f32> {
     let starts: Vec<usize> = sources
         .iter()
         .map(|source| (source.offset_s.max(0.0) * f64::from(rate)).round() as usize)
@@ -228,7 +306,7 @@ pub fn mix(sources: &[Source<'_>], rate: u32) -> Vec<f32> {
 
     let mut stereo = vec![0.0; frames * CHANNELS];
     for (source, start) in sources.iter().zip(&starts) {
-        let gain = normalizing_gain(source.samples, rate);
+        let gain = normalization.map_or(1.0, |n| n.gain(source.samples, rate));
         let (left, right) = constant_power(source.pan);
         for (index, sample) in source.samples.iter().enumerate() {
             let at = (start + index) * CHANNELS;
@@ -246,21 +324,6 @@ pub fn mix(sources: &[Source<'_>], rate: u32) -> Vec<f32> {
     }
 
     stereo
-}
-
-/// The static gain that brings one source to [`TARGET_LUFS`], capped at [`MAX_BOOST_DB`].
-///
-/// Unity when there is no speech to measure. That is the whole handling of the empty case: an
-/// imported session has a silent mic track, and the answer for it is "leave it alone" rather
-/// than either an error to propagate or an unbounded boost of nothing.
-fn normalizing_gain(samples: &[f32], rate: u32) -> f32 {
-    match loudness::integrated_lufs(samples, rate) {
-        None => 1.0,
-        Some(lufs) => {
-            let correction_db = (TARGET_LUFS - lufs).min(MAX_BOOST_DB);
-            10.0f64.powf(correction_db / 20.0) as f32
-        }
-    }
 }
 
 /// The left and right gains that place a mono source at `pan`.
@@ -749,8 +812,8 @@ mod tests {
         let quiet_participant = bursts(60.0, 9.0, 0.2, TARGET_RATE); // ~10.5 s of talking
         let talkative_one = bursts(60.0, 2.0, 0.2, TARGET_RATE); // ~45 s of talking
 
-        let quiet_gain = normalizing_gain(&quiet_participant, TARGET_RATE);
-        let talkative_gain = normalizing_gain(&talkative_one, TARGET_RATE);
+        let quiet_gain = Normalization::default().gain(&quiet_participant, TARGET_RATE);
+        let talkative_gain = Normalization::default().gain(&talkative_one, TARGET_RATE);
 
         let apart = 20.0 * f64::from(quiet_gain / talkative_gain).log10();
         assert!(
@@ -779,10 +842,10 @@ mod tests {
         let mic = vec![0.0; 10 * TARGET_RATE as usize];
         let speaker = bursts(10.0, 2.0, 0.2, TARGET_RATE);
 
-        assert_eq!(normalizing_gain(&mic, TARGET_RATE), 1.0);
+        assert_eq!(Normalization::default().gain(&mic, TARGET_RATE), 1.0);
         // The speaker is corrected on its own merits, not held back or dragged up by an
         // unmeasurable neighbour.
-        let alone = normalizing_gain(&speaker, TARGET_RATE);
+        let alone = Normalization::default().gain(&speaker, TARGET_RATE);
         assert!(alone > 1.0, "the speaker was not corrected: {alone}");
 
         let both = mix(
@@ -854,6 +917,95 @@ mod tests {
         assert!(
             (first - second).abs() < 1.5,
             "the two halves ended {first} and {second} LUFS apart"
+        );
+    }
+
+    #[test]
+    fn an_unnormalized_mix_leaves_the_sources_where_they_were() {
+        // The mirror of the test above, and the thing the listening A/B in
+        // `examples/session-mixdown.rs` rests on: with no normalization the two tracks arrive in
+        // the mix as far apart as they were on disk. Same placement as that test -- centred, at
+        // non-overlapping times -- so each half can be measured on its own.
+        let quiet = bursts(10.0, 2.0, 0.2, TARGET_RATE);
+        let loud = bursts(10.0, 2.0, 0.5, TARGET_RATE);
+
+        let sources_apart = crate::loudness::integrated_lufs(&loud, TARGET_RATE).unwrap()
+            - crate::loudness::integrated_lufs(&quiet, TARGET_RATE).unwrap();
+        assert!(
+            sources_apart > 6.0,
+            "the sources start {sources_apart} apart"
+        );
+
+        let stereo = mix_with(
+            &[centred(&quiet, 0.0), centred(&loud, 10.0)],
+            TARGET_RATE,
+            None,
+        );
+
+        let first =
+            crate::loudness::integrated_lufs(&channel(&stereo, 0, 10), TARGET_RATE).unwrap();
+        let second =
+            crate::loudness::integrated_lufs(&channel(&stereo, 10, 20), TARGET_RATE).unwrap();
+        let mix_apart = second - first;
+        assert!(
+            (mix_apart - sources_apart).abs() < 0.5,
+            "sources were {sources_apart} LU apart and the mix has them {mix_apart} apart"
+        );
+        // And the same mix through `mix` does level them, so this is a claim about the argument
+        // rather than about a fixture that happens to need no correction.
+        let normalized = mix(&[centred(&quiet, 0.0), centred(&loud, 10.0)], TARGET_RATE);
+        assert_ne!(normalized, stereo);
+    }
+
+    #[test]
+    fn a_lower_boost_cap_leaves_a_quiet_track_quieter() {
+        // A track far enough under the target that both caps bind, so the two gains differ by
+        // exactly the difference between the caps. This is what makes the boost-cap arm of
+        // `examples/session-mixdown.rs` a real comparison rather than four identical files.
+        let quiet = bursts(10.0, 2.0, 0.01, TARGET_RATE);
+        let lufs = crate::loudness::integrated_lufs(&quiet, TARGET_RATE).unwrap();
+        assert!(
+            TARGET_LUFS - lufs > MAX_BOOST_DB,
+            "the fixture only wants {} dB, so neither cap binds",
+            TARGET_LUFS - lufs
+        );
+
+        let capped = Normalization {
+            max_boost_db: 6.0,
+            ..Normalization::default()
+        }
+        .gain(&quiet, TARGET_RATE);
+        let default = Normalization::default().gain(&quiet, TARGET_RATE);
+
+        let apart = 20.0 * f64::from(default / capped).log10();
+        assert!(
+            (apart - (MAX_BOOST_DB - 6.0)).abs() < 0.01,
+            "gains {default} and {capped} are {apart} dB apart"
+        );
+        // The default cap is genuinely a cap here, not the full correction the track wanted.
+        assert!(
+            f64::from(default) < 10.0f64.powf((TARGET_LUFS - lufs) / 20.0),
+            "the cap did not bind: {default}"
+        );
+    }
+
+    #[test]
+    fn a_different_target_moves_the_whole_mix() {
+        // The other arm the example sweeps. A track close enough to the target that no cap is
+        // involved, so the gain tracks the target one dB for one dB.
+        let speech = bursts(10.0, 2.0, 0.2, TARGET_RATE);
+
+        let at_default = Normalization::default().gain(&speech, TARGET_RATE);
+        let quieter = Normalization {
+            target_lufs: TARGET_LUFS - 6.0,
+            ..Normalization::default()
+        }
+        .gain(&speech, TARGET_RATE);
+
+        let apart = 20.0 * f64::from(at_default / quieter).log10();
+        assert!(
+            (apart - 6.0).abs() < 0.01,
+            "targets moved the gain {apart} dB"
         );
     }
 

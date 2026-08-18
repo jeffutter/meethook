@@ -58,6 +58,11 @@ pub use gpu::NoMetalDevice;
 pub use identify::{IDENTIFY_DISTANCE, Identification, identify_clusters};
 pub use import::{BuiltSession, ImportedSource, MIC_SILENCE_S, SPLICE_GAP_S, build_session};
 pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
+// The measurement only, not the module: `loudness` stays private because its constants and
+// block arithmetic are BS.1770's business rather than a caller's. The one number comes out so
+// that `examples/session-mixdown.rs` can report a track's loudness in LUFS beside the gain
+// `mixdown` gave it, instead of only the gain.
+pub use loudness::integrated_lufs;
 pub use merge::merge;
 pub use onnx::{Loaded, open_session};
 pub use reference::{
