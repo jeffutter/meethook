@@ -56,13 +56,25 @@ use crate::{Error, Result};
 ///
 /// One constant rather than a spread of literals so that the value can be revised from a
 /// listening session by editing one line.
+///
+/// Re-confirmed by ear after levelling landed (TASK-039), which is what retires the open
+/// question TASK-032.01 left here. The worry was that levelling would narrow the apparent
+/// separation, since part of it had been carried by a level difference that no longer exists;
+/// it did not. Swept over 0, 0.3, 0.45, 0.6 and 1.0: 0.6 is too wide, 0 does not separate at
+/// all, and 0.3 and 0.45 both read well. 0.3 stands as the narrow end of that band.
 pub const PAN_POSITION: f32 = 0.3;
 
 /// The target bitrate for the mixdown, in bits per second.
 ///
-/// Provisional, pending a listening session: 32 kbps sits in the middle of the 24-48 kbps
-/// range Opus is normally run at for speech, and at stereo 16 kHz input it costs about
-/// 14 MB an hour against the ~690 MB an hour the two source WAVs occupy.
+/// 32 kbps sits in the middle of the 24-48 kbps range Opus is normally run at for speech, and
+/// at stereo 16 kHz input it costs about 14 MB an hour against the ~690 MB an hour the two
+/// source WAVs occupy.
+///
+/// Kept at TASK-032.01's value when TASK-039 re-opened it. The reason to re-ask was that
+/// levelling gives a VBR encoder more signal to spend bits on over a quiet track's turns, so
+/// the bitrate at which a far-end voice turns to gravel could have moved; the listener chose
+/// to keep 32 kbps rather than reporting a new floor, so this value is confirmed by preference
+/// and not by a fresh sweep down from 64.
 pub const BITRATE_BPS: u32 = 32_000;
 
 /// The narrowest and widest bitrates Opus itself accepts (RFC 6716 §2.1.1).
@@ -154,9 +166,16 @@ const PEAK_CEILING: f32 = 0.99;
 /// this module's peak ceiling at this level; when it does not, the peak scale below pulls the
 /// whole mix down uniformly and the balance between the tracks survives it.
 ///
-/// Provisional pending a listening confirmation, and public for the same reason
-/// [`PAN_POSITION`] is: a listening run has to be able to name the value it is arguing about,
-/// and `examples/session-mixdown.rs` sweeps around it.
+/// Confirmed by ear (TASK-039), though weakly: swept over -23, -20, -18, -16 and -14 LUFS on a
+/// real meeting, on headphones and on a laptop speaker, the listener could not tell the five
+/// apart. Read that as "no evidence to move it" rather than as a vindication of -16, and note
+/// the reason the sweep was less sensitive than it looks: on that session the mic track was
+/// capped by [`MAX_BOOST_DB`] and never reached the target at all, so only the speaker track
+/// tracked the sweep. A session where neither track is capped would be a sharper test if this
+/// is ever re-opened.
+///
+/// Public for the same reason [`PAN_POSITION`] is: a listening run has to be able to name the
+/// value it is arguing about, and `examples/session-mixdown.rs` sweeps around it.
 pub const TARGET_LUFS: f64 = -16.0;
 
 /// The most a single source may be turned up, in dB.
@@ -170,16 +189,21 @@ pub const TARGET_LUFS: f64 = -16.0;
 /// are left unmatched by the difference. That is the cap declining to amplify a nearly dead
 /// track, not a failure to balance.
 ///
-/// 12 dB is provisional pending a listening confirmation, the same posture [`BITRATE_BPS`]
-/// shipped in. It does bind in practice: across the sessions under `~/meethook/sessions` most
-/// tracks measured -20 to -22 LUFS and wanted 4-6 dB, but one mic track measured -32.2 LUFS
-/// against its speaker track's -20.7, so the cap left that pair 4.2 dB apart instead of the
-/// 11.5 they started at. Whether the remaining 4 dB is worth that mic's noise floor is exactly
-/// the question a person with headphones has to answer, and it is why this number is not
-/// simply larger.
+/// 18 dB, raised from the 12 dB this shipped with provisionally, by the listening run in
+/// TASK-039. Two things decided it. First, 12 dB was never enough on real material: measured
+/// across the sessions under `~/meethook/sessions`, every mic track sat between -32 and
+/// -54 LUFS against a speaker track at -20 to -22, and the cap bound on all of them -- the
+/// "most tracks want 4-6 dB" reading it was set against turned out to describe the speaker
+/// track only. Second, the artefact it guards against was judged directly: sweeping 6, 12, 18
+/// and 24 dB, 6 dB is audibly not enough correction, and 18 dB does not bring up hiss or HVAC
+/// rumble badly enough to regret it.
+///
+/// The cap is on the upward direction only, for the reason above, and 18 dB still leaves the
+/// deeply quiet end of that corpus unmatched -- a -40 LUFS mic wants 24 dB and gets 18. That is
+/// the cap declining to amplify a nearly dead track, which is the intended behaviour.
 ///
 /// Public alongside [`TARGET_LUFS`], and for the same reason.
-pub const MAX_BOOST_DB: f64 = 12.0;
+pub const MAX_BOOST_DB: f64 = 18.0;
 
 /// How each source is brought to a common loudness before the two are summed.
 ///
