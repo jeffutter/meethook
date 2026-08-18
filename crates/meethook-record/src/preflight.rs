@@ -17,11 +17,17 @@ use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCapture
 
 use crate::Result;
 
-/// How long to wait for the user to answer the microphone prompt.
+/// How long to wait for the user to answer a TCC prompt.
 ///
 /// Long, because the answer is a human decision, but finite, because a wedged recorder is
 /// worse than one that fails with a message.
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// Shared with [`crate::calendar`]'s prompt rather than duplicated: "how long may a TCC
+/// prompt sit unanswered before the recorder gives up on it" is one decision, and both
+/// prompts are raised from the same point on the same thread. The calendar probe run in
+/// TASK-030.01.01 waited 30 seconds and timed out on an operator who was simply *reading*
+/// the dialog, which is what settled the number here as the floor rather than the ceiling.
+pub(crate) const PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Proof that both required permissions were granted.
 ///

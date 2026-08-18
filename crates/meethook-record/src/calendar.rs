@@ -15,15 +15,32 @@
 //! edited during the meeting resolves to its edited form, which is the better of the two
 //! errors.
 //!
-//! **Nothing here can prompt, and nothing here can be killed.** Only
-//! `authorizationStatusForEntityType:` is called, which is a pure read: no prompt, no daemon
-//! wake, no Info.plist requirement. Both of EventKit's *request* APIs are hazardous in ways
-//! that would land inside [`crate::RunningSession::finish`], between the last audio buffer
-//! and the `session.json` write: `requestFullAccessToEventsWithCompletion:` requires
-//! `NSCalendarsFullAccessUsageDescription` in the responsible process's Info.plist on macOS
-//! 14+ and *terminates the process* when the key is absent, which most terminal emulators do
-//! not ship. A termination there would convert a complete recording into an orphaned
-//! directory. So the grant is read, never asked for; producing it is a separate job.
+//! **The lookup only ever reads the grant; asking for one is a different call at a different
+//! time.** [`meeting_at`] calls `authorizationStatusForEntityType:` and nothing else, which is
+//! a pure read: no prompt, no daemon wake, no Info.plist requirement. That matters because the
+//! lookup runs inside [`crate::RunningSession::finish`], between the last audio buffer and the
+//! `session.json` write, where a modal dialog would cost a human's full attention span and a
+//! process termination would cost the recording outright.
+//!
+//! [`request_calendar_access`] is where the asking happens, and it is called **once per
+//! process at record start** -- right after [`crate::preflight()`], before the activity
+//! watcher is installed, so nothing is being captured while the prompt is up and the exposure
+//! is identical to the microphone prompt `preflight` already blocks on at the same point.
+//!
+//! It calls the *deprecated* `requestAccessToEntityType:completion:`, deliberately. The modern
+//! `requestFullAccessToEventsWithCompletion:` requires `NSCalendarsFullAccessUsageDescription`
+//! in the *responsible* process's Info.plist on macOS 14+ and *terminates the process* when
+//! the key is absent -- which most terminal emulators, including the one this was measured on,
+//! do not ship. The deprecated selector needs only `NSCalendarsUsageDescription`, which they
+//! do ship. Apple documents that selector as granting write-only access for events on macOS
+//! 14+, and write-only cannot read events; TASK-030.01.01 measured it granting `FullAccess`
+//! instead, on hardware, with events readable afterwards.
+//!
+//! That measurement contradicts the documentation, so it is guarded rather than trusted: the
+//! status is **re-read after the request** and anything other than `FullAccess` -- including
+//! `WriteOnly` -- is treated as no access, by the same rule [`meeting_at`] already applies. If
+//! a future macOS starts behaving as documented, the result is a degradation to `meeting:
+//! None` and a guidance line, not a store that silently returns nothing.
 //!
 //! **Failure is never fatal.** A missing permission, no match, an Objective-C raise, or a
 //! panic out of a binding all degrade to `None` and a finished recording. Losing a recording
@@ -37,16 +54,23 @@
 //! is what makes the policy testable on a machine with no calendar at all.
 
 use std::cmp::Ordering;
+use std::fmt;
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::panic::AssertUnwindSafe;
+use std::sync::mpsc;
 
+use block2::RcBlock;
 use jiff::{SignedDuration, Timestamp};
 use meethook_session::{Attendee, AttendeeStatus, Meeting};
+use objc2::runtime::Bool;
 use objc2_event_kit::{
     EKAuthorizationStatus, EKEntityType, EKEvent, EKEventStatus, EKEventStore, EKParticipant,
     EKParticipantStatus,
 };
-use objc2_foundation::NSDate;
+use objc2_foundation::{NSDate, NSError};
+
+use crate::preflight::PROMPT_TIMEOUT;
 
 /// How far outside a meeting a session may start and still be attributed to it.
 ///
@@ -84,9 +108,7 @@ struct Candidate {
 /// same outcome to the one function whose failure would cost a recording, so the branch
 /// belongs here rather than at the call site.
 pub(crate) fn meeting_at(at: Timestamp) -> Option<Meeting> {
-    // SAFETY: a class-level status read taking only the entity type. It touches no store,
-    // no calendar and no user data, and is the one EventKit entry point that cannot prompt.
-    let status = unsafe { EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) };
+    let status = status();
     if status != EKAuthorizationStatus::FullAccess {
         debug(&format!(
             "calendar access is not granted (status {}); no meeting will be recorded",
@@ -99,7 +121,9 @@ pub(crate) fn meeting_at(at: Timestamp) -> Option<Meeting> {
     // finishing thread with both capture engines already stopped. The store, the dates and
     // the predicate all outlive the query, and every event is converted to owned Rust before
     // any of them is dropped.
-    let candidates = caught(|| unsafe { candidates_around(at) })?;
+    let candidates = caught("EKEventStore.eventsMatchingPredicate", || unsafe {
+        candidates_around(at)
+    })?;
     if debugging() {
         for candidate in &candidates {
             debug(&summarize(candidate));
@@ -114,7 +138,183 @@ pub(crate) fn meeting_at(at: Timestamp) -> Option<Meeting> {
     chosen
 }
 
-/// Runs the EventKit lookup with both ways out of it blocked.
+/// The calendar authorization status.
+///
+/// One expression with two readers -- [`meeting_at`] and [`request_calendar_access`] -- rather
+/// than the same `unsafe` call written twice, because getting the entity type wrong in one of
+/// them would answer a question about reminders.
+fn status() -> EKAuthorizationStatus {
+    // SAFETY: a class-level status read taking only the entity type. It touches no store,
+    // no calendar and no user data, and is the one EventKit entry point that cannot prompt.
+    unsafe { EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) }
+}
+
+/// Calendar access is not available, and sessions will not be named after their meetings.
+///
+/// A value rather than a printed line, mirroring [`crate::MissingPermissions`]: this crate
+/// owns the wording, the CLI owns the output stream. It is not an [`crate::Error`] variant and
+/// is never returned through `Result` -- calendar access is not a precondition for recording,
+/// and making it one would invert this crate's priority ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoCalendarAccess;
+
+impl fmt::Display for NoCalendarAccess {
+    /// Says all three things a user needs: what is lost, what is *not* lost, and where the
+    /// fix is -- including the terminal-inheritance trap, in the same words
+    /// [`crate::MissingPermissions`] uses, because macOS will never create a "meethook" entry
+    /// in the Calendars pane for the user to look for.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "Calendar access is not available, so sessions will not be named after the meeting"
+        )?;
+        writeln!(
+            f,
+            "they were recorded during. Recording itself is unaffected."
+        )?;
+        writeln!(f)?;
+        writeln!(f, "  System Settings > Privacy & Security > Calendars")?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "meethook is a command-line tool, so macOS attributes this permission to the"
+        )?;
+        writeln!(
+            f,
+            "terminal application you launched it from -- grant it to that app, not to a"
+        )?;
+        write!(
+            f,
+            "\"meethook\" entry. You may need to quit and reopen the terminal afterwards."
+        )
+    }
+}
+
+/// Asks macOS for calendar access if it has never been asked, and reports whether the store
+/// can be read afterwards.
+///
+/// `None` means a meeting can be looked up. `Some(_)` carries the guidance for the user, which
+/// the caller prints; nothing here is fatal and nothing here returns a `Result`.
+///
+/// Called once at record start rather than from [`crate::RunningSession::finish`], and that
+/// placement is the whole reason this function exists separately from the lookup. The
+/// lookup was put in `finish` because the start path is where lost audio comes from -- but
+/// that argument is about a several-millisecond store read, and it does not survive a
+/// two-minute human decision landing between the last audio buffer and the `session.json`
+/// write. At record start nothing is being captured yet, so the wait costs nothing.
+///
+/// The accepted cost, recorded rather than solved: somebody who runs `meethook record` for the
+/// first time *while already in a call* and then walks away from the prompt loses up to
+/// two minutes before watching begins. First run only, and [`crate::preflight()`]'s microphone
+/// prompt already has exactly this exposure on the same line of the same function.
+pub fn request_calendar_access() -> Option<NoCalendarAccess> {
+    let granted = resolve(status(), || {
+        // A raise or a panic out of the request costs the prompt and not the process -- the
+        // same trade the lookup already makes. It reads as `NotDetermined` because that is
+        // what it left behind: nothing was resolved, and no access follows either way.
+        caught("EKEventStore.requestAccessToEntityType", ask)
+            .unwrap_or(EKAuthorizationStatus::NotDetermined)
+    });
+
+    if granted {
+        debug("calendar access is available");
+        return None;
+    }
+    debug(&format!(
+        "calendar access is unavailable (status {})",
+        status().0
+    ));
+    Some(NoCalendarAccess)
+}
+
+/// Whether the store is readable, given the status before asking and a way to ask.
+///
+/// The whole policy, with no framework in reach -- the same split this module already makes
+/// between [`select`] and [`candidates_around`], and for the same reason: every rule below is
+/// then decidable in `cargo test` on a machine with no calendar, no grant, and no prompt
+/// anywhere near it.
+///
+/// - `FullAccess` -- already granted, and `ask` is never called.
+/// - `NotDetermined` -- `ask`, and the answer is whatever status it leaves behind.
+/// - anything else (`Denied`, `Restricted`, `WriteOnly`, a value from a later macOS) -- no
+///   access, and `ask` is never called. **A resolved denial is never re-asked**: macOS would
+///   not prompt for it anyway, so asking only converts a settled answer into a nuisance.
+///
+/// `WriteOnly` is not access. Apple documents the deprecated request path as producing exactly
+/// that on macOS 14+, and a write-only store cannot read events, so it is rejected on both
+/// sides -- as a starting status and as an answer.
+fn resolve(before: EKAuthorizationStatus, ask: impl FnOnce() -> EKAuthorizationStatus) -> bool {
+    match before {
+        EKAuthorizationStatus::FullAccess => true,
+        EKAuthorizationStatus::NotDetermined => ask() == EKAuthorizationStatus::FullAccess,
+        _ => false,
+    }
+}
+
+/// Raises the OS prompt, waits for the answer, and returns the status it left behind.
+///
+/// The status re-read is the authoritative answer rather than the block's `granted` boolean --
+/// identical in shape and reasoning to [`crate::preflight()`]'s microphone request. It covers a
+/// block that never fired, and it is what turns a documented write-only downgrade into a
+/// reported failure instead of a store that answers nothing.
+fn ask() -> EKAuthorizationStatus {
+    // The status is `NotDetermined`, so a dialog is about to appear over whatever the user is
+    // looking at. This line lives here rather than in the CLI because this is the only code
+    // that knows a prompt is coming; a caller-side check would duplicate the status read.
+    // Flushed before the call on the probe's precedent -- cheap insurance on a call family
+    // where one member terminates the process, even though this member does not.
+    println!("Asking macOS for calendar access, so sessions can be named after their meeting.");
+    let _ = std::io::stdout().flush();
+
+    let (tx, rx) = mpsc::channel::<(bool, Option<String>)>();
+    // Two arguments, unlike `AVCaptureDevice`'s one-argument block: EventKit's completion
+    // handler is `(BOOL, NSError *)`.
+    let handler = RcBlock::new(move |granted: Bool, error: *mut NSError| {
+        // SAFETY: EventKit passes either null or a valid autoreleased `NSError` here, and the
+        // description is copied into an owned `String` before this block returns.
+        let message =
+            unsafe { error.as_ref() }.map(|error| error.localizedDescription().to_string());
+        let _ = tx.send((granted.as_bool(), message));
+    });
+
+    // The store is created here and dropped at the end of this function, so it stays alive
+    // behind the completion block for the whole of the wait.
+    //
+    // SAFETY: `handler` is a live block for the whole call -- `RcBlock` owns it and this
+    // function blocks until the block has fired or the wait times out -- and the selector
+    // accepts a completion handler of exactly this signature.
+    unsafe {
+        let store = EKEventStore::new();
+        #[expect(
+            deprecated,
+            reason = "the modern requestFullAccessToEventsWithCompletion: requires \
+                      NSCalendarsFullAccessUsageDescription in the responsible process and \
+                      terminates the process outright without it, which terminal emulators do \
+                      not ship. This selector needs only NSCalendarsUsageDescription, and \
+                      TASK-030.01.01 measured it granting FullAccess on hardware rather than \
+                      the write-only access Apple documents -- which the status re-read below \
+                      guards against regardless"
+        )]
+        store.requestAccessToEntityType_completion(EKEntityType::Event, RcBlock::as_ptr(&handler));
+
+        // Ignored on purpose: the re-read below is the authoritative answer, and a timeout
+        // here is indistinguishable from a prompt nobody answered -- which reads as
+        // `NotDetermined`, i.e. no access, which is the right outcome for both.
+        match rx.recv_timeout(PROMPT_TIMEOUT) {
+            Ok((granted, error)) => debug(&format!(
+                "the calendar request returned granted {granted}, error {error:?}"
+            )),
+            Err(_) => debug(&format!(
+                "the calendar prompt went unanswered for {}s",
+                PROMPT_TIMEOUT.as_secs()
+            )),
+        }
+
+        status()
+    }
+}
+
+/// Runs an EventKit call with both ways out of it blocked.
 ///
 /// Two nets, because there are two ways a framework call can leave without returning.
 /// [`crate::exception::catching`] turns an Objective-C raise into an error -- an uncaught one
@@ -129,22 +329,23 @@ pub(crate) fn meeting_at(at: Timestamp) -> Option<Meeting> {
 /// either failure path every object the closure touched is dropped unused, and nothing it
 /// wrote is observed afterwards.
 ///
-/// The lookup is a parameter rather than the body so that both failure paths are decidable
+/// The call is a parameter rather than the body so that both failure paths are decidable
 /// in `cargo test`: a claim that a raise costs a field instead of a recording is worth
-/// nothing until something has actually raised here.
-fn caught(lookup: impl FnOnce() -> Vec<Candidate>) -> Option<Vec<Candidate>> {
-    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        crate::exception::catching("EKEventStore.eventsMatchingPredicate", lookup)
-    }));
+/// nothing until something has actually raised here. `api` names the raising call, as
+/// [`crate::exception::catching`] documents, so the two callers are distinguishable in the
+/// debug line.
+fn caught<T>(api: &'static str, call: impl FnOnce() -> T) -> Option<T> {
+    let outcome =
+        std::panic::catch_unwind(AssertUnwindSafe(|| crate::exception::catching(api, call)));
 
     match outcome {
-        Ok(Ok(candidates)) => Some(candidates),
+        Ok(Ok(value)) => Some(value),
         Ok(Err(raise)) => {
             debug(&format!("{raise}"));
             None
         }
         Err(_) => {
-            debug("the EventKit lookup panicked; continuing without a meeting");
+            debug(&format!("{api} panicked; continuing without a meeting"));
             None
         }
     }
@@ -710,18 +911,21 @@ mod tests {
         use objc2::rc::Retained;
         use objc2::runtime::NSObject;
 
-        let answer = caught(|| {
+        let answer = caught("test", || {
             let object = NSObject::new();
             // SAFETY: none required -- sending a selector `NSObject` does not implement is
             // exactly the misuse being provoked, and the raise it produces is the subject.
             let _: Retained<NSObject> = unsafe { objc2::msg_send![&*object, copy] };
-            Vec::new()
+            Vec::<Candidate>::new()
         });
 
         assert!(answer.is_none(), "a raise must not produce a meeting");
         // The property this whole arrangement exists for: control reached this line, so a
         // recording being finalized around it would have gone on to be written.
-        assert_eq!(caught(Vec::new).map(|c| c.len()), Some(0));
+        assert_eq!(
+            caught("test", Vec::<Candidate>::new).map(|c| c.len()),
+            Some(0)
+        );
     }
 
     /// AC #2 again, for the other way out. The bindings return non-optional `Retained<T>`
@@ -730,10 +934,15 @@ mod tests {
     /// recording. (The panic message this prints is expected test output.)
     #[test]
     fn a_panic_in_the_lookup_costs_the_meeting_and_not_the_recording() {
-        let answer = caught(|| panic!("nil where the binding demands a value"));
+        let answer = caught("test", || -> Vec<Candidate> {
+            panic!("nil where the binding demands a value")
+        });
 
         assert!(answer.is_none(), "a panic must not produce a meeting");
-        assert_eq!(caught(Vec::new).map(|c| c.len()), Some(0));
+        assert_eq!(
+            caught("test", Vec::<Candidate>::new).map(|c| c.len()),
+            Some(0)
+        );
     }
 
     /// The conversion half, against real framework objects rather than a stand-in for them.
@@ -812,14 +1021,105 @@ mod tests {
     /// The permission arm of AC #2, exercised for real rather than simulated: on any machine
     /// without a full-access calendar grant -- which includes every CI runner -- the lookup
     /// must answer `None` rather than prompt, block, or fail.
+    ///
+    /// It is also the standing proof that [`meeting_at`] did not acquire a request path when
+    /// [`request_calendar_access`] was added: a lookup that asked would hang this test on an
+    /// ungranted machine instead of returning.
     #[test]
     fn a_lookup_without_a_grant_answers_none() {
-        // SAFETY: as `meeting_at`.
-        let status = unsafe { EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) };
-        if status == EKAuthorizationStatus::FullAccess {
+        if status() == EKAuthorizationStatus::FullAccess {
             // A granted machine cannot assert absence; the hardware check covers that side.
             return;
         }
         assert!(meeting_at(session_start()).is_none());
+    }
+
+    // The request-path rules, every one of them driven through `resolve` with a closure.
+    //
+    // Hard rule: **no test may call the real request path.** A test that prompted would hang
+    // CI, and on a developer machine a reflexive "Don't Allow" writes a `Denied` into TCC that
+    // is far stickier than the `NotDetermined` it replaced -- the same reasoning that kept
+    // TASK-030.01 from running its `request-legacy` mode from a sandbox. `ask` is the only
+    // function here that touches EventKit's request selector, and nothing below reaches it.
+
+    /// A grant already in place is used, not re-requested: asking again would raise a second
+    /// dialog on every single run of `meethook record`.
+    #[test]
+    fn a_grant_already_in_place_is_not_asked_for_again() {
+        assert!(resolve(EKAuthorizationStatus::FullAccess, || unreachable!(
+            "an existing grant must not be re-requested"
+        )));
+    }
+
+    /// A settled answer is never re-asked. Table-driven so that a status a later macOS adds --
+    /// which lands in the same catch-all arm -- cannot quietly become a re-ask either.
+    #[test]
+    fn a_resolved_denial_is_never_re_asked() {
+        for status in [
+            EKAuthorizationStatus::Denied,
+            EKAuthorizationStatus::Restricted,
+            EKAuthorizationStatus(99),
+        ] {
+            assert!(
+                !resolve(status, || unreachable!(
+                    "status {} must not be re-requested",
+                    status.0
+                )),
+                "status {} was treated as access",
+                status.0
+            );
+        }
+    }
+
+    /// The guard against the macOS 14+ downgrade Apple documents for the deprecated request
+    /// path: a write-only store cannot read events, so it is not access -- neither as a
+    /// starting status nor as the answer a request comes back with.
+    ///
+    /// This is the one behaviour that cannot be checked on the machine where the contrary
+    /// observation was made, which is exactly why it is asserted here.
+    #[test]
+    fn write_only_access_is_not_access() {
+        assert!(!resolve(EKAuthorizationStatus::WriteOnly, || unreachable!(
+            "a write-only grant is settled and must not be re-requested"
+        )));
+        assert!(!resolve(EKAuthorizationStatus::NotDetermined, || {
+            EKAuthorizationStatus::WriteOnly
+        }));
+    }
+
+    /// AC #2's timeout arm. A `recv_timeout` expiry and a completion block that never fired
+    /// both leave the status where it started, and that shape must read as no access rather
+    /// than as a grant.
+    #[test]
+    fn an_unanswered_prompt_reads_as_no_access() {
+        assert!(!resolve(EKAuthorizationStatus::NotDetermined, || {
+            EKAuthorizationStatus::NotDetermined
+        }));
+    }
+
+    #[test]
+    fn a_granted_prompt_is_access() {
+        assert!(resolve(EKAuthorizationStatus::NotDetermined, || {
+            EKAuthorizationStatus::FullAccess
+        }));
+    }
+
+    /// The sentence is the whole value of the type, so a refactor must not drop it. Same
+    /// shape, and same reason, as `preflight`'s two `MissingPermissions` tests.
+    #[test]
+    fn the_guidance_names_the_pane_and_the_terminal_trap() {
+        let message = NoCalendarAccess.to_string();
+        assert!(
+            message.contains("Privacy & Security > Calendars"),
+            "the pane is missing: {message}"
+        );
+        assert!(
+            message.contains("terminal application"),
+            "the inheritance trap is missing: {message}"
+        );
+        assert!(
+            message.contains("Recording itself is unaffected"),
+            "the message must say recording still works: {message}"
+        );
     }
 }

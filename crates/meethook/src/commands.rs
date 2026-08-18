@@ -199,8 +199,11 @@ impl Capture for SessionCapture<'_> {
 
 /// Records every call until the process is interrupted.
 ///
-/// Permissions are checked first and separately, so a missing TCC grant costs the user an
-/// error message rather than a silently unrecorded meeting.
+/// The two required permissions are checked first and separately, so a missing TCC grant costs
+/// the user an error message rather than a silently unrecorded meeting. Calendar access is
+/// asked for immediately afterwards and is *not* required: it only decides whether a session
+/// can be named after the meeting it was recorded during, so a refusal prints guidance and the
+/// recorder carries on.
 ///
 /// The loop is deliberately forgiving of a failed session: a two-second false start that
 /// produces a silent track prints an error and goes back to watching. Ending a day of
@@ -211,6 +214,15 @@ impl Capture for SessionCapture<'_> {
 pub fn record(paths: &Paths) -> Result<()> {
     let authorized = preflight()?;
     let recorder = Recorder::new(authorized)?;
+
+    // After `preflight` on purpose: a run about to abort for a missing microphone grant must
+    // not first ask for an optional one, and the essential prompts should arrive before it.
+    // Before the watcher on purpose too: nothing is being watched, and nothing can be
+    // recorded, while this prompt is up.
+    if let Some(problem) = meethook_record::request_calendar_access() {
+        println!("{problem}");
+    }
+
     let debug = std::env::var_os("MEETHOOK_ACTIVITY_DEBUG").is_some();
 
     let (tx, rx) = mpsc::channel::<Event>();
