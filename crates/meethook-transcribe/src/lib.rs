@@ -1186,8 +1186,11 @@ mod tests {
             "diarization must be run on the speaker track and on nothing else"
         );
 
-        // AC #9: one line per turn, in transcript order. Read out of the rendered file below
-        // its frontmatter, which is the template's business rather than this test's.
+        // AC #9: one line per run of consecutive same-speaker turns, in transcript order. Read
+        // out of the rendered file below its frontmatter, which is the template's business
+        // rather than this test's. Nobody speaks twice in a row in this fixture, so the runs
+        // are the turns -- counted as runs anyway, since "== turns.len()" would be a
+        // coincidence of the fixture rather than the claim.
         let metadata = session.load_metadata().unwrap();
         let rendered = transcript
             .render_markdown(
@@ -1196,7 +1199,13 @@ mod tests {
             )
             .unwrap();
         let body = rendered.split_once("\n---\n").unwrap().1.trim_start();
-        assert_eq!(body.lines().count(), transcript.turns.len(), "{rendered}");
+        let runs = transcript
+            .turns
+            .windows(2)
+            .filter(|w| w[0].speaker != w[1].speaker)
+            .count()
+            + 1;
+        assert_eq!(body.lines().count(), runs, "{rendered}");
         assert!(
             body.starts_with("**[00:00] Unknown 1:** hi there\n"),
             "{rendered}"

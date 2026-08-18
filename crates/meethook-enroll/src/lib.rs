@@ -3102,6 +3102,105 @@ mod tests {
         );
     }
 
+    /// The transcript body a re-render left on disk, below its frontmatter.
+    ///
+    /// Compared rather than the whole file because `updated` is the render instant, and two
+    /// renderings a few microseconds apart can straddle a second boundary. The body is the
+    /// half TASK-038 is about.
+    fn markdown_body(session: &SessionPaths) -> String {
+        let markdown = std::fs::read_to_string(session.transcript_md()).unwrap();
+        markdown.split_once("\n---\n").unwrap().1.to_string()
+    }
+
+    /// TASK-038 acceptance criterion #6, the half where the rename does *not* merge anything:
+    /// naming the voice between two runs of another leaves the blocks where they were, and the
+    /// re-rendered file is what a fresh rendering of the relabelled turns produces.
+    #[test]
+    fn a_rename_that_merges_nothing_re_renders_the_same_blocks() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+
+        let (report, output) = run_naming_at(&paths, &["20260809-052600"], "00:03", "Alice");
+        assert_eq!(report.named, 1, "{output}");
+
+        let transcript = transcript_of(&session);
+        assert_eq!(
+            said(&transcript)
+                .iter()
+                .map(|(speaker, _, _)| *speaker)
+                .collect::<Vec<_>>(),
+            ["Unknown 1", "You", "Alice", "Unknown 1"]
+        );
+        let body = markdown_body(&session);
+        assert_eq!(
+            body,
+            transcript
+                .render_markdown(
+                    &TranscriptTemplate::resolve(&paths, None).unwrap(),
+                    &TranscriptContext::now(&session_metadata(
+                        &SessionId::parse("20260809-052600").unwrap()
+                    )),
+                )
+                .unwrap()
+                .split_once("\n---\n")
+                .unwrap()
+                .1
+        );
+        // Four speakers in a row, none of them repeating: four lines, as before collapsing.
+        assert_eq!(body.trim_start().lines().count(), 4, "{body}");
+        assert!(body.contains("**[00:03] Alice:** and from me\n"), "{body}");
+    }
+
+    /// TASK-038 acceptance criterion #6, the half that only collapsing can get wrong: naming a
+    /// voice clustering had split in two puts one name on both halves, and where those halves
+    /// are adjacent the re-render must print them as one block rather than the same name twice
+    /// in a row -- which is what a fresh `transcribe` of the relabelled turns now produces.
+    #[test]
+    fn a_rename_that_makes_two_blocks_adjacent_merges_them_on_re_render() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+
+        // One voice the clusterer did not join up, so naming it once names both halves.
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+        assert_eq!(report.named, 1, "{output}");
+
+        let transcript = transcript_of(&session);
+        assert_eq!(
+            said(&transcript)
+                .iter()
+                .map(|(speaker, _, _)| *speaker)
+                .collect::<Vec<_>>(),
+            ["Alice", "You", "Alice", "Alice"]
+        );
+        let body = markdown_body(&session);
+        assert_eq!(
+            body,
+            transcript
+                .render_markdown(
+                    &TranscriptTemplate::resolve(&paths, None).unwrap(),
+                    &TranscriptContext::now(&session_metadata(
+                        &SessionId::parse("20260809-052600").unwrap()
+                    )),
+                )
+                .unwrap()
+                .split_once("\n---\n")
+                .unwrap()
+                .1
+        );
+        // The last two turns were two blocks under two names before the rename and are one
+        // block under one timestamp after it.
+        assert_eq!(body.trim_start().lines().count(), 3, "{body}");
+        assert!(
+            body.contains("**[00:03] Alice:** and from me let us start\n"),
+            "{body}"
+        );
+        assert!(!body.contains("Unknown"), "{body}");
+    }
+
     /// TASK-019.03 acceptance criteria #1 and #2, which is the whole ticket in one test: a
     /// voice the database has named the wrong person is reached, corrected, and lands in both
     /// files -- and a later default run does not ask about it again.

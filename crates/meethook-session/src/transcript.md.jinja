@@ -11,6 +11,6 @@ meeting_description: {{ meeting.notes | yaml }}
 {%- endif %}
 ---
 
-{% for turn in turns -%}
-**[{{ turn.time }}] {{ turn.speaker }}:** {{ turn.text }}
+{% for block in blocks -%}
+**[{{ block.time }}] {{ block.speaker }}:** {{ block.text }}
 {% endfor -%}

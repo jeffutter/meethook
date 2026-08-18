@@ -475,6 +475,18 @@ const BUILTIN_NAME: &str = "<meethook's built-in transcript.md.jinja>";
 ///   which most are not.
 /// - `turns` -- each with `time` (the `MM:SS` label), `speaker`, `text`, `start`, `end`,
 ///   `source_track`, `cluster` and `speaker_id_confidence`.
+/// - `blocks` -- the same turns, with each run of consecutive same-speaker turns collapsed into
+///   one entry: `time` (the `MM:SS` label of the run's *first* turn), `speaker` (the shared
+///   label), `text` (the run's texts joined by a single space), `start` (the first turn's),
+///   `end` (the last turn's), and `turns`, the run's own turns in the shape above.
+///
+/// `turns` is the record and `blocks` is the reading of it. The shipped default renders
+/// `blocks`, so a speaker who talks for a minute is one paragraph rather than a wall of
+/// near-identical lines; a template that wants a line per turn keeps looping `turns` and gets
+/// exactly what it always got. A block carries no `cluster`, `source_track` or
+/// `speaker_id_confidence` because a run under one label can come from two clusters -- one
+/// person whose voice clustering split in two, both named by `enroll` -- so no single value
+/// would be a claim the block could make; those are reachable per turn through `block.turns`.
 ///
 /// Undefined values are semi-strict: a template may test one for truth (`{% if meeting %}`),
 /// which is how the built-in default emits meeting keys only when there is a meeting, but
@@ -505,8 +517,8 @@ impl std::fmt::Debug for TranscriptTemplate {
 }
 
 impl TranscriptTemplate {
-    /// The shipped default: frontmatter, then one line per turn in the shape every transcript
-    /// written before templates existed used.
+    /// The shipped default: frontmatter, then one line per run of consecutive same-speaker
+    /// turns -- see `blocks` in the context above.
     ///
     /// Infallible, and it has to stay that way -- it is the fallback the resolution below lands
     /// on for the overwhelmingly common case of a user who has never heard of templates. The
@@ -643,6 +655,7 @@ struct RenderContext<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     meeting: Option<&'a Meeting>,
     turns: Vec<RenderTurn<'a>>,
+    blocks: Vec<RenderBlock<'a>>,
 }
 
 impl<'a> RenderContext<'a> {
@@ -653,6 +666,7 @@ impl<'a> RenderContext<'a> {
             updated: local_rfc3339(ctx.rendered_at),
             meeting: ctx.session.meeting.as_ref(),
             turns: transcript.turns.iter().map(RenderTurn::new).collect(),
+            blocks: RenderBlock::group(&transcript.turns),
         }
     }
 }
@@ -684,6 +698,68 @@ impl<'a> RenderTurn<'a> {
             cluster: turn.cluster,
             speaker_id_confidence: turn.speaker_id_confidence,
         }
+    }
+}
+
+/// A run of consecutive turns by one speaker, rendered as a single timestamped paragraph.
+///
+/// The reading of the turns rather than the record of them: a reader does not need to know at
+/// what second the same person started their second sentence, so the block is timestamped at
+/// the moment that speaker took the floor and prints their name once. Field names mirror
+/// [`RenderTurn`]'s so a template author's knowledge carries across, and `turns` keeps the
+/// run's own turns reachable for anything a block cannot honestly claim -- see the context
+/// documented on [`TranscriptTemplate`].
+#[derive(Serialize)]
+struct RenderBlock<'a> {
+    /// The *first* turn's start as [`TranscriptTime`] spells it. This is the only timestamp the
+    /// block prints, and it is one a turn really started at, so it still parses back and
+    /// resolves to the voice speaking then.
+    time: String,
+    /// The label shared by every turn in the run.
+    speaker: &'a str,
+    /// The run's texts joined by a single space. Turn text arrives already trimmed and
+    /// non-empty from transcription, so a single space is the whole of the separator; a
+    /// one-turn block therefore reproduces that turn's line byte for byte.
+    text: String,
+    /// The first turn's start, in seconds.
+    start: f64,
+    /// The *last* turn's end, in seconds, so `start`..`end` spans the whole run.
+    end: f64,
+    turns: Vec<RenderTurn<'a>>,
+}
+
+impl<'a> RenderBlock<'a> {
+    /// Collapses `turns` into blocks: a new block starts wherever the speaker label changes.
+    ///
+    /// Walks the slice in file order and never sorts. `Transcript` is a deserialized file and
+    /// the rest of this module is careful not to assume its turns are sorted (see
+    /// `candidates_at`); the blocks are the order the transcript is read in, whatever that is.
+    ///
+    /// Grouping is on the label text alone, deliberately -- the label is exactly the thing a
+    /// collapsed block prints once, so grouping on anything finer (cluster, track) would let
+    /// two adjacent blocks print the same name twice in a row. There is no gap threshold
+    /// either: two same-speaker turns an hour apart still collapse.
+    fn group(turns: &'a [Turn]) -> Vec<Self> {
+        let mut blocks: Vec<Self> = Vec::new();
+        for turn in turns {
+            match blocks.last_mut() {
+                Some(block) if block.speaker == turn.speaker => {
+                    block.text.push(' ');
+                    block.text.push_str(&turn.text);
+                    block.end = turn.end;
+                    block.turns.push(RenderTurn::new(turn));
+                }
+                _ => blocks.push(RenderBlock {
+                    time: TranscriptTime::of(turn.start).to_string(),
+                    speaker: &turn.speaker,
+                    text: turn.text.clone(),
+                    start: turn.start,
+                    end: turn.end,
+                    turns: vec![RenderTurn::new(turn)],
+                }),
+            }
+        }
+        blocks
     }
 }
 
@@ -724,6 +800,20 @@ mod tests {
             session_id(),
             vec![
                 mic_turn(12.34, 14.0, "first"),
+                mic_turn(5405.0, 5410.0, "much later"),
+            ],
+        )
+    }
+
+    /// The same two turns with another speaker between them, so the default renders three
+    /// lines. `two_turns()` collapses into one under the shipped template, and several of the
+    /// tests below want a body with more than one line in it.
+    fn alternating() -> Transcript {
+        Transcript::new(
+            session_id(),
+            vec![
+                mic_turn(12.34, 14.0, "first"),
+                speaker_turn(20.0, 25.0, Some(1)),
                 mic_turn(5405.0, 5410.0, "much later"),
             ],
         )
@@ -847,17 +937,170 @@ mod tests {
         assert!(error.contains("cluster"), "{error}");
     }
 
-    /// The body half of the shipped default, unchanged from the format string it replaced: one
-    /// line per turn, in transcript order, minutes unwrapped past 60. A pre-template
-    /// `transcript.md` and a post-template one differ only by the header.
+    /// The body half of the shipped default: one line per *run* of consecutive same-speaker
+    /// turns, in transcript order, minutes unwrapped past 60.
+    ///
+    /// `two_turns()` is one speaker twice, ninety minutes apart, and it collapses -- adjacency
+    /// and the label are the whole of the rule, with no gap threshold. So this no longer
+    /// asserts what it did before templates existed, when the body was one line per turn.
     #[test]
-    fn the_default_template_renders_one_line_per_turn_under_frontmatter() {
+    fn the_default_template_renders_one_block_per_speaker_run_under_frontmatter() {
         let rendered = render(&two_turns(), &TranscriptTemplate::builtin(), &metadata());
         let (_, body) = frontmatter(&rendered);
         assert_eq!(
-            body, "\n**[00:12] You:** first\n**[90:05] You:** much later\n",
+            body, "\n**[00:12] You:** first much later\n",
             "{rendered:?}"
         );
+    }
+
+    /// The multi-line body a collapsing transcript still has: alternating speakers give a line
+    /// each, in transcript order, and the unwrapped minutes are pinned here now that
+    /// `two_turns()` renders as one line.
+    #[test]
+    fn the_default_template_renders_alternating_speakers_one_line_each() {
+        let rendered = render(&alternating(), &TranscriptTemplate::builtin(), &metadata());
+        let (_, body) = frontmatter(&rendered);
+        assert_eq!(
+            body,
+            "\n**[00:12] You:** first\n**[00:20] Unknown 1:** words\n\
+             **[90:05] You:** much later\n",
+            "{rendered:?}"
+        );
+    }
+
+    /// Acceptance criterion #1: a run of three collapses to one line, timestamped at the first
+    /// turn's start, with the label printed once and the texts joined by a single space.
+    #[test]
+    fn consecutive_turns_by_one_speaker_collapse_under_the_first_timestamp() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![
+                mic_turn(12.34, 14.0, "So the thing about the merge threshold"),
+                mic_turn(14.9, 17.0, "is that it only looks at centroids."),
+                mic_turn(17.2, 21.0, "Which is why the second pass exists."),
+            ],
+        );
+        let rendered = render(&transcript, &TranscriptTemplate::builtin(), &metadata());
+        let (_, body) = frontmatter(&rendered);
+        assert_eq!(
+            body,
+            "\n**[00:12] You:** So the thing about the merge threshold is that it only \
+             looks at centroids. Which is why the second pass exists.\n",
+            "{rendered:?}"
+        );
+    }
+
+    /// Acceptance criterion #2: a turn between two different speakers renders the line it
+    /// rendered before collapsing existed, asserted as a byte equality rather than by
+    /// re-deriving it -- a one-turn block is meant to be an identity, not an approximation.
+    #[test]
+    fn a_turn_between_different_speakers_renders_exactly_as_it_did() {
+        let rendered = render(&alternating(), &TranscriptTemplate::builtin(), &metadata());
+        let (_, body) = frontmatter(&rendered);
+        assert!(
+            body.contains("\n**[00:20] Unknown 1:** words\n"),
+            "{rendered:?}"
+        );
+    }
+
+    /// Acceptance criterion #4, as a property rather than an example, in the spirit of
+    /// TASK-033.01: every `[MM:SS]` the collapsed body prints parses back and resolves to the
+    /// voice that opened that block. Collapsing removes timestamps; it must not invent one.
+    ///
+    /// The third turn is the case that matters -- it is swallowed into cluster 1's block, so
+    /// the second it started at is no longer printed anywhere and the label that *is* printed
+    /// still has to reach the right voice.
+    #[test]
+    fn every_timestamp_a_collapsed_transcript_prints_resolves_to_its_blocks_voice() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![
+                speaker_turn(750.0, 754.0, Some(1)),
+                speaker_turn(754.3, 758.0, Some(1)),
+                speaker_turn(760.0, 764.0, Some(1)),
+                speaker_turn(800.0, 809.0, Some(7)),
+                speaker_turn(880.0, 884.0, Some(1)),
+            ],
+        );
+        let rendered = render(&transcript, &TranscriptTemplate::builtin(), &metadata());
+        let (_, body) = frontmatter(&rendered);
+
+        let printed: Vec<TranscriptTime> = body
+            .lines()
+            .filter_map(|line| {
+                line.split_once('[')
+                    .and_then(|(_, rest)| rest.split_once(']'))
+            })
+            .map(|(label, _)| label)
+            .map(|label| label.parse().expect(label))
+            .collect();
+        assert_eq!(printed, [at("12:30"), at("13:20"), at("14:40")], "{body:?}");
+        assert_eq!(
+            printed
+                .iter()
+                .map(|t| transcript.voice_at(*t))
+                .collect::<Vec<_>>(),
+            [
+                VoiceAt::Cluster(1),
+                VoiceAt::Cluster(7),
+                VoiceAt::Cluster(1)
+            ],
+            "{body:?}"
+        );
+        // The second a swallowed turn started at is gone from the rendering, which is the
+        // whole of what collapsing removes.
+        assert!(!body.contains("12:34"), "{body:?}");
+    }
+
+    /// Acceptance criterion #5: `turns` is the record and is untouched by collapsing, so a
+    /// template that loops it gets one line per turn even where the default would collapse
+    /// them.
+    #[test]
+    fn a_user_template_looping_turns_still_gets_one_line_per_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mine.jinja");
+        std::fs::write(
+            &path,
+            "{% for t in turns %}{{ t.time }}|{{ t.speaker }}|{{ t.text }}\n{% endfor %}",
+        )
+        .unwrap();
+
+        let rendered = render(
+            &two_turns(),
+            &TranscriptTemplate::load(&path).unwrap(),
+            &metadata(),
+        );
+        assert_eq!(rendered, "00:12|You|first\n90:05|You|much later\n");
+    }
+
+    /// The per-turn provenance a block deliberately does not carry is still reachable through
+    /// the block's own turns, which is what makes leaving it off the block honest rather than
+    /// lossy.
+    #[test]
+    fn a_blocks_turns_carry_the_provenance_the_block_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mine.jinja");
+        std::fs::write(
+            &path,
+            "{% for b in blocks %}{{ b.start }}-{{ b.end }}:\
+             {% for t in b.turns %} {{ t.cluster }}/{{ t.source_track }}{% endfor %}\n\
+             {% endfor %}",
+        )
+        .unwrap();
+
+        // One label, two clusters -- the case a block-level `cluster` would have to lie about.
+        let mut second = speaker_turn(30.0, 40.0, Some(2));
+        second.speaker = unknown_speaker(1);
+        let transcript = Transcript::new(
+            session_id(),
+            vec![speaker_turn(10.0, 20.0, Some(1)), second],
+        );
+        let rendered = render(
+            &transcript,
+            &TranscriptTemplate::load(&path).unwrap(),
+            &metadata(),
+        );
+        assert_eq!(rendered, "10.0-40.0: 1/speaker 2/speaker\n");
     }
 
     /// The header half: `created` is the session start and `updated` the render instant, both
@@ -943,6 +1186,10 @@ mod tests {
 
     /// Acceptance criterion #2: a user template is the whole of the output, frontmatter
     /// included -- nothing of the default is prepended, appended, or merged in.
+    ///
+    /// Its body loops `turns`, so it is also the guard that collapsing left that view alone:
+    /// these two turns share a speaker and the default now renders them as one line, while
+    /// this template's expected output has not moved.
     #[test]
     fn a_user_template_fully_replaces_the_default() {
         let dir = tempfile::tempdir().unwrap();
