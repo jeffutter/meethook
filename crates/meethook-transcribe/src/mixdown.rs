@@ -4,8 +4,16 @@
 //! together, uncompressed, at roughly 230 MB per hour each. That is the right shape for
 //! everything downstream of it -- the echo canceller wants the local voice alone, diarization
 //! wants the far end alone -- and the wrong shape for the one reader who is a person. This
-//! module produces the artefact for that reader: both tracks on one timeline, panned apart
-//! far enough to tell apart, in a container any player opens.
+//! module produces the artefact for that reader: both tracks on one timeline, levelled against
+//! each other, panned apart far enough to tell apart, in a container any player opens.
+//!
+//! The levelling is not cosmetic. The two tracks have no reason to arrive matched -- one is a
+//! close local microphone at whatever gain CoreAudio hands over, the other is the far end
+//! already through a conferencing codec and its own AGC -- so summing them as they arrive lets
+//! whichever side is hotter dominate the file and leaves the listener riding the volume knob.
+//! Each source is measured and corrected before the sum; the crate's private `loudness` module
+//! holds the measurement, including why it is a gated BS.1770 loudness rather than a peak or an
+//! RMS, and why it is hand-rolled rather than taken from `ebur128`.
 //!
 //! The mix and the encode live together rather than in two modules because they are one
 //! responsibility with one caller. Split, each half would be a shallow module whose interface
@@ -34,6 +42,7 @@ use ogg::writing::PacketWriteEndInfo;
 use ropus::{Application, Bitrate, Channels, Encoder, Signal};
 
 use crate::audio::file_name;
+use crate::loudness;
 use crate::progress::Phase;
 use crate::{Error, Result};
 
@@ -126,6 +135,46 @@ const MAX_PACKET: usize = 4000;
 /// margin at all makes the outcome turn on float rounding.
 const PEAK_CEILING: f32 = 0.99;
 
+/// The loudness each source is brought to before the two are summed, in LUFS.
+///
+/// An absolute target rather than merely matching the two tracks to each other, because the
+/// measurement is being computed anyway and an absolute one makes `meeting.opus` comparable
+/// from session to session instead of only internally balanced. Matching falls out of it for
+/// free: two tracks aimed at the same number are aimed at each other.
+///
+/// A per-track target is legitimate as a whole-mix target here specifically because a meeting
+/// is turn-taking. The two tracks rarely carry speech at the same instant, so the mix's gated
+/// loudness is about each track's loudness rather than their sum, and the constant-power
+/// panning below preserves power on the way. Where they do overlap the mix runs hot by up to
+/// 3 LU, which is the correct answer for two people talking over each other.
+///
+/// -16 LUFS is the podcast and streaming convention rather than EBU R 128's -23, because the
+/// reader here is a person on headphones or a laptop speaker rather than a broadcast chain,
+/// and -23 arrives too quiet on both. Speech crest factor normally leaves room under
+/// [`PEAK_CEILING`] at this level; when it does not, the peak scale below pulls the whole mix
+/// down uniformly and the balance between the tracks survives it.
+const TARGET_LUFS: f64 = -16.0;
+
+/// The most a single source may be turned up, in dB.
+///
+/// Gain applied to a quiet-but-not-silent track arrives as hiss and HVAC rumble, so past some
+/// point the correction is a worse artefact than the imbalance it fixes. The cap is on the
+/// upward direction only: turning a hot track down cannot manufacture noise, so attenuation is
+/// deliberately uncapped, and the asymmetry is a decision rather than an oversight.
+///
+/// The honest consequence: when one track needs more than this and the other does not, the two
+/// are left unmatched by the difference. That is the cap declining to amplify a nearly dead
+/// track, not a failure to balance.
+///
+/// 12 dB is provisional pending a listening confirmation, the same posture [`BITRATE_BPS`]
+/// shipped in. It does bind in practice: across the sessions under `~/meethook/sessions` most
+/// tracks measured -20 to -22 LUFS and wanted 4-6 dB, but one mic track measured -32.2 LUFS
+/// against its speaker track's -20.7, so the cap left that pair 4.2 dB apart instead of the
+/// 11.5 they started at. Whether the remaining 4 dB is worth that mic's noise floor is exactly
+/// the question a person with headphones has to answer, and it is why this number is not
+/// simply larger.
+const MAX_BOOST_DB: f64 = 12.0;
+
 /// The logical stream's serial number.
 ///
 /// Any non-zero value identifies a single-stream file, and a fixed one is what makes two runs
@@ -151,12 +200,19 @@ pub struct Source<'a> {
 /// costs only the length it would have occupied -- which is what keeps a session with one
 /// usable track producing a normal, playable mix rather than a special case.
 ///
-/// The whole result is scaled by one static gain when it would otherwise clip. Static rather
-/// than per-window, because a compressor that pumps is a worse artefact than a mix that is
-/// quiet, and because a constant is a thing a listener can un-learn.
+/// The order of operations is: measure each source, apply its own gain, pan it, sum, then
+/// scale the whole result down if the sum would clip. Both gains are static -- the per-source
+/// correction and the clip protection alike -- because a compressor that pumps is a worse
+/// artefact than a mix that is quiet, and because a constant is a thing a listener can
+/// un-learn. The clip scale stays last and stays uniform across the mix, so it cannot undo the
+/// balance the per-source gains established.
 ///
-/// `rate` is only used to turn offsets into sample counts; the samples are passed through
-/// untouched, so it must be the rate they are already at.
+/// A source with no measurable speech in it -- silence, or a track shorter than one 400 ms
+/// measurement block -- passes through untouched rather than being boosted on the strength of
+/// its own noise floor. See `normalizing_gain` below.
+///
+/// `rate` turns offsets into sample counts and is the rate the loudness measurement runs at,
+/// so it must be the rate the samples are already at; nothing here resamples.
 pub fn mix(sources: &[Source<'_>], rate: u32) -> Vec<f32> {
     let starts: Vec<usize> = sources
         .iter()
@@ -172,11 +228,12 @@ pub fn mix(sources: &[Source<'_>], rate: u32) -> Vec<f32> {
 
     let mut stereo = vec![0.0; frames * CHANNELS];
     for (source, start) in sources.iter().zip(&starts) {
+        let gain = normalizing_gain(source.samples, rate);
         let (left, right) = constant_power(source.pan);
         for (index, sample) in source.samples.iter().enumerate() {
             let at = (start + index) * CHANNELS;
-            stereo[at] += sample * left;
-            stereo[at + 1] += sample * right;
+            stereo[at] += sample * gain * left;
+            stereo[at + 1] += sample * gain * right;
         }
     }
 
@@ -189,6 +246,21 @@ pub fn mix(sources: &[Source<'_>], rate: u32) -> Vec<f32> {
     }
 
     stereo
+}
+
+/// The static gain that brings one source to [`TARGET_LUFS`], capped at [`MAX_BOOST_DB`].
+///
+/// Unity when there is no speech to measure. That is the whole handling of the empty case: an
+/// imported session has a silent mic track, and the answer for it is "leave it alone" rather
+/// than either an error to propagate or an unbounded boost of nothing.
+fn normalizing_gain(samples: &[f32], rate: u32) -> f32 {
+    match loudness::integrated_lufs(samples, rate) {
+        None => 1.0,
+        Some(lufs) => {
+            let correction_db = (TARGET_LUFS - lufs).min(MAX_BOOST_DB);
+            10.0f64.powf(correction_db / 20.0) as f32
+        }
+    }
 }
 
 /// The left and right gains that place a mono source at `pan`.
@@ -378,6 +450,31 @@ mod tests {
 
     use super::*;
     use crate::TARGET_RATE;
+    use crate::loudness::fixtures::bursts;
+
+    /// The one channel of an interleaved stereo mix, over `from_s..to_s`.
+    ///
+    /// Only meaningful for centre-panned sources, where both channels carry every source at the
+    /// same gain, which is why the tests that use it pan nothing.
+    fn channel(stereo: &[f32], from_s: usize, to_s: usize) -> Vec<f32> {
+        let rate = TARGET_RATE as usize;
+        stereo[from_s * rate * CHANNELS..to_s * rate * CHANNELS]
+            .iter()
+            .step_by(CHANNELS)
+            .copied()
+            .collect()
+    }
+
+    /// Mean square of a whole track in dB, with no gating at all -- the naive measure this
+    /// module deliberately does not use, kept here so a test can show what it gets wrong.
+    fn ungated_db(samples: &[f32]) -> f64 {
+        let mean = samples
+            .iter()
+            .map(|s| f64::from(*s) * f64::from(*s))
+            .sum::<f64>()
+            / samples.len() as f64;
+        10.0 * mean.log10()
+    }
 
     /// A source at the centre, so a test that is not about panning does not have to think
     /// about it.
@@ -643,6 +740,121 @@ mod tests {
         let (_, channels, decoded) = decode(&path);
         assert_eq!(channels, 2);
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn equal_speaking_loudness_at_unequal_talk_time_gets_equal_gain() {
+        // Two people in the same meeting, speaking at the same level, one of whom holds the
+        // floor four times as long. This is the case the gates exist for.
+        let quiet_participant = bursts(60.0, 9.0, 0.2, TARGET_RATE); // ~10.5 s of talking
+        let talkative_one = bursts(60.0, 2.0, 0.2, TARGET_RATE); // ~45 s of talking
+
+        let quiet_gain = normalizing_gain(&quiet_participant, TARGET_RATE);
+        let talkative_gain = normalizing_gain(&talkative_one, TARGET_RATE);
+
+        let apart = 20.0 * f64::from(quiet_gain / talkative_gain).log10();
+        assert!(
+            apart.abs() < 0.5,
+            "gains {quiet_gain} and {talkative_gain} are {apart} dB apart"
+        );
+        // And the gains are doing something, rather than agreeing because both are unity.
+        assert!(quiet_gain > 1.5, "no correction was applied: {quiet_gain}");
+
+        // The other half of the claim: an ungated mean would have read the same two tracks as
+        // 6 dB apart -- 10*log10(45/10.5) -- purely from talk time, and boosted the quieter
+        // person's room tone by that much to "fix" it. Asserting this is what makes the test
+        // prove the gating is doing the work rather than that two similar signals measure
+        // similarly.
+        let ungated_apart = ungated_db(&talkative_one) - ungated_db(&quiet_participant);
+        assert!(
+            (ungated_apart - 6.32).abs() < 0.5,
+            "ungated measures them {ungated_apart} dB apart"
+        );
+    }
+
+    #[test]
+    fn a_silent_track_passes_through_at_unity() {
+        // An imported session: the mic track is digital silence and everything said is on the
+        // other one.
+        let mic = vec![0.0; 10 * TARGET_RATE as usize];
+        let speaker = bursts(10.0, 2.0, 0.2, TARGET_RATE);
+
+        assert_eq!(normalizing_gain(&mic, TARGET_RATE), 1.0);
+        // The speaker is corrected on its own merits, not held back or dragged up by an
+        // unmeasurable neighbour.
+        let alone = normalizing_gain(&speaker, TARGET_RATE);
+        assert!(alone > 1.0, "the speaker was not corrected: {alone}");
+
+        let both = mix(
+            &[
+                Source {
+                    samples: &mic,
+                    offset_s: 0.0,
+                    pan: -PAN_POSITION,
+                },
+                Source {
+                    samples: &speaker,
+                    offset_s: 0.0,
+                    pan: PAN_POSITION,
+                },
+            ],
+            TARGET_RATE,
+        );
+        let speaker_only = mix(
+            &[Source {
+                samples: &speaker,
+                offset_s: 0.0,
+                pan: PAN_POSITION,
+            }],
+            TARGET_RATE,
+        );
+
+        // Sample for sample the same mix: the silent track contributed nothing and changed
+        // nothing about what the other track was scaled by.
+        assert_eq!(both, speaker_only);
+        assert!(both.iter().any(|s| s.abs() > 0.01), "the mix is silent");
+    }
+
+    #[test]
+    fn normalization_survives_the_peak_ceiling() {
+        // The two sources are placed at non-overlapping times so each half of the result can be
+        // measured on its own, and centred so that neither half's level is a statement about
+        // panning.
+        let quiet = {
+            let mut samples = bursts(10.0, 2.0, 0.2, TARGET_RATE);
+            // A door slamming: 8 ms of decaying 900 Hz at full scale. Far too short to move a
+            // gated loudness measurement, and more than enough to drive the sum past the
+            // ceiling once this track is turned up -- which is the entire argument against
+            // normalizing on peak.
+            for i in 0..(0.008 * f64::from(TARGET_RATE)) as usize {
+                let t = i as f32 / TARGET_RATE as f32;
+                samples[TARGET_RATE as usize + i] =
+                    (-t / 0.002).exp() * (std::f32::consts::TAU * 900.0 * t).sin();
+            }
+            samples
+        };
+        let loud = bursts(10.0, 2.0, 0.5, TARGET_RATE);
+
+        let apart = crate::loudness::integrated_lufs(&loud, TARGET_RATE).unwrap()
+            - crate::loudness::integrated_lufs(&quiet, TARGET_RATE).unwrap();
+        assert!(apart > 6.0, "the sources only start {apart} LU apart");
+
+        let stereo = mix(&[centred(&quiet, 0.0), centred(&loud, 10.0)], TARGET_RATE);
+
+        // The ceiling engaged, so this is a mix that had to be scaled down after balancing.
+        let peak = stereo.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+        assert!((peak - PEAK_CEILING).abs() < 1e-5, "peak {peak}");
+
+        // And the balance the per-source gains established is still there afterwards, because
+        // the scale that pulled the peak down was uniform across the whole mix.
+        let first =
+            crate::loudness::integrated_lufs(&channel(&stereo, 0, 10), TARGET_RATE).unwrap();
+        let second =
+            crate::loudness::integrated_lufs(&channel(&stereo, 10, 20), TARGET_RATE).unwrap();
+        assert!(
+            (first - second).abs() < 1.5,
+            "the two halves ended {first} and {second} LUFS apart"
+        );
     }
 
     #[test]

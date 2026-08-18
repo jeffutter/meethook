@@ -23,6 +23,7 @@ mod gpu;
 mod identify;
 mod import;
 mod levels;
+mod loudness;
 mod merge;
 // Public, unlike every other module here, for the same reason `meethook_session::wav` is: its
 // two functions are called `mix` and `write`, and those names carry their meaning only next to
