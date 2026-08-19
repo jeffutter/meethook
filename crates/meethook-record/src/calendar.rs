@@ -62,7 +62,7 @@ use std::sync::mpsc;
 
 use block2::RcBlock;
 use jiff::{SignedDuration, Timestamp};
-use meethook_session::{Attendee, AttendeeStatus, Meeting};
+use meethook_session::{Attendee, AttendeeStatus, Meeting, MeetingFit};
 use objc2::runtime::Bool;
 use objc2_event_kit::{
     EKAuthorizationStatus, EKEntityType, EKEvent, EKEventStatus, EKEventStore, EKParticipant,
@@ -72,10 +72,15 @@ use objc2_foundation::{NSDate, NSError};
 
 use crate::preflight::PROMPT_TIMEOUT;
 
-/// How far outside a meeting a session may start and still be attributed to it.
+/// How far outside a meeting a session may start and still be attributed to it, and how far
+/// *inside* the start it may begin and still be called a clean join.
 ///
-/// Covers the two ordinary human cases in one number: joining a call a few minutes early,
-/// and carrying on recording a conversation that outlived the invite.
+/// Covers three ordinary human cases in one number, so the whole policy is one sentence --
+/// "the recording began near the meeting's start" -- rather than two tunables whose
+/// relationship to each other nobody could state: joining a call a few minutes early, carrying
+/// on recording a conversation that outlived the invite, and starting a minute or two after
+/// the hour, which is indistinguishable from starting on it. Past this much of the meeting the
+/// start no longer supports the match; see [`MeetingFit::JoinedLate`].
 const NEAR_WINDOW: SignedDuration = SignedDuration::from_secs(15 * 60);
 
 /// How much calendar to fetch on either side of the session start.
@@ -404,36 +409,45 @@ unsafe fn candidate(event: &EKEvent) -> Option<Candidate> {
                 .iter()
                 .any(|a| a.is_you && a.status == AttendeeStatus::Declined);
 
+        // No fit is set here, and `Meeting::new` leaves it `Unknown`: a converted event is a
+        // *candidate*, not yet a match, and only `select` knows how the session start sat
+        // against it.
+        let meeting = Meeting::new(
+            // `eventIdentifier` is nil only for an event not yet saved to a store, which
+            // one fetched *from* a store cannot be. The fallback is the calendar item's
+            // own identifier rather than an empty string so that the field keeps its
+            // meaning -- something a later pass can look the event back up by.
+            event.eventIdentifier().map_or_else(
+                || event.calendarItemIdentifier().to_string(),
+                |id| id.to_string(),
+            ),
+            event.title().to_string(),
+            event
+                .calendar()
+                .map(|calendar| calendar.title().to_string())
+                .unwrap_or_default(),
+            start,
+            end,
+        )
+        .with_people(
+            event.organizer().map(|organizer| attendee(&organizer)),
+            attendees,
+        )
+        .with_invite(
+            event
+                .URL()
+                .and_then(|url| url.absoluteString())
+                .map(|url| url.to_string()),
+            // Both are absent-or-present, never present-and-empty: EventKit hands back an
+            // empty string for a field the organizer left blank in some accounts and nil
+            // in others, and `"notes": ""` in `session.json` would read as "the agenda
+            // was empty" rather than "there was no agenda".
+            text(event.location()),
+            text(event.notes()),
+        );
+
         Some(Candidate {
-            meeting: Meeting {
-                title: event.title().to_string(),
-                start,
-                end,
-                calendar: event
-                    .calendar()
-                    .map(|calendar| calendar.title().to_string())
-                    .unwrap_or_default(),
-                organizer: event.organizer().map(|organizer| attendee(&organizer)),
-                attendees,
-                url: event
-                    .URL()
-                    .and_then(|url| url.absoluteString())
-                    .map(|url| url.to_string()),
-                // Both are absent-or-present, never present-and-empty: EventKit hands back an
-                // empty string for a field the organizer left blank in some accounts and nil
-                // in others, and `"notes": ""` in `session.json` would read as "the agenda
-                // was empty" rather than "there was no agenda".
-                location: text(event.location()),
-                notes: text(event.notes()),
-                // `eventIdentifier` is nil only for an event not yet saved to a store, which
-                // one fetched *from* a store cannot be. The fallback is the calendar item's
-                // own identifier rather than an empty string so that the field keeps its
-                // meaning -- something a later pass can look the event back up by.
-                event_id: event.eventIdentifier().map_or_else(
-                    || event.calendarItemIdentifier().to_string(),
-                    |id| id.to_string(),
-                ),
-            },
+            meeting,
             all_day: event.isAllDay(),
             declined,
         })
@@ -522,12 +536,26 @@ fn timestamp(date: &NSDate) -> Option<Timestamp> {
 /// Every comparison ends in a total tie-break, on start and then on event id, because the
 /// framework guarantees no order at all for its results -- a rule that resolved ties by
 /// input position would pass a test one day and fail it the next.
+///
+/// The chosen meeting also carries a [`MeetingFit`], which is a *description* of the winning
+/// rule and never an input to it. **Which meeting is selected does not depend on the fit, and
+/// does not depend on the session's end.** A session running 2:24-3:40 against a 2:00-3:00
+/// standup and a 3:30 invite still resolves to the standup it started inside; it is simply
+/// marked [`MeetingFit::JoinedLate`] rather than presented as a meeting it certainly was.
 fn select(candidates: Vec<Candidate>, at: Timestamp) -> Option<Meeting> {
     let usable: Vec<Candidate> = candidates
         .into_iter()
         .filter(|c| !c.all_day && !c.declined)
         .collect();
 
+    choose(&usable, at).map(|(candidate, fit)| candidate.meeting.clone().with_fit(fit))
+}
+
+/// Which of the three rules wins, and what that says about the match.
+///
+/// Split out of [`select`] so that a stored [`Meeting`] is constructed in exactly one place
+/// and cannot escape without a fit having been decided for it.
+fn choose(usable: &[Candidate], at: Timestamp) -> Option<(&Candidate, MeetingFit)> {
     // Note that a zero-length event can never satisfy this (`at < end` fails) and falls
     // through to rules 2 and 3, which is what should happen to a bare calendar marker.
     let containing = usable
@@ -538,7 +566,15 @@ fn select(candidates: Vec<Candidate>, at: Timestamp) -> Option<Meeting> {
             a_len.cmp(&b_len).then_with(|| tie_break(a, b))
         });
     if let Some(candidate) = containing {
-        return Some(candidate.meeting.clone());
+        // The one place the fit carries information the selection did not already have: a
+        // session that began within `NEAR_WINDOW` of the start is the meeting, and one that
+        // began deep inside it may be a late join or an unrelated call.
+        let fit = if at.duration_since(candidate.meeting.start) <= NEAR_WINDOW {
+            MeetingFit::Started
+        } else {
+            MeetingFit::JoinedLate
+        };
+        return Some((candidate, fit));
     }
 
     let upcoming = usable
@@ -551,7 +587,7 @@ fn select(candidates: Vec<Candidate>, at: Timestamp) -> Option<Meeting> {
                 .then_with(|| tie_break(a, b))
         });
     if let Some(candidate) = upcoming {
-        return Some(candidate.meeting.clone());
+        return Some((candidate, MeetingFit::StartedEarly));
     }
 
     usable
@@ -565,7 +601,7 @@ fn select(candidates: Vec<Candidate>, at: Timestamp) -> Option<Meeting> {
                 .cmp(&a.meeting.end)
                 .then_with(|| tie_break(a, b))
         })
-        .map(|candidate| candidate.meeting.clone())
+        .map(|candidate| (candidate, MeetingFit::AfterEnd))
 }
 
 fn length(candidate: &Candidate) -> SignedDuration {
@@ -616,7 +652,7 @@ fn summarize(candidate: &Candidate) -> String {
         candidate.meeting.end,
         candidate.meeting.title,
         candidate.meeting.calendar,
-        candidate.meeting.attendees.len(),
+        candidate.meeting.attendee_count(),
     );
     if candidate.all_day {
         line.push_str("  all-day");
@@ -650,18 +686,13 @@ mod tests {
 
     fn candidate(id: &str, start: &str, end: &str) -> Candidate {
         Candidate {
-            meeting: Meeting {
-                title: id.to_owned(),
-                start: at(start),
-                end: at(end),
-                calendar: "Work".to_owned(),
-                organizer: None,
-                attendees: Vec::new(),
-                url: None,
-                location: None,
-                notes: None,
-                event_id: id.to_owned(),
-            },
+            meeting: Meeting::new(
+                id.to_owned(),
+                id.to_owned(),
+                "Work".to_owned(),
+                at(start),
+                at(end),
+            ),
             all_day: false,
             declined: false,
         }
@@ -671,18 +702,25 @@ mod tests {
         select(candidates, session_start()).map(|meeting| meeting.title)
     }
 
+    /// The chosen meeting's title *and* the fit that was recorded for it.
+    fn chosen_with_fit(candidates: Vec<Candidate>, at: Timestamp) -> Option<(String, MeetingFit)> {
+        select(candidates, at).map(|meeting| (meeting.title, meeting.fit))
+    }
+
     /// Asserts the answer does not depend on the order the framework happened to return the
-    /// events in -- which it explicitly does not guarantee.
+    /// events in -- which it explicitly does not guarantee. The fit is compared alongside the
+    /// title, because a fit that flipped with input order would be no better than a title that
+    /// did.
     fn chosen_either_way(candidates: Vec<Candidate>) -> Option<String> {
-        let forwards = chosen(candidates.clone());
+        let forwards = chosen_with_fit(candidates.clone(), session_start());
         let mut reversed = candidates;
         reversed.reverse();
         assert_eq!(
             forwards,
-            chosen(reversed),
+            chosen_with_fit(reversed, session_start()),
             "the answer depends on input order"
         );
-        forwards
+        forwards.map(|(title, _)| title)
     }
 
     #[test]
@@ -798,33 +836,152 @@ mod tests {
         assert_eq!(chosen(candidates), Some("marker".to_owned()));
     }
 
+    // --- the fit ----------------------------------------------------------------------
+    //
+    // Every outcome below is decided from plain `Candidate` values: no calendar, no grant, no
+    // recording, no session length anywhere in reach.
+
+    /// One 10:00-11:00 event, and every fit it can produce, keyed on where the session began.
+    ///
+    /// The boundaries sit exactly on `NEAR_WINDOW` on both sides of the start, which is where
+    /// a change to the policy would show up first.
+    #[test]
+    fn the_fit_is_decided_by_where_the_session_started() {
+        for (start, expected) in [
+            // Before the event: matched by proximity, and strong -- joining early is ordinary.
+            ("2026-08-15T09:50:00Z", Some(MeetingFit::StartedEarly)),
+            ("2026-08-15T09:59:59Z", Some(MeetingFit::StartedEarly)),
+            // On the start, and up to `NEAR_WINDOW` inside it.
+            ("2026-08-15T10:00:00Z", Some(MeetingFit::Started)),
+            ("2026-08-15T10:15:00Z", Some(MeetingFit::Started)),
+            // One second past `NEAR_WINDOW`: a late join, or a different call entirely.
+            ("2026-08-15T10:15:01Z", Some(MeetingFit::JoinedLate)),
+            ("2026-08-15T10:40:00Z", Some(MeetingFit::JoinedLate)),
+            // After the event ended, within `NEAR_WINDOW` of its end.
+            ("2026-08-15T11:05:00Z", Some(MeetingFit::AfterEnd)),
+            // Out of range on either side: no meeting at all, hence no fit.
+            ("2026-08-15T09:44:00Z", None),
+            ("2026-08-15T11:16:00Z", None),
+        ] {
+            let candidates = vec![candidate(
+                "standup",
+                "2026-08-15T10:00:00Z",
+                "2026-08-15T11:00:00Z",
+            )];
+            assert_eq!(
+                chosen_with_fit(candidates, at(start)).map(|(_, fit)| fit),
+                expected,
+                "a session starting at {start}"
+            );
+        }
+    }
+
+    /// The ticket's motivating case: a hop from one call to another inside a booked hour.
+    ///
+    /// The 2:00 standup is still selected -- the calendar cannot tell a late join from an
+    /// incident bridge, and rejecting this would reject the far more common late join too --
+    /// but it is no longer stated as though the session had been that meeting all along.
+    #[test]
+    fn a_session_starting_deep_inside_a_meeting_keeps_it_but_is_marked_uncertain() {
+        let standup = || {
+            vec![candidate(
+                "standup",
+                "2026-08-15T14:00:00Z",
+                "2026-08-15T15:00:00Z",
+            )]
+        };
+
+        assert_eq!(
+            chosen_with_fit(standup(), at("2026-08-15T14:24:00Z")),
+            Some(("standup".to_owned(), MeetingFit::JoinedLate)),
+            "the meeting must be kept, and marked"
+        );
+        assert!(!MeetingFit::JoinedLate.is_strong());
+
+        // The honest late-ish join of the same meeting is unaffected.
+        assert_eq!(
+            chosen_with_fit(standup(), at("2026-08-15T14:05:00Z")),
+            Some(("standup".to_owned(), MeetingFit::Started))
+        );
+    }
+
+    /// The claim the whole design rests on, asserted where a change would trip over it: the
+    /// session's *end* is not an input, so a recording that overran its event -- the most
+    /// ordinary outcome there is -- fits exactly as well as one that stopped on time.
+    ///
+    /// `select` is not even given a session end to consider; this test states that fact so
+    /// that any future attempt to introduce one has to delete an assertion that says why not.
+    #[test]
+    fn a_session_that_overruns_its_meeting_fits_no_worse_for_it() {
+        // The same session start against a meeting it covers entirely, a meeting it stops
+        // short of, and a meeting it runs hours past -- one input, so one answer.
+        for (end, note) in [
+            ("2026-08-15T10:05:00Z", "the meeting ended five minutes in"),
+            ("2026-08-15T11:00:00Z", "the meeting ran its full hour"),
+            (
+                "2026-08-15T18:00:00Z",
+                "the meeting was booked all afternoon",
+            ),
+        ] {
+            let candidates = vec![candidate("standup", "2026-08-15T10:00:00Z", end)];
+            assert_eq!(
+                chosen_with_fit(candidates, at("2026-08-15T10:00:00Z")).map(|(_, fit)| fit),
+                Some(MeetingFit::Started),
+                "{note}"
+            );
+        }
+    }
+
+    /// Selection is unchanged by the fit: the shortest containing event still wins even when
+    /// the session started deep inside it and the longer one would have scored better.
+    #[test]
+    fn the_fit_never_decides_which_meeting_is_selected() {
+        let candidates = vec![
+            // Starts at the session start -- a `Started` fit, if it were allowed to compete.
+            candidate("block", "2026-08-15T10:00:00Z", "2026-08-15T12:00:00Z"),
+            // Shorter, so it wins rule 1, even though the session joined it late.
+            candidate("standup", "2026-08-15T09:30:00Z", "2026-08-15T11:00:00Z"),
+        ];
+        assert_eq!(
+            chosen_with_fit(candidates, session_start()),
+            Some(("standup".to_owned(), MeetingFit::JoinedLate))
+        );
+    }
+
     /// AC #5, in the only place a meeting is ever rendered for a human: attendee names and
     /// addresses, the invite body and the location reach `session.json` and nothing else.
     #[test]
     fn the_debug_line_counts_attendees_without_naming_them() {
         let mut candidate = candidate("standup", "2026-08-15T09:55:00Z", "2026-08-15T10:25:00Z");
-        candidate.meeting.notes = Some("Dial-in 555-0100, passcode 481516".to_owned());
-        candidate.meeting.location = Some("Babbage Room, 12 Ada Street".to_owned());
-        candidate.meeting.attendees = vec![
-            Attendee {
-                name: Some("Grace Hopper".to_owned()),
-                email: Some("grace@example.com".to_owned()),
-                status: AttendeeStatus::Accepted,
-                is_you: false,
-            },
-            Attendee {
-                name: Some("Ada Lovelace".to_owned()),
-                email: Some("ada@example.com".to_owned()),
-                status: AttendeeStatus::Accepted,
-                is_you: true,
-            },
-        ];
-        candidate.meeting.organizer = Some(Attendee {
-            name: Some("Alan Turing".to_owned()),
-            email: Some("alan@example.com".to_owned()),
-            status: AttendeeStatus::Accepted,
-            is_you: false,
-        });
+        candidate.meeting = candidate
+            .meeting
+            .with_invite(
+                None,
+                Some("Babbage Room, 12 Ada Street".to_owned()),
+                Some("Dial-in 555-0100, passcode 481516".to_owned()),
+            )
+            .with_people(
+                Some(Attendee {
+                    name: Some("Alan Turing".to_owned()),
+                    email: Some("alan@example.com".to_owned()),
+                    status: AttendeeStatus::Accepted,
+                    is_you: false,
+                }),
+                vec![
+                    Attendee {
+                        name: Some("Grace Hopper".to_owned()),
+                        email: Some("grace@example.com".to_owned()),
+                        status: AttendeeStatus::Accepted,
+                        is_you: false,
+                    },
+                    Attendee {
+                        name: Some("Ada Lovelace".to_owned()),
+                        email: Some("ada@example.com".to_owned()),
+                        status: AttendeeStatus::Accepted,
+                        is_you: true,
+                    },
+                ],
+            );
 
         let line = summarize(&candidate);
 
@@ -1003,8 +1160,10 @@ mod tests {
         assert!(!converted.all_day);
         assert!(!converted.declined);
         // An unsaved event has no invitation behind it, so these are empty rather than wrong.
-        assert!(converted.meeting.attendees.is_empty());
+        assert_eq!(converted.meeting.attendee_count(), 0);
         assert!(converted.meeting.organizer.is_none());
+        // A converted event is a candidate, not yet a match: nothing has scored it.
+        assert_eq!(converted.meeting.fit, MeetingFit::Unknown);
         // And the identifier fallback holds: something a later pass can look the event up by,
         // never an empty string.
         assert!(!converted.meeting.event_id.is_empty());

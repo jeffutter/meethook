@@ -473,6 +473,13 @@ const BUILTIN_NAME: &str = "<meethook's built-in transcript.md.jinja>";
 ///   `meeting.notes`, `meeting.attendees`, ...), so a template and the JSON use one name per
 ///   concept. **Undefined**, not null, when the session was not recorded during a meeting,
 ///   which most are not.
+/// - `meeting.fit` -- how strongly the session's start supports that being the meeting, as one
+///   of `started`, `started_early`, `joined_late`, `after_end` or `unknown`. The first two are
+///   strong; the last three are tentative and are why the shipped default emits a
+///   `meeting_match:` key for them and nothing for the others. A recording that *overran* its
+///   meeting is not tentative -- the fit is a function of the start alone. `unknown` is what a
+///   `session.json` written before fits existed reads as, so it is never evidence of a good
+///   match. See `MeetingFit`.
 /// - `turns` -- each with `time` (the `MM:SS` label), `speaker`, `text`, `start`, `end`,
 ///   `source_track`, `cluster` and `speaker_id_confidence`.
 /// - `blocks` -- the same turns, with each run of consecutive same-speaker turns collapsed into
@@ -833,19 +840,26 @@ mod tests {
         )
     }
 
+    /// A meeting the session is claimed to have actually been -- the ordinary case, and the
+    /// one the frontmatter tests below are written around.
     fn meeting(title: &str, notes: Option<&str>) -> crate::Meeting {
-        crate::Meeting {
-            title: title.to_string(),
-            start: "2026-08-09T05:26:00Z".parse().unwrap(),
-            end: "2026-08-09T06:26:00Z".parse().unwrap(),
-            calendar: "Work".to_string(),
-            organizer: None,
-            attendees: Vec::new(),
-            url: None,
-            location: None,
-            notes: notes.map(str::to_string),
-            event_id: "event-1".to_string(),
-        }
+        meeting_with_fit(title, notes, crate::MeetingFit::Started)
+    }
+
+    fn meeting_with_fit(
+        title: &str,
+        notes: Option<&str>,
+        fit: crate::MeetingFit,
+    ) -> crate::Meeting {
+        crate::Meeting::new(
+            "event-1".to_string(),
+            title.to_string(),
+            "Work".to_string(),
+            "2026-08-09T05:26:00Z".parse().unwrap(),
+            "2026-08-09T06:26:00Z".parse().unwrap(),
+        )
+        .with_invite(None, None, notes.map(str::to_string))
+        .with_fit(fit)
     }
 
     /// A fixed render instant, so two renderings of the same input are comparable.
@@ -1133,6 +1147,35 @@ mod tests {
             lines[3], r#"meeting_description: "the agenda""#,
             "{rendered:?}"
         );
+    }
+
+    /// A weak match is visibly tentative in the frontmatter, and a strong one adds nothing.
+    ///
+    /// Driven over every [`crate::MeetingFit`] variant rather than the ones somebody
+    /// remembered, and asserted against `is_strong()` rather than against a second list: this
+    /// is what stops the template's list of tentative fits and the Rust predicate from
+    /// drifting apart when a variant is added.
+    #[test]
+    fn a_tentative_meeting_match_reaches_the_frontmatter_and_a_strong_one_does_not() {
+        for fit in crate::MeetingFit::ALL {
+            let md = metadata().with_meeting(Some(meeting_with_fit("Weekly sync", None, fit)));
+            let rendered = render(&two_turns(), &TranscriptTemplate::builtin(), &md);
+            let (lines, _) = frontmatter(&rendered);
+            let matched: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.starts_with("meeting_match: "))
+                .collect();
+
+            if fit.is_strong() {
+                assert!(matched.is_empty(), "{fit:?} must be silent: {rendered:?}");
+                continue;
+            }
+            assert_eq!(matched.len(), 1, "{fit:?} must be marked: {rendered:?}");
+            // The rendered value is the serde spelling, so the frontmatter and `session.json`
+            // say the same word for the same fit.
+            let spelling = serde_json::to_string(&fit).unwrap();
+            assert_eq!(*matched[0], format!("meeting_match: {spelling}"));
+        }
     }
 
     /// Acceptance criterion #4: most sessions are recorded outside any meeting, and those must

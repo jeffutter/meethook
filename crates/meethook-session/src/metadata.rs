@@ -62,11 +62,98 @@ pub struct Attendee {
     pub is_you: bool,
 }
 
+/// How strongly a session's start supports the meeting it was matched to.
+///
+/// **The fit is about the start, and only about the start.** A session's *end* is not an input
+/// to any variant here, deliberately: meetings run long routinely, so a recording that
+/// overruns its event end is the most ordinary outcome there is and must never fit worse for
+/// it. A coverage ratio -- session length over event length -- would score exactly that
+/// ordinary case as a weak match, which is why there is not one.
+///
+/// What the start can say is which of three shapes the match has: the recording began with the
+/// meeting, it began materially after the meeting had already started, or it was never
+/// contained by the meeting at all and was matched by adjacency. The middle case is the one
+/// worth marking. "Joined the 2:00 standup twenty minutes late" and "left the standup and took
+/// an unrelated call" are identical in start and end times, so no rule sharp enough to reject
+/// the second survives the first -- which is far more common. This type therefore does not
+/// change *which* meeting is selected. It records how strong the claim is, so a consumer can
+/// tell a meeting a session *was* from a meeting a session merely *sat inside*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingFit {
+    /// Nobody scored this match: a `session.json` written before fits existed, or a meeting
+    /// that never went through the recorder's selection. Both read the same way downstream,
+    /// which is the point of one variant covering them -- neither is evidence of a good match.
+    #[default]
+    Unknown,
+    /// The recording began at, or shortly after, the meeting's start, inside it. The strong
+    /// case, and the one an ordinary join produces.
+    Started,
+    /// The recording began before the meeting started, and was matched to it by proximity.
+    /// Strong -- joining a call early is ordinary -- but distinct from [`MeetingFit::Started`]
+    /// because it was never contained by the event.
+    StartedEarly,
+    /// The recording began well after the meeting had already started, though still inside it.
+    /// A late join or an entirely unrelated call; the calendar cannot tell which, and saying so
+    /// is the whole of what this variant claims.
+    JoinedLate,
+    /// The recording began after the meeting had already ended, and was matched to it by
+    /// proximity. The ad-hoc call that inherits the invite it happened to follow.
+    AfterEnd,
+}
+
+impl MeetingFit {
+    /// Every variant, so a caller iterating outcomes cannot list only the ones it remembered.
+    pub const ALL: [MeetingFit; 5] = [
+        MeetingFit::Unknown,
+        MeetingFit::Started,
+        MeetingFit::StartedEarly,
+        MeetingFit::JoinedLate,
+        MeetingFit::AfterEnd,
+    ];
+
+    /// Whether the session's start actually supports this being the meeting.
+    ///
+    /// Written as an exhaustive `match` rather than a `matches!` with a wildcard so that a
+    /// variant added later cannot default into "strong" by omission -- it will not compile
+    /// until somebody decides.
+    pub fn is_strong(&self) -> bool {
+        match self {
+            MeetingFit::Started | MeetingFit::StartedEarly => true,
+            MeetingFit::Unknown | MeetingFit::JoinedLate | MeetingFit::AfterEnd => false,
+        }
+    }
+
+    /// How to qualify this meeting where it is shown to a person, or `None` when the fit is
+    /// strong enough to state the meeting plainly.
+    ///
+    /// The wording lives here rather than in the CLI, on the precedent this crate's other
+    /// user-facing values set: the library owns the sentence, the caller owns the stream, and
+    /// the sentence is then testable without a terminal. It names no attendee and no invite
+    /// content, so it is safe on any surface the title itself is safe on.
+    pub fn caveat(&self) -> Option<&'static str> {
+        match self {
+            MeetingFit::Started | MeetingFit::StartedEarly => None,
+            MeetingFit::JoinedLate => {
+                Some("uncertain: the recording began after this meeting had started")
+            }
+            MeetingFit::AfterEnd => {
+                Some("uncertain: the recording began after this meeting had ended")
+            }
+            MeetingFit::Unknown => {
+                Some("unverified: this session was recorded before meethook scored the match")
+            }
+        }
+    }
+}
+
 /// The calendar meeting a session was recorded during.
 ///
 /// The attendee list is the load-bearing part rather than decoration: it is the per-session
 /// set of people who could plausibly be speaking, which is what a speaker-identification
-/// pass needs to avoid matching a voice against every person ever enrolled.
+/// pass needs to avoid matching a voice against every person ever enrolled. It is reachable
+/// as a roster only through [`Meeting::speaker_roster`], which consults [`Meeting::fit`] --
+/// see that method for why.
 ///
 /// `notes` is the invite body, stored because it is the field most likely to answer "what
 /// was this meeting about" for a transcript that has outlived anyone's memory of it. It is
@@ -87,8 +174,12 @@ pub struct Meeting {
     pub calendar: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organizer: Option<Attendee>,
+    /// Private, and the one field here that is: the list is reachable as a *roster* only
+    /// through [`Meeting::speaker_roster`]. It still serializes exactly as it always did, so a
+    /// user's own transcript template can print the names into their own notes -- the guard is
+    /// on code paths that consume the list to decide who is speaking, not on the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attendees: Vec<Attendee>,
+    attendees: Vec<Attendee>,
     /// The event's own URL, which for most video-conferencing invites is the join link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -104,6 +195,90 @@ pub struct Meeting {
     /// `EKEvent.eventIdentifier`, stored so a later pass can re-resolve the event against
     /// the live calendar rather than trusting this snapshot of it.
     pub event_id: String,
+    /// How strongly the session's start supports this being the meeting.
+    ///
+    /// `default` on the way in, with no `skip_serializing_if`: every meeting this build writes
+    /// has a fit, so an absent key only ever means a `session.json` written before fits
+    /// existed -- which reads as [`MeetingFit::Unknown`], i.e. not a strong match. Living on
+    /// [`Meeting`] rather than on [`SessionMetadata`] is what keeps a session with no meeting
+    /// writing byte-identical JSON: there is no meeting to hang a fit on.
+    #[serde(default)]
+    pub fit: MeetingFit,
+}
+
+impl Meeting {
+    /// The identity of a calendar event, with nobody attached and nothing scored.
+    ///
+    /// A constructor rather than a struct literal because the `attendees` field is private;
+    /// the people, the invite fields and the fit are attached by the builders below, in the
+    /// shape [`SessionMetadata::with_meeting`] already establishes here.
+    pub fn new(
+        event_id: String,
+        title: String,
+        calendar: String,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Self {
+        Meeting {
+            title,
+            start,
+            end,
+            calendar,
+            organizer: None,
+            attendees: Vec::new(),
+            url: None,
+            location: None,
+            notes: None,
+            event_id,
+            fit: MeetingFit::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub fn with_people(mut self, organizer: Option<Attendee>, attendees: Vec<Attendee>) -> Self {
+        self.organizer = organizer;
+        self.attendees = attendees;
+        self
+    }
+
+    #[must_use]
+    pub fn with_invite(
+        mut self,
+        url: Option<String>,
+        location: Option<String>,
+        notes: Option<String>,
+    ) -> Self {
+        self.url = url;
+        self.location = location;
+        self.notes = notes;
+        self
+    }
+
+    #[must_use]
+    pub fn with_fit(mut self, fit: MeetingFit) -> Self {
+        self.fit = fit;
+        self
+    }
+
+    /// The people who could plausibly be speaking in this session, or `None` when the match is
+    /// too weak to say.
+    ///
+    /// The only way to obtain the attendee list as a whole, and the reason the field is
+    /// private. A per-session attendee whitelist is what fixes cross-session speaker
+    /// contamination -- doc-001 records that finding -- so seeding one from a meeting the
+    /// session merely *sat inside* is that same contamination arriving through the calendar
+    /// instead. Routing the roster through [`Meeting::fit`] means a future
+    /// speaker-identification pass cannot consume a weak match by not knowing to ask.
+    pub fn speaker_roster(&self) -> Option<&[Attendee]> {
+        self.fit.is_strong().then_some(self.attendees.as_slice())
+    }
+
+    /// How many people were invited -- what a diagnostic line needs, and all it needs.
+    ///
+    /// Deliberately not a way around [`Meeting::speaker_roster`]: a count names nobody.
+    pub fn attendee_count(&self) -> usize {
+        self.attendees.len()
+    }
 }
 
 /// `session.json`: the marker that a session shut down cleanly, plus the sync data

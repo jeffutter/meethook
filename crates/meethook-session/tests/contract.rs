@@ -8,8 +8,9 @@ use std::path::Path;
 
 use jiff::Timestamp;
 use meethook_session::{
-    Attendee, AttendeeStatus, Classification, Meeting, Paths, SESSION_SCHEMA_VERSION, SessionId,
-    SessionMetadata, SessionPaths, TrackSync, create_session_dir, discover_sessions, write_atomic,
+    Attendee, AttendeeStatus, Classification, Meeting, MeetingFit, Paths, SESSION_SCHEMA_VERSION,
+    SessionId, SessionMetadata, SessionPaths, TrackSync, create_session_dir, discover_sessions,
+    write_atomic,
 };
 use tempfile::TempDir;
 
@@ -150,28 +151,33 @@ fn metadata_never_duplicates_wav_header_fields() {
 // --- the meeting field, and its compatibility in both directions ---------------------
 
 fn sample_meeting() -> Meeting {
-    Meeting {
-        title: "Incident review".to_owned(),
-        start: "2026-08-09T05:00:00Z".parse().unwrap(),
-        end: "2026-08-09T06:00:00Z".parse().unwrap(),
-        calendar: "Work".to_owned(),
-        organizer: Some(Attendee {
+    Meeting::new(
+        "EVENT-ABC".to_owned(),
+        "Incident review".to_owned(),
+        "Work".to_owned(),
+        "2026-08-09T05:00:00Z".parse().unwrap(),
+        "2026-08-09T06:00:00Z".parse().unwrap(),
+    )
+    .with_people(
+        Some(Attendee {
             name: Some("Ada Lovelace".to_owned()),
             email: Some("ada@example.com".to_owned()),
             status: AttendeeStatus::Accepted,
             is_you: false,
         }),
-        attendees: vec![Attendee {
+        vec![Attendee {
             name: Some("Grace Hopper".to_owned()),
             email: Some("grace@example.com".to_owned()),
             status: AttendeeStatus::Tentative,
             is_you: true,
         }],
-        url: Some("https://example.com/j/12345".to_owned()),
-        location: Some("Babbage Room".to_owned()),
-        notes: Some("Agenda: the pager, then the fix".to_owned()),
-        event_id: "EVENT-ABC".to_owned(),
-    }
+    )
+    .with_invite(
+        Some("https://example.com/j/12345".to_owned()),
+        Some("Babbage Room".to_owned()),
+        Some("Agenda: the pager, then the fix".to_owned()),
+    )
+    .with_fit(MeetingFit::Started)
 }
 
 /// The old-file/new-build direction, written as a literal rather than as a
@@ -224,12 +230,115 @@ fn session_json_with_a_meeting_still_reads_on_a_build_without_one() {
 
 /// A session recorded outside any meeting must write exactly the bytes it wrote before this
 /// field existed -- that equivalence is why `SESSION_SCHEMA_VERSION` did not move.
+///
+/// The fit lives on the meeting rather than on the session for exactly this reason: with no
+/// meeting there is nothing to hang one on, so no `fit` key can appear either.
 #[test]
 fn a_session_with_no_meeting_writes_no_meeting_key() {
     let json = serde_json::to_string(&sample_metadata("20260809-052607")).unwrap();
     assert!(
         !json.contains("meeting"),
         "an absent meeting must be absent, not null: {json}"
+    );
+    assert!(
+        !json.contains("fit"),
+        "a session with no meeting has no fit: {json}"
+    );
+}
+
+// --- the fit ---------------------------------------------------------------------------
+
+/// A `session.json` whose meeting predates fits must not read as a *good* match.
+///
+/// Written as a literal rather than as a re-serialization, for the same reason
+/// `session_json_written_before_meetings_still_reads` gives: a re-serialization would track
+/// the struct through every future change and so could never fail.
+#[test]
+fn a_meeting_written_before_fits_reads_as_unknown_and_yields_no_roster() {
+    let (_tmp, paths) = temp_root();
+    let session = make_session(&paths, "20260809-052607", &[]);
+    let before = r#"{
+      "session_id": "20260809-052607",
+      "schema_version": 1,
+      "start_time": "2026-08-09T05:26:00Z",
+      "mic": { "host_ticks": 9007199254740993, "timebase_numer": 125, "timebase_denom": 3 },
+      "speaker": { "host_ticks": 9007199254740995, "timebase_numer": 125, "timebase_denom": 3 },
+      "meeting": {
+        "title": "Incident review",
+        "start": "2026-08-09T05:00:00Z",
+        "end": "2026-08-09T06:00:00Z",
+        "calendar": "Work",
+        "attendees": [
+          { "name": "Grace Hopper", "status": "tentative", "is_you": true }
+        ],
+        "event_id": "EVENT-ABC"
+      }
+    }"#;
+    fs::write(session.session_json(), before).unwrap();
+
+    let meeting = SessionMetadata::read(&session.session_json())
+        .unwrap()
+        .meeting
+        .expect("the meeting still reads");
+
+    assert_eq!(meeting.title, "Incident review");
+    assert_eq!(meeting.fit, MeetingFit::Unknown);
+    assert!(!meeting.fit.is_strong());
+    // The people are still on disk -- this is not redaction -- but they are not a roster.
+    assert_eq!(meeting.attendee_count(), 1);
+    assert_eq!(meeting.speaker_roster(), None);
+}
+
+/// Every fit survives a round trip through `session.json`, spelled in snake case.
+#[test]
+fn every_fit_round_trips_through_session_json() {
+    for fit in MeetingFit::ALL {
+        let metadata =
+            sample_metadata("20260809-052607").with_meeting(Some(sample_meeting().with_fit(fit)));
+        let json = serde_json::to_string(&metadata).unwrap();
+        let decoded: SessionMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded, metadata, "{fit:?}");
+        assert_eq!(decoded.meeting.unwrap().fit, fit);
+    }
+}
+
+/// The guard doc-001's finding asks for: the attendee list is reachable as a speaker roster
+/// only through the fit, so a weak match cannot seed an identification pass with the wrong
+/// people. Driven over every variant, so a new one has to decide rather than inherit.
+#[test]
+fn the_attendee_roster_is_only_available_for_a_strong_match() {
+    for fit in MeetingFit::ALL {
+        let meeting = sample_meeting().with_fit(fit);
+        assert_eq!(meeting.attendee_count(), 1, "{fit:?}");
+
+        match meeting.speaker_roster() {
+            Some(roster) => {
+                assert!(fit.is_strong(), "{fit:?} handed out a roster");
+                assert_eq!(roster.len(), 1);
+            }
+            None => assert!(!fit.is_strong(), "{fit:?} withheld a roster"),
+        }
+    }
+}
+
+/// A weak fit always has a caveat to show a person, and a strong one never does -- the
+/// property the record command's finish line and the transcript frontmatter both rely on.
+#[test]
+fn a_caveat_exists_exactly_when_the_fit_is_weak() {
+    for fit in MeetingFit::ALL {
+        assert_eq!(
+            fit.caveat().is_none(),
+            fit.is_strong(),
+            "{fit:?}: {:?}",
+            fit.caveat()
+        );
+    }
+    // And the wording names the timing rather than any meeting content.
+    let caveat = MeetingFit::JoinedLate.caveat().unwrap();
+    assert!(
+        caveat.contains("after this meeting had started"),
+        "{caveat}"
     );
 }
 
@@ -244,9 +353,13 @@ fn a_meeting_round_trips_with_its_attendees() {
     assert_eq!(meeting.title, "Incident review");
     assert_eq!(meeting.calendar, "Work");
     assert_eq!(meeting.event_id, "EVENT-ABC");
-    assert_eq!(meeting.attendees.len(), 1);
-    assert!(meeting.attendees[0].is_you);
-    assert_eq!(meeting.attendees[0].status, AttendeeStatus::Tentative);
+    // Read through the guard, so this also asserts that a strong match yields the roster.
+    let roster = meeting
+        .speaker_roster()
+        .expect("a strong match has a roster");
+    assert_eq!(roster.len(), 1);
+    assert!(roster[0].is_you);
+    assert_eq!(roster[0].status, AttendeeStatus::Tentative);
     assert_eq!(
         meeting.organizer.as_ref().unwrap().email.as_deref(),
         Some("ada@example.com")
@@ -277,11 +390,8 @@ fn meeting_metadata_stores_the_invite_body_and_location() {
 /// and empty mean different things to anything reading these files later.
 #[test]
 fn a_meeting_without_notes_writes_no_notes_key() {
-    let bare = Meeting {
-        notes: None,
-        location: None,
-        ..sample_meeting()
-    };
+    let bare =
+        sample_meeting().with_invite(Some("https://example.com/j/12345".to_owned()), None, None);
     let json = serde_json::to_string(&sample_metadata("20260809-052607").with_meeting(Some(bare)))
         .unwrap();
 

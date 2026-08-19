@@ -8,6 +8,9 @@ meeting_title: {{ meeting.title | yaml }}
 {%- if meeting.notes %}
 meeting_description: {{ meeting.notes | yaml }}
 {%- endif %}
+{%- if meeting.fit in ["joined_late", "after_end", "unknown"] %}
+meeting_match: {{ meeting.fit | yaml }}
+{%- endif %}
 {%- endif %}
 ---
 

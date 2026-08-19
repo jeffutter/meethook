@@ -44,7 +44,8 @@ pub use atomic::{write_atomic, write_atomic_with};
 pub use discovery::{Classification, DiscoveredSession, discover_sessions};
 pub use id::{SessionId, create_session_dir, discard_session_dir};
 pub use metadata::{
-    Attendee, AttendeeStatus, Meeting, SESSION_SCHEMA_VERSION, SessionMetadata, TrackSync,
+    Attendee, AttendeeStatus, Meeting, MeetingFit, SESSION_SCHEMA_VERSION, SessionMetadata,
+    TrackSync,
 };
 pub use paths::{Paths, SessionPaths};
 pub use speaker_clusters::{

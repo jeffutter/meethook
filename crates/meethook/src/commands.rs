@@ -166,12 +166,8 @@ impl Capture for SessionCapture<'_> {
             recording.speaker.seconds(),
             recording.paths.dir().display()
         );
-        // The title only, and only when there is one. It is the sole user-visible evidence
-        // that the calendar lookup worked, and the one field of a meeting that is safe to
-        // put on a terminal: attendee names and addresses are written to session.json for
-        // speaker identification and are deliberately never printed.
         if let Some(meeting) = &recording.metadata.meeting {
-            println!("  meeting   {}", meeting.title);
+            println!("{}", meeting_line(meeting));
         }
         Ok(())
     }
@@ -954,6 +950,27 @@ fn parse_session_ids(raw: &[String]) -> Result<Vec<SessionId>> {
     Ok(ids)
 }
 
+/// What `record` prints about the meeting a finished session was matched to.
+///
+/// The title only, and only the title. It is the sole user-visible evidence that the calendar
+/// lookup worked, and it is the one field of a meeting that is safe to put on a terminal:
+/// attendee names and addresses are written to `session.json` for speaker identification and
+/// are deliberately never printed, and neither is the invite body.
+///
+/// A match the session's start does not actually support is qualified rather than stated flat,
+/// so a session that merely *sat inside* a booked hour does not read as that meeting. The
+/// wording is `MeetingFit`'s own -- this crate owns the stream, the library owns the sentence
+/// -- and it names only the timing, so the rule above survives it.
+///
+/// A function rather than the `println!` it replaced so that the whole rule is decidable in
+/// `cargo test` with no terminal, which is the split this module's own documentation describes.
+fn meeting_line(meeting: &meethook_session::Meeting) -> String {
+    match meeting.fit.caveat() {
+        Some(caveat) => format!("  meeting   {}  ({caveat})", meeting.title),
+        None => format!("  meeting   {}", meeting.title),
+    }
+}
+
 /// The record loop's sequencing, exercised without a microphone.
 ///
 /// This is where "a blip does not split a session", "a mute does not end one", "two calls
@@ -968,7 +985,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{Capture, Event, Outcome, Timing, await_end, record_loop};
+    use super::{Capture, Event, Outcome, Timing, await_end, meeting_line, record_loop};
 
     /// Long enough that scheduling noise cannot be mistaken for a timeout, short enough
     /// that the suite stays fast.
@@ -988,6 +1005,79 @@ mod tests {
             let _ = feeder.send(event);
         });
         (tx, rx)
+    }
+
+    /// The finish line says the title plainly for a match the start supports, and qualifies
+    /// one it does not -- driven over every fit so a variant added later cannot slip through
+    /// unqualified.
+    ///
+    /// It also re-asserts the standing rule on this line, against a meeting carrying every
+    /// field that must never reach a terminal: no attendee, no organizer, no location and no
+    /// invite body, however the fit came out.
+    #[test]
+    fn the_finish_line_qualifies_a_meeting_the_session_start_does_not_support() {
+        use meethook_session::{Attendee, AttendeeStatus, Meeting, MeetingFit};
+
+        for fit in MeetingFit::ALL {
+            let meeting = Meeting::new(
+                "EVENT-ABC".to_owned(),
+                "Incident review".to_owned(),
+                "Work".to_owned(),
+                "2026-08-15T10:00:00Z".parse().unwrap(),
+                "2026-08-15T11:00:00Z".parse().unwrap(),
+            )
+            .with_people(
+                Some(Attendee {
+                    name: Some("Alan Turing".to_owned()),
+                    email: Some("alan@example.com".to_owned()),
+                    status: AttendeeStatus::Accepted,
+                    is_you: false,
+                }),
+                vec![Attendee {
+                    name: Some("Grace Hopper".to_owned()),
+                    email: Some("grace@example.com".to_owned()),
+                    status: AttendeeStatus::Accepted,
+                    is_you: true,
+                }],
+            )
+            .with_invite(
+                None,
+                Some("Babbage Room".to_owned()),
+                Some("Dial-in 555-0100, passcode 481516".to_owned()),
+            )
+            .with_fit(fit);
+
+            let line = meeting_line(&meeting);
+            assert!(line.contains("Incident review"), "{fit:?}: {line}");
+
+            if fit.is_strong() {
+                assert_eq!(line, "  meeting   Incident review", "{fit:?}");
+            } else {
+                let caveat = fit.caveat().expect("a weak fit has a caveat");
+                assert!(line.contains(caveat), "{fit:?}: {line}");
+                assert!(
+                    line.contains("uncertain") || line.contains("unverified"),
+                    "{line}"
+                );
+            }
+
+            for secret in [
+                "Grace",
+                "Hopper",
+                "grace@example.com",
+                "Alan",
+                "Turing",
+                "@",
+                "Babbage",
+                "Dial-in",
+                "481516",
+            ] {
+                assert!(
+                    !line.contains(secret),
+                    "the finish line leaks {secret:?}: {line}"
+                );
+            }
+        }
     }
 
     #[test]
