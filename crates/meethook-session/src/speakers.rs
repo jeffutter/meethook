@@ -21,56 +21,92 @@ use crate::{Error, Paths, Result, write_atomic};
 /// reading a v2 file replaces only the *first* row for a name and silently keeps the rest as
 /// stale claims about a voice. That downgrade is what [`crate::Error::UnsupportedSchema`]
 /// catches from the other side.
-pub const ENROLLED_SPEAKERS_SCHEMA_VERSION: u32 = 2;
+///
+/// # v2 -> v3, one optional field
+///
+/// v3 adds [`EnrolledSpeaker::clip_seconds`]: how much speech the row was built from, which is
+/// what [`EnrolledSpeakers::store_reference`] now compares when the cap is full. The field is
+/// optional and absent means *unknown*, so every v2 row is a valid v3 row and the migration is
+/// again a normalization rather than a transformation.
+///
+/// The downgrade hazard is the same shape as before and is why the number moves: a v2-writing
+/// binary round-tripping a v3 file drops the lengths, and every row silently becomes unmeasured
+/// -- which does not lose a reference, but does lose the tool's ability to make room for a
+/// better one.
+pub const ENROLLED_SPEAKERS_SCHEMA_VERSION: u32 = 3;
 
 /// The oldest `speakers.json` this build can read. Below this nothing exists to migrate from.
 const OLDEST_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// How many recordings of one person are kept as references.
 ///
-/// # Why there is a cap at all, and why it is five
+/// # Why there is a cap at all, and why it is ten
 ///
-/// The cost of the extra dot products is not the argument -- five 256-dim products per person
-/// is nothing. The argument is **false accepts: every extra reference is another independent
-/// draw at clearing the identification cut for a stranger.** TASK-027.01 measured the nearest
-/// impostor pair over 1014 LibriSpeech pairs at 0.362 against a 0.350 cut, i.e. 0.012 of
-/// headroom at one or two references, so multiplying the draws is not free. Against that, the
-/// measured gain from the *second* reference was +2.1pp with overlapping Wilson intervals --
-/// real but small -- and a fifth reference cannot plausibly be worth more than the second.
+/// The cost of the extra dot products is not the argument -- ten 256-dim products per person is
+/// nothing. The argument is **false accepts: every extra reference is another independent draw
+/// at clearing the identification cut for a stranger.** TASK-027.01 measured the nearest
+/// impostor pair over 1014 LibriSpeech pairs at 0.362, and `transcribe`'s `IDENTIFY_DISTANCE`
+/// now sits at 0.400 -- so the draws are no longer free of each other the way they were when the
+/// cut was 0.350 and the measured impostor population sat entirely above it.
 ///
-/// Five covers a person met in five different rooms while bounding the impostor exposure at
-/// 5x. It is a judgement rather than a measurement, and the measurement that would revise it
-/// is scoring `k = 1..3` references per person on the chapter cache.
+/// Ten rather than five because the binding constraint in practice was not impostor exposure
+/// but **running out of room for a better recording of somebody already enrolled**: a person met
+/// in a sixth meeting had nothing to offer the database, however much cleaner the sixth
+/// recording was than the five it could not displace. Five was already a judgement rather than
+/// a measurement, and doubling it is the same judgement with the eviction rule below carrying
+/// the risk that the extra draws add.
 ///
-/// # What happens at the cap: the new reference is refused, nothing stored is dropped
+/// # What happens at the cap: the longest clips win, and only strictly better evidence displaces
 ///
-/// [`EnrolledSpeakers::store_reference`] returns [`Stored::AtCapacity`] and writes nothing.
-/// The caller names the voice against that session instead -- the same `speaker_names.json`
+/// [`EnrolledSpeakers::store_reference`] compares the new clip's length against the shortest
+/// [`EnrolledSpeaker::clip_seconds`] this name holds. If the new one is longer it replaces that
+/// shortest row ([`Stored::Replaced`]); otherwise nothing is written ([`Stored::AtCapacity`])
+/// and the caller names the voice against that session instead -- the same `speaker_names.json`
 /// path a below-floor voice takes -- so the transcript still reads the right person and the
 /// recording simply does not contribute to recognising them.
 ///
-/// The two alternatives are worse rather than merely different:
+/// A cap holding the ten *longest* recordings of a person is a better database than one holding
+/// the first ten, and it is what pays for the doubled draw count: a longer clip yields a
+/// tighter, less noisy centroid, so the references that survive are individually less likely to
+/// clear the cut for a stranger than the ones they displaced.
 ///
-/// - **Drop the oldest.** The dropped reference may be the only thing naming a voice in some
-///   past session, whose transcript then reads "Unknown N" on the next `enroll` run over it --
-///   which is exactly the defect this reference set exists to end. Worse, nothing here records
-///   provenance, so the tool could not even say which session it had broken.
-/// - **Merge the nearest pair.** That is averaging, which TASK-027.01 measured halving the
-///   impostor headroom (0.376 -> 0.362), and a blended vector equals no cluster on disk, so it
-///   would silently stop [`EnrolledSpeakers::forget_reference`]'s exact-equality removal from
-///   ever firing again.
+/// **A row with no measured length is never the one evicted.** Absent lengths come from a
+/// pre-v3 file, where the only thing knowable about the clip is that it cleared the reference
+/// floor -- it could equally have been six seconds or six minutes. Treating unknown as short
+/// would preferentially destroy exactly the long, good references written before the field
+/// existed, so the rule declines to guess and those rows are removable only by hand.
 ///
-/// What makes refusing acceptable rather than merely safest is that the user can now make room
-/// deliberately: `meethook speakers` says which voices each of a person's recordings is naming, and
-/// `meethook forget` removes the one they choose after printing what that costs. So the provenance
-/// this file does not record is *derived* on demand, by whoever is in a position to decide.
-pub const MAX_REFERENCES_PER_SPEAKER: usize = 5;
+/// # What this reverses, and why that is safe now
+///
+/// Before TASK-027.02's cap grew this rule, *nothing* stored was ever dropped, because "drop the
+/// oldest" can take away the only reference naming a voice in some past session, whose
+/// transcript then reads "Unknown N" on the next `enroll` run over it. That hazard is real and
+/// has not gone away. What makes it acceptable here is that this is not "drop the oldest": a row
+/// is displaced only by a **longer recording of the same person**, so the evidence that replaces
+/// it is strictly stronger than the evidence removed, and a voice the short clip was naming is
+/// more likely to be named by the long one than not. Callers report the eviction and its length
+/// on the line that reports the enrollment, because an enrollment that vanishes without a line
+/// about it is worse than the bug.
+///
+/// The alternative that stays rejected is **merging the nearest pair**. That is averaging, which
+/// TASK-027.01 measured halving the impostor headroom (0.376 -> 0.362), and a blended vector
+/// equals no cluster on disk, so it would silently stop
+/// [`EnrolledSpeakers::forget_reference`]'s exact-equality removal from ever firing again.
+///
+/// Deliberate removal remains the escape hatch for everything this rule will not do: `meethook
+/// speakers` says which voices each of a person's recordings is naming, and `meethook forget`
+/// removes the one the user chooses after printing what that costs.
+pub const MAX_REFERENCES_PER_SPEAKER: usize = 10;
 
 /// What [`EnrolledSpeakers::store_reference`] did, so a caller can say so in one line.
 ///
-/// An enum rather than a bool-and-count, because the four cases want four different sentences
+/// An enum rather than a bool-and-count, because the five cases want five different sentences
 /// and the caller must not have to re-derive which it was by counting rows itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`, unlike its first four variants alone: [`Stored::AtCapacity`] carries the
+/// shortest length held so the caller can say *why* the recording was refused, and a future
+/// field that is not a number should not be blocked by a derive nothing needs.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stored {
     /// The first reference for this name: a person who was not in the database is now.
     Enrolled,
@@ -82,11 +118,26 @@ pub enum Stored {
     ///
     /// Re-answering the same voice with the same name is the common way to reach this -- a
     /// second `enroll` run over one session under `--correct` -- and duplicating the row would
-    /// spend one of the five slots on no new information.
+    /// spend one of the slots on no new information.
     AlreadyHeld,
 
-    /// Nothing was stored: this name already holds [`MAX_REFERENCES_PER_SPEAKER`].
-    AtCapacity { held: usize },
+    /// The name was full, and this recording was longer than the shortest it held, which was
+    /// dropped to make room. `held` stays at [`MAX_REFERENCES_PER_SPEAKER`].
+    ///
+    /// `evicted_seconds` is what went, so the caller can print the trade it just made. The
+    /// dropped row may have been the only thing naming a voice in some other session -- see
+    /// [`MAX_REFERENCES_PER_SPEAKER`] for why that is accepted here and nowhere else -- which is
+    /// why this is a distinct variant rather than an [`Stored::Added`] at the cap.
+    Replaced { held: usize, evicted_seconds: f64 },
+
+    /// Nothing was stored: this name already holds [`MAX_REFERENCES_PER_SPEAKER`], none of them
+    /// shorter than what was offered.
+    ///
+    /// `shortest` is the smallest measured length held, or `None` when every row this name holds
+    /// predates [`EnrolledSpeaker::clip_seconds`] and so cannot be compared against anything.
+    /// The two cases want different sentences: one says the stored recordings are better, the
+    /// other says their lengths are simply not known.
+    AtCapacity { held: usize, shortest: Option<f64> },
 }
 
 /// A name that lost a reference to somebody else's correction, and what it has left.
@@ -132,6 +183,21 @@ pub struct EnrolledSpeaker {
     /// meethook ships against); this file does not pin it, so a future model change is a
     /// schema bump rather than a lie in a constant here.
     pub embedding: Vec<f32>,
+
+    /// How much speech the cluster this was built from held, in seconds. `None` for a row
+    /// written before v3, where it is genuinely unknown rather than zero.
+    ///
+    /// The one thing this file records about a reference beyond the voice and the name, and it
+    /// earns that place by being what [`EnrolledSpeakers::store_reference`] decides on at the
+    /// cap: longer clip, tighter centroid, better reference, so the shortest is the one to
+    /// displace. It is a *quality* measure, deliberately not provenance -- it does not say which
+    /// session or cluster the row came from, which is still derived on demand by re-labelling.
+    ///
+    /// `None` is not `0.0` anywhere that matters: an unmeasured row never loses the comparison
+    /// above, because "unknown" and "shortest" are different claims and only one of them is
+    /// supported by the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_seconds: Option<f64>,
 }
 
 /// `speakers.json`: everybody meethook can put a name to, across all sessions.
@@ -195,15 +261,23 @@ impl EnrolledSpeakers {
         names
     }
 
-    /// Records `embedding` as another recording of `name`, reporting what that did.
+    /// Records `embedding`, built from `clip_seconds` of speech, as another recording of `name`,
+    /// reporting what that did.
     ///
-    /// Nothing existing is ever modified or removed: the only outcomes are one row appended or
-    /// no change at all. That is what makes the caller's promise -- naming a voice never costs
-    /// an earlier name -- true of the database layer rather than merely intended above it.
+    /// Below the cap the only outcomes are one row appended or no change at all. At the cap the
+    /// one thing that can be removed is **another recording of this same name, shorter than this
+    /// one** -- see [`MAX_REFERENCES_PER_SPEAKER`] for why that trade is made and why no other
+    /// row is ever touched. So the caller's promise still holds where it was always the point:
+    /// naming a voice never costs somebody *else* their name.
     ///
     /// Names match exactly, so "alice" and "Alice" are two people, which is the same rule the
     /// rest of the tool applies to a name the user typed.
-    pub fn store_reference(&mut self, name: &str, embedding: Vec<f32>) -> Stored {
+    pub fn store_reference(
+        &mut self,
+        name: &str,
+        embedding: Vec<f32>,
+        clip_seconds: f64,
+    ) -> Stored {
         let held = self.references(name);
         if self
             .speakers
@@ -212,17 +286,43 @@ impl EnrolledSpeakers {
         {
             return Stored::AlreadyHeld;
         }
-        if held >= MAX_REFERENCES_PER_SPEAKER {
-            return Stored::AtCapacity { held };
-        }
-        self.speakers.push(EnrolledSpeaker {
+        let row = EnrolledSpeaker {
             name: name.to_string(),
             embedding,
-        });
-        if held == 0 {
-            Stored::Enrolled
-        } else {
-            Stored::Added { held: held + 1 }
+            clip_seconds: Some(clip_seconds),
+        };
+        if held < MAX_REFERENCES_PER_SPEAKER {
+            self.speakers.push(row);
+            return if held == 0 {
+                Stored::Enrolled
+            } else {
+                Stored::Added { held: held + 1 }
+            };
+        }
+
+        // Full. The shortest *measured* recording of this person is the only row that can go, and
+        // only to something longer. Ties keep the incumbent -- an equal-length clip is not better
+        // evidence, and churning the file on it would displace a reference for nothing.
+        let shortest = self
+            .speakers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.name == name)
+            .filter_map(|(index, s)| s.clip_seconds.map(|seconds| (index, seconds)))
+            .min_by(|(_, a), (_, b)| a.total_cmp(b));
+        match shortest {
+            Some((index, seconds)) if clip_seconds > seconds => {
+                self.speakers.remove(index);
+                self.speakers.push(row);
+                Stored::Replaced {
+                    held,
+                    evicted_seconds: seconds,
+                }
+            }
+            _ => Stored::AtCapacity {
+                held,
+                shortest: shortest.map(|(_, seconds)| seconds),
+            },
         }
     }
 
@@ -393,15 +493,22 @@ impl EnrolledSpeakers {
 mod tests {
     use super::*;
 
+    /// A clip length for the tests that are not about clip lengths. Well clear of any floor, and
+    /// the same for every reference they store, so nothing in those tests turns on the ordering
+    /// the eviction rule imposes -- the ones that do say their own numbers.
+    const CLIP: f64 = 30.0;
+
     fn speakers() -> EnrolledSpeakers {
         EnrolledSpeakers::new(vec![
             EnrolledSpeaker {
                 name: "Alice".to_string(),
                 embedding: vec![0.6, 0.8],
+                clip_seconds: None,
             },
             EnrolledSpeaker {
                 name: "Bob".to_string(),
                 embedding: vec![0.8, -0.6],
+                clip_seconds: None,
             },
         ])
     }
@@ -438,6 +545,7 @@ mod tests {
         EnrolledSpeakers::new(vec![EnrolledSpeaker {
             name: "Alice".to_string(),
             embedding: reference.clone(),
+            clip_seconds: None,
         }])
         .write(&paths)
         .unwrap();
@@ -622,7 +730,7 @@ mod tests {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
 
         assert_eq!(
-            speakers.store_reference("Alice", vec![1.0, 0.0]),
+            speakers.store_reference("Alice", vec![1.0, 0.0], CLIP),
             Stored::Enrolled
         );
         assert_eq!(speakers.references("Alice"), 1);
@@ -634,10 +742,10 @@ mod tests {
     #[test]
     fn a_second_recording_is_added_rather_than_replacing_the_first() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Alice", vec![1.0, 0.0]);
+        speakers.store_reference("Alice", vec![1.0, 0.0], CLIP);
 
         assert_eq!(
-            speakers.store_reference("Alice", vec![0.0, 1.0]),
+            speakers.store_reference("Alice", vec![0.0, 1.0], CLIP),
             Stored::Added { held: 2 }
         );
         let stored: Vec<&[f32]> = speakers
@@ -657,10 +765,10 @@ mod tests {
     #[test]
     fn a_byte_identical_reference_is_recognised_rather_than_duplicated() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Alice", vec![1.0, 0.0]);
+        speakers.store_reference("Alice", vec![1.0, 0.0], CLIP);
 
         assert_eq!(
-            speakers.store_reference("Alice", vec![1.0, 0.0]),
+            speakers.store_reference("Alice", vec![1.0, 0.0], CLIP),
             Stored::AlreadyHeld
         );
         assert_eq!(speakers.references("Alice"), 1);
@@ -671,40 +779,178 @@ mod tests {
     #[test]
     fn the_duplicate_rule_is_per_name_rather_than_across_the_database() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Alice", vec![1.0, 0.0]);
+        speakers.store_reference("Alice", vec![1.0, 0.0], CLIP);
 
         assert_eq!(
-            speakers.store_reference("Bob", vec![1.0, 0.0]),
+            speakers.store_reference("Bob", vec![1.0, 0.0], CLIP),
             Stored::Enrolled
         );
         assert_eq!(speakers.references("Bob"), 1);
     }
 
-    /// At the cap nothing stored is dropped: the new reference is refused and the caller is
-    /// told what is held, so it can name the voice against the session instead. Dropping the
-    /// oldest would un-name a voice in some past session, which is the defect v2 exists to end.
-    #[test]
-    fn at_the_cap_the_new_reference_is_refused_and_nothing_is_dropped() {
+    /// A full name, with `seconds[i]` of speech behind the reference on axis `i`.
+    fn full(seconds: &[f64]) -> EnrolledSpeakers {
+        assert_eq!(seconds.len(), MAX_REFERENCES_PER_SPEAKER);
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        for i in 0..MAX_REFERENCES_PER_SPEAKER {
+        for (i, &clip) in seconds.iter().enumerate() {
             let mut embedding = vec![0.0f32; MAX_REFERENCES_PER_SPEAKER + 1];
             embedding[i] = 1.0;
             assert!(matches!(
-                speakers.store_reference("Alice", embedding),
+                speakers.store_reference("Alice", embedding, clip),
                 Stored::Enrolled | Stored::Added { .. }
             ));
         }
+        speakers
+    }
+
+    /// One past the cap on an axis nothing held occupies, so it is always a new reference rather
+    /// than a duplicate.
+    fn over_the_cap() -> Vec<f32> {
         let mut over = vec![0.0f32; MAX_REFERENCES_PER_SPEAKER + 1];
         over[MAX_REFERENCES_PER_SPEAKER] = 1.0;
+        over
+    }
+
+    /// At the cap a recording no longer than the shortest held is refused and nothing is
+    /// dropped, and the refusal carries that shortest length so the caller can say why.
+    #[test]
+    fn at_the_cap_a_recording_no_longer_than_the_shortest_held_is_refused() {
+        let mut speakers = full(&[12.0, 40.0, 31.0, 55.0, 22.0, 90.0, 18.0, 33.0, 47.0, 61.0]);
         let held_before = speakers.speakers.clone();
 
         assert_eq!(
-            speakers.store_reference("Alice", over),
+            speakers.store_reference("Alice", over_the_cap(), 12.0),
             Stored::AtCapacity {
-                held: MAX_REFERENCES_PER_SPEAKER
-            }
+                held: MAX_REFERENCES_PER_SPEAKER,
+                shortest: Some(12.0),
+            },
+            "an equal-length clip is not better evidence, so the incumbent keeps the slot"
         );
         assert_eq!(speakers.speakers, held_before);
+    }
+
+    /// The other half: a longer recording of somebody full displaces the shortest one they hold,
+    /// and the report names the length that went so the caller can print the trade.
+    #[test]
+    fn at_the_cap_a_longer_recording_displaces_the_shortest_held() {
+        let mut speakers = full(&[12.0, 40.0, 31.0, 55.0, 22.0, 90.0, 18.0, 33.0, 47.0, 61.0]);
+        let over = over_the_cap();
+
+        assert_eq!(
+            speakers.store_reference("Alice", over.clone(), 12.5),
+            Stored::Replaced {
+                held: MAX_REFERENCES_PER_SPEAKER,
+                evicted_seconds: 12.0,
+            }
+        );
+        assert_eq!(speakers.references("Alice"), MAX_REFERENCES_PER_SPEAKER);
+        let lengths: Vec<Option<f64>> = speakers.speakers.iter().map(|s| s.clip_seconds).collect();
+        assert!(
+            !lengths.contains(&Some(12.0)),
+            "the 12.0 s reference should be gone, held {lengths:?}"
+        );
+        assert_eq!(
+            speakers.speakers.last().map(|s| s.embedding.as_slice()),
+            Some(over.as_slice()),
+            "the replacement goes on the end, like every other stored reference"
+        );
+    }
+
+    /// Repeated displacement converges on the longest recordings rather than the latest ones:
+    /// the point of the rule is that the database gets better as it is used, not merely newer.
+    #[test]
+    fn displacement_leaves_a_name_holding_its_longest_recordings() {
+        let mut speakers = full(&[12.0, 40.0, 31.0, 55.0, 22.0, 90.0, 18.0, 33.0, 47.0, 61.0]);
+
+        for (i, clip) in [70.0f64, 5.0, 25.0].into_iter().enumerate() {
+            let mut embedding = vec![0.0f32; MAX_REFERENCES_PER_SPEAKER + 4];
+            embedding[MAX_REFERENCES_PER_SPEAKER + i] = 1.0;
+            speakers.store_reference("Alice", embedding, clip);
+        }
+
+        // 70.0 displaces the 12.0; 5.0 is refused, being shorter than the 18.0 that is now
+        // shortest; 25.0 displaces that 18.0. What is left is the ten longest of the thirteen.
+        let mut held: Vec<f64> = speakers
+            .speakers
+            .iter()
+            .filter_map(|s| s.clip_seconds)
+            .collect();
+        held.sort_by(f64::total_cmp);
+        assert_eq!(
+            held,
+            [22.0, 25.0, 31.0, 33.0, 40.0, 47.0, 55.0, 61.0, 70.0, 90.0]
+        );
+    }
+
+    /// A reference with no measured length predates the field, and the only thing knowable about
+    /// it is that it cleared the floor -- it could have been six seconds or six minutes. So it is
+    /// never the row a longer clip displaces, and a name holding nothing else is simply full.
+    #[test]
+    fn a_reference_with_no_measured_length_is_never_the_one_displaced() {
+        let mut speakers = EnrolledSpeakers::new(
+            (0..MAX_REFERENCES_PER_SPEAKER)
+                .map(|i| {
+                    let mut embedding = vec![0.0f32; MAX_REFERENCES_PER_SPEAKER + 1];
+                    embedding[i] = 1.0;
+                    EnrolledSpeaker {
+                        name: "Alice".to_string(),
+                        embedding,
+                        clip_seconds: None,
+                    }
+                })
+                .collect(),
+        );
+        let held_before = speakers.speakers.clone();
+
+        assert_eq!(
+            speakers.store_reference("Alice", over_the_cap(), 600.0),
+            Stored::AtCapacity {
+                held: MAX_REFERENCES_PER_SPEAKER,
+                shortest: None,
+            },
+            "nothing held is comparable, so there is no basis for calling one of them the worst"
+        );
+        assert_eq!(speakers.speakers, held_before);
+    }
+
+    /// The mixed case, which is what every existing database becomes on its first enrollment
+    /// after v3: unmeasured rows sit the comparison out, and the shortest *measured* one is what
+    /// a longer recording displaces. So a person carrying old references can still be improved,
+    /// without those old references being guessed at.
+    #[test]
+    fn among_mixed_rows_only_the_shortest_measured_one_is_displaced() {
+        let mut speakers = EnrolledSpeakers::new(Vec::new());
+        for i in 0..MAX_REFERENCES_PER_SPEAKER / 2 {
+            let mut embedding = vec![0.0f32; MAX_REFERENCES_PER_SPEAKER + 1];
+            embedding[i] = 1.0;
+            speakers.speakers.push(EnrolledSpeaker {
+                name: "Alice".to_string(),
+                embedding,
+                clip_seconds: None,
+            });
+        }
+        for (offset, clip) in [44.0f64, 9.0, 61.0, 27.0, 38.0].into_iter().enumerate() {
+            let mut embedding = vec![0.0f32; MAX_REFERENCES_PER_SPEAKER + 1];
+            embedding[MAX_REFERENCES_PER_SPEAKER / 2 + offset] = 1.0;
+            speakers.store_reference("Alice", embedding, clip);
+        }
+
+        assert_eq!(
+            speakers.store_reference("Alice", over_the_cap(), 15.0),
+            Stored::Replaced {
+                held: MAX_REFERENCES_PER_SPEAKER,
+                evicted_seconds: 9.0,
+            }
+        );
+        assert_eq!(
+            speakers
+                .speakers
+                .iter()
+                .filter(|s| s.clip_seconds.is_none())
+                .count(),
+            MAX_REFERENCES_PER_SPEAKER / 2,
+            "the unmeasured rows are untouched"
+        );
     }
 
     /// The cap is per person, so somebody else being full says nothing about a new name.
@@ -714,11 +960,11 @@ mod tests {
         for i in 0..MAX_REFERENCES_PER_SPEAKER {
             let mut embedding = vec![0.0f32; MAX_REFERENCES_PER_SPEAKER];
             embedding[i] = 1.0;
-            speakers.store_reference("Alice", embedding);
+            speakers.store_reference("Alice", embedding, CLIP);
         }
 
         assert_eq!(
-            speakers.store_reference("Bob", vec![1.0, 0.0]),
+            speakers.store_reference("Bob", vec![1.0, 0.0], CLIP),
             Stored::Enrolled
         );
     }
@@ -729,9 +975,9 @@ mod tests {
     #[test]
     fn forgetting_a_reference_drops_only_that_row_and_reports_what_is_left() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Nate", vec![1.0, 0.0]);
-        speakers.store_reference("Nate", vec![0.0, 1.0]);
-        speakers.store_reference("Ryan", vec![0.0, 1.0]);
+        speakers.store_reference("Nate", vec![1.0, 0.0], CLIP);
+        speakers.store_reference("Nate", vec![0.0, 1.0], CLIP);
+        speakers.store_reference("Ryan", vec![0.0, 1.0], CLIP);
 
         // Ryan is being given the voice Nate's second reference was built from.
         let displaced = speakers.forget_reference(&[0.0, 1.0], "Ryan");
@@ -753,7 +999,7 @@ mod tests {
     #[test]
     fn forgetting_a_names_only_reference_leaves_it_with_none() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Nate", vec![1.0, 0.0]);
+        speakers.store_reference("Nate", vec![1.0, 0.0], CLIP);
 
         let displaced = speakers.forget_reference(&[1.0, 0.0], "Ryan");
 
@@ -766,7 +1012,7 @@ mod tests {
     #[test]
     fn forgetting_leaves_a_different_recording_of_the_wrong_name_alone() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Nate", vec![0.6, 0.8]);
+        speakers.store_reference("Nate", vec![0.6, 0.8], CLIP);
 
         assert!(speakers.forget_reference(&[1.0, 0.0], "Ryan").is_empty());
         assert_eq!(speakers.references("Nate"), 1);
@@ -777,9 +1023,9 @@ mod tests {
     #[test]
     fn the_enrolled_names_are_deduplicated_in_first_appearance_order() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Silas", vec![1.0, 0.0]);
-        speakers.store_reference("Alice", vec![0.0, 1.0]);
-        speakers.store_reference("Silas", vec![0.6, 0.8]);
+        speakers.store_reference("Silas", vec![1.0, 0.0], CLIP);
+        speakers.store_reference("Alice", vec![0.0, 1.0], CLIP);
+        speakers.store_reference("Silas", vec![0.6, 0.8], CLIP);
 
         assert_eq!(speakers.enrolled_names(), ["Silas", "Alice"]);
     }
@@ -798,10 +1044,10 @@ mod tests {
     #[test]
     fn without_drops_the_addressed_row_and_only_that_row() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Alice", vec![1.0, 0.0]);
-        speakers.store_reference("Bob", vec![0.0, 1.0]);
-        speakers.store_reference("Alice", vec![0.6, 0.8]);
-        speakers.store_reference("Alice", vec![0.8, -0.6]);
+        speakers.store_reference("Alice", vec![1.0, 0.0], CLIP);
+        speakers.store_reference("Bob", vec![0.0, 1.0], CLIP);
+        speakers.store_reference("Alice", vec![0.6, 0.8], CLIP);
+        speakers.store_reference("Alice", vec![0.8, -0.6], CLIP);
 
         let rest = speakers.without("Alice", 2).unwrap();
 
@@ -832,7 +1078,7 @@ mod tests {
     #[test]
     fn without_the_last_row_leaves_that_name_with_none() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Alice", vec![1.0, 0.0]);
+        speakers.store_reference("Alice", vec![1.0, 0.0], CLIP);
 
         let rest = speakers.without("Alice", 1).unwrap();
 
@@ -845,8 +1091,8 @@ mod tests {
     #[test]
     fn without_a_reference_that_is_not_there_is_none() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Alice", vec![1.0, 0.0]);
-        speakers.store_reference("Alice", vec![0.0, 1.0]);
+        speakers.store_reference("Alice", vec![1.0, 0.0], CLIP);
+        speakers.store_reference("Alice", vec![0.0, 1.0], CLIP);
 
         assert!(speakers.without("Alice", 3).is_none(), "past the end");
         assert!(
@@ -861,11 +1107,11 @@ mod tests {
     #[test]
     fn without_person_drops_every_row_of_that_name_and_nothing_else() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Alice", vec![1.0, 0.0]);
-        speakers.store_reference("Bob", vec![0.0, 1.0]);
-        speakers.store_reference("Alice", vec![0.6, 0.8]);
-        speakers.store_reference("Cara", vec![0.8, -0.6]);
-        speakers.store_reference("Alice", vec![-0.6, 0.8]);
+        speakers.store_reference("Alice", vec![1.0, 0.0], CLIP);
+        speakers.store_reference("Bob", vec![0.0, 1.0], CLIP);
+        speakers.store_reference("Alice", vec![0.6, 0.8], CLIP);
+        speakers.store_reference("Cara", vec![0.8, -0.6], CLIP);
+        speakers.store_reference("Alice", vec![-0.6, 0.8], CLIP);
 
         let rest = speakers.without_person("Alice").unwrap();
 
@@ -894,7 +1140,7 @@ mod tests {
     #[test]
     fn without_person_who_is_not_stored_is_none() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Alice", vec![1.0, 0.0]);
+        speakers.store_reference("Alice", vec![1.0, 0.0], CLIP);
 
         assert!(speakers.without_person("Bob").is_none(), "not enrolled");
         assert!(
@@ -917,8 +1163,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Alice", vec![1.0, 0.0]);
-        speakers.store_reference("Alice", vec![0.0, 1.0]);
+        speakers.store_reference("Alice", vec![1.0, 0.0], CLIP);
+        speakers.store_reference("Alice", vec![0.0, 1.0], CLIP);
 
         speakers
             .without_person("Alice")
@@ -941,8 +1187,8 @@ mod tests {
     #[test]
     fn forgetting_never_touches_the_name_being_kept() {
         let mut speakers = EnrolledSpeakers::new(Vec::new());
-        speakers.store_reference("Ryan", vec![1.0, 0.0]);
-        speakers.store_reference("Ryan", vec![0.0, 1.0]);
+        speakers.store_reference("Ryan", vec![1.0, 0.0], CLIP);
+        speakers.store_reference("Ryan", vec![0.0, 1.0], CLIP);
 
         assert!(speakers.forget_reference(&[1.0, 0.0], "Ryan").is_empty());
         assert_eq!(speakers.references("Ryan"), 2);

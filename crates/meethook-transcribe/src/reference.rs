@@ -912,6 +912,7 @@ impl<'a> Session<'a> {
                 .map(|&(owner, embedding)| EnrolledSpeaker {
                     name: enrolled_name(owner),
                     embedding: embedding.to_vec(),
+                    clip_seconds: None,
                 })
                 .collect(),
         );
@@ -1333,10 +1334,12 @@ mod tests {
             EnrolledSpeaker {
                 name: "fragment".to_string(),
                 embedding: voices[4].clone().unwrap(),
+                clip_seconds: None,
             },
             EnrolledSpeaker {
                 name: "wrong model".to_string(),
                 embedding: vec![1.0, 0.0],
+                clip_seconds: None,
             },
         ]);
 

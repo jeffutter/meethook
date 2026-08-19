@@ -809,6 +809,7 @@ fn score_arm(
         .map(|embedding| EnrolledSpeaker {
             name: owner.to_string(),
             embedding: embedding.clone(),
+            clip_seconds: None,
         })
         .collect();
     database.extend_from_slice(impostors);
@@ -903,6 +904,7 @@ fn single_session_impostors(
             Some(item) => built.rows.push(EnrolledSpeaker {
                 name: speaker.to_string(),
                 embedding: item.embedding.clone(),
+                clip_seconds: None,
             }),
             None => built.dropped += 1,
         }
@@ -957,6 +959,7 @@ fn policy_impostors(
             built.rows.push(EnrolledSpeaker {
                 name: speaker.to_string(),
                 embedding,
+                clip_seconds: None,
             });
         }
     }

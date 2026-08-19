@@ -1021,11 +1021,13 @@ fn enroll_session(
             candidate_assigned.assign(cluster.id, name, cluster.embedding.clone());
             None
         } else {
-            let stored = candidate.store_reference(name, cluster.embedding.clone());
+            let stored =
+                candidate.store_reference(name, cluster.embedding.clone(), cluster.speech_seconds);
             if matches!(stored, Stored::AtCapacity { .. }) {
-                // At the cap the recording is not stored, so the answer falls back to the
-                // session-only path rather than being lost: the transcript still reads the
-                // right person, and nothing already stored is dropped to make room.
+                // At the cap with nothing shorter than this recording to displace, so it is not
+                // stored and the answer falls back to the session-only path rather than being
+                // lost: the transcript still reads the right person, and nothing already stored
+                // is dropped for a recording that is no better than it.
                 candidate_assigned.assign(cluster.id, name, cluster.embedding.clone());
             } else {
                 // One voice, one record. A voice named for this session only and then enrolled
@@ -1145,17 +1147,39 @@ fn enroll_session(
                 "{}  {name} already has a reference built from this voice",
                 session.id
             )?,
-            Some(Stored::AtCapacity { held }) => {
+            Some(Stored::Replaced {
+                held,
+                evicted_seconds,
+            }) => writeln!(
+                out,
+                "{}  enrolled a better recording of {name}: {:.1} s replaces the shortest of \
+                 their {held}, which was {evicted_seconds:.1} s -- that one may have been \
+                 naming a voice in another session, and meethook enroll over it says so",
+                session.id, cluster.speech_seconds
+            )?,
+            Some(Stored::AtCapacity { held, shortest }) => {
+                // Why it was refused, not just that it was: at the cap the answer turns on this
+                // clip's length, and a user who is not told that cannot tell "come back with a
+                // longer recording" from "this person is full forever".
+                let why = match shortest {
+                    Some(shortest) => format!(
+                        "{:.1} s of speech is no longer than the shortest of them, at {shortest:.1} s",
+                        cluster.speech_seconds
+                    ),
+                    None => "none of them records how long a recording it was built from, so \
+                             there is nothing to say this one is better"
+                        .to_string(),
+                };
                 // Both commands, and in this order: the line cannot know which reference should
                 // go -- that is the question `speakers` exists to answer -- and naming only
                 // `forget` would send the user to pick a number blind.
                 writeln!(
                     out,
                     "{}  named {name} in this session only: {name} already holds {held} \
-                     reference(s), the most meethook keeps for one person, so this recording \
-                     is not stored and does not help recognise them -- meethook speakers shows \
-                     what each of them is naming, meethook forget {name} --reference N removes \
-                     the one you pick",
+                     reference(s), the most meethook keeps for one person, and {why}, so this \
+                     recording is not stored and does not help recognise them -- meethook \
+                     speakers shows what each of them is naming, meethook forget {name} \
+                     --reference N removes the one you pick",
                     session.id
                 )?;
                 report.session_only += 1;
@@ -2219,6 +2243,7 @@ mod tests {
                 .map(|(name, embedding)| EnrolledSpeaker {
                     name: name.to_string(),
                     embedding: embedding.clone(),
+                    clip_seconds: None,
                 })
                 .collect(),
         )
@@ -2792,10 +2817,12 @@ mod tests {
             EnrolledSpeaker {
                 name: "Alice".to_string(),
                 embedding: voice(0),
+                clip_seconds: None,
             },
             EnrolledSpeaker {
                 name: "Bob".to_string(),
                 embedding: voice(1),
+                clip_seconds: None,
             },
         ])
         .write(&paths)
@@ -2906,6 +2933,7 @@ mod tests {
         EnrolledSpeakers::new(vec![EnrolledSpeaker {
             name: "Alice".to_string(),
             embedding: voice(3),
+            clip_seconds: None,
         }])
         .write(&paths)
         .unwrap();
@@ -3634,12 +3662,14 @@ mod tests {
     }
 
     /// The growth cap. A person met in more rooms than meethook keeps recordings of gets the
-    /// name in that transcript and no new reference -- and, crucially, loses none of the five
-    /// they have. Dropping the oldest would un-name a voice in some earlier session, which is
-    /// the defect this whole ticket exists to end.
+    /// name in that transcript and no new reference -- and, crucially, loses none of the ones
+    /// they have, because this recording is no better than any of them. Dropping the oldest
+    /// would un-name a voice in some earlier session, which is the defect this whole ticket
+    /// exists to end; only a *longer* recording displaces anything, which is the companion test.
     ///
-    /// Every voice here is on its own axis, so no two are ever within reach of each other and
-    /// each session really does have to ask.
+    /// Every session here holds the same 10.0 s in the answered cluster, so the offer past the
+    /// cap ties with the shortest held rather than beating it. Every voice is on its own axis,
+    /// so no two are ever within reach of each other and each session really does have to ask.
     #[test]
     fn at_the_reference_cap_the_name_is_recorded_against_the_session_instead() {
         let root = tempfile::tempdir().unwrap();
@@ -3699,6 +3729,84 @@ mod tests {
         assert!(
             !output.contains(&paths.speakers_json().display().to_string()),
             "no remedy in this tool is a hand-edit of speakers.json any more: {output}"
+        );
+    }
+
+    /// The companion to the cap: a *longer* recording of somebody full displaces the shortest
+    /// one they hold, and says so. This is what makes a person's references get better with use
+    /// rather than merely being whichever ten meethook happened to meet first.
+    ///
+    /// The last session carries 90.0 s where the ten before it carried 10.0 s, so the offer past
+    /// the cap beats the shortest held rather than tying with it. The line has to name both
+    /// lengths: something stored was dropped, and an enrollment that vanishes without a line
+    /// about it is worse than the bug.
+    #[test]
+    fn past_the_cap_a_longer_recording_displaces_the_shortest_and_says_what_went() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let axes = MAX_REFERENCES_PER_SPEAKER + 2;
+        let sessions: Vec<SessionPaths> = (0..=MAX_REFERENCES_PER_SPEAKER)
+            .map(|i| {
+                let session = make_session(&paths, &format!("20260809-0526{i:02}"));
+                with_embeddings(&session, &[axis(i, axes), axis(axes - 1, axes)]);
+                with_speech_seconds(
+                    &session,
+                    &[
+                        if i == MAX_REFERENCES_PER_SPEAKER {
+                            90.0
+                        } else {
+                            10.0
+                        },
+                        10.0,
+                    ],
+                );
+                session
+            })
+            .collect();
+
+        let mut interviewer = Scripted::answering(
+            sessions
+                .iter()
+                .flat_map(|_| [named("Alice"), Answer::Skip])
+                .collect(),
+        );
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(
+            speakers.references("Alice"),
+            MAX_REFERENCES_PER_SPEAKER,
+            "the cap still holds: {output}"
+        );
+        assert!(
+            speakers
+                .speakers
+                .iter()
+                .any(|s| s.clip_seconds == Some(90.0)),
+            "the longer recording is what is now stored: {:?}",
+            speakers.speakers
+        );
+        assert_eq!(
+            speakers
+                .speakers
+                .iter()
+                .filter(|s| s.clip_seconds == Some(10.0))
+                .count(),
+            MAX_REFERENCES_PER_SPEAKER - 1,
+            "exactly one of the ten should have gone: {:?}",
+            speakers.speakers
+        );
+        assert_eq!(
+            report.session_only, 0,
+            "the answer stored a reference, so it is not a session-only name: {output}"
+        );
+        assert!(
+            output.contains("enrolled a better recording of Alice: 90.0 s replaces the shortest"),
+            "{output}"
+        );
+        assert!(
+            output.contains("which was 10.0 s"),
+            "the line has to say what was dropped, not just what was kept: {output}"
         );
     }
 
@@ -3884,10 +3992,59 @@ mod tests {
             "a v1 name must survive the upgrade: {output}"
         );
         let on_disk = std::fs::read_to_string(paths.speakers_json()).unwrap();
-        assert!(on_disk.contains("\"schema_version\": 2"), "{on_disk}");
+        assert!(
+            on_disk.contains(&format!(
+                "\"schema_version\": {}",
+                meethook_session::ENROLLED_SPEAKERS_SCHEMA_VERSION
+            )),
+            "{on_disk}"
+        );
         let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
         assert_eq!(speakers.references("Alice"), 1, "{:?}", speakers.speakers);
         assert_eq!(speakers.references("Bob"), 1, "{:?}", speakers.speakers);
+    }
+
+    /// The v2 -> v3 half of the same guarantee. A v2 row carries no clip length, and the
+    /// migration must leave it that way rather than inventing one: an unmeasured reference is
+    /// never the row an eviction picks, and a zero written here would make it the first to go.
+    #[test]
+    fn a_v2_reference_keeps_its_name_and_gains_no_invented_clip_length() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        std::fs::write(
+            paths.speakers_json(),
+            b"{\n  \"schema_version\": 2,\n  \"speakers\": [\
+              {\"name\": \"Alice\", \"embedding\": [1.0, 0.0, 0.0, 0.0]}]\n}\n"
+                .as_slice(),
+        )
+        .unwrap();
+
+        let mut interviewer = Scripted::answering(vec![named("Bob")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(
+            transcript_of(&session).turns[0].speaker,
+            "Alice",
+            "a v2 name must survive the upgrade: {output}"
+        );
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        let alice = speakers
+            .speakers
+            .iter()
+            .find(|s| s.name == "Alice")
+            .expect("Alice survives the migration");
+        assert_eq!(alice.clip_seconds, None, "{:?}", speakers.speakers);
+        let bob = speakers
+            .speakers
+            .iter()
+            .find(|s| s.name == "Bob")
+            .expect("Bob was just enrolled");
+        assert!(
+            bob.clip_seconds.is_some(),
+            "a reference written now records what it was built from: {bob:?}"
+        );
     }
 
     /// A database from a *newer* meethook cannot be read as though it were this one, and a run

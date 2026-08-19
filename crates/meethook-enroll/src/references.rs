@@ -100,6 +100,16 @@ pub struct Reference {
     /// listing prints and [`EnrolledSpeakers::without`] accepts.
     pub handle: usize,
 
+    /// How much speech this row was built from, or `None` for one stored before meethook
+    /// recorded that.
+    ///
+    /// Printed because this listing exists to be read by somebody choosing which reference to
+    /// drop, and length is half of that judgement: what a reference is *naming* says what
+    /// removing it costs today, and how long a recording it came from says how good it is
+    /// likely to be tomorrow. It is also what `enroll` compares at the cap, so a listing that
+    /// hid it would leave the user unable to predict the one decision the tool makes for them.
+    pub clip_seconds: Option<f64>,
+
     /// Voices that read this person's name and would stop reading it if this row were removed.
     ///
     /// Empty is the answer somebody at the cap is looking for: a reference that is naming
@@ -361,6 +371,12 @@ pub fn scan(paths: &Paths) -> Result<Scan> {
             }
             references.push(Reference {
                 handle,
+                clip_seconds: speakers
+                    .speakers
+                    .iter()
+                    .filter(|speaker| speaker.name == name)
+                    .nth(handle - 1)
+                    .and_then(|speaker| speaker.clip_seconds),
                 depends,
                 elsewhere,
             });
@@ -422,18 +438,24 @@ pub fn run_speakers(paths: &Paths, out: &mut dyn Write) -> Result<Scan> {
             person.references.len()
         )?;
         for reference in &person.references {
+            // "unknown length", not a blank: absent is a fact about rows stored before meethook
+            // recorded it, and it is the fact that keeps such a row from ever being evicted.
+            let built_from = match reference.clip_seconds {
+                Some(seconds) => format!("from {seconds:.1} s"),
+                None => "from a recording of unknown length".to_string(),
+            };
             // "in any session read", not "names nothing": the clause that keeps the sentence
             // honest about the scope printed two lines above it.
             if reference.depends.is_empty() {
                 writeln!(
                     out,
-                    "  reference {}  names nothing in any session read",
+                    "  reference {}  {built_from}, names nothing in any session read",
                     reference.handle
                 )?;
             } else {
                 writeln!(
                     out,
-                    "  reference {}  names {} voice(s):",
+                    "  reference {}  {built_from}, names {} voice(s):",
                     reference.handle,
                     reference.depends.len()
                 )?;
@@ -605,7 +627,7 @@ mod tests {
             "{output}"
         );
         assert!(
-            output.contains("reference 1  names 2 voice(s):"),
+            output.contains("reference 1  from a recording of unknown length, names 2 voice(s):"),
             "{output}"
         );
         assert!(
@@ -633,8 +655,39 @@ mod tests {
         assert_eq!(references[0].depends.len(), 1, "{output}");
         assert!(references[1].depends.is_empty(), "{output}");
         assert!(
-            output.contains("reference 2  names nothing in any session read"),
+            output.contains(
+                "reference 2  from a recording of unknown length, names nothing in any session read"
+            ),
             "{output}"
+        );
+    }
+
+    /// The other half of the choice this listing exists to inform. What a reference is naming
+    /// says what dropping it costs now; how long a recording it came from says how good it is,
+    /// and is what `enroll` itself compares at the cap -- so both belong on the line, and a
+    /// measured length must print as a number rather than falling back to the unknown wording.
+    #[test]
+    fn a_reference_says_how_long_a_recording_it_was_built_from() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        let mut speakers = EnrolledSpeakers::new(Vec::new());
+        speakers.store_reference("Alice", voice(0), 42.5);
+        speakers.store_reference("Alice", axis(5, 8), 7.25);
+        speakers.write(&paths).unwrap();
+
+        let (found, output) = scanned(&paths);
+
+        let references = &person(&found, "Alice").references;
+        assert_eq!(references[0].clip_seconds, Some(42.5), "{output}");
+        assert_eq!(references[1].clip_seconds, Some(7.25), "{output}");
+        assert!(
+            output.contains("reference 1  from 42.5 s, names"),
+            "{output}"
+        );
+        assert!(
+            output.contains("reference 2  from 7.2 s, names nothing in any session read"),
+            "one decimal place, like every other duration this tool prints: {output}"
         );
     }
 

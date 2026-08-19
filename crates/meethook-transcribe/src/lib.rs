@@ -830,6 +830,7 @@ mod tests {
                 .map(|&(name, from_cluster)| EnrolledSpeaker {
                     name: name.to_string(),
                     embedding: voice(from_cluster),
+                    clip_seconds: None,
                 })
                 .collect(),
         )

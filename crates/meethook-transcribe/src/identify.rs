@@ -57,8 +57,10 @@ use meethook_session::{EnrolledSpeakers, SpeakerCluster};
 /// linkage, **0.429** centroid, shrinkage **0.603**, which `cluster-speaker-track` prints in
 /// its speaker-vs-speaker block. Both restatements satisfy the identity above, the centroid is
 /// unchanged to three figures, and the gap between the quantities has *widened* rather than
-/// closed, so nothing here rests on the older grouping. Two constants, 0.45 and 0.35, now sit
-/// either side of that pair rather than both above it.
+/// closed, so nothing here rests on the older grouping. Two constants, 0.45 and 0.40, now sit
+/// either side of that pair rather than both above it -- by 0.029 on this side, where it was
+/// 0.079 while this constant was 0.35. That margin is the tightest constraint on this value and
+/// is what puts a hard ceiling below 0.429 on any further loosening.
 ///
 /// # Where the value comes from
 ///
@@ -87,20 +89,52 @@ use meethook_session::{EnrolledSpeakers, SpeakerCluster};
 /// this constant will ever face, cross-session variation being strictly larger, and 0.45
 /// already fails it.
 ///
-/// So **0.35**: it removes every misattribution measured on the corpus, at a cost of at most
-/// one extra false reject in 86, and it rejects the ear-confirmed different-speaker pair with
-/// 0.079 of margin.
+/// # Where the value comes from, second pass: what the corpus could not see
 ///
-/// Two caveats belong with those numbers. The corpus holds the channel constant -- one
+/// The table above is why this constant was **0.35** -- the largest cut with zero measured
+/// misattributions, since the corpus's nearest different-speaker pair sits at 0.364. What that
+/// corpus cannot price is the failure the loosening below is bought to fix, because LibriSpeech
+/// has no fragments in it: every item is a clean read of tens of seconds, so its same-speaker
+/// distribution is tight and 0.35 rejects almost nothing.
+///
+/// Real sessions are not like that. On `20260818-132033` -- 181 clusters over 17.1 min of
+/// speech, seven people, most of the talk time in clusters of five to ten seconds -- the cut
+/// prices out like this, against a database in which all seven were already enrolled:
+///
+/// | cut   | clusters identified | speech identified |
+/// |-------|---------------------|-------------------|
+/// | 0.350 | 32/181              | 10.7 / 17.1 min   |
+/// | 0.400 | 49/181              | 11.9 / 17.1 min   |
+/// | 0.450 | 71/181              | 13.4 / 17.1 min   |
+///
+/// A short cluster's centroid is pooled over less speech and is therefore noisier, so a genuine
+/// match lands further out than the corpus's tens-of-seconds reads ever do. Those are the
+/// clusters between 0.35 and 0.45, and by inspection they are overwhelmingly the enrolled
+/// speakers rather than strangers -- the session has seven people in it and nobody else.
+///
+/// So **0.40**, moved from 0.35, and both halves of that trade are real:
+///
+/// - It buys +17 clusters and +1.2 min on the session above: 17 `Unknown N`s a user would
+///   otherwise answer by hand, on a run that asked 34 questions.
+/// - It gives up the zero-misattribution property. 0.40 is past the corpus's nearest
+///   different-speaker pair at 0.364, so it accepts part of that one confusable pair's
+///   0.364-0.416 band. It is *not* past the ear-confirmed Andrew/Ryan pair at 0.429, which is
+///   the constraint that decided the value: 0.45 is unavailable at any price, because it is
+///   known to refile one real person's speech under another real person's name.
+///
+/// Three caveats belong with those numbers. The corpus holds the channel constant -- one
 /// volunteer, room and microphone per speaker -- so its same-speaker distances are a *floor*
-/// and its false-reject rate is optimistic. And 36 same-speaker pairs put the false-reject rate
-/// at roughly one significant figure: a 95% interval of about 1.5%-18%. TASK-014 still owes the
-/// recording sitting that would measure this against meethook's own capture channel.
+/// and its false-reject rate is optimistic. 36 same-speaker pairs put that rate at roughly one
+/// significant figure: a 95% interval of about 1.5%-18%. And the session table is one session
+/// with no ground truth beyond who was in the room, so it prices the *gain* from loosening
+/// without pricing the loss. TASK-014 still owes the recording sitting that would measure both
+/// against meethook's own capture channel, and it is now owed more than it was at 0.35.
 ///
-/// The two mistakes here are not symmetric, and the bias follows from that. A false match puts
-/// one person's words under another person's name in a transcript nobody will re-read. A false
-/// rejection is an `Unknown N` the user fixes in `enroll` in ten seconds. So: below the
-/// crossover, accepting that some real matches are missed.
+/// The two mistakes here are not symmetric, and the bias still follows from that. A false match
+/// puts one person's words under another person's name in a transcript nobody will re-read. A
+/// false rejection is an `Unknown N` the user fixes in `enroll` in ten seconds. What moved is
+/// the second half of that sentence: at 0.35 a session like the one above produces `Unknown N`s
+/// by the dozen, and "ten seconds" was a claim about answering one of them.
 ///
 /// Public so that the measurement can name the cut it is measuring against: the
 /// `cluster-speaker-track` example prints every cluster-to-reference distance alongside this
@@ -109,7 +143,7 @@ use meethook_session::{EnrolledSpeakers, SpeakerCluster};
 /// not for deciding -- [`identify_clusters`] is argmax *then* threshold, so anything that
 /// compares against this on its own will call a reference that clears the cut but is not the
 /// closest a match, which it is not.
-pub const IDENTIFY_DISTANCE: f32 = 0.35;
+pub const IDENTIFY_DISTANCE: f32 = 0.40;
 
 /// A cluster matched to an enrolled speaker.
 #[derive(Debug, Clone, PartialEq)]
@@ -335,6 +369,7 @@ mod tests {
                 .map(|(name, embedding)| EnrolledSpeaker {
                     name: name.to_string(),
                     embedding: embedding.clone(),
+                    clip_seconds: None,
                 })
                 .collect(),
         )

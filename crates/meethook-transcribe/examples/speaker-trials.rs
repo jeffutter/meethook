@@ -891,6 +891,7 @@ fn database(references: &[&Voice], without: Option<&str>) -> EnrolledSpeakers {
             .map(|reference| EnrolledSpeaker {
                 name: reference.speaker.clone(),
                 embedding: reference.embedding.clone(),
+                clip_seconds: None,
             })
             .collect(),
     )
