@@ -140,6 +140,32 @@ pub enum PassThrough {
     NoReference,
     /// The two tracks would not align, so there is no reference to subtract.
     Unalignable(NotMeasurable),
+    /// AEC3 itself could not produce a cancelled track.
+    Cancellation(CancellationFailure),
+}
+
+/// Why `subtract` could not hand back a cancelled track. Every variant means AEC3 itself
+/// failed, as distinct from [`Cleaning::Cancelled`]'s `erle_db: None`, which means AEC3 ran
+/// to completion but never converged far enough to report a figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationFailure {
+    /// `Processor::new` could not construct the canceller.
+    ProcessorUnavailable,
+    /// A frame errored partway through the track.
+    FrameFailed,
+}
+
+impl std::fmt::Display for CancellationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CancellationFailure::ProcessorUnavailable => {
+                write!(f, "the echo canceller could not be constructed")
+            }
+            CancellationFailure::FrameFailed => {
+                write!(f, "the echo canceller failed partway through the track")
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for Cleaning {
@@ -176,6 +202,7 @@ impl std::fmt::Display for PassThrough {
                 write!(f, "the speaker track is missing or silent, so nothing bled")
             }
             PassThrough::Unalignable(reason) => write!(f, "{reason}"),
+            PassThrough::Cancellation(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -211,16 +238,17 @@ pub fn cancel_bleed(mic_16k: &[f32], speaker_16k: &[f32], metadata_offset_s: f64
         };
 
     let reference = shift_reference(speaker_16k, lag - RENDER_HEADROOM, mic_16k.len());
-    let (audio, erle_db) = subtract(mic_16k, &reference, FRAMES_PER_STATS_READ);
-
-    Cleaned {
-        audio,
-        cleaning: Cleaning::Cancelled {
-            lag_samples: lag,
-            spread_samples: spread,
-            drift_ms_per_hour,
-            erle_db,
+    match subtract(mic_16k, &reference, FRAMES_PER_STATS_READ) {
+        Ok((audio, erle_db)) => Cleaned {
+            audio,
+            cleaning: Cleaning::Cancelled {
+                lag_samples: lag,
+                spread_samples: spread,
+                drift_ms_per_hour,
+                erle_db,
+            },
         },
+        Err(failure) => passed_through(mic_16k, PassThrough::Cancellation(failure)),
     }
 }
 
@@ -270,30 +298,18 @@ fn shift_reference(speaker: &[f32], lag: i64, mic_len: usize) -> Vec<f32> {
 /// must be at least 1. Every caller outside the tests passes [`FRAMES_PER_STATS_READ`]; it is
 /// a parameter only so a test can show that the reported median does not move when the figure
 /// is read less often.
-fn subtract(mic: &[f32], reference: &[f32], stats_every: usize) -> (Vec<f32>, Option<f64>) {
+///
+/// `Ok` audio is always the cancelled track. On `Err` the caller already holds the untouched
+/// mic track and does not need one back.
+fn subtract(
+    mic: &[f32],
+    reference: &[f32],
+    stats_every: usize,
+) -> Result<(Vec<f32>, Option<f64>), CancellationFailure> {
     debug_assert_eq!(mic.len(), reference.len());
     debug_assert!(stats_every >= 1);
 
-    let processor = match Processor::new(TARGET_RATE) {
-        Ok(processor) => processor,
-        // Constructing the processor is the linkage check, and it succeeded once at startup
-        // for the whole workspace's tests. If it fails here the honest move is still to hand
-        // back the mic track rather than lose the session.
-        Err(_) => return (mic.to_vec(), None),
-    };
-    assert_eq!(
-        processor.num_samples_per_frame(),
-        SAMPLES_PER_FRAME,
-        "AEC3 panics rather than erroring on a frame-length mismatch"
-    );
-
-    processor.set_config(Config {
-        echo_canceller: Some(EchoCanceller::Full {
-            stream_delay_ms: None,
-        }),
-        high_pass_filter: Some(Default::default()),
-        ..Default::default()
-    });
+    let processor = build_processor(TARGET_RATE)?;
 
     // The track is run through with `PROCESSOR_DELAY` samples of silence appended, so the
     // last real sample gets pushed out of the canceller rather than being left inside it,
@@ -331,13 +347,10 @@ fn subtract(mic: &[f32], reference: &[f32], stats_every: usize) -> (Vec<f32>, Op
 
         // Render before capture, always: the canceller has to have seen what was played
         // before it can be asked what of it survives in what was heard.
-        if processor.process_render_frame(&mut render_frame).is_err()
-            || processor.process_capture_frame(&mut capture_frame).is_err()
-        {
-            // Mid-track failure would leave a half-cancelled track, which is worse than an
-            // uncancelled one because nothing downstream could tell.
-            return (mic.to_vec(), None);
-        }
+        //
+        // Mid-track failure would leave a half-cancelled track, which is worse than an
+        // uncancelled one because nothing downstream could tell.
+        process_frame_pair(&processor, &mut render_frame, &mut capture_frame)?;
 
         cleaned.extend_from_slice(&capture_frame[0][..taken]);
         // `Option` iterates over its contents, so this is "record it if there was one".
@@ -354,7 +367,45 @@ fn subtract(mic: &[f32], reference: &[f32], stats_every: usize) -> (Vec<f32>, Op
     // there is no echo to enhance the loss of and the figure says nothing.
     erle.sort_by(f64::total_cmp);
     let median = erle.get(erle.len() / 2).copied();
-    (cleaned, median)
+    Ok((cleaned, median))
+}
+
+/// Constructs the canceller, applying the config every caller of `subtract` needs.
+///
+/// A separate function so a test can exercise the failure path directly: constructing the
+/// processor is the linkage check, and it succeeded once at startup for the whole workspace's
+/// tests, so a real failure here is worth its own coverage rather than trusting the one
+/// happy-path construction elsewhere to stand in for it.
+fn build_processor(sample_rate_hz: u32) -> Result<Processor, CancellationFailure> {
+    let processor =
+        Processor::new(sample_rate_hz).map_err(|_| CancellationFailure::ProcessorUnavailable)?;
+    assert_eq!(
+        processor.num_samples_per_frame(),
+        SAMPLES_PER_FRAME,
+        "AEC3 panics rather than erroring on a frame-length mismatch"
+    );
+
+    processor.set_config(Config {
+        echo_canceller: Some(EchoCanceller::Full {
+            stream_delay_ms: None,
+        }),
+        high_pass_filter: Some(Default::default()),
+        ..Default::default()
+    });
+
+    Ok(processor)
+}
+
+/// Runs one render/capture frame pair through `processor` in place.
+fn process_frame_pair(
+    processor: &Processor,
+    render: &mut [Vec<f32>],
+    capture: &mut [Vec<f32>],
+) -> Result<(), CancellationFailure> {
+    processor
+        .process_render_frame(render)
+        .and_then(|()| processor.process_capture_frame(capture))
+        .map_err(|_| CancellationFailure::FrameFailed)
 }
 
 fn samples_to_ms(samples: i64) -> f64 {
@@ -621,9 +672,11 @@ mod tests {
         let fixture = bleed_fixture(lag);
         let reference = shift_reference(&fixture.speaker, lag - RENDER_HEADROOM, fixture.mic.len());
 
-        let (per_frame_audio, per_frame_erle) = subtract(&fixture.mic, &reference, 1);
+        let (per_frame_audio, per_frame_erle) =
+            subtract(&fixture.mic, &reference, 1).expect("AEC3 should run to completion");
         let (strided_audio, strided_erle) =
-            subtract(&fixture.mic, &reference, FRAMES_PER_STATS_READ);
+            subtract(&fixture.mic, &reference, FRAMES_PER_STATS_READ)
+                .expect("AEC3 should run to completion");
 
         let dense = per_frame_erle.expect("AEC3 reported no echo reduction reading every frame");
         let sparse = strided_erle
@@ -642,6 +695,55 @@ mod tests {
                 .zip(&strided_audio)
                 .position(|(dense, sparse)| dense != sparse)
         );
+    }
+
+    /// Acceptance criterion #2. `process_capture_frame`/`process_render_frame` really do
+    /// return `Err(BadNumberChannels)` for a zero-channel frame -- proven by
+    /// `webrtc_audio_processing`'s own `test_zero_channels` -- so driving `process_frame_pair`
+    /// with an empty capture buffer is real library failure, not an assumption.
+    #[test]
+    fn a_frame_that_errors_mid_track_is_reported_as_a_failure_not_swallowed() {
+        let processor = build_processor(TARGET_RATE).expect("processor should construct");
+        let mut render = vec![vec![0.0f32; SAMPLES_PER_FRAME]];
+        let mut capture: Vec<Vec<f32>> = vec![];
+
+        assert_eq!(
+            process_frame_pair(&processor, &mut render, &mut capture),
+            Err(CancellationFailure::FrameFailed)
+        );
+    }
+
+    /// Acceptance criteria #1 and #2: a cancellation failure names its cause rather than
+    /// reading as the generic "no echo cancellation" a caller could mistake for success.
+    #[test]
+    fn a_cancellation_failure_names_its_cause() {
+        assert_eq!(
+            PassThrough::Cancellation(CancellationFailure::ProcessorUnavailable).to_string(),
+            "the echo canceller could not be constructed"
+        );
+        assert_eq!(
+            PassThrough::Cancellation(CancellationFailure::FrameFailed).to_string(),
+            "the echo canceller failed partway through the track"
+        );
+    }
+
+    /// Acceptance criterion #3. Whichever way `subtract` fails, the mic track that comes
+    /// back through `cancel_bleed` is untouched and exactly as long -- the same guarantee
+    /// `NoReference` and `Unalignable` already give, via the same `passed_through` helper.
+    #[test]
+    fn a_cancellation_failure_still_returns_the_mic_track_byte_for_byte() {
+        let mic = voice_band(5, RATE * 3 + 73);
+        for failure in [
+            CancellationFailure::ProcessorUnavailable,
+            CancellationFailure::FrameFailed,
+        ] {
+            let cleaned = passed_through(&mic, PassThrough::Cancellation(failure));
+            assert_eq!(cleaned.audio, mic);
+            assert_eq!(
+                cleaned.cleaning,
+                Cleaning::PassedThrough(PassThrough::Cancellation(failure))
+            );
+        }
     }
 
     /// Pins the measured capture-path delay the code compensates for. If a library update
