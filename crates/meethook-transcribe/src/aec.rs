@@ -106,12 +106,18 @@ pub enum Cleaning {
     /// The reference lined up and AEC3 ran over the whole track.
     Cancelled {
         /// How much later the mic track heard the far end than the speaker track recorded it,
-        /// in samples. This is the measurement, not the shift: the reference is actually laid
-        /// down `RENDER_HEADROOM` samples ahead of it.
+        /// in samples, at the midpoint in time of the windows it was measured over. This is
+        /// the measurement, not the shift: the reference is actually laid down
+        /// `RENDER_HEADROOM` samples ahead of it.
         lag_samples: i64,
-        /// How far the windows the lag was measured over disagreed. A wide spread on an
-        /// accepted measurement means the delay drifted or the correlation was marginal.
+        /// How far the windows the lag was measured over disagreed, after fitting out
+        /// whatever drift `drift_ms_per_hour` reports. A wide spread on an accepted
+        /// measurement means the correlation was marginal.
         spread_samples: i64,
+        /// How fast `lag_samples` itself was moving across the recording, in milliseconds per
+        /// hour -- positive if the lag grew over the meeting, negative if it shrank. Near zero
+        /// on a session where the two capture clocks stayed in step.
+        drift_ms_per_hour: f64,
         /// Median echo return loss enhancement across the track, in dB, or `None` if AEC3
         /// never converged far enough to report one.
         erle_db: Option<f64>,
@@ -142,13 +148,16 @@ impl std::fmt::Display for Cleaning {
             Cleaning::Cancelled {
                 lag_samples,
                 spread_samples,
+                drift_ms_per_hour,
                 erle_db,
             } => {
                 write!(
                     f,
-                    "speaker bleed cancelled (reference lag {:+.0} ms, spread {:.0} ms",
+                    "speaker bleed cancelled (reference lag {:+.0} ms, spread {:.0} ms, \
+                     drift {:+.1} ms/hour",
                     samples_to_ms(*lag_samples),
-                    samples_to_ms(*spread_samples)
+                    samples_to_ms(*spread_samples),
+                    drift_ms_per_hour
                 )?;
                 match erle_db {
                     Some(db) => write!(f, ", {db:.1} dB echo reduction)"),
@@ -188,17 +197,18 @@ pub fn cancel_bleed(mic_16k: &[f32], speaker_16k: &[f32], metadata_offset_s: f64
         return passed_through(mic_16k, PassThrough::NoReference);
     }
 
-    let (lag, spread) = match align::measure_reference_lag(mic_16k, speaker_16k, metadata_offset_s)
-    {
-        Alignment::Measured {
-            lag_samples,
-            spread_samples,
-            ..
-        } => (lag_samples, spread_samples),
-        Alignment::NotMeasurable { reason } => {
-            return passed_through(mic_16k, PassThrough::Unalignable(reason));
-        }
-    };
+    let (lag, spread, drift_ms_per_hour) =
+        match align::measure_reference_lag(mic_16k, speaker_16k, metadata_offset_s) {
+            Alignment::Measured {
+                lag_samples,
+                spread_samples,
+                drift_ms_per_hour,
+                ..
+            } => (lag_samples, spread_samples, drift_ms_per_hour),
+            Alignment::NotMeasurable { reason } => {
+                return passed_through(mic_16k, PassThrough::Unalignable(reason));
+            }
+        };
 
     let reference = shift_reference(speaker_16k, lag - RENDER_HEADROOM, mic_16k.len());
     let (audio, erle_db) = subtract(mic_16k, &reference, FRAMES_PER_STATS_READ);
@@ -208,6 +218,7 @@ pub fn cancel_bleed(mic_16k: &[f32], speaker_16k: &[f32], metadata_offset_s: f64
         cleaning: Cleaning::Cancelled {
             lag_samples: lag,
             spread_samples: spread,
+            drift_ms_per_hour,
             erle_db,
         },
     }

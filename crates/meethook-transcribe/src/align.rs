@@ -38,6 +38,21 @@
 //! documents that failure. Windows are chosen where the speaker track actually has energy,
 //! kept apart so they measure independent moments, and each yields its own lag.
 //!
+//! *A line, not a point.* The two clocks recording a long meeting drift against each other --
+//! a real property of independent hardware, not a measurement error -- so the per-window lags
+//! are fit to a line in time rather than reduced straight to a single median. Outlier
+//! rejection runs against each window's residual from that line, not against the raw lag, so
+//! drift across the meeting is absorbed by the fit instead of being read as disagreement.
+//! `scratch/click_align.py` fits this line with plain Theil-Sen (the median of every pairwise
+//! slope); it was not carried across when this module split the click take into a
+//! whole-meeting search, and plain Theil-Sen turns out not to be the right carry-over. At the
+//! window counts this module actually works with -- as few as `MIN_WINDOWS` -- a single stray
+//! window corrupts as many as half of Theil-Sen's pairwise slopes, which is enough to move its
+//! median off the true value; a 35 s click take with dozens of clicks never exercised that
+//! edge. Siegel's repeated-median refinement -- take the median slope *from each point's own
+//! pairs* first, then the median of those -- has a much higher breakdown point at small counts
+//! and recovers the true line in exactly the cases plain Theil-Sen does not.
+//!
 //! *Guards.* Each rejection below was added to `click_align.py` after it produced a
 //! confident wrong answer, and each still applies:
 //!
@@ -98,9 +113,12 @@ const EDGE_SAMPLES: i64 = 2;
 /// a gated mic, and every ratio computed from it would be meaningless.
 const NOISE_FLOOR_MIN: f32 = 1e-6;
 
-/// How far apart surviving windows may disagree and still be one measurement. Clock drift
-/// across a whole meeting was below the resolution of a 35 s click take, so a spread this
-/// wide means the windows locked onto different things rather than that the delay moved.
+/// How far surviving windows' residuals against the fitted drift line may still disagree and
+/// remain one measurement. `aggregate` fits a line through the windows first and measures this
+/// against what is left over -- a real, slowly drifting delay lands near zero here even across
+/// an hour, because the drift itself is absorbed by the line rather than counted as spread. A
+/// spread this wide in the residuals means the windows locked onto genuinely different delays
+/// -- a second regime, such as a mid-meeting output device change -- not that the delay moved.
 const MAX_SPREAD_MS: f64 = 20.0;
 
 /// Only the band where the bleed carries usable content is whitened and inverted. Whitening
@@ -110,7 +128,7 @@ const BAND_LO_HZ: f64 = 80.0;
 const BAND_HI_HZ: f64 = 7000.0;
 
 /// The measured shift between the recorded speaker track and the recorded mic track.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Alignment {
     /// The two tracks correlate, at this lag.
     ///
@@ -118,16 +136,29 @@ pub enum Alignment {
     /// speaker-track sample `i` is the same instant in the room as mic-track sample
     /// `i + lag_samples`. So a caller pairing frames for the echo canceller reads the render
     /// frame from `speaker[i..]` and the matching capture frame from `mic[i + lag..]`,
-    /// starting at whichever `i` makes both sides non-negative.
+    /// starting at whichever `i` makes both sides non-negative. It is reported at the
+    /// midpoint in time of the surviving windows, not at the start of the recording, which
+    /// bounds the worst-case error against the true instantaneous lag at either end of the
+    /// meeting to half of `drift_ms_per_hour`'s total excursion -- `cancel_bleed` applies one
+    /// constant shift to the whole track, and its own `RENDER_HEADROOM` plus AEC3's adaptive
+    /// filter absorb the rest.
     ///
-    /// `spread_samples` is the range between the highest and lowest surviving window
-    /// estimate. It is reported rather than smoothed away: a wide spread on an accepted
-    /// measurement means the delay is drifting or the correlation is marginal, which the
-    /// caller may want to say out loud.
+    /// `spread_samples` is the range between the highest and lowest surviving window's
+    /// residual against the fitted drift line -- not the raw range of their lags, which drift
+    /// alone can widen without the windows actually disagreeing. It is reported rather than
+    /// smoothed away: a wide residual spread on an accepted measurement means the correlation
+    /// was marginal, which the caller may want to say out loud.
+    ///
+    /// `drift_ms_per_hour` is the fitted line's slope, converted from the dimensionless ratio
+    /// between the two clocks to how many milliseconds of lag that ratio accumulates over an
+    /// hour of recording. Near zero on a session with two clocks that stay in step; the ~2
+    /// ms/hour to ~7 ms/hour range has been observed between a MacBook's microphone clock and
+    /// ScreenCaptureKit's.
     Measured {
         lag_samples: i64,
         windows_used: usize,
         spread_samples: i64,
+        drift_ms_per_hour: f64,
     },
     /// No reliable correlation, so there is no lag to report -- not a lag of zero. The caller
     /// skips echo cancellation and passes the mic track through untouched.
@@ -221,14 +252,16 @@ pub fn measure_reference_lag(
     // most `MAX_WINDOWS` FFT correlations -- and a percentage that jumped back to zero halfway
     // would read as a bug. Both are usually quick, in which case neither says anything.
     let mut phase = Phase::start("aligning: correlating windows");
-    let mut lags: Vec<i64> = Vec::with_capacity(starts.len());
+    // `(window_start_sample, lag_samples)`: the time axis `aggregate` fits a drift line
+    // against, paired with the lag measured at that instant.
+    let mut lags: Vec<(i64, i64)> = Vec::with_capacity(starts.len());
     for (measured, start) in starts.iter().enumerate() {
         phase.at(measured, starts.len());
         let reference = &speaker_16k[*start as usize..*start as usize + window];
         let heard_from = (start + lo_lag) as usize;
         let heard = &mic_16k[heard_from..heard_from + capture];
         if let Some(offset) = window_lag(heard, reference, span, &correlator) {
-            lags.push(lo_lag + offset);
+            lags.push((*start, lo_lag + offset));
         }
     }
     phase.done();
@@ -333,18 +366,29 @@ fn window_lag(
     Some(peak_at)
 }
 
-/// Turns per-window lags into one answer, or into a refusal.
+/// Turns per-window `(window_start_sample, lag_samples)` pairs into one answer, or into a
+/// refusal.
+///
+/// The model is a line, `lag(t) = intercept + slope * t`, fit with a repeated-median
+/// regression (see [`repeated_median_fit`]) so that a single stray window cannot swing it --
+/// least squares was tried against exactly that failure mode in `click_align.py` and rejected
+/// there for the same reason a mean is rejected below.
 ///
 /// Outlier rejection around the median, on median absolute deviation rather than standard
 /// deviation, is `click_align.py`'s rule: a single stray detection dominates a mean and skews
-/// the very deviation that is supposed to catch it.
+/// the very deviation that is supposed to catch it. It runs here against each window's
+/// *residual* from the fitted line rather than against its raw lag -- the one change that
+/// matters, because a residual is deviation from a delay that is allowed to move, and a real
+/// drift across a long meeting no longer inflates it the way it inflated deviation from a flat
+/// median.
 ///
-/// What is not `click_align.py`'s rule is the size of the discarded group. A stray or two is
-/// ordinary, but if as many windows are discarded as it takes to make a measurement, they are
-/// not strays -- they are a second regime, which is what a mid-meeting output device change
-/// looks like. There is no honest way to pick between two credible groups, so neither is
-/// reported.
-fn aggregate(mut lags: Vec<i64>, examined: usize) -> Alignment {
+/// What used to also live here -- refusing outright once as many windows were discarded as it
+/// takes to make a measurement -- is gone. It fired before the spread check below ever ran, so
+/// it could refuse a window set the spread check would have passed, and separately it is not a
+/// reliable way to tell a real second regime (a mid-meeting output device change) from a
+/// handful of strays: a true even split between two regimes does not reliably produce a large
+/// enough discard count to trip it. Telling the two apart is entirely the spread check's job.
+fn aggregate(mut lags: Vec<(i64, i64)>, examined: usize) -> Alignment {
     if lags.len() < MIN_WINDOWS {
         return Alignment::NotMeasurable {
             reason: NotMeasurable::TooFewWindows {
@@ -354,25 +398,28 @@ fn aggregate(mut lags: Vec<i64>, examined: usize) -> Alignment {
         };
     }
 
-    lags.sort_unstable();
-    let centre = median(&lags);
-    let mut deviations: Vec<i64> = lags.iter().map(|lag| (lag - centre).abs()).collect();
-    deviations.sort_unstable();
-    let tolerance = (4 * median(&deviations)).max(ms_to_samples(2.0));
-    let kept: Vec<i64> = lags
+    lags.sort_unstable_by_key(|&(start, _)| start);
+    let (slope, intercept) = repeated_median_fit(&lags);
+
+    // `(window_start, lag, residual)`. `lags` is already ordered by `start`, so this and
+    // everything derived from it by filtering stays ordered too.
+    let points: Vec<(i64, i64, i64)> = lags
         .iter()
-        .copied()
-        .filter(|lag| (lag - centre).abs() <= tolerance)
+        .map(|&(start, lag)| (start, lag, lag - fitted_lag(slope, intercept, start)))
         .collect();
 
-    if lags.len() - kept.len() >= MIN_WINDOWS {
-        return Alignment::NotMeasurable {
-            reason: NotMeasurable::InconsistentWindows {
-                windows: lags.len(),
-                spread_samples: lags[lags.len() - 1] - lags[0],
-            },
-        };
-    }
+    let mut residuals: Vec<i64> = points.iter().map(|&(_, _, r)| r).collect();
+    residuals.sort_unstable();
+    let centre = median(&residuals);
+    let mut deviations: Vec<i64> = residuals.iter().map(|r| (r - centre).abs()).collect();
+    deviations.sort_unstable();
+    let tolerance = (4 * median(&deviations)).max(ms_to_samples(2.0));
+
+    let kept: Vec<(i64, i64, i64)> = points
+        .into_iter()
+        .filter(|&(_, _, residual)| (residual - centre).abs() <= tolerance)
+        .collect();
+
     if kept.len() < MIN_WINDOWS {
         return Alignment::NotMeasurable {
             reason: NotMeasurable::TooFewWindows {
@@ -382,8 +429,8 @@ fn aggregate(mut lags: Vec<i64>, examined: usize) -> Alignment {
         };
     }
 
-    // `kept` inherits `lags`'s ordering, so the ends are the extremes.
-    let spread = kept[kept.len() - 1] - kept[0];
+    let kept_residuals = kept.iter().map(|&(_, _, r)| r);
+    let spread = kept_residuals.clone().max().unwrap() - kept_residuals.min().unwrap();
     if spread > ms_to_samples(MAX_SPREAD_MS) {
         return Alignment::NotMeasurable {
             reason: NotMeasurable::InconsistentWindows {
@@ -393,11 +440,79 @@ fn aggregate(mut lags: Vec<i64>, examined: usize) -> Alignment {
         };
     }
 
+    // The lag at the midpoint in time of the surviving windows, not at the fitted line's
+    // `t = 0` intercept, which would usually sit well before the recording started and say
+    // nothing about the meeting itself. See the doc comment on [`Alignment::Measured`].
+    let t_min = kept.first().unwrap().0;
+    let t_max = kept.last().unwrap().0;
+    let midpoint = t_min as f64 + (t_max - t_min) as f64 / 2.0;
+
     Alignment::Measured {
-        lag_samples: median(&kept),
+        lag_samples: (intercept + slope * midpoint).round() as i64,
         windows_used: kept.len(),
         spread_samples: spread,
+        drift_ms_per_hour: slope * 3_600_000.0,
     }
+}
+
+/// Fitted lag at `start`, rounded to the nearest sample.
+fn fitted_lag(slope: f64, intercept: f64, start: i64) -> i64 {
+    (intercept + slope * start as f64).round() as i64
+}
+
+/// Siegel's repeated-median regression: for each point, the median of its own slope to every
+/// other point; the overall slope is the median of those `n` per-point medians. The intercept
+/// is the ordinary companion step, the median of each point's own `lag - slope * t`.
+///
+/// This is a refinement of Theil-Sen (whose slope is the single median over all `O(n^2)`
+/// pairwise slopes at once), chosen over plain Theil-Sen specifically for its breakdown point
+/// at the small window counts this module works with. With one bad point among `n`, plain
+/// Theil-Sen has that point corrupting `n - 1` of the `n * (n - 1) / 2` pairwise slopes; at
+/// `n = MIN_WINDOWS + 1 = 4`, that is 3 of 6 -- half -- which is already enough to move the
+/// median off the true value, confirmed by hand against the fixture this broke
+/// (`a_single_stray_window_never_turns_a_measurable_recording_into_a_refusal`). Because a
+/// repeated median takes a per-point median first, a single bad point can dominate only *its
+/// own* row of medians, not the pooled set, which is what gives it its well-established 50%
+/// breakdown point (Rousseeuw & Leroy, *Robust Regression and Outlier Detection*) versus plain
+/// Theil-Sen's roughly 29%. `scratch/click_align.py` uses plain Theil-Sen, over a single 35 s
+/// take with far more clicks relative to its rare stray than a window count this small ever
+/// has -- an edge plain Theil-Sen never had to survive there.
+///
+/// `points` here is at most `MAX_WINDOWS` long, so this computes at most `MAX_WINDOWS` times
+/// `MAX_WINDOWS` minus one pairwise slopes -- trivial next to the FFT work that produced the
+/// points in the first place.
+fn repeated_median_fit(points: &[(i64, i64)]) -> (f64, f64) {
+    let mut per_point_slopes: Vec<f64> = Vec::with_capacity(points.len());
+    for i in 0..points.len() {
+        let (t_i, lag_i) = points[i];
+        let mut slopes: Vec<f64> = Vec::with_capacity(points.len() - 1);
+        for (j, &(t_j, lag_j)) in points.iter().enumerate() {
+            // Window starts are chosen distinct and at least a window apart, so `t_j != t_i`
+            // holds for every real call; it guards the arithmetic rather than expecting to
+            // fire.
+            if j != i && t_j != t_i {
+                slopes.push((lag_j - lag_i) as f64 / (t_j - t_i) as f64);
+            }
+        }
+        per_point_slopes.push(median_f64(&mut slopes));
+    }
+    let slope = median_f64(&mut per_point_slopes);
+
+    let mut intercepts: Vec<f64> = points
+        .iter()
+        .map(|&(t, lag)| lag as f64 - slope * t as f64)
+        .collect();
+    let intercept = median_f64(&mut intercepts);
+
+    (slope, intercept)
+}
+
+/// Median of a slice, sorted in place. Unlike [`median`], this is for the `f64` slopes and
+/// intercepts [`repeated_median_fit`] works in, which have no total order of their own to rely
+/// on.
+fn median_f64(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
 }
 
 /// Generalized cross-correlation with a phase transform, wrapped around the one FFT size this
@@ -590,13 +705,45 @@ mod tests {
     /// The direct sound and nothing else.
     const DIRECT: &[(i64, f32)] = &[(0, 0.35)];
 
-    fn measured(alignment: Alignment) -> (i64, usize, i64) {
+    /// A mic track whose lag against `speaker` drifts linearly across the recording, rather
+    /// than staying fixed -- what two independent clocks running at very slightly different
+    /// rates produce, not a moving microphone.
+    ///
+    /// `lag_at(i) = lag_start + drift_per_sample * i` is placed by rounding the speaker-track
+    /// sample's landing index to the nearest mic sample rather than by resampling the speaker
+    /// track at the mismatched rate. That is a coarser model of drift than a real recording
+    /// has -- it steps instead of interpolating -- but it is faithful to sample accuracy,
+    /// which is what GCC-PHAT and the repeated-median fit are both being asked to recover here.
+    fn mic_hearing_with_drift(
+        speaker: &[f32],
+        lag_start: i64,
+        drift_per_sample: f64,
+        gain: f32,
+        seed: u64,
+    ) -> Vec<f32> {
+        let mut floor = Noise(seed);
+        let near_end = speech_like(seed ^ 0x5eed, speaker.len());
+        let mut mic: Vec<f32> = (0..speaker.len())
+            .map(|i| near_end[i] * 0.6 + floor.sample() * 0.005)
+            .collect();
+        for (i, sample) in speaker.iter().enumerate() {
+            let lag = lag_start as f64 + drift_per_sample * i as f64;
+            let heard_at = (i as f64 + lag).round();
+            if heard_at >= 0.0 && (heard_at as usize) < mic.len() {
+                mic[heard_at as usize] += sample * gain;
+            }
+        }
+        mic
+    }
+
+    fn measured(alignment: Alignment) -> (i64, usize, i64, f64) {
         match alignment {
             Alignment::Measured {
                 lag_samples,
                 windows_used,
                 spread_samples,
-            } => (lag_samples, windows_used, spread_samples),
+                drift_ms_per_hour,
+            } => (lag_samples, windows_used, spread_samples, drift_ms_per_hour),
             Alignment::NotMeasurable { reason } => {
                 panic!("expected a measurement, got: {reason}")
             }
@@ -634,7 +781,7 @@ mod tests {
             let truth = baseline + ms_to_samples(residual_ms);
             let mic = mic_hearing(&speaker, truth, DIRECT, 7);
 
-            let (lag, windows, spread) =
+            let (lag, windows, spread, drift) =
                 measured(measure_reference_lag(&mic, &speaker, metadata_offset_s));
             assert!(
                 (lag - truth).abs() <= tolerance,
@@ -645,6 +792,10 @@ mod tests {
             assert!(
                 spread <= tolerance,
                 "a single fixed delay should not spread {spread} samples"
+            );
+            assert!(
+                drift.abs() <= 1000.0,
+                "a single fixed delay should not fit a large slope, got {drift:.1} ms/hour"
             );
         }
     }
@@ -673,7 +824,7 @@ mod tests {
             dulled.push(state);
         }
 
-        let (lag, _, _) = measured(measure_reference_lag(&dulled, &speaker, 0.0));
+        let (lag, _, _, _) = measured(measure_reference_lag(&dulled, &speaker, 0.0));
         assert!(
             (lag - truth).abs() <= ms_to_samples(1.0),
             "recovered {lag} samples against a direct path at {truth}"
@@ -787,7 +938,7 @@ mod tests {
         let speaker = speech_like(10, RATE_HZ * 40);
         let mic = mic_hearing(&speaker, ms_to_samples(120.0), DIRECT, 17);
 
-        let (_, windows, _) = measured(measure_reference_lag(&mic, &speaker, 0.0));
+        let (_, windows, _, _) = measured(measure_reference_lag(&mic, &speaker, 0.0));
         assert!(windows >= MIN_WINDOWS, "only {windows} window(s) survived");
 
         let window = ms_to_samples(WINDOW_MS) as usize;
@@ -821,5 +972,91 @@ mod tests {
             reason(measure_reference_lag(&mic, &speaker, 0.0)),
             NotMeasurable::TooFewWindows { .. }
         ));
+    }
+
+    /// Acceptance criterion #3. Clock drift across a long meeting is a real, slowly moving
+    /// delay, not disagreement between windows, and the reported lag has to stay close to the
+    /// truth at both ends of an hour, not just wherever the windows happened to cluster.
+    #[test]
+    fn a_hand_hour_of_clock_drift_is_measured_within_tolerance_at_both_ends() {
+        let speaker = speech_like(20, RATE_HZ * 3600);
+        let lag_start = ms_to_samples(120.0);
+        // A few ms of drift over the hour -- inside the ~2 to ~7 ms/hour range seen between a
+        // MacBook's microphone clock and ScreenCaptureKit's, and, at the old raw-spread rule,
+        // already more than a quarter of MAX_SPREAD_MS by itself.
+        let total_drift_ms = 6.0;
+        let drift_per_sample = ms_to_samples(total_drift_ms) as f64 / speaker.len() as f64;
+        let mic = mic_hearing_with_drift(&speaker, lag_start, drift_per_sample, 0.35, 23);
+
+        let (lag_samples, windows, spread, drift_ms_per_hour) =
+            measured(measure_reference_lag(&mic, &speaker, 0.0));
+        assert!(windows >= MIN_WINDOWS, "only {windows} windows");
+        assert!(
+            spread <= ms_to_samples(MAX_SPREAD_MS),
+            "residual spread {spread} should fit under the limit once drift is fit out"
+        );
+        assert!(
+            (drift_ms_per_hour - total_drift_ms).abs() <= 2.0,
+            "fitted drift {drift_ms_per_hour:.2} ms/hour, true rate was {total_drift_ms} ms/hour"
+        );
+
+        // The reported lag sits at the midpoint of the surviving windows, so the worst-case
+        // error against the true instantaneous lag at either end is bounded to half the total
+        // drift -- see the doc comment on `Alignment::Measured`. A couple of extra ms covers
+        // ordinary GCC-PHAT/repeated-median noise on top of that bound.
+        let true_lag_at = |i: usize| lag_start + (drift_per_sample * i as f64).round() as i64;
+        let tolerance = ms_to_samples(total_drift_ms / 2.0 + 2.0);
+        let true_start = true_lag_at(0);
+        let true_end = true_lag_at(speaker.len() - 1);
+        assert!(
+            (lag_samples - true_start).abs() <= tolerance,
+            "recovered {lag_samples}, true lag at the start of the recording was {true_start}"
+        );
+        assert!(
+            (lag_samples - true_end).abs() <= tolerance,
+            "recovered {lag_samples}, true lag at the end of the recording was {true_end}"
+        );
+    }
+
+    /// Acceptance criterion #4. One stray detection among otherwise consistent windows must
+    /// not be able to trip a refusal, at every window count from the smallest measurable set
+    /// up through a typical one -- guards the specific failure the discard-count branch this
+    /// task removes used to risk: it counted how many windows disagreed rather than how far.
+    ///
+    /// Exercised directly against `aggregate`: the acoustics that produce a `(start, lag)`
+    /// pair are somebody else's job (`window_lag`'s and `select_windows`'s own tests cover
+    /// them), and folding them in here would make this test about GCC-PHAT's accuracy instead
+    /// of about the aggregation rule this acceptance criterion is actually about.
+    #[test]
+    fn a_single_stray_window_never_turns_a_measurable_recording_into_a_refusal() {
+        for consistent in MIN_WINDOWS..=9 {
+            let step = ms_to_samples(WINDOW_MS);
+            let truth = ms_to_samples(150.0);
+            let mut lags: Vec<(i64, i64)> =
+                (0..consistent as i64).map(|i| (i * step, truth)).collect();
+            // One stray, far outside any tolerance the consistent windows could produce, at
+            // its own distinct time.
+            lags.push((consistent as i64 * step, truth + ms_to_samples(500.0)));
+
+            let (lag, windows, _, _) = measured(aggregate(lags, consistent + 1));
+            assert_eq!(
+                windows, consistent,
+                "at {consistent} consistent windows plus one stray, only the stray should be \
+                 discarded"
+            );
+            assert_eq!(lag, truth, "at {consistent} consistent windows");
+        }
+    }
+
+    /// The arithmetic of `repeated_median_fit`, independent of `aggregate`'s outlier rejection
+    /// or of any audio at all -- so a future change to the outlier logic cannot silently break
+    /// the fit itself. Every point sits exactly on the line, since the fit's robustness
+    /// against a stray point is already exercised end to end above.
+    #[test]
+    fn repeated_median_fit_recovers_a_hand_computed_line() {
+        let points = [(0, 5), (10, 25), (20, 45), (30, 65), (40, 85)];
+        let (slope, intercept) = repeated_median_fit(&points);
+        assert!((slope - 2.0).abs() < 1e-9, "slope {slope}");
+        assert!((intercept - 5.0).abs() < 1e-9, "intercept {intercept}");
     }
 }
