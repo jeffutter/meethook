@@ -34,6 +34,42 @@ fn parse_pan(value: &str) -> Result<f32, String> {
     Ok(pan)
 }
 
+/// Parses a loudness target, refusing one the measurement could never reach.
+///
+/// Same posture as [`parse_pan`]: the bounds are what the arithmetic admits, not what sounds
+/// sensible, so an unwise-but-meaningful target is the user's to choose and an impossible one is
+/// refused where it was typed. NaN falls out as a refusal because a range never contains it.
+fn parse_target_lufs(value: &str) -> Result<f64, String> {
+    parse_bounded(
+        value,
+        mixdown::TARGET_MIN_LUFS,
+        mixdown::TARGET_MAX_LUFS,
+        "LUFS",
+    )
+}
+
+/// Parses a boost cap, refusing one outside the span any target could ask for.
+fn parse_max_boost_db(value: &str) -> Result<f64, String> {
+    parse_bounded(
+        value,
+        mixdown::MAX_BOOST_MIN_DB,
+        mixdown::MAX_BOOST_MAX_DB,
+        "dB",
+    )
+}
+
+/// The shared body of the two levelling parsers: parse, range-check, and name the range and the
+/// unit in the refusal.
+fn parse_bounded(value: &str, min: f64, max: f64, unit: &str) -> Result<f64, String> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a number"))?;
+    if !(min..=max).contains(&parsed) {
+        return Err(format!("`{value}` is outside {min}..={max} {unit}"));
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "meethook",
@@ -72,10 +108,11 @@ enum Command {
     /// Transcribe recorded sessions
     ///
     /// With no session ids, every discovered session is considered.
-    // Negative numbers reach the value parsers rather than clap's argument scanner, so that
-    // `--pan -0.1` is refused by the range check and names the range, instead of being
-    // reported as an unexpected argument `-0`. Safe here because no option takes a value that
-    // could be confused with a flag, and session ids never begin with a hyphen.
+    // Negative numbers reach the value parsers rather than clap's argument scanner. `--pan -0.1`
+    // needs this to be refused by the range check and name the range, instead of being reported
+    // as an unexpected argument `-0` -- and `--target-lufs -16` needs it simply to work, since a
+    // loudness target is negative every time anyone types one. Safe because session ids never
+    // begin with a hyphen, so nothing positional can be swallowed by it.
     #[command(allow_negative_numbers = true)]
     Transcribe {
         /// Session ids to transcribe; omit to consider all discovered sessions
@@ -114,6 +151,34 @@ enum Command {
             value_parser = parse_pan,
         )]
         pan: f32,
+
+        /// Loudness each track is brought to before mixing, in LUFS
+        ///
+        /// Negative, always: 0 is digital full scale. The default is the podcast convention
+        /// rather than EBU R 128's -23, which arrives too quiet on headphones and on a laptop
+        /// speaker.
+        #[arg(
+            long,
+            value_name = "LUFS",
+            default_value_t = mixdown::TARGET_LUFS,
+            value_parser = parse_target_lufs,
+            allow_negative_numbers = true,
+        )]
+        target_lufs: f64,
+
+        /// Most a quiet track may be turned up on its way to the target, in dB
+        ///
+        /// The ceiling exists because gain applied to a quiet track brings its hiss and room
+        /// rumble up with the voice. Raise it to match a very quiet microphone at the cost of
+        /// its noise floor; a track needing more than this is left short of the target rather
+        /// than amplified past it.
+        #[arg(
+            long,
+            value_name = "DB",
+            default_value_t = mixdown::MAX_BOOST_DB,
+            value_parser = parse_max_boost_db,
+        )]
+        max_boost_db: f64,
     },
 
     /// Name speakers that transcription could not identify
@@ -223,6 +288,8 @@ fn main() -> Result<()> {
             force,
             bitrate,
             pan,
+            target_lufs,
+            max_boost_db,
         } => commands::transcribe(
             &paths,
             &session_ids,
@@ -231,6 +298,10 @@ fn main() -> Result<()> {
             mixdown::Settings {
                 bitrate_bps: bitrate,
                 pan,
+                normalization: mixdown::Normalization {
+                    target_lufs,
+                    max_boost_db,
+                },
             },
         ),
         Command::Enroll(args) => commands::enroll(&paths, &args, template),
@@ -261,10 +332,23 @@ fn resolve_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    /// The bitrate and pan `meethook transcribe` would run with, given these arguments.
-    fn transcribe_mixdown(args: &[&str]) -> (u32, f32) {
+    /// The mixdown settings `meethook transcribe` would run with, given these arguments.
+    fn transcribe_mixdown(args: &[&str]) -> mixdown::Settings {
         match Cli::try_parse_from(args).expect("should parse").command {
-            Command::Transcribe { bitrate, pan, .. } => (bitrate, pan),
+            Command::Transcribe {
+                bitrate,
+                pan,
+                target_lufs,
+                max_boost_db,
+                ..
+            } => mixdown::Settings {
+                bitrate_bps: bitrate,
+                pan,
+                normalization: mixdown::Normalization {
+                    target_lufs,
+                    max_boost_db,
+                },
+            },
             other => panic!("expected a transcribe command, got {other:?}"),
         }
     }
@@ -277,28 +361,83 @@ mod tests {
 
     #[test]
     fn the_mixdown_defaults_are_the_constants_the_listening_run_settled() {
-        // Compared against the constants rather than against `32000` and `0.3`, so that
-        // changing a value settled by listening stays a one-line edit in `mixdown.rs` and
-        // does not need this test edited to match. This is also what pins "omitting both
-        // flags encodes exactly what the previous build encoded".
+        // Compared against `Settings::default()` rather than against `32000`, `0.3`, `-16` and
+        // `18`, so that changing a value settled by listening stays a one-line edit in
+        // `mixdown.rs` and does not need this test edited to match. This is also what pins
+        // "omitting every flag encodes exactly what the previous build encoded".
         assert_eq!(
             transcribe_mixdown(&["meethook", "transcribe"]),
-            (mixdown::BITRATE_BPS, mixdown::PAN_POSITION)
+            mixdown::Settings::default()
         );
     }
 
     #[test]
-    fn both_settings_are_overridable() {
-        let (bitrate, pan) = transcribe_mixdown(&[
+    fn every_mixdown_setting_is_overridable() {
+        let settings = transcribe_mixdown(&[
             "meethook",
             "transcribe",
             "--bitrate",
             "48000",
             "--pan",
             "0.5",
+            "--target-lufs",
+            "-20",
+            "--max-boost-db",
+            "24",
         ]);
-        assert_eq!(bitrate, 48_000);
-        assert!((pan - 0.5).abs() < f32::EPSILON, "{pan}");
+        assert_eq!(settings.bitrate_bps, 48_000);
+        assert!(
+            (settings.pan - 0.5).abs() < f32::EPSILON,
+            "{}",
+            settings.pan
+        );
+        assert_eq!(settings.normalization.target_lufs, -20.0);
+        assert_eq!(settings.normalization.max_boost_db, 24.0);
+    }
+
+    #[test]
+    fn a_negative_loudness_target_is_a_value_rather_than_a_flag() {
+        // The ordinary way this option gets typed: a loudness target is negative every time.
+        // Without `allow_negative_numbers` on the subcommand, clap reads `-20` as an unknown
+        // short flag and the option is unusable, so this pins the setting rather than leaving
+        // it resting on the comment beside it.
+        for value in ["-16", "-23.5", "-0.5"] {
+            let settings = transcribe_mixdown(&["meethook", "transcribe", "--target-lufs", value]);
+            assert_eq!(
+                settings.normalization.target_lufs,
+                value.parse::<f64>().unwrap(),
+                "--target-lufs {value} did not survive parsing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_levelling_value_outside_what_the_measurement_admits_is_refused_at_the_edge() {
+        // Both ends of both options. The floor on a target is the loudness gate: below it no
+        // block survives measurement, so the target names a loudness nothing can be brought to.
+        // The ceiling on a cap is the widest correction any legal target can ask for, above
+        // which the cap can never bind.
+        for (option, value) in [
+            ("--target-lufs", mixdown::TARGET_MIN_LUFS - 1.0),
+            ("--target-lufs", mixdown::TARGET_MAX_LUFS + 1.0),
+            ("--max-boost-db", mixdown::MAX_BOOST_MIN_DB - 1.0),
+            ("--max-boost-db", mixdown::MAX_BOOST_MAX_DB + 1.0),
+        ] {
+            let typed = value.to_string();
+            let message = refused(&["meethook", "transcribe", option, &typed]);
+            assert!(
+                message.contains(&typed),
+                "{option} {typed} not named in: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_levelling_value_that_is_not_a_number_is_refused() {
+        for option in ["--target-lufs", "--max-boost-db"] {
+            let message = refused(&["meethook", "transcribe", option, "NaN"]);
+            assert!(message.contains("NaN"), "{option}: {message}");
+        }
     }
 
     #[test]

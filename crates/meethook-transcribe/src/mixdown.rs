@@ -94,10 +94,10 @@ pub const PAN_MAX: f32 = 1.0;
 
 /// The two mixdown settings a listener can reasonably disagree about.
 ///
-/// One struct rather than two loose numbers because they travel together through four call
-/// layers, and a bare `(u32, f32)` that far from here is a pair of arguments waiting to be
-/// swapped. [`Default`] is the pair TASK-032.01 settled by listening, so the values stay
-/// written down once, in the two constants above.
+/// One struct rather than loose numbers because they travel together through four call layers,
+/// and a bare tuple that far from here is a set of arguments waiting to be swapped. [`Default`]
+/// is what TASK-032.01 and TASK-039 settled by listening, so the values stay written down once,
+/// in the constants above.
 ///
 /// The source rate is deliberately absent. It is not a taste setting: the mix reuses the
 /// tracks `transcribe` already holds in memory, and any other rate means reading the session's
@@ -108,6 +108,8 @@ pub struct Settings {
     pub bitrate_bps: u32,
     /// How far from centre each source sits. See [`PAN_POSITION`].
     pub pan: f32,
+    /// How the two sources are brought to a common loudness. See [`Normalization`].
+    pub normalization: Normalization,
 }
 
 impl Default for Settings {
@@ -115,6 +117,7 @@ impl Default for Settings {
         Settings {
             bitrate_bps: BITRATE_BPS,
             pan: PAN_POSITION,
+            normalization: Normalization::default(),
         }
     }
 }
@@ -178,6 +181,31 @@ const PEAK_CEILING: f32 = 0.99;
 /// value it is arguing about, and `examples/session-mixdown.rs` sweeps around it.
 pub const TARGET_LUFS: f64 = -16.0;
 
+/// The range a loudness target may occupy, in LUFS.
+///
+/// Both ends are what the measurement admits rather than what sounds reasonable, which is the
+/// same principle [`BITRATE_MIN_BPS`] and [`PAN_MIN`] are chosen on: a caller taking this from a
+/// user can refuse a meaningless value where it was typed, and leave the merely unwise ones to
+/// the person who typed them.
+///
+/// The floor *is* the loudness module's absolute gate, not a second copy of it. Nothing quieter
+/// than that gate survives measurement at all, so a target below it names a loudness no source
+/// can be brought to.
+pub const TARGET_MIN_LUFS: f64 = loudness::ABSOLUTE_GATE_LUFS;
+/// Digital full scale. A positive target asks for louder than the format can represent.
+pub const TARGET_MAX_LUFS: f64 = 0.0;
+
+/// The range a boost cap may occupy, in dB.
+///
+/// Zero is a real value -- it means "level nothing upward, only downward" -- and negative is
+/// not: the cap is upward-only by construction (see [`MAX_BOOST_DB`]), so a negative cap would
+/// be asking this field to mean something it does not mean.
+pub const MAX_BOOST_MIN_DB: f64 = 0.0;
+/// The widest span any legal target can ask of any measurable source, so a cap above this can
+/// never bind. Derived from the target range rather than written out, because that is the fact
+/// that makes it the right number.
+pub const MAX_BOOST_MAX_DB: f64 = TARGET_MAX_LUFS - TARGET_MIN_LUFS;
+
 /// The most a single source may be turned up, in dB.
 ///
 /// Gain applied to a quiet-but-not-silent track arrives as hiss and HVAC rumble, so past some
@@ -207,16 +235,18 @@ pub const MAX_BOOST_DB: f64 = 18.0;
 
 /// How each source is brought to a common loudness before the two are summed.
 ///
-/// Deliberately *not* part of [`Settings`]. `Settings` is the pair a listener can reasonably
-/// disagree about and that `meethook transcribe` therefore exposes as `--bitrate` and `--pan`;
-/// these two are decisions this module makes on the listener's behalf, and the outcome of
-/// arguing about them is an edit to [`TARGET_LUFS`] or [`MAX_BOOST_DB`] rather than a new flag.
-/// Nothing on the shipping path constructs one of these -- [`mix`] uses [`Default`] and the CLI
-/// has no way to say otherwise -- so please do not add a flag for them by symmetry with the
-/// other two.
+/// Part of [`Settings`], and so reachable from `meethook transcribe --target-lufs` and
+/// `--max-boost-db` alongside `--bitrate` and `--pan`. All four are the same kind of thing: a
+/// judgement about how a meeting should sound, which this module makes a default for and a
+/// listener may disagree with. The defaults are not placeholders -- each was settled by
+/// listening to a real meeting on headphones and on a laptop speaker (TASK-032.01, TASK-039) --
+/// so a run that passes no flags is the run this module is arguing for, and the flags exist for
+/// the person whose ears or whose recordings differ.
 ///
-/// It exists as a struct at all so that `examples/session-mixdown.rs` can sweep the two values
-/// and print the gain each track is about to receive, without restating the formula.
+/// A struct rather than two loose parameters so that `examples/session-mixdown.rs` can sweep the
+/// pair and print the gain each track is about to receive without restating the formula, and so
+/// that adding a third levelling decision later does not widen every signature between here and
+/// the CLI.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Normalization {
     /// The loudness each source is brought to, in LUFS. See [`TARGET_LUFS`].
@@ -301,16 +331,16 @@ pub fn mix(sources: &[Source<'_>], rate: u32) -> Vec<f32> {
 
 /// [`mix`], with the levelling step made answerable.
 ///
-/// `Some(normalization)` is [`mix`]'s behaviour with the two constants replaced. `None` skips
-/// the per-source gain entirely, leaving each track at the level it arrived at -- pan, sum, and
-/// then the peak ceiling, which still applies, because a mix that clips is not a comparison of
+/// `Some(normalization)` is [`mix`]'s behaviour with the two constants replaced, and is what the
+/// pipeline calls, passing whatever [`Settings::normalization`] holds. `None` skips the
+/// per-source gain entirely, leaving each track at the level it arrived at -- pan, sum, and then
+/// the peak ceiling, which still applies, because a mix that clips is not a comparison of
 /// anything.
 ///
-/// This exists for one diagnostic: the normalized/unnormalized A/B in
-/// `examples/session-mixdown.rs`, which is how the levelling's own value gets confirmed by ear.
-/// It is not a configuration point. [`mix`] is the entry point for anything real, and it is the
-/// only one the pipeline calls, so the shipping path never sees this `Option` and never has to
-/// have an opinion about it.
+/// Only the `None` arm is diagnostic-only. It exists for the normalized/unnormalized A/B in
+/// `examples/session-mixdown.rs`, which is how the levelling's own value gets confirmed by ear,
+/// and there is deliberately no way to reach it from the CLI: "should this tool level at all" is
+/// a question this module has answered, unlike the two values inside [`Normalization`].
 pub fn mix_with(
     sources: &[Source<'_>],
     rate: u32,
@@ -979,6 +1009,19 @@ mod tests {
         // rather than about a fixture that happens to need no correction.
         let normalized = mix(&[centred(&quiet, 0.0), centred(&loud, 10.0)], TARGET_RATE);
         assert_ne!(normalized, stereo);
+    }
+
+    #[test]
+    fn the_default_settings_level_exactly_as_mix_does() {
+        // The join that keeps "transcribe with no flags" byte-identical to what the build
+        // before `--target-lufs` and `--max-boost-db` produced. The pipeline calls `mix_with`
+        // with `Settings::normalization` where it used to call `mix`, and `mix` is `mix_with`
+        // with `Normalization::default()`, so the two agree only as long as this does.
+        assert_eq!(
+            Settings::default().normalization,
+            Normalization::default(),
+            "a no-flag run would no longer level the way mix() does"
+        );
     }
 
     #[test]

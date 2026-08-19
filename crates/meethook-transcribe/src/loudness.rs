@@ -49,7 +49,11 @@ const LOUDNESS_OFFSET_LU: f64 = -0.691;
 
 /// The absolute gate (BS.1770-4 §3): blocks quieter than this are silence, not speech, and
 /// are dropped before any mean is taken.
-const ABSOLUTE_GATE_LUFS: f64 = -70.0;
+///
+/// Visible to the crate because it is also the floor on a loudness target: nothing under this
+/// survives measurement, so no source can be brought to a target below it. See
+/// [`crate::mixdown::TARGET_MIN_LUFS`], which is this constant rather than a second `-70.0`.
+pub(crate) const ABSOLUTE_GATE_LUFS: f64 = -70.0;
 
 /// The relative gate (BS.1770-4 §3): after the absolute gate, blocks more than this far below
 /// the mean of what survived are dropped too.

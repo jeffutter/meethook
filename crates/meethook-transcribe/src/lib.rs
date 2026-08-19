@@ -612,7 +612,7 @@ fn write_mixdown(
 
     mixdown::write(
         &session.paths.meeting_opus(),
-        &mixdown::mix(&sources, TARGET_RATE),
+        &mixdown::mix_with(&sources, TARGET_RATE, Some(settings.normalization)),
         TARGET_RATE,
         settings.bitrate_bps,
     )
