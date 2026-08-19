@@ -221,6 +221,39 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+
+    /// Correct, or clear, the meeting a session was labelled with
+    ///
+    /// The calendar match is a guess over start and end times, and a guess is sometimes wrong:
+    /// a session that began twenty minutes into a booked hour is either a late join or an
+    /// unrelated call, and a double-booked hour resolves to whichever invite the recorder
+    /// preferred. This is how a person who was there settles it.
+    ///
+    /// With neither flag, prints the label the session carries and the meetings around it,
+    /// numbered, and writes nothing. --event attaches one of them; --clear records that the
+    /// session was not recorded during a meeting at all and needs no calendar access. Either
+    /// way the label is marked as one a human chose, so nothing guesses over it afterwards,
+    /// and the session's transcript.md is brought in line in the same run.
+    Meeting {
+        /// The session to relabel, exactly as its directory is named
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+
+        /// Attach the Nth meeting of the list this command prints when given neither flag
+        ///
+        /// The number beside the meeting in that list, not a calendar identifier: nothing
+        /// shows you one of those, and they are not typeable.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        event: Option<u32>,
+
+        /// Record that this session was not recorded during any meeting
+        ///
+        /// The other half of a correction, and the half that needs no calendar: a session
+        /// matched to a meeting that was never held is fixed on a machine with the grant
+        /// refused.
+        #[arg(long, conflicts_with = "event")]
+        clear: bool,
+    },
 }
 
 /// `enroll`'s options.
@@ -311,6 +344,11 @@ fn main() -> Result<()> {
             reference,
             yes,
         } => commands::forget(&paths, &name, reference, yes, template),
+        Command::Meeting {
+            session_id,
+            event,
+            clear,
+        } => commands::meeting(&paths, &session_id, event, clear, template),
     }
 }
 
@@ -463,5 +501,74 @@ mod tests {
             let message = refused(&["meethook", "transcribe", "--pan", value]);
             assert!(message.contains(value), "{value} not named in: {message}");
         }
+    }
+
+    /// What `meethook meeting` would do, given these arguments: the session, and the two flags
+    /// that decide between showing, attaching and clearing.
+    fn meeting_args(args: &[&str]) -> (String, Option<u32>, bool) {
+        match Cli::try_parse_from(args).expect("should parse").command {
+            Command::Meeting {
+                session_id,
+                event,
+                clear,
+            } => (session_id, event, clear),
+            other => panic!("expected a meeting command, got {other:?}"),
+        }
+    }
+
+    /// The preview is what you get for typing the least, which is the shape this command is
+    /// built around: nothing is written until a flag says which correction to make.
+    #[test]
+    fn a_meeting_command_with_no_flag_is_the_listing() {
+        assert_eq!(
+            meeting_args(&["meethook", "meeting", "20260809-052600"]),
+            ("20260809-052600".to_owned(), None, false)
+        );
+    }
+
+    #[test]
+    fn a_meeting_can_be_attached_by_number_or_cleared() {
+        assert_eq!(
+            meeting_args(&["meethook", "meeting", "20260809-052600", "--event", "2"]),
+            ("20260809-052600".to_owned(), Some(2), false)
+        );
+        assert_eq!(
+            meeting_args(&["meethook", "meeting", "20260809-052600", "--clear"]),
+            ("20260809-052600".to_owned(), None, true)
+        );
+    }
+
+    /// Attaching a meeting and recording that there was none are contradictory, and a run that
+    /// silently picked one of them would write the wrong answer to `session.json` -- so clap
+    /// refuses the pair rather than this being an ordering decision inside the command.
+    #[test]
+    fn attaching_and_clearing_at_once_is_refused() {
+        let message = refused(&[
+            "meethook",
+            "meeting",
+            "20260809-052600",
+            "--event",
+            "1",
+            "--clear",
+        ]);
+        assert!(message.contains("--clear"), "{message}");
+        assert!(message.contains("--event"), "{message}");
+    }
+
+    /// The listing is 1-based, as it prints. `--event 0` is refused where the range can be
+    /// named rather than reaching the library as an index nobody offered.
+    #[test]
+    fn an_event_number_below_the_first_one_is_refused_at_the_edge() {
+        let message = refused(&["meethook", "meeting", "20260809-052600", "--event", "0"]);
+        assert!(message.contains('0'), "{message}");
+        assert!(message.contains('1'), "the range is not named: {message}");
+    }
+
+    /// A session id is required: there is no "all sessions" reading of a correction, and
+    /// guessing one would be a write to a session nobody named.
+    #[test]
+    fn a_meeting_command_needs_a_session() {
+        let message = refused(&["meethook", "meeting"]);
+        assert!(message.contains("SESSION_ID"), "{message}");
     }
 }

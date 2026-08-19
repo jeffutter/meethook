@@ -143,6 +143,64 @@ pub(crate) fn meeting_at(at: Timestamp) -> Option<Meeting> {
     chosen
 }
 
+/// Every meeting worth offering as a correction for a session that started at `at`.
+///
+/// The listing half of `meeting_at`: that one picks, this one shows the choices, and both
+/// read the same `QUERY_WINDOW` of calendar around the same instant. `meethook meeting` is
+/// the caller -- a session recorded during a double-booked hour resolves to whichever
+/// candidate `select` prefers, and the only remaining way to fix that is a person who knows
+/// which of the two it was.
+///
+/// Total, exactly as `meeting_at` is and for the same reason: a missing grant, an empty
+/// calendar, a raise and a panic are all an empty `Vec`. Nothing offered is a correction
+/// command with nothing to list, never a failed one -- and its other half, clearing a label,
+/// needs no calendar at all.
+///
+/// Each meeting keeps [`MeetingFit::Unknown`]: a candidate is not a match, and only a person
+/// choosing one makes it [`MeetingFit::Confirmed`].
+pub fn meetings_around(at: Timestamp) -> Vec<Meeting> {
+    let status = status();
+    if status != EKAuthorizationStatus::FullAccess {
+        debug(&format!(
+            "calendar access is not granted (status {}); no meetings can be offered",
+            status.0
+        ));
+        return Vec::new();
+    }
+
+    // SAFETY: as `meeting_at` -- a read against a freshly created store, with every event
+    // converted to owned Rust before the store, dates or predicate are dropped.
+    let candidates = caught("EKEventStore.eventsMatchingPredicate", || unsafe {
+        candidates_around(at)
+    })
+    .unwrap_or_default();
+    if debugging() {
+        for candidate in &candidates {
+            debug(&summarize(candidate));
+        }
+    }
+    offerable(candidates)
+}
+
+/// Which candidates may be offered, and in what order.
+///
+/// Drops all-day and declined events -- [`select`]'s own two disqualifications, applied here
+/// from the same place so a listing cannot offer something the automatic lookup would never
+/// have picked. Everything else survives, including events no rule of `select` would choose:
+/// the whole point of a listing is that the rules got it wrong.
+///
+/// Ordered by [`tie_break`] -- start, then event id -- because `eventsMatchingPredicate:`
+/// guarantees no order at all, and a numbered list whose numbering moved between two runs of
+/// the same command would be worse than no numbering.
+fn offerable(candidates: Vec<Candidate>) -> Vec<Meeting> {
+    let mut usable: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(|c| !c.all_day && !c.declined)
+        .collect();
+    usable.sort_by(tie_break);
+    usable.into_iter().map(|c| c.meeting).collect()
+}
+
 /// The calendar authorization status.
 ///
 /// One expression with two readers -- [`meeting_at`] and [`request_calendar_access`] -- rather
@@ -788,6 +846,79 @@ mod tests {
         }
     }
 
+    /// The titles a listing would offer, in the order it would number them.
+    fn offers(candidates: Vec<Candidate>) -> Vec<String> {
+        offerable(candidates)
+            .into_iter()
+            .map(|meeting| meeting.title)
+            .collect()
+    }
+
+    /// A listing exists because `select` got it wrong, so it must keep the candidates `select`
+    /// passed over -- the ones it *disqualified* are a different matter, and go.
+    #[test]
+    fn a_listing_offers_everything_but_the_all_day_and_declined_events() {
+        let mut all_day = candidate("conference", "2026-08-15T00:00:00Z", "2026-08-16T00:00:00Z");
+        all_day.all_day = true;
+        let mut declined = candidate("declined", "2026-08-15T09:55:00Z", "2026-08-15T10:25:00Z");
+        declined.declined = true;
+        let candidates = vec![
+            candidate("containing", "2026-08-15T09:55:00Z", "2026-08-15T10:25:00Z"),
+            all_day,
+            // The one `select` would never choose over the containing event, and precisely the
+            // one a user in a double-booked hour is here to pick.
+            candidate(
+                "also containing",
+                "2026-08-15T09:50:00Z",
+                "2026-08-15T11:00:00Z",
+            ),
+            declined,
+            candidate("upcoming", "2026-08-15T10:05:00Z", "2026-08-15T10:35:00Z"),
+            candidate("ended", "2026-08-15T09:25:00Z", "2026-08-15T09:55:00Z"),
+        ];
+
+        assert_eq!(
+            offers(candidates),
+            vec!["ended", "also containing", "containing", "upcoming"]
+        );
+    }
+
+    /// The numbering a user types `--event 2` against has to address the same meeting on the
+    /// next run, and `eventsMatchingPredicate:` guarantees no order whatsoever.
+    #[test]
+    fn the_offered_order_does_not_depend_on_the_order_the_framework_returned() {
+        let candidates = vec![
+            candidate("second", "2026-08-15T10:00:00Z", "2026-08-15T10:30:00Z"),
+            candidate("first", "2026-08-15T09:30:00Z", "2026-08-15T10:30:00Z"),
+            // Same start as "second": the id breaks the tie, so the order is total rather than
+            // merely usually-stable.
+            candidate("third", "2026-08-15T10:00:00Z", "2026-08-15T11:00:00Z"),
+        ];
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+
+        assert_eq!(offers(candidates), vec!["first", "second", "third"]);
+        assert_eq!(offers(reversed), vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn nothing_on_the_calendar_offers_nothing() {
+        assert!(offers(Vec::new()).is_empty());
+    }
+
+    /// An offered candidate is not a match: it is one of several a person is about to choose
+    /// between, and nothing here has decided anything about it. The fit it eventually carries
+    /// is `Confirmed`, and only whoever picks it can put that there.
+    #[test]
+    fn an_offered_candidate_carries_no_fit_of_its_own() {
+        let offered = offerable(vec![candidate(
+            "containing",
+            "2026-08-15T09:55:00Z",
+            "2026-08-15T10:25:00Z",
+        )]);
+        assert_eq!(offered[0].fit, MeetingFit::Unknown);
+    }
+
     #[test]
     fn a_meeting_about_to_start_beats_one_that_just_ended() {
         let candidates = vec![
@@ -1191,6 +1322,17 @@ mod tests {
             return;
         }
         assert!(meeting_at(session_start()).is_none());
+    }
+
+    /// The same for the listing, and the reason `meethook meeting --clear` needs no calendar:
+    /// on an ungranted machine the offer is empty rather than a prompt, a hang or a failure,
+    /// so the correction command degrades to the half that needs no events.
+    #[test]
+    fn nothing_is_offered_without_a_grant() {
+        if status() == EKAuthorizationStatus::FullAccess {
+            return;
+        }
+        assert!(meetings_around(session_start()).is_empty());
     }
 
     // The request-path rules, every one of them driven through `resolve` with a closure.

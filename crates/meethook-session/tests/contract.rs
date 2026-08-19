@@ -244,6 +244,136 @@ fn a_session_with_no_meeting_writes_no_meeting_key() {
         !json.contains("fit"),
         "a session with no meeting has no fit: {json}"
     );
+    // `meeting_cleared` contains "meeting", so the first assertion already covers it -- which
+    // is the point worth stating rather than leaving to be rediscovered. A session nobody has
+    // corrected serializes byte-identically to one written before the flag existed, and that
+    // is why adding it did not need a schema version.
+    assert!(
+        !json.contains("cleared"),
+        "a session nobody corrected must not carry the flag: {json}"
+    );
+}
+
+// --- a label settled by hand -----------------------------------------------------------
+
+/// The three states a label can be in, and the fact that only two of them are settled.
+///
+/// "No meeting" is the ambiguous one: it is both what a session recorded outside any meeting
+/// looks like and what one the calendar could not be read for looks like. `meeting_cleared` is
+/// the whole of the difference, and it is what stops a later pass from filling the second
+/// answer into the first.
+#[test]
+fn a_label_is_settled_by_hand_only_when_somebody_settled_it() {
+    let found = sample_metadata("20260809-052607").with_meeting(Some(sample_meeting()));
+    assert!(!found.meeting_settled_by_hand());
+    assert!(!sample_metadata("20260809-052607").meeting_settled_by_hand());
+
+    let mut attached = sample_metadata("20260809-052607");
+    attached.label_by_hand(Some(sample_meeting()));
+    assert!(attached.meeting_settled_by_hand());
+    assert_eq!(
+        attached.meeting.as_ref().unwrap().fit,
+        MeetingFit::Confirmed
+    );
+    assert!(!attached.meeting_cleared);
+
+    let mut cleared = found.clone();
+    cleared.label_by_hand(None);
+    assert!(cleared.meeting_settled_by_hand());
+    assert!(cleared.meeting.is_none());
+    assert!(cleared.meeting_cleared);
+
+    // And correcting a correction: attaching after clearing takes the flag back down, so a
+    // session cannot end up both cleared and labelled.
+    let mut corrected = cleared;
+    corrected.label_by_hand(Some(sample_meeting()));
+    assert!(!corrected.meeting_cleared);
+    assert_eq!(
+        corrected.meeting.as_ref().unwrap().fit,
+        MeetingFit::Confirmed
+    );
+}
+
+/// The guard itself: `with_meeting` is the one door an automatic pass writes a label through,
+/// and it refuses a session somebody has already settled.
+///
+/// Structural rather than a rule each future caller has to remember -- which is the only form
+/// of "nothing overwrites a human's answer" that survives code nobody has written yet.
+#[test]
+fn an_automatic_pass_cannot_overwrite_a_label_settled_by_hand() {
+    let guess = sample_meeting()
+        .with_fit(MeetingFit::Started)
+        .with_invite(None, None, None);
+
+    let mut attached = sample_metadata("20260809-052607");
+    attached.label_by_hand(Some(sample_meeting()));
+    assert_eq!(attached.clone().with_meeting(Some(guess.clone())), attached);
+    assert_eq!(attached.clone().with_meeting(None), attached);
+
+    let mut cleared = sample_metadata("20260809-052607");
+    cleared.label_by_hand(None);
+    assert_eq!(cleared.clone().with_meeting(Some(guess)), cleared);
+
+    // A session nobody has settled is still writable, or the recorder could never label one.
+    let fresh = sample_metadata("20260809-052607").with_meeting(Some(sample_meeting()));
+    assert!(fresh.meeting.is_some());
+}
+
+/// A confirmed label is a strong match, so the attendee roster and the caveat follow from it
+/// exactly as they do for the automatic strong fits -- the two properties every consumer of a
+/// meeting reads.
+#[test]
+fn a_confirmed_label_is_strong_and_carries_no_caveat() {
+    assert!(MeetingFit::Confirmed.is_strong());
+    assert_eq!(MeetingFit::Confirmed.caveat(), None);
+    assert!(MeetingFit::ALL.contains(&MeetingFit::Confirmed));
+
+    let meeting = sample_meeting().with_fit(MeetingFit::Confirmed);
+    assert_eq!(meeting.speaker_roster().map(<[_]>::len), Some(1));
+}
+
+/// A correction survives the round trip through `session.json`, spelled the way a person
+/// reading the file would expect.
+#[test]
+fn a_cleared_label_round_trips_through_session_json() {
+    let mut cleared = sample_metadata("20260809-052607").with_meeting(Some(sample_meeting()));
+    cleared.label_by_hand(None);
+    let json = serde_json::to_string(&cleared).unwrap();
+
+    assert!(json.contains(r#""meeting_cleared":true"#), "{json}");
+    assert!(!json.contains("Incident review"), "{json}");
+    let decoded: SessionMetadata = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, cleared);
+    assert!(decoded.meeting_settled_by_hand());
+}
+
+/// A `session.json` written before corrections existed reads as one nobody has corrected,
+/// rather than failing to parse -- the same rule every other addition to this file has had to
+/// meet, and the reason the schema version did not move.
+#[test]
+fn session_json_written_before_corrections_still_reads() {
+    let (_tmp, paths) = temp_root();
+    let session = make_session(&paths, "20260809-052607", &[]);
+    let before = r#"{
+      "session_id": "20260809-052607",
+      "schema_version": 1,
+      "start_time": "2026-08-09T05:26:00Z",
+      "mic": { "host_ticks": 9007199254740993, "timebase_numer": 125, "timebase_denom": 3 },
+      "speaker": { "host_ticks": 9007199254740995, "timebase_numer": 125, "timebase_denom": 3 }
+    }"#;
+    write_atomic(&session.session_json(), before.as_bytes()).unwrap();
+
+    let metadata = SessionMetadata::read(&session.session_json()).unwrap();
+
+    assert!(!metadata.meeting_cleared);
+    assert!(!metadata.meeting_settled_by_hand());
+    // So the recorder's own lookup still reaches it.
+    assert!(
+        metadata
+            .with_meeting(Some(sample_meeting()))
+            .meeting
+            .is_some()
+    );
 }
 
 // --- the fit ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 [package]
 name = "meethook-enroll"
 version = "0.1.0"
-description = "Naming the voices transcription could not identify, and rewriting their transcripts"
+description = "Correcting what an automatic pass got wrong -- the voices it could not name, the meeting it guessed at -- and rewriting the transcripts that said so"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
@@ -19,8 +19,10 @@ meethook-transcribe = { workspace = true }
 hound = { workspace = true }
 thiserror = { workspace = true }
 
-[dev-dependencies]
-# For the session timestamps the cross-command test's fixtures need; nothing in the crate
-# itself has an opinion about time.
+# `meeting` prints when a calendar event ran, in the machine's own zone, and takes the instant
+# to look around from a session's start. Already in the graph through `meethook-session`, whose
+# public types carry `Timestamp`; nothing new is compiled.
 jiff = { workspace = true }
+
+[dev-dependencies]
 tempfile = { workspace = true }

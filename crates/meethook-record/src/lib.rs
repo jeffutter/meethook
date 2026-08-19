@@ -32,7 +32,10 @@ mod track;
 pub use activity::{Activity, MicActivityWatcher};
 // `calendar` stays private: only the request and the value it reports cross the boundary, so
 // no caller can learn an EventKit selector or a status enum from this crate.
-pub use calendar::{NoCalendarAccess, request_calendar_access};
+// `meetings_around` crosses it as a plain `Vec<Meeting>` for the same reason: `meethook
+// meeting` needs the events around a session to offer as a correction, and gets them without
+// learning that EventKit exists.
+pub use calendar::{NoCalendarAccess, meetings_around, request_calendar_access};
 pub use preflight::{Authorized, MissingPermissions, preflight};
 pub use track::TrackSummary;
 

@@ -1,4 +1,8 @@
-//! Naming the voices transcription could not identify.
+//! Correcting what an automatic pass got wrong: the voices it could not name, and the meeting
+//! it guessed at.
+//!
+//! Naming voices is the larger half and the one everything below is about; the calendar
+//! correction is at the bottom, on the same premise and the same seam-shaped design.
 //!
 //! This is the only interactive path in meethook, and it is built so that almost none of it
 //! is interactive. Which sessions get visited, which voices get asked about, in what order,
@@ -46,11 +50,23 @@
 //! it to say what dropping a reference -- or a whole person -- would cost, and writes only once the
 //! user has confirmed. See the `forget` module for the ordering and the wording. It is the last
 //! thing in the tool that used to require a text editor.
+//!
+//! # And it corrects the *meeting* a session was labelled with
+//!
+//! [`run_meeting`] is this crate's premise -- an automatic guess, a human correction, a
+//! transcript rewritten in place -- aimed at the calendar match rather than at a voice. It is
+//! here because it needs the second and third of those and nothing from `meethook-record`: the
+//! events it offers arrive through the one-method [`MeetingSource`] seam, exactly as an answer
+//! arrives through [`Interviewer`], so its whole wording is decidable in `cargo test` on a
+//! machine with no calendar grant. See the `meeting` module for what a correction may print,
+//! which is deliberately less than it holds.
 
 mod forget;
+mod meeting;
 mod references;
 
 pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
+pub use meeting::{Labelled, MeetingChoice, MeetingSource, Relabelling, run_meeting};
 pub use references::{Enrolled, Reference, Scan, Unreadable, VoiceChange, run_speakers, scan};
 
 use std::collections::BTreeMap;

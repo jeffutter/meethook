@@ -1,6 +1,6 @@
 //! Subcommand bodies.
 //!
-//! All five are thin: the rules they enforce live in `meethook-record`,
+//! All six are thin: the rules they enforce live in `meethook-record`,
 //! `meethook-transcribe` and `meethook-enroll`, where they can be tested without a terminal.
 //! What is left here is the terminal itself -- printing, prompting, and playing audio --
 //! which is exactly the part no test can decide.
@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use meethook_enroll::{
-    Answer, Confirm, EnrollRules, Enrolment, Forgotten, GivenName, Interviewer, Offer, Selection,
-    Target, Voice, VoiceSelector, run_enroll, run_forget, run_speakers, speech, write_clip,
+    Answer, Confirm, EnrollRules, Enrolment, Forgotten, GivenName, Interviewer, Labelled,
+    MeetingChoice, MeetingSource, Offer, Selection, Target, Voice, VoiceSelector, run_enroll,
+    run_forget, run_meeting, run_speakers, speech, write_clip,
 };
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
@@ -829,6 +830,79 @@ pub fn forget(
         );
     }
     Ok(())
+}
+
+/// Corrects, or clears, the meeting a session was labelled with.
+///
+/// Thin like `speakers` and `forget`: every printed line, including the numbered offer and the
+/// instruction for acting on it, comes back from `run_meeting`, which is what makes the whole
+/// wording decidable in `cargo test` on a machine with no calendar grant. Left here are the
+/// three things that genuinely need this crate -- the real calendar, the optional grant prompt,
+/// and the exit status.
+///
+/// The grant is asked for only when a listing is needed. `--clear` reaching a calendar prompt
+/// would be the opposite of the point: it is the path for the user whose calendar is refused,
+/// unreadable, or simply does not contain the meeting they were in.
+pub fn meeting(
+    paths: &Paths,
+    session_id: &str,
+    event: Option<u32>,
+    clear: bool,
+    template: Option<&Path>,
+) -> Result<()> {
+    // Before any filesystem work, so a typo fails as a typo, exactly as the positional ids of
+    // `transcribe` and `enroll` do.
+    let session = match SessionId::parse(session_id) {
+        Ok(session) => session,
+        Err(e) => bail!(e),
+    };
+    let template = TranscriptTemplate::resolve(paths, template)?;
+    let choice = match (clear, event) {
+        // clap refuses the two flags together, so this order decides nothing a user can reach.
+        (true, _) => MeetingChoice::Clear,
+        (false, Some(nth)) => MeetingChoice::Event(nth as usize),
+        (false, None) => MeetingChoice::Show,
+    };
+
+    if !matches!(choice, MeetingChoice::Clear)
+        && let Some(problem) = meethook_record::request_calendar_access()
+    {
+        // Guidance, not an error: a refused grant means an empty offer, which `run_meeting`
+        // prints as a sentence pointing at `--clear`. Never fatal, for the reason `record`
+        // gives at its own call to this -- the calendar is an enrichment, not a prerequisite.
+        println!("{problem}");
+    }
+
+    match run_meeting(
+        paths,
+        &session,
+        choice,
+        &Calendar,
+        &template,
+        &mut io::stdout(),
+    )? {
+        // The count and the way to see the list have already been printed; this only makes the
+        // exit status say the request was not served, as `forget` does for a name nobody holds.
+        Labelled::NoSuchEvent { offered } => bail!(
+            "there is no meeting {} to attach: {offered} were offered around {session}",
+            event.unwrap_or_default()
+        ),
+        Labelled::Shown | Labelled::Written(_) => Ok(()),
+    }
+}
+
+/// The real calendar, behind `meethook-enroll`'s one-method seam.
+///
+/// The whole of what the correction command needs a calendar for, and the only place in this
+/// binary that knows where meetings come from. Total by construction on the other side: a
+/// refused grant, an unreadable store and a session with nothing booked around it are all an
+/// empty list, so no correction fails because the calendar was unavailable.
+struct Calendar;
+
+impl MeetingSource for Calendar {
+    fn around(&self, at: jiff::Timestamp) -> Vec<meethook_session::Meeting> {
+        meethook_record::meetings_around(at)
+    }
 }
 
 /// The interactive half of `enroll`: what a prompt looks like, and how a clip gets played.

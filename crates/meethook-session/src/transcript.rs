@@ -474,12 +474,13 @@ const BUILTIN_NAME: &str = "<meethook's built-in transcript.md.jinja>";
 ///   concept. **Undefined**, not null, when the session was not recorded during a meeting,
 ///   which most are not.
 /// - `meeting.fit` -- how strongly the session's start supports that being the meeting, as one
-///   of `started`, `started_early`, `joined_late`, `after_end` or `unknown`. The first two are
-///   strong; the last three are tentative and are why the shipped default emits a
-///   `meeting_match:` key for them and nothing for the others. A recording that *overran* its
-///   meeting is not tentative -- the fit is a function of the start alone. `unknown` is what a
-///   `session.json` written before fits existed reads as, so it is never evidence of a good
-///   match. See `MeetingFit`.
+///   of `started`, `started_early`, `confirmed`, `joined_late`, `after_end` or `unknown`. The
+///   first three are strong; the last three are tentative and are why the shipped default emits
+///   a `meeting_match:` key for them and nothing for the others. A recording that *overran* its
+///   meeting is not tentative -- the fit is a function of the start alone. `confirmed` is a
+///   label a human chose with `meethook meeting`, which is the strongest of the six rather than
+///   another degree of guess. `unknown` is what a `session.json` written before fits existed
+///   reads as, so it is never evidence of a good match. See `MeetingFit`.
 /// - `turns` -- each with `time` (the `MM:SS` label), `speaker`, `text`, `start`, `end`,
 ///   `source_track`, `cluster` and `speaker_id_confidence`.
 /// - `blocks` -- the same turns, with each run of consecutive same-speaker turns collapsed into

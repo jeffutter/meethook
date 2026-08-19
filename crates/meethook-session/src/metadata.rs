@@ -100,16 +100,22 @@ pub enum MeetingFit {
     /// The recording began after the meeting had already ended, and was matched to it by
     /// proximity. The ad-hoc call that inherits the invite it happened to follow.
     AfterEnd,
+    /// A human said this is the meeting. The strongest claim available, and the only one here
+    /// not derived from arithmetic over timestamps: somebody who was in the call is better
+    /// evidence about what it was than any rule over start and end times can be. Written only
+    /// by [`SessionMetadata::label_by_hand`], and never produced by the recorder's own lookup.
+    Confirmed,
 }
 
 impl MeetingFit {
     /// Every variant, so a caller iterating outcomes cannot list only the ones it remembered.
-    pub const ALL: [MeetingFit; 5] = [
+    pub const ALL: [MeetingFit; 6] = [
         MeetingFit::Unknown,
         MeetingFit::Started,
         MeetingFit::StartedEarly,
         MeetingFit::JoinedLate,
         MeetingFit::AfterEnd,
+        MeetingFit::Confirmed,
     ];
 
     /// Whether the session's start actually supports this being the meeting.
@@ -117,9 +123,12 @@ impl MeetingFit {
     /// Written as an exhaustive `match` rather than a `matches!` with a wildcard so that a
     /// variant added later cannot default into "strong" by omission -- it will not compile
     /// until somebody decides.
+    /// [`MeetingFit::Confirmed`] is strong, and deliberately so: withholding
+    /// [`Meeting::speaker_roster`] from the one label somebody typed on purpose would invert
+    /// the point of the guard, which is to keep a *guess* from seeding an identification pass.
     pub fn is_strong(&self) -> bool {
         match self {
-            MeetingFit::Started | MeetingFit::StartedEarly => true,
+            MeetingFit::Started | MeetingFit::StartedEarly | MeetingFit::Confirmed => true,
             MeetingFit::Unknown | MeetingFit::JoinedLate | MeetingFit::AfterEnd => false,
         }
     }
@@ -133,7 +142,7 @@ impl MeetingFit {
     /// content, so it is safe on any surface the title itself is safe on.
     pub fn caveat(&self) -> Option<&'static str> {
         match self {
-            MeetingFit::Started | MeetingFit::StartedEarly => None,
+            MeetingFit::Started | MeetingFit::StartedEarly | MeetingFit::Confirmed => None,
             MeetingFit::JoinedLate => {
                 Some("uncertain: the recording began after this meeting had started")
             }
@@ -305,6 +314,20 @@ pub struct SessionMetadata {
     /// directions by builds on either side of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meeting: Option<Meeting>,
+    /// A human said this session was not recorded during any meeting.
+    ///
+    /// True only when `meeting` is `None`, and written only by
+    /// [`SessionMetadata::label_by_hand`] -- the two are set together so they cannot disagree.
+    /// It is the cleared half of the provenance whose attached half is
+    /// [`MeetingFit::Confirmed`]: a cleared label has no [`Meeting`] to hang a fit on, so the
+    /// fact has to live here instead.
+    ///
+    /// Skipped when false, which is what keeps a session nobody has corrected writing
+    /// byte-identical JSON to what this build's predecessors wrote -- the same equivalence
+    /// that keeps [`SESSION_SCHEMA_VERSION`] where it is. Only a session somebody actually
+    /// cleared gains the key, and an old file with neither key reads as not settled by hand.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub meeting_cleared: bool,
 }
 
 impl SessionMetadata {
@@ -321,6 +344,7 @@ impl SessionMetadata {
             mic,
             speaker,
             meeting: None,
+            meeting_cleared: false,
         }
     }
 
@@ -330,10 +354,55 @@ impl SessionMetadata {
     /// constructor's four call sites have no calendar in reach at all -- `transcribe`'s
     /// importer and two test helpers -- and widening the signature would make all of them
     /// pass a `None` to say so.
+    ///
+    /// **A no-op on a session whose label a human settled.** A label somebody set or cleared
+    /// is the strongest evidence this tool holds about what a session was, and an automatic
+    /// lookup must never overwrite it by guessing again. The guard lives here rather than in
+    /// any future re-guessing pass because this is the one door such a pass would come
+    /// through -- there is no re-guessing pass today, and the cheap moment to settle the rule
+    /// is before there is one. It is unreachable from the recorder, which only ever calls this
+    /// on a freshly [`SessionMetadata::new`]'d value.
     #[must_use]
     pub fn with_meeting(mut self, meeting: Option<Meeting>) -> Self {
+        if self.meeting_settled_by_hand() {
+            return self;
+        }
         self.meeting = meeting;
         self
+    }
+
+    /// Records the meeting label a human decided on, or the absence of one they decided on.
+    ///
+    /// `Some(meeting)` stores it as [`MeetingFit::Confirmed`] whatever fit it arrived with --
+    /// a candidate offered for correction carries [`MeetingFit::Unknown`], and what makes this
+    /// one a match is the person choosing it. `None` drops the meeting and records that the
+    /// absence was decided rather than merely never found.
+    ///
+    /// The only way to write either half, which is what keeps them consistent: a caller cannot
+    /// construct a session that both names a meeting and claims one was cleared.
+    pub fn label_by_hand(&mut self, meeting: Option<Meeting>) {
+        match meeting {
+            Some(meeting) => {
+                self.meeting = Some(meeting.with_fit(MeetingFit::Confirmed));
+                self.meeting_cleared = false;
+            }
+            None => {
+                self.meeting = None;
+                self.meeting_cleared = true;
+            }
+        }
+    }
+
+    /// Whether a human has decided this session's meeting label, either way.
+    ///
+    /// The one question a re-guessing pass has to ask before writing, and the reason both
+    /// halves of the provenance are readable through one call rather than two fields.
+    pub fn meeting_settled_by_hand(&self) -> bool {
+        self.meeting_cleared
+            || self
+                .meeting
+                .as_ref()
+                .is_some_and(|meeting| meeting.fit == MeetingFit::Confirmed)
     }
 
     /// Writes `session.json` atomically.
