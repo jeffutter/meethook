@@ -20,11 +20,13 @@
 //!       session.json              presence == "valid/complete session"
 //!       speaker_clusters.json     diarization output reused by enroll
 //!       speaker_names.json        voices named by hand in this session only
+//!       cleaning.json             outcome of the AEC pre-pass
 //!       transcript.json           presence == "already transcribed"
 //!       transcript.md             human-readable rendering
 //! ```
 
 mod atomic;
+mod cleaning;
 mod discovery;
 mod id;
 mod metadata;
@@ -41,6 +43,10 @@ mod transcript;
 pub mod wav;
 
 pub use atomic::{write_atomic, write_atomic_with};
+pub use cleaning::{
+    CLEANING_SCHEMA_VERSION, CancellationFailure, Cleaning, CleaningRecord, NotMeasurable,
+    PassThrough,
+};
 pub use discovery::{Classification, DiscoveredSession, discover_sessions};
 pub use id::{SessionId, create_session_dir, discard_session_dir};
 pub use metadata::{

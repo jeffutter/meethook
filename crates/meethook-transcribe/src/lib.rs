@@ -83,9 +83,9 @@ pub use vad::{SileroVad, SpeechRegion, VadTuning};
 
 use meethook_models::ModelSpec;
 use meethook_session::{
-    Classification, DiscoveredSession, EnrolledSpeakers, Paths, SessionId, SessionMetadata,
-    SpeakerClusters, SpeakerNames, Transcript, TranscriptContext, TranscriptTemplate,
-    discover_sessions,
+    Classification, CleaningRecord, DiscoveredSession, EnrolledSpeakers, Paths, SessionId,
+    SessionMetadata, SpeakerClusters, SpeakerNames, Transcript, TranscriptContext,
+    TranscriptTemplate, discover_sessions,
 };
 
 /// The Whisper checkpoint this tool transcribes with.
@@ -564,6 +564,7 @@ fn clean_mic_track(
     let cleaned = aec::cancel_bleed(&mic, speaker, mic_minus_speaker_s);
     writeln!(progress, "{}  {}", session.id, cleaned.cleaning)?;
     audio::write_track_16k_mono(&session.paths.mic_cleaned_wav(), &cleaned.audio)?;
+    CleaningRecord::new(session.id.clone(), cleaned.cleaning.into()).write(&session.paths)?;
 
     Ok(cleaned.audio)
 }
@@ -1674,6 +1675,125 @@ mod tests {
         assert_eq!(lines.len(), 1, "{progress}");
         assert!(lines[0].contains("speaker bleed cancelled"), "{progress}");
         assert!(!progress.contains('%'), "{progress}");
+    }
+
+    /// AC #1 and #2: after a real transcribe run, `cleaning.json` exists and reports the same
+    /// cancelled outcome the progress line does. The expected numbers come from an independent
+    /// call to `cancel_bleed` over the same tracks rather than from hard-coded values, so this
+    /// test does not need to know what the bleed fixture measures; the progress-line check is
+    /// then a straight comparison against that value's own `Display`, its ground truth.
+    #[test]
+    fn cleaning_json_records_the_cancelled_outcome_matching_the_progress_line() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_bleeding_session(&paths, "20260809-052600");
+
+        let mut progress = Vec::new();
+        transcribe_session(
+            &session,
+            &mut FakeAsr::default(),
+            &mut FakeDiarizer::default(),
+            &nobody_enrolled(),
+            mixdown::Settings::default(),
+            &mut progress,
+        )
+        .unwrap();
+
+        let metadata = session.load_metadata().unwrap();
+        let mic = audio::read_track_16k_mono(&session.paths.mic_wav()).unwrap();
+        let speaker = audio::read_track_16k_mono(&session.paths.speaker_wav()).unwrap();
+        let expected = cancel_bleed(
+            &mic,
+            &speaker,
+            mic_minus_speaker_seconds(&metadata).unwrap(),
+        );
+        let Cleaning::Cancelled {
+            lag_samples: expected_lag,
+            erle_db: expected_erle,
+            ..
+        } = expected.cleaning
+        else {
+            panic!("the bleed fixture must cancel, got {}", expected.cleaning);
+        };
+
+        let progress = String::from_utf8(progress).unwrap();
+        assert!(
+            progress.contains(&expected.cleaning.to_string()),
+            "progress line {progress:?} does not match the independently recomputed outcome \
+             {expected}",
+            expected = expected.cleaning
+        );
+
+        let record = CleaningRecord::read_if_present(&session.paths)
+            .unwrap()
+            .expect("cleaning.json must exist after a transcribe run");
+        assert_eq!(record.session_id, session.id);
+        let meethook_session::Cleaning::Cancelled {
+            lag_samples,
+            erle_db,
+            ..
+        } = record.outcome
+        else {
+            panic!("expected a cancelled outcome, got {:?}", record.outcome);
+        };
+        assert_eq!(lag_samples, expected_lag);
+        assert_eq!(erle_db, expected_erle);
+    }
+
+    /// AC #4: the pass-through case is as legible in the record as the cancelled case.
+    #[test]
+    fn cleaning_json_records_a_pass_through_reason_when_there_is_no_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_bleeding_session(&paths, "20260809-052600");
+        std::fs::remove_file(session.paths.speaker_wav()).unwrap();
+
+        transcribe_session(
+            &session,
+            &mut FakeAsr::default(),
+            &mut FakeDiarizer::default(),
+            &nobody_enrolled(),
+            mixdown::Settings::default(),
+            &mut quiet(),
+        )
+        .unwrap();
+
+        let record = CleaningRecord::read_if_present(&session.paths)
+            .unwrap()
+            .expect("cleaning.json must exist after a transcribe run");
+        assert_eq!(
+            record.outcome,
+            meethook_session::Cleaning::PassedThrough {
+                reason: meethook_session::PassThrough::NoReference
+            }
+        );
+    }
+
+    /// A `--force` re-run replaces `cleaning.json` rather than leaving a stale copy, mirroring
+    /// `transcribing_adds_a_compressed_mixdown_and_leaves_every_source_track_intact` above.
+    #[test]
+    fn a_second_transcribe_run_replaces_cleaning_json_rather_than_leaving_it_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_bleeding_session(&paths, "20260809-052600");
+
+        let mut asr = FakeAsr::default();
+        mic_only(&session, &mut asr).unwrap();
+        std::fs::remove_file(session.paths.speaker_wav()).unwrap();
+
+        let mut asr = FakeAsr::default();
+        mic_only(&session, &mut asr).unwrap();
+
+        let record = CleaningRecord::read_if_present(&session.paths)
+            .unwrap()
+            .expect("cleaning.json must exist after the second run");
+        assert_eq!(
+            record.outcome,
+            meethook_session::Cleaning::PassedThrough {
+                reason: meethook_session::PassThrough::NoReference
+            },
+            "the second run's pass-through outcome must replace the first run's cancelled one"
+        );
     }
 
     #[test]

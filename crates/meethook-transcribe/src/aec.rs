@@ -207,6 +207,74 @@ impl std::fmt::Display for PassThrough {
     }
 }
 
+/// Projects the in-process outcome down to the on-disk contract `meethook-session` owns. Flat
+/// field-for-field, and deliberately a `From` rather than a shared type: `meethook-session`
+/// cannot depend on this crate, so it stays ignorant of `aec::Cleaning` entirely, and this is
+/// the one place that knows how to translate.
+impl From<Cleaning> for meethook_session::Cleaning {
+    fn from(cleaning: Cleaning) -> Self {
+        match cleaning {
+            Cleaning::Cancelled {
+                lag_samples,
+                spread_samples,
+                drift_ms_per_hour,
+                erle_db,
+            } => meethook_session::Cleaning::Cancelled {
+                lag_samples,
+                spread_samples,
+                drift_ms_per_hour,
+                erle_db,
+            },
+            Cleaning::PassedThrough(reason) => meethook_session::Cleaning::PassedThrough {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+impl From<PassThrough> for meethook_session::PassThrough {
+    fn from(reason: PassThrough) -> Self {
+        match reason {
+            PassThrough::NoReference => meethook_session::PassThrough::NoReference,
+            PassThrough::Unalignable(reason) => {
+                meethook_session::PassThrough::Unalignable(reason.into())
+            }
+            PassThrough::Cancellation(reason) => {
+                meethook_session::PassThrough::Cancellation(reason.into())
+            }
+        }
+    }
+}
+
+impl From<NotMeasurable> for meethook_session::NotMeasurable {
+    fn from(reason: NotMeasurable) -> Self {
+        match reason {
+            NotMeasurable::TracksTooShort => meethook_session::NotMeasurable::TracksTooShort,
+            NotMeasurable::TooFewWindows { survived, examined } => {
+                meethook_session::NotMeasurable::TooFewWindows { survived, examined }
+            }
+            NotMeasurable::InconsistentWindows {
+                windows,
+                spread_samples,
+            } => meethook_session::NotMeasurable::InconsistentWindows {
+                windows,
+                spread_samples,
+            },
+        }
+    }
+}
+
+impl From<CancellationFailure> for meethook_session::CancellationFailure {
+    fn from(failure: CancellationFailure) -> Self {
+        match failure {
+            CancellationFailure::ProcessorUnavailable => {
+                meethook_session::CancellationFailure::ProcessorUnavailable
+            }
+            CancellationFailure::FrameFailed => meethook_session::CancellationFailure::FrameFailed,
+        }
+    }
+}
+
 /// Removes speaker bleed from `mic_16k`, using `speaker_16k` as the far-end reference.
 ///
 /// Both tracks must already be 16 kHz mono, as [`crate::audio::read_track_16k_mono`]

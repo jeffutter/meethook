@@ -15,6 +15,7 @@ const MEETING_OPUS: &str = "meeting.opus";
 const SESSION_JSON: &str = "session.json";
 const SPEAKER_CLUSTERS_JSON: &str = "speaker_clusters.json";
 const SPEAKER_NAMES_JSON: &str = "speaker_names.json";
+const CLEANING_JSON: &str = "cleaning.json";
 const TRANSCRIPT_JSON: &str = "transcript.json";
 const TRANSCRIPT_MD: &str = "transcript.md";
 
@@ -126,6 +127,12 @@ impl SessionPaths {
     /// Voices in this session the user named without enrolling. Absent until one is.
     pub fn speaker_names_json(&self) -> PathBuf {
         self.dir.join(SPEAKER_NAMES_JSON)
+    }
+
+    /// Outcome of the AEC pre-pass over `mic.wav`. Absent for a session transcribed before this
+    /// file existed.
+    pub fn cleaning_json(&self) -> PathBuf {
+        self.dir.join(CLEANING_JSON)
     }
 
     /// Presence marks the session as already transcribed.
