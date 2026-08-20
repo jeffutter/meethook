@@ -1148,7 +1148,7 @@ impl Interviewer for Terminal {
         // Cut to `SNIPPETS` here rather than across the seam, so a voice with fifty lines still
         // leaves the question visible at the bottom of the screen.
         for snippet in voice.snippets.iter().take(SNIPPETS) {
-            println!("    \"{snippet}\"");
+            println!("    \"{}\"", snippet.text);
         }
         self.play(voice.clip);
 

@@ -112,7 +112,7 @@ use meethook_session::{
 };
 use meethook_transcribe::{
     Attribution, Naming, Resemblance, TARGET_RATE, attributions, identify_clusters, rank_enrolled,
-    read_track_16k_mono,
+    read_track_16k_mono, speaker_offset_seconds,
 };
 
 /// How much of one line to show. Long enough for a sentence, short enough to stay on a line.
@@ -324,6 +324,50 @@ pub struct Queued<'a> {
     pub below_floor: bool,
 }
 
+/// One line a voice said, and the audio under it.
+///
+/// Four fields and no methods, for the reason [`Queued`]'s doc gives: it is a row, and what a
+/// row reads like belongs to whatever is drawing it. Four things a reader cannot get from the
+/// type, each of them a place this goes wrong quietly rather than loudly:
+///
+/// - **`start` is track time, not timeline time.** A [`meethook_session::Turn`]'s seconds are
+///   on the session timeline, which begins at whichever track started first;
+///   `start` here is an offset into `speaker.wav`, the same space a
+///   [`meethook_session::RepresentativeSegment`] is in and the same space [`Voice::clip`] was
+///   cut from. The difference between the two is
+///   [`meethook_transcribe::speaker_offset_seconds`]. Nothing fails if it is not applied --
+///   the words and the sound simply drift apart by however long the microphone led by, and
+///   only a listener would notice.
+///
+/// - **`duration` is what the transcript says, `audio.len()` is what there is to play, and
+///   they can disagree.** A truncated `speaker.wav` gives a full `duration` and short `audio`;
+///   a missing one gives a full `duration` and empty `audio`. That split is deliberate: one
+///   says how long the line took, the other says how much of it survives on disk, so anything
+///   sizing a progress bar wants `audio.len() / TARGET_RATE` and not `duration`.
+///
+/// - **Empty `audio` is normal**, exactly as an empty [`Voice::clip`] is: a voice that can
+///   still be named from its lines rather than a session that has to fail.
+///
+/// - **`text` is the same text a prompt always had** -- whitespace-trimmed, cut to
+///   `SNIPPET_CHARS` characters, and never empty, because a line the recogniser heard nothing
+///   over is dropped before a snippet is built at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Snippet<'a> {
+    /// What was said, trimmed and cut. A borrow of the transcript, so a voice that talked for
+    /// ten minutes costs pointers rather than text.
+    pub text: &'a str,
+
+    /// When it was said, in seconds from the first sample of `speaker.wav`.
+    pub start: f64,
+
+    /// How long the line lasted, in seconds, as the transcript has it.
+    pub duration: f64,
+
+    /// The samples for exactly that stretch: 16 kHz mono, the rate everything else in meethook
+    /// works in. A borrow of the resampled track, not a copy.
+    pub audio: &'a [f32],
+}
+
 /// One voice being asked about, and everything needed to ask.
 ///
 /// Usually a voice nothing in the database matched, which is what `enroll` exists for. Under
@@ -389,14 +433,18 @@ pub struct Voice<'a> {
     pub queue: &'a [Queued<'a>],
 
     /// What this voice said, whitespace-trimmed and cut to `SNIPPET_CHARS` characters each,
-    /// with the lines the recogniser heard nothing over dropped. Empty if it heard nothing at
-    /// all.
+    /// with the lines the recogniser heard nothing over dropped -- and the audio under each.
+    /// Empty if it heard nothing at all.
     ///
     /// Every snippet, uncapped. How many will fit is a fact about the thing displaying them --
     /// a line prompt has one screenful of scrollback and takes three; a pane can scroll -- so
-    /// capping here would decide it for both. They are borrows of the transcript, so a voice
-    /// that talked for ten minutes costs pointers rather than text.
-    pub snippets: Vec<&'a str>,
+    /// capping here would decide it for both. Both the text and the samples are borrows, of
+    /// the transcript and of the resampled track, so a voice that talked for ten minutes costs
+    /// pointers rather than text or audio.
+    ///
+    /// See [`Snippet`] for what "when it was said" means here, which is not the same clock a
+    /// transcript reads in.
+    pub snippets: Vec<Snippet<'a>>,
 
     /// The longest representative clip: 16 kHz mono, the same rate everything else in
     /// meethook works in.
@@ -1123,6 +1171,15 @@ fn enroll_session(
     // with no clip can still be named from its snippets.
     let track = read_track_16k_mono(&session.paths.speaker_wav()).unwrap_or_default();
 
+    // Turn times are on the session timeline; a snippet's are offsets into `speaker.wav`.
+    // `Err` is a degenerate timebase in `session.json`: the two clocks cannot be related at
+    // all, so the snippets get no audio rather than audio a second out -- the same tolerance
+    // an unreadable `speaker.wav` already gets a line above, and for the same reason. `clip`
+    // is unaffected either way, because a representative's seconds are already track time.
+    let offset = speaker_offset_seconds(&metadata);
+    let snippet_track: &[f32] = if offset.is_ok() { &track } else { &[] };
+    let offset = offset.unwrap_or(0.0);
+
     // What each voice was called when this queue was built. The guard below compares against
     // *this* rather than against the live labels, because under `--correct` a queued voice may
     // legitimately be one the database had already named.
@@ -1171,16 +1228,7 @@ fn enroll_session(
                 // Keyed on the cluster, not on the label text: under `--correct` two voices can
                 // sit under one enrolled name -- which is the false accept being corrected -- and
                 // a prompt showing the other person's lines cannot be answered.
-                let snippets: Vec<&str> = transcript
-                    .turns
-                    .iter()
-                    .filter(|turn| {
-                        turn.source_track == SourceTrack::Speaker
-                            && turn.cluster == Some(cluster.id)
-                    })
-                    .map(|turn| snippet(&turn.text))
-                    .filter(|text| !text.is_empty())
-                    .collect();
+                let snippets = snippets_for(&transcript, cluster.id, snippet_track, offset);
 
                 // Every voice in the session, built here and now rather than once above the
                 // loop, for the reason `Voice::queue` gives and because the borrow checker
@@ -1888,25 +1936,68 @@ fn snippet(text: &str) -> &str {
     }
 }
 
+/// The samples between two offsets into the 16 kHz speaker track.
+///
+/// The one place the clamping rule lives, because both things that cut audio out of a track --
+/// a voice's clip and a line's snippet -- have to obey the same one: a range running off the
+/// end of the track yields what is there, and anything left empty is audio that is missing
+/// rather than a session that fails.
+fn samples_between(track: &[f32], start: f64, end: f64) -> &[f32] {
+    let start = sample_at(start).min(track.len());
+    let end = sample_at(end).min(track.len());
+    if end <= start {
+        return &[];
+    }
+    &track[start..end]
+}
+
 /// The audio to play for one voice: its longest representative, cut out of the speaker track.
 ///
 /// The clip is sliced rather than seeked to because `afplay` cannot seek -- it has no start
 /// offset at all -- so somebody has to extract it either way. Slicing the 16 kHz track
 /// diarization itself ran on is what makes the seconds in a [`meethook_session::RepresentativeSegment`]
 /// impossible to misinterpret: they are offsets into exactly this buffer.
-///
-/// A range running off the end of the track is clipped to what is there, and anything left
-/// empty is a voice asked about without audio rather than a session that fails.
 fn clip_for<'a>(track: &'a [f32], cluster: &SpeakerCluster) -> &'a [f32] {
     let Some(segment) = cluster.representatives.first() else {
         return &[];
     };
-    let start = sample_at(segment.start).min(track.len());
-    let end = sample_at(segment.end).min(track.len());
-    if end <= start {
-        return &[];
-    }
-    &track[start..end]
+    samples_between(track, segment.start, segment.end)
+}
+
+/// Every line one voice said, as a prompt needs them: the text, when it was said, and the
+/// samples for it.
+///
+/// `offset` is [`meethook_transcribe::speaker_offset_seconds`] -- what turns a
+/// session-timeline second into an offset into `track`. Same filter, same trim, same order as
+/// the text-only list this replaced, so the lines a prompt shows do not move.
+fn snippets_for<'a>(
+    transcript: &'a Transcript,
+    cluster: u32,
+    track: &'a [f32],
+    offset: f64,
+) -> Vec<Snippet<'a>> {
+    transcript
+        .turns
+        .iter()
+        .filter(|turn| turn.source_track == SourceTrack::Speaker && turn.cluster == Some(cluster))
+        .filter_map(|turn| {
+            let text = snippet(&turn.text);
+            if text.is_empty() {
+                return None;
+            }
+            // Both clamps are the habit `sample_at` and `samples_between` already have of
+            // defining the edge away rather than checking for it. A speaker-track turn cannot
+            // begin before the speaker track by construction, so neither is a real case.
+            let start = (turn.start - offset).max(0.0);
+            let end = (turn.end - offset).max(start);
+            Some(Snippet {
+                text,
+                start,
+                duration: end - start,
+                audio: samples_between(track, start, end),
+            })
+        })
+        .collect()
 }
 
 fn sample_at(seconds: f64) -> usize {
@@ -1993,6 +2084,12 @@ mod tests {
         /// what a queue pane would hold and that it is current.
         queue: Vec<Row>,
         snippets: Vec<String>,
+        /// Each snippet's `(start, duration)`, so a test can prove the prompt was handed track
+        /// time rather than timeline time -- the one failure no assertion about text can see.
+        snippet_times: Vec<(f64, f64)>,
+        /// How many samples each snippet carried, which is what says the audio was cut from
+        /// the stretch those times name.
+        snippet_samples: Vec<usize>,
         clip_samples: usize,
         /// Who the prompt was told this voice resembles, in the order it was handed them --
         /// which is the only way a test can check that an [`Interviewer`] can offer names
@@ -2097,7 +2194,13 @@ mod tests {
                         below_floor: row.below_floor,
                     })
                     .collect(),
-                snippets: voice.snippets.iter().map(|s| s.to_string()).collect(),
+                snippets: voice.snippets.iter().map(|s| s.text.to_string()).collect(),
+                snippet_times: voice
+                    .snippets
+                    .iter()
+                    .map(|s| (s.start, s.duration))
+                    .collect(),
+                snippet_samples: voice.snippets.iter().map(|s| s.audio.len()).collect(),
                 clip_samples: voice.clip.len(),
                 resembles: voice.resembles.clone(),
                 enrolled: voice.enrolled.iter().map(|n| n.to_string()).collect(),
@@ -3219,6 +3322,12 @@ mod tests {
         assert_eq!(report.failed, 0, "{output}");
         assert_eq!(interviewer.seen[0].clip_samples, 0);
         assert_eq!(interviewer.seen[0].snippets, ["hi there", "let us start"]);
+        assert_eq!(
+            interviewer.seen[0].snippet_samples,
+            [0, 0],
+            "and no audio under any line either, with the times still saying when they were said"
+        );
+        assert_eq!(interviewer.seen[0].snippet_times, [(0.0, 1.0), (4.0, 1.0)]);
         assert_eq!(transcript_of(&session).turns[0].speaker, "Alice");
     }
 
@@ -3247,6 +3356,187 @@ mod tests {
         // second.
         assert_eq!(interviewer.seen[0].clip_samples, 16_000);
         assert_eq!(interviewer.seen[1].clip_samples, 0);
+    }
+
+    /// Six seconds of a 16 kHz track whose every sample says which sample it is, so a slice
+    /// out of it can be checked for *where* it came from and not merely how long it is.
+    fn counted_track() -> Vec<f32> {
+        (0..16_000 * 6).map(|i| i as f32).collect()
+    }
+
+    /// A transcript with one speaker turn per `(start, text)`, all from cluster 0.
+    fn transcript_of_lines(lines: &[(f64, &str)]) -> Transcript {
+        Transcript::new(
+            SessionId::parse("20260809-052600").unwrap(),
+            lines
+                .iter()
+                .map(|(start, text)| speaker_turn(*start, 0, "Unknown 1", text))
+                .collect(),
+        )
+    }
+
+    /// Acceptance criterion #2: a snippet's seconds are offsets into `speaker.wav`, not into the
+    /// session timeline, and its samples come from where those seconds point.
+    ///
+    /// The first-sample assertion is the point of the counted track: a length-only check passes
+    /// just as happily when the offset is applied with the wrong sign.
+    #[test]
+    fn snippet_times_are_track_time_and_the_audio_starts_there() {
+        let track = counted_track();
+        let transcript = transcript_of_lines(&[(3.0, "and from me")]);
+
+        let snippets = snippets_for(&transcript, 0, &track, 1.0);
+
+        assert_eq!(snippets.len(), 1);
+        assert_eq!((snippets[0].start, snippets[0].duration), (2.0, 1.0));
+        assert_eq!(snippets[0].audio.len(), 16_000);
+        assert_eq!(
+            snippets[0].audio[0], 32_000.0,
+            "two seconds into the track, which is the turn's three seconds less the offset"
+        );
+    }
+
+    /// Acceptance criterion #3: a line running off the end of a truncated track keeps the
+    /// duration the transcript gave it and plays what survives -- nothing at all when the line
+    /// is entirely past the end.
+    #[test]
+    fn a_snippet_past_the_end_of_the_track_carries_what_is_there() {
+        let track = counted_track();
+        let transcript = transcript_of_lines(&[(5.5, "trailing off"), (30.0, "long gone")]);
+
+        let snippets = snippets_for(&transcript, 0, &track, 0.0);
+
+        assert_eq!((snippets[0].start, snippets[0].duration), (5.5, 1.0));
+        assert_eq!(
+            snippets[0].audio.len(),
+            8_000,
+            "half the line is on disk; the duration still says how long it took"
+        );
+        assert_eq!((snippets[1].start, snippets[1].duration), (30.0, 1.0));
+        assert!(snippets[1].audio.is_empty());
+    }
+
+    /// Acceptance criterion #3, the other half: no track is no audio and not a lost line. The
+    /// times are still there, which is what leaves a later run able to say what could not be
+    /// played.
+    #[test]
+    fn an_empty_track_leaves_every_snippet_with_its_times_and_no_audio() {
+        let transcript = transcript_of_lines(&[(0.0, "hi there"), (4.0, "let us start")]);
+
+        let snippets = snippets_for(&transcript, 0, &[], 0.0);
+
+        assert_eq!(
+            snippets
+                .iter()
+                .map(|s| (s.start, s.duration))
+                .collect::<Vec<_>>(),
+            [(0.0, 1.0), (4.0, 1.0)]
+        );
+        assert!(snippets.iter().all(|s| s.audio.is_empty()));
+    }
+
+    /// Acceptance criterion #4: the same lines, the same text and the same order as the
+    /// text-only list this replaced -- this voice's turns only, trimmed, cut, and with the ones
+    /// the recogniser heard nothing over dropped rather than carried as empty rows.
+    #[test]
+    fn the_snippets_are_the_same_lines_in_the_same_order_as_before() {
+        let long = "x".repeat(SNIPPET_CHARS + 20);
+        let transcript = Transcript::new(
+            SessionId::parse("20260809-052600").unwrap(),
+            vec![
+                speaker_turn(0.0, 0, "Unknown 1", "  hi there  "),
+                mic_turn(1.0, "morning"),
+                speaker_turn(2.0, 1, "Unknown 2", "and from me"),
+                speaker_turn(3.0, 0, "Unknown 1", "   "),
+                speaker_turn(4.0, 0, "Unknown 1", &long),
+            ],
+        );
+
+        let snippets = snippets_for(&transcript, 0, &[], 0.0);
+
+        assert_eq!(
+            snippets.iter().map(|s| s.text).collect::<Vec<_>>(),
+            ["hi there", &"x".repeat(SNIPPET_CHARS)],
+            "the mic turn, the other voice and the line with nothing in it are all out"
+        );
+    }
+
+    /// The clamping rule both a clip and a snippet obey, stated once where it lives.
+    #[test]
+    fn samples_between_clamps_to_what_the_track_holds() {
+        let track = counted_track();
+
+        assert_eq!(samples_between(&track, 1.0, 2.0).len(), 16_000);
+        assert_eq!(samples_between(&track, 1.0, 2.0)[0], 16_000.0);
+        assert_eq!(samples_between(&track, 5.0, 90.0).len(), 16_000);
+        assert!(samples_between(&track, 600.0, 620.0).is_empty());
+        assert!(samples_between(&track, 2.0, 2.0).is_empty());
+        assert!(samples_between(&[], 0.0, 1.0).is_empty());
+    }
+
+    /// Acceptance criterion #2 end to end, which is the half no unit test can see: that the run
+    /// actually reads the offset out of `session.json` rather than defaulting it to zero.
+    ///
+    /// The fixture's speaker track starts a second after the microphone's, so every snippet's
+    /// track time is its turn's timeline second less one -- and the audio under it is a second
+    /// earlier in `speaker.wav` than a run that ignored the offset would have cut.
+    #[test]
+    fn a_session_whose_speaker_track_started_late_still_lines_the_audio_up() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        let metadata = with_speaker_offset(&session, "20260809-052600", 1.0);
+        // Every turn after the speaker track's own start, so that what this test measures is
+        // the offset and not the clamp that catches a turn from before it.
+        write_transcript(
+            &Transcript::new(
+                SessionId::parse("20260809-052600").unwrap(),
+                vec![
+                    speaker_turn(2.0, 0, "Unknown 1", "hi there"),
+                    mic_turn(2.5, "morning"),
+                    speaker_turn(3.0, 1, "Unknown 2", "and from me"),
+                    speaker_turn(5.0, 0, "Unknown 1", "let us start"),
+                ],
+            ),
+            &paths,
+            &session,
+            &metadata,
+        );
+
+        let mut interviewer = Scripted::default();
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Unknown 1", "Unknown 2"], "{output}");
+        assert_eq!(
+            interviewer.seen[0].snippet_times,
+            [(1.0, 1.0), (4.0, 1.0)],
+            "the turns are at 2 s and 5 s on the timeline, and the speaker track began at 1 s"
+        );
+        assert_eq!(interviewer.seen[1].snippet_times, [(2.0, 1.0)]);
+        assert_eq!(interviewer.seen[0].snippet_samples, [16_000, 16_000]);
+        assert_eq!(interviewer.seen[1].snippet_samples, [16_000]);
+        // The clip is untouched by the offset: a representative's seconds are already track
+        // time, which is exactly the confusion this ticket exists to keep apart.
+        assert_eq!(interviewer.seen[0].clip_samples, 32_000);
+    }
+
+    /// Rewrites a fixture's `session.json` so that its speaker track begins `seconds` after its
+    /// microphone track, which is what `speaker_offset_seconds` reads.
+    ///
+    /// Separate from [`session_metadata`] so that the default fixture -- both tracks starting
+    /// together, which is what every other test here assumes -- does not move.
+    fn with_speaker_offset(session: &SessionPaths, id: &str, seconds: f64) -> SessionMetadata {
+        let id = SessionId::parse(id).unwrap();
+        let base = session_metadata(&id);
+        let mut speaker = base.speaker;
+        // Ticks, not nanoseconds: `session.json` records the machine's rational timebase and
+        // the arithmetic that reads it back is exact, so the fixture does the same conversion
+        // in reverse rather than guessing at a tick.
+        speaker.host_ticks += (seconds * 1e9 * f64::from(speaker.timebase_denom)
+            / f64::from(speaker.timebase_numer)) as u64;
+        let metadata = SessionMetadata::new(id, base.start_time, base.mic, speaker);
+        metadata.write(&session.session_json()).unwrap();
+        metadata
     }
 
     /// A session transcribed by a build that did not record first appearances cannot be
@@ -4800,6 +5090,8 @@ mod tests {
             speech_seconds,
             queue,
             snippets,
+            snippet_times,
+            snippet_samples,
             clip_samples,
             resembles,
             enrolled,
@@ -4813,6 +5105,8 @@ mod tests {
         // *asked about*, and the queue is what the session holds.
         assert_eq!(queue, &queued.queue);
         assert_eq!(snippets, &queued.snippets);
+        assert_eq!(snippet_times, &queued.snippet_times);
+        assert_eq!(snippet_samples, &queued.snippet_samples);
         assert_eq!(clip_samples, &queued.clip_samples);
         assert_eq!(resembles, &queued.resembles);
         assert_eq!(enrolled, &queued.enrolled);

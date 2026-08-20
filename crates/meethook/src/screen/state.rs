@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use meethook_enroll::{Answer, Position, Queued, Refusal, Resolution, resolve};
+use meethook_enroll::{Answer, Position, Queued, Refusal, Resolution, Snippet, resolve};
 use meethook_session::SessionId;
 use meethook_transcribe::{Attribution, Resemblance};
 
@@ -46,11 +46,15 @@ pub struct VoiceView<'a> {
     pub speech_seconds: f64,
     pub attribution: &'a Attribution,
     pub queue: &'a [Queued<'a>],
-    pub snippets: &'a [&'a str],
+    pub snippets: &'a [Snippet<'a>],
     pub resembles: &'a [Resemblance],
     pub enrolled: &'a [&'a str],
     /// Whether there is audio to play. The clip itself is the shell's business, and a state
     /// machine holding a quarter of a megabyte of samples per redraw would be paying for nothing.
+    ///
+    /// The samples a [`Snippet`] carries are not the same trade: they are borrowed with the
+    /// snippet's text rather than copied, so a slice of them costs the same pointers per
+    /// redraw whether or not anything reads the audio.
     pub clip_is_empty: bool,
 }
 
@@ -184,7 +188,7 @@ pub struct View<'a> {
     /// What choosing the highlighted candidate would do.
     pub consequence: Vec<String>,
     /// Every snippet, with the pane scrolled to [`View::snippet`].
-    pub snippets: &'a [&'a str],
+    pub snippets: &'a [Snippet<'a>],
     pub snippet: usize,
     pub clip_is_empty: bool,
     /// One line about what just happened -- a clip that would not play, a voice that turned out
@@ -481,10 +485,10 @@ impl Screen {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::Cell;
 
-    use meethook_enroll::{Answer, Position, Queued};
+    use meethook_enroll::{Answer, Position, Queued, Snippet};
     use meethook_session::SessionId;
     use meethook_transcribe::{Attribution, Resemblance};
 
@@ -574,6 +578,18 @@ mod tests {
             .collect()
     }
 
+    /// A snippet of a fixture line. The times and the audio are a real prompt's business, not
+    /// this module's -- nothing in the state machine reads either -- so they are zeroed and
+    /// only the text carries.
+    pub(crate) fn snippet(text: &str) -> Snippet<'_> {
+        Snippet {
+            text,
+            start: 0.0,
+            duration: 0.0,
+            audio: &[],
+        }
+    }
+
     /// A question about `number`, with everything else defaulted by the caller's slices.
     #[allow(clippy::too_many_arguments)]
     fn view<'a>(
@@ -581,7 +597,7 @@ mod tests {
         number: &'a str,
         nth: usize,
         queue: &'a [Queued<'a>],
-        snippets: &'a [&'a str],
+        snippets: &'a [Snippet<'a>],
         resembles: &'a [Resemblance],
         enrolled: &'a [&'a str],
         attribution: &'a Attribution,
@@ -1011,7 +1027,7 @@ mod tests {
         let session = session();
         let owned = rows(&[("Unknown 1", 60.0, false)]);
         let queue = queue(&owned);
-        let snippets = ["one", "two", "three", "four", "five"];
+        let snippets = ["one", "two", "three", "four", "five"].map(snippet);
         let voice = view(
             &session,
             "Unknown 1",

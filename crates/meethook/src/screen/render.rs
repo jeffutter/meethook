@@ -259,7 +259,7 @@ fn snippets(frame: &mut Frame, area: Rect, view: &View<'_>) {
         .snippets
         .iter()
         .skip(view.snippet)
-        .map(|snippet| Line::from(format!("\"{snippet}\"")))
+        .map(|snippet| Line::from(format!("\"{}\"", snippet.text)))
         .collect();
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
@@ -307,6 +307,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use super::super::state::tests::snippet;
     use super::super::state::{Cost, Costs, Event, Screen, VoiceView};
     use super::draw;
 
@@ -382,7 +383,7 @@ mod tests {
                 references: 1,
             },
         ];
-        let snippets = ["so where did we land on the migration", "right, next week"];
+        let snippets = ["so where did we land on the migration", "right, next week"].map(snippet);
         let enrolled = ["Milo", "Ivan"];
         let voice = VoiceView {
             session: &session,
