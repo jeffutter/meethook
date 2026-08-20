@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use meethook_enroll::{
     Answer, Confirm, EnrollRules, Enrolment, Forgotten, GivenName, Interviewer, Labelled, Lines,
-    MeetingChoice, MeetingSource, Offer, Selection, Target, Voice, VoiceSelector, run_enroll,
-    run_forget, run_meeting, run_speakers, speech, write_clip,
+    MeetingChoice, MeetingSource, Offer, Selection, Sessions, Target, Voice, VoiceSelector,
+    run_enroll, run_forget, run_meeting, run_speakers, speech, write_clip,
 };
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
@@ -714,6 +714,15 @@ pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Resu
             quiet: args.all,
             named: args.correct,
         },
+        // The other half of what `--correct` means, and a separate axis from `offer` for the
+        // reason `Sessions` gives: `offer` says which voices a session asks about, this says
+        // whether a session with nothing unresolved is opened at all. Both come off the same
+        // flag today, which is why this is not a behaviour change.
+        sessions: if args.correct {
+            Sessions::Every
+        } else {
+            Sessions::Unresolved
+        },
         // A separate axis from `offer`: that one decides which voices are asked about, this
         // one what an answer to a quiet voice writes.
         enrolment: if args.force_reference {
@@ -988,6 +997,16 @@ fn answerer(named: bool, plain: bool, tty: Tty) -> Answerer {
     }
 }
 
+/// How many of a voice's lines this prompt shows before asking who it is.
+///
+/// Enough to hear a person in the words -- what they said, what they were asked -- without
+/// turning a prompt into a page of transcript that hides the question at the bottom of it.
+///
+/// Here rather than in `meethook-enroll`, which hands over every snippet a voice has: this is a
+/// fact about one screenful of scrollback, and so about *this* answerer. A frame that can scroll
+/// takes a different number.
+const SNIPPETS: usize = 3;
+
 /// The interactive half of `enroll`: what a prompt looks like, and how a clip gets played.
 ///
 /// Everything about *which* voice is asked about, and what an answer writes, is on the other
@@ -1062,7 +1081,9 @@ impl Interviewer for Terminal {
         if voice.snippets.is_empty() {
             println!("    (nothing was transcribed for this voice)");
         }
-        for snippet in &voice.snippets {
+        // Cut to `SNIPPETS` here rather than across the seam, so a voice with fifty lines still
+        // leaves the question visible at the bottom of the screen.
+        for snippet in voice.snippets.iter().take(SNIPPETS) {
             println!("    \"{snippet}\"");
         }
         self.play(voice.clip);

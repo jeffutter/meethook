@@ -19,7 +19,8 @@
 //! rather than about this code. It is TASK-014, and it needs a microphone.
 
 use meethook_enroll::{
-    Answer, EnrollReport, EnrollRules, Enrolment, Interviewer, Offer, Voice, run_enroll, write_clip,
+    Answer, EnrollReport, EnrollRules, Enrolment, Interviewer, Offer, Sessions, Voice, run_enroll,
+    write_clip,
 };
 use meethook_session::{
     Paths, RepresentativeSegment, SessionId, SessionMetadata, SpeakerCluster, SpeakerNames,
@@ -206,6 +207,12 @@ fn enroll_offering(paths: &Paths, offer: Offer, interviewer: &mut dyn Interviewe
         EnrollRules {
             selector: None,
             offer,
+            // Mirrors the CLI, where both halves come off `--correct`.
+            sessions: if offer.named {
+                Sessions::Every
+            } else {
+                Sessions::Unresolved
+            },
             enrolment: Enrolment::default(),
             template: &TranscriptTemplate::resolve(paths, None).unwrap(),
         },

@@ -115,12 +115,6 @@ use meethook_transcribe::{
     read_track_16k_mono,
 };
 
-/// How many of a voice's lines to show before asking who it is.
-///
-/// Enough to hear a person in the words -- what they said, what they were asked -- without
-/// turning a prompt into a page of transcript that hides the question at the bottom of it.
-const SNIPPETS: usize = 3;
-
 /// How much of one line to show. Long enough for a sentence, short enough to stay on a line.
 const SNIPPET_CHARS: usize = 100;
 
@@ -273,6 +267,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///   -- and that voice is then passed over, so a number can be skipped: 1/4, 2/4, 4/4. The gap
 ///   is the honest reading, because it means `of - nth` is a true upper bound on the questions
 ///   left rather than a promise of more questions than the run will ask.
+///
+/// `nth` is fixed when the queue is built, so [`Answer::Later`] does not renumber anything: a
+/// voice deferred at 3/9 comes back at 3/9, however many passes it takes. The alternative --
+/// numbering the passes -- would have the same voice arrive as 3/9 and then 1/2, which reads as
+/// a different voice in a different session rather than as the one question still open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
     /// 1-based place in the queue this run offered for this session. Never greater than `of`.
@@ -286,6 +285,43 @@ impl std::fmt::Display for Position {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.nth, self.of)
     }
+}
+
+/// One voice of a session as a queue pane lists it, which is not the same thing as a question.
+///
+/// Every voice the session has, including the ones this run is not asking about: the quiet
+/// fragments held back under the prompt floor, and the ones the database has already named.
+/// An interface that draws a queue needs all of them at once -- a pane showing only the voices
+/// currently being asked about would leave the user unable to see that the two-second fragment
+/// they are looking for exists at all -- whereas [`Voice`] is one question.
+///
+/// Four fields and no methods on purpose: it is a row, and what a row *reads like* belongs to
+/// whatever is drawing it.
+pub struct Queued<'a> {
+    /// The "Unknown N" this voice was transcribed with, which does not move when it is named.
+    /// The same handle [`Voice::number`] carries, so an interface can match a row against the
+    /// question it is being asked.
+    pub number: &'a str,
+
+    /// What this voice currently reads as and on what basis, exactly as
+    /// [`Voice::attribution`] means it -- and as the database and this run's answers stand
+    /// right now, not as they stood when the session was opened.
+    pub attribution: &'a Attribution,
+
+    /// Total speech attributed to this voice, in seconds. What tells a participant from
+    /// somebody who coughed once, and so what a queue is worth sorting or dimming by.
+    pub speech_seconds: f64,
+
+    /// Whether the prompt floor would have held this voice back -- so a queue can say why a
+    /// row is not among this run's questions, and offer `--all` by name.
+    ///
+    /// A boolean rather than `PROMPT_FLOOR_SECONDS` made public: where the floor sits, and that
+    /// a voice sitting exactly on it is offered, stay this library's decisions. An interface
+    /// comparing its own copy of the number would be a second answer to the same question.
+    ///
+    /// True even under `--all`, which changes which voices are *asked about* and not which ones
+    /// are quiet.
+    pub below_floor: bool,
 }
 
 /// One voice being asked about, and everything needed to ask.
@@ -321,12 +357,45 @@ pub struct Voice<'a> {
     /// so the user can find the voice in the file in front of them.
     pub attribution: &'a Attribution,
 
+    /// The "Unknown N" this voice was transcribed with -- a handle that does not move.
+    ///
+    /// [`attribution`](Voice::attribution)'s label is what the voice reads as *now*, so it
+    /// changes the moment the voice is named. This does not: it comes from [`unknown_labels`],
+    /// which ranks every voice by first appearance whether or not it has a name, and is fixed
+    /// for the session. An [`Interviewer`] with state of its own -- a cursor, a row it has
+    /// marked, a name half-typed -- has to key that state on something stable across
+    /// [`identify`](Interviewer::identify) calls, and this is the only field that qualifies.
+    ///
+    /// Not the cluster id, for the reason [`VoiceSelector`] gives: the id appears in
+    /// `transcript.json` and nowhere a person reads, and two numbering systems reachable from
+    /// one interface is how a cursor lands on the wrong voice.
+    pub number: &'a str,
+
     /// Total speech attributed to this voice, in seconds. How the user tells a participant
     /// from someone who coughed once.
     pub speech_seconds: f64,
 
-    /// Up to `SNIPPETS` of what this voice said, whitespace-trimmed and cut to
-    /// `SNIPPET_CHARS` characters. Empty if the recogniser heard nothing over it.
+    /// Every voice in this session, in first-appearance order -- the order the transcript
+    /// reads in -- whether or not this run is asking about it.
+    ///
+    /// What lets an interface draw the whole session beside the one question, which is what
+    /// makes the quiet voices and the already-named ones visible rather than merely reachable.
+    /// It includes the voice being asked about, so a queue pane needs nothing stitched onto it.
+    ///
+    /// Rebuilt for every call rather than handed over once per session, which is what makes it
+    /// current: an answer accepted a moment ago has already been written and the session
+    /// relabelled through it, so a voice named by the previous question arrives here under its
+    /// new name.
+    pub queue: &'a [Queued<'a>],
+
+    /// What this voice said, whitespace-trimmed and cut to `SNIPPET_CHARS` characters each,
+    /// with the lines the recogniser heard nothing over dropped. Empty if it heard nothing at
+    /// all.
+    ///
+    /// Every snippet, uncapped. How many will fit is a fact about the thing displaying them --
+    /// a line prompt has one screenful of scrollback and takes three; a pane can scroll -- so
+    /// capping here would decide it for both. They are borrows of the transcript, so a voice
+    /// that talked for ten minutes costs pointers rather than text.
     pub snippets: Vec<&'a str>,
 
     /// The longest representative clip: 16 kHz mono, the same rate everything else in
@@ -361,6 +430,20 @@ pub struct Voice<'a> {
     ///   name the first half was just given.
     pub resembles: Vec<Resemblance>,
 
+    /// Every enrolled name, deduplicated, in enrolment order -- the universe [`resolve()`]
+    /// requires.
+    ///
+    /// Not [`resembles`](Voice::resembles) with the numbers stripped off, and the difference is
+    /// the whole reason this field exists: ranking a voice against the database drops a person
+    /// whose every stored recording is a stale embedding dimension, and that person is still
+    /// real, so resolving a typed name against the ranked list would silently enrol a second
+    /// copy of them. `resembles` answers "who does this sound like"; this answers "who is
+    /// there", which is the question a name being typed is about.
+    ///
+    /// As the database stands now, like `resembles`: a name given earlier in this same run is
+    /// in here.
+    pub enrolled: Vec<&'a str>,
+
     /// What answering with a given name *would* do, asked without writing anything.
     ///
     /// [`resembles`](Voice::resembles) says who this voice sounds like; this says what happens
@@ -387,6 +470,23 @@ pub struct Voice<'a> {
 pub enum Answer {
     Named(String),
     Skip,
+    /// Not this voice, not yet: put it back in the queue and ask again later in this session.
+    ///
+    /// Distinct from [`Skip`](Self::Skip), which is a decision -- the question was asked and
+    /// went unanswered -- where this is a request to be asked again. It exists because a queue
+    /// is walked in first-appearance order and the voice somebody can actually place is often
+    /// not the one at the top: without it, reaching the four-minute voice at 7/9 means pressing
+    /// Enter past six people, and every one of those presses is a chance to type a name onto
+    /// the wrong person. Only an interface that can show the whole queue at once has any use
+    /// for it; a line prompt has nowhere to move a cursor to.
+    ///
+    /// Deferring costs nothing and writes nothing. The voice comes back with the [`Position`]
+    /// it had, and a session ends when a pass over the deferred voices produces no answer at
+    /// all -- at which point they are counted exactly as the skips and kept identifications
+    /// they have turned out to be. So deferring every voice and then stopping is the same
+    /// outcome as skipping every voice, which is what makes "not yet" safe to answer with when
+    /// there turns out to be no later.
+    Later,
     /// End the run here. A variant rather than an error because stopping early is an
     /// ordinary outcome -- everything accepted so far is already on disk.
     Quit,
@@ -585,6 +685,33 @@ pub struct Offer {
     pub named: bool,
 }
 
+/// Whether a session with nothing left unresolved is opened at all.
+///
+/// The other half of what [`Offer::named`] used to decide on its own, pulled out because they
+/// are two questions: *which voices does a session offer*, which is `Offer`'s own subject, and
+/// *is this session worth visiting*. They coincide for the two combinations the CLI shipped, and
+/// come apart the moment an interface wants every voice in the queue pane -- widening `Offer`
+/// for that would also, silently, have `meethook enroll` over a directory of finished sessions
+/// open one on each of them.
+///
+/// An enum rather than a bool, following [`Enrolment`] and [`Confirm`]: at the call site
+/// `Sessions::Every` says what it does, where `true` would need the parameter name to be read.
+///
+/// Nothing here applies to a run with a [`Selection`]: pointing at a voice or a moment has
+/// already made this judgement, so neither of those paths has ever had this gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Sessions {
+    /// The default: pass over a session where every voice already carries a name, because there
+    /// is no question left to ask about it.
+    #[default]
+    Unresolved,
+
+    /// `--correct`, and the full-screen frame: opened anyway. A session where nothing is
+    /// unresolved is exactly where a wrong identification sits, so it is the one a user
+    /// correcting an identification is reaching for.
+    Every,
+}
+
 /// When an accepted name is allowed to become a reference in `speakers.json`.
 ///
 /// A separate axis from [`Offer`] rather than a third field on it, because the two answer
@@ -629,6 +756,10 @@ pub struct EnrollRules<'a> {
     /// Which voices get asked about. Changes the questions and nothing else: the same answers
     /// write the same files however a voice came to be offered.
     pub offer: Offer,
+
+    /// Which sessions get visited -- the separate question [`Sessions`] describes. Ignored when
+    /// `selector` is `Some`, which stands in for the queue and its gates alike.
+    pub sessions: Sessions,
 
     /// What an accepted name writes -- the other axis, and the only one that changes that.
     pub enrolment: Enrolment,
@@ -943,7 +1074,15 @@ fn enroll_session(
             notes,
             report,
         )?,
-        None => queue(&order, &shown, rules.offer, session, notes, report)?,
+        None => queue(
+            &order,
+            &shown,
+            rules.offer,
+            rules.sessions,
+            session,
+            notes,
+            report,
+        )?,
     };
     let Some(offered) = offered else {
         return Ok(Outcome::Finished);
@@ -963,195 +1102,267 @@ fn enroll_session(
     // one call ago, so the two cannot drift apart.
     let of = offered.len();
 
-    for (index, cluster) in offered.into_iter().enumerate() {
-        // A voice an answer given earlier in this run has already put a name to: clustering
-        // that split one person in two must not ask about them twice. Only an in-run answer
-        // can have moved a label since `baseline` was taken, so "named, and not the name it
-        // had when we queued it" is exactly that case and nothing else. The `is_named()`
-        // half matters as much: an in-run answer can also *un*-name a voice -- re-anchoring a
-        // reference to another cluster drops this one back to its "Unknown N" -- and that is a
-        // question this run created and has not answered.
-        //
-        // This `continue` is the one place a [`Position`] skips a number, and it is skipped
-        // rather than compressed on purpose: the voice really was in the queue and really is
-        // now answered, so the gap says work disappeared and the end came closer.
-        if shown[&cluster.id].is_named() && shown[&cluster.id] != baseline[&cluster.id] {
-            continue;
-        }
+    // The queue, numbered once. `nth` travels with the voice from here on rather than being
+    // counted per pass, which is what makes a deferred voice come back as the same question --
+    // see [`Position`].
+    let mut pending: Vec<(usize, &SpeakerCluster)> = offered
+        .into_iter()
+        .enumerate()
+        .map(|(index, cluster)| (index + 1, cluster))
+        .collect();
 
-        // Scoped so the borrows of `transcript` and `shown` inside the voice end before the
-        // answer is acted on.
-        let answer = {
-            let attribution = &shown[&cluster.id];
-            // Keyed on the cluster, not on the label text: under `--correct` two voices can
-            // sit under one enrolled name -- which is the false accept being corrected -- and
-            // a prompt showing the other person's lines cannot be answered.
-            let snippets: Vec<&str> = transcript
-                .turns
-                .iter()
-                .filter(|turn| {
-                    turn.source_track == SourceTrack::Speaker && turn.cluster == Some(cluster.id)
-                })
-                .map(|turn| snippet(&turn.text))
-                .filter(|text| !text.is_empty())
-                .take(SNIPPETS)
-                .collect();
+    // Passes over a shrinking list rather than one walk, so that [`Answer::Later`] can put a
+    // voice back. Each pass asks about whatever is still pending; anything deferred is asked
+    // again on the next one.
+    loop {
+        let asked = pending.len();
+        let mut deferred: Vec<(usize, &SpeakerCluster)> = Vec::new();
 
-            // Computed eagerly for every voice, including on the `--name` path where nothing
-            // reads it, and deliberately not deferred behind a closure: two dozen people at
-            // 256 dimensions is a few thousand multiply-adds, against a run that has already
-            // read and resampled the whole speaker track a few lines above. An owned `Vec`
-            // rather than a borrow of the database, so the reborrow ends here and nothing
-            // downstream -- least of all an `Interviewer` -- has to reason about the write
-            // that replaces `speakers` once this answer is accepted.
-            interviewer.identify(&Voice {
-                session: &session.id,
-                position: Position { nth: index + 1, of },
-                attribution,
-                speech_seconds: cluster.speech_seconds,
-                snippets,
-                clip: clip_for(&track, cluster),
-                resembles: rank_enrolled(&cluster.embedding, speakers),
-                // Six borrows and no work: what an answer would do is computed only if the
-                // answerer asks. Nothing is written by asking, so this is safe to hand out
-                // even though it holds the database -- see `Voice::preview`.
-                preview: Preview::new(
-                    &clusters.clusters,
-                    &unknown,
-                    speakers,
-                    &assigned,
-                    cluster,
-                    rules.enrolment,
-                ),
-            })
-        };
-
-        // Leaving an already-named voice alone is keeping that identification, which is an
-        // answer; leaving an unnamed one alone is the question going unanswered. Same write --
-        // none -- and different enough that the summary must not conflate them.
-        let left_alone = if shown[&cluster.id].is_named() {
-            &mut report.kept
-        } else {
-            &mut report.skipped
-        };
-
-        let name = match answer {
-            Answer::Quit => return Ok(Outcome::Quit),
-            Answer::Skip => {
-                *left_alone += 1;
+        for (nth, cluster) in pending {
+            // A voice an answer given earlier in this run has already put a name to: clustering
+            // that split one person in two must not ask about them twice. Only an in-run answer
+            // can have moved a label since `baseline` was taken, so "named, and not the name it
+            // had when we queued it" is exactly that case and nothing else. The `is_named()`
+            // half matters as much: an in-run answer can also *un*-name a voice -- re-anchoring a
+            // reference to another cluster drops this one back to its "Unknown N" -- and that is a
+            // question this run created and has not answered.
+            //
+            // This `continue` is the one place a [`Position`] skips a number, and it is skipped
+            // rather than compressed on purpose: the voice really was in the queue and really is
+            // now answered, so the gap says work disappeared and the end came closer.
+            if shown[&cluster.id].is_named() && shown[&cluster.id] != baseline[&cluster.id] {
                 continue;
             }
-            Answer::Named(name) => name,
-        };
-        // Everything this answer would write, worked out on copies first -- the dry run the
-        // `consequence` module holds, and the same one an [`Interviewer`] may have already run
-        // through `Voice::preview`. Two files can carry a name and both feed the same
-        // labelling, so the only way to know what an answer *does* is to build the state it
-        // would leave and label the session through it; and the answer is not simply written
-        // and inspected afterwards because undoing a write that turned out to cost somebody
-        // their name means writing three files back, with a run interrupted mid-undo leaving
-        // exactly the mess this prevents.
-        //
-        // Built here rather than held from the prompt above because the commit below needs
-        // `speakers` mutably and a live `Preview` would keep it borrowed. It is the same six
-        // references and the same `of`, so the preview an answerer saw and the write cannot
-        // disagree.
-        //
-        // `None` is a name of nothing but spaces: somebody pressing Enter with a stray
-        // keystroke in the buffer, not a request for an entry called "". Where that is decided
-        // is `of`, so this path and a preview agree about it too.
-        let Some(consequence) = Preview::new(
-            &clusters.clusters,
-            &unknown,
-            speakers,
-            &assigned,
-            cluster,
-            rules.enrolment,
-        )
-        .of(&name) else {
-            *left_alone += 1;
-            continue;
-        };
-        let name = name.trim();
 
-        // The refusal. An answer that would take a name off a voice the user is not answering
-        // about is not honoured at all -- see `Refusal` for the three ways that can happen and
-        // why one check covers them. Nothing is written, the voice keeps whatever it read, and
-        // the note names the voice that would have paid.
-        if let Some(refusal) = &consequence.refused {
-            let answered = handle(cluster.id, &unknown);
+            // Scoped so the borrows of `transcript` and `shown` inside the voice end before the
+            // answer is acted on.
+            let answer = {
+                let attribution = &shown[&cluster.id];
+                // Keyed on the cluster, not on the label text: under `--correct` two voices can
+                // sit under one enrolled name -- which is the false accept being corrected -- and
+                // a prompt showing the other person's lines cannot be answered.
+                let snippets: Vec<&str> = transcript
+                    .turns
+                    .iter()
+                    .filter(|turn| {
+                        turn.source_track == SourceTrack::Speaker
+                            && turn.cluster == Some(cluster.id)
+                    })
+                    .map(|turn| snippet(&turn.text))
+                    .filter(|text| !text.is_empty())
+                    .collect();
+
+                // Every voice in the session, built here and now rather than once above the
+                // loop, for the reason `Voice::queue` gives and because the borrow checker
+                // insists: `shown` is *reassigned* at the end of an accepted answer, so rows
+                // borrowing it cannot outlive one question. That is the same thing as the rows
+                // being current, which is why no separate refresh exists.
+                //
+                // `order` and not `pending`: a queue pane is the session, so the quiet voices
+                // and the already-named ones are in it whether or not this run asks about them.
+                let rows: Vec<Queued<'_>> = order
+                    .iter()
+                    .map(|c| Queued {
+                        number: &unknown[&c.id],
+                        attribution: &shown[&c.id],
+                        speech_seconds: c.speech_seconds,
+                        // Strictly less than the floor: a cluster sitting exactly on it is
+                        // offered, which is the convention every floor in this codebase states.
+                        below_floor: c.speech_seconds < PROMPT_FLOOR_SECONDS,
+                    })
+                    .collect();
+
+                // Computed eagerly for every voice, including on the `--name` path where nothing
+                // reads it, and deliberately not deferred behind a closure: two dozen people at
+                // 256 dimensions is a few thousand multiply-adds, against a run that has already
+                // read and resampled the whole speaker track a few lines above. An owned `Vec`
+                // rather than a borrow of the database, so the reborrow ends here and nothing
+                // downstream -- least of all an `Interviewer` -- has to reason about the write
+                // that replaces `speakers` once this answer is accepted.
+                interviewer.identify(&Voice {
+                    session: &session.id,
+                    position: Position { nth, of },
+                    attribution,
+                    number: &unknown[&cluster.id],
+                    speech_seconds: cluster.speech_seconds,
+                    queue: &rows,
+                    snippets,
+                    clip: clip_for(&track, cluster),
+                    resembles: rank_enrolled(&cluster.embedding, speakers),
+                    // The universe `resolve()` requires, and not the ranking above -- see
+                    // `Voice::enrolled`. Owned borrows, like `resembles`, so the reborrow of
+                    // the database ends with this block.
+                    enrolled: speakers.enrolled_names(),
+                    // Six borrows and no work: what an answer would do is computed only if the
+                    // answerer asks. Nothing is written by asking, so this is safe to hand out
+                    // even though it holds the database -- see `Voice::preview`.
+                    preview: Preview::new(
+                        &clusters.clusters,
+                        &unknown,
+                        speakers,
+                        &assigned,
+                        cluster,
+                        rules.enrolment,
+                    ),
+                })
+            };
+
+            // Leaving an already-named voice alone is keeping that identification, which is an
+            // answer; leaving an unnamed one alone is the question going unanswered. Same write --
+            // none -- and different enough that the summary must not conflate them.
+            let left_alone = if shown[&cluster.id].is_named() {
+                &mut report.kept
+            } else {
+                &mut report.skipped
+            };
+
+            let name = match answer {
+                Answer::Quit => return Ok(Outcome::Quit),
+                Answer::Skip => {
+                    *left_alone += 1;
+                    continue;
+                }
+                // Back into the queue with the number it already has, and counted as nothing:
+                // it has not been answered yet. The pass that finds nobody willing to answer is
+                // where these turn into skips -- see the fixed point below.
+                Answer::Later => {
+                    deferred.push((nth, cluster));
+                    continue;
+                }
+                Answer::Named(name) => name,
+            };
+            // Everything this answer would write, worked out on copies first -- the dry run the
+            // `consequence` module holds, and the same one an [`Interviewer`] may have already run
+            // through `Voice::preview`. Two files can carry a name and both feed the same
+            // labelling, so the only way to know what an answer *does* is to build the state it
+            // would leave and label the session through it; and the answer is not simply written
+            // and inspected afterwards because undoing a write that turned out to cost somebody
+            // their name means writing three files back, with a run interrupted mid-undo leaving
+            // exactly the mess this prevents.
+            //
+            // Built here rather than held from the prompt above because the commit below needs
+            // `speakers` mutably and a live `Preview` would keep it borrowed. It is the same six
+            // references and the same `of`, so the preview an answerer saw and the write cannot
+            // disagree.
+            //
+            // `None` is a name of nothing but spaces: somebody pressing Enter with a stray
+            // keystroke in the buffer, not a request for an entry called "". Where that is decided
+            // is `of`, so this path and a preview agree about it too.
+            let Some(consequence) = Preview::new(
+                &clusters.clusters,
+                &unknown,
+                speakers,
+                &assigned,
+                cluster,
+                rules.enrolment,
+            )
+            .of(&name) else {
+                *left_alone += 1;
+                continue;
+            };
+            let name = name.trim();
+
+            // The refusal. An answer that would take a name off a voice the user is not answering
+            // about is not honoured at all -- see `Refusal` for the three ways that can happen and
+            // why one check covers them. Nothing is written, the voice keeps whatever it read, and
+            // the note names the voice that would have paid.
+            if let Some(refusal) = &consequence.refused {
+                let answered = handle(cluster.id, &unknown);
+                after(
+                    notes,
+                    &session.id,
+                    AnswerNote::Refused {
+                        name,
+                        voice: &answered,
+                        refusal,
+                    },
+                )?;
+                report.refused += 1;
+                continue;
+            }
+
+            // Everything this answer wrote, as one note rather than as the four to six lines it
+            // used to print, because that is the block an interface lays out together.
+            //
+            // Narrated *before* the copies are taken out of the consequence below: nothing between
+            // here and there writes a byte, so the order the user sees is unchanged, and a
+            // partially moved `Consequence` can no longer be borrowed.
             after(
                 notes,
                 &session.id,
-                AnswerNote::Refused {
+                AnswerNote::Committed {
                     name,
-                    voice: &answered,
-                    refusal,
+                    speech_seconds: cluster.speech_seconds,
+                    consequence: &consequence,
                 },
             )?;
-            report.refused += 1;
-            continue;
+            // A sub-count of `named`, and now read off the type rather than off the two arms of
+            // the match that used to print those two sentences -- which is what
+            // `Consequence::session_only` is documented to be.
+            if consequence.session_only() {
+                report.session_only += 1;
+            }
+            report.named += 1;
+
+            // Committed by taking the copies the dry run produced, so what lands on disk is the
+            // state that was checked rather than a second construction of it.
+            let speakers_changed = *speakers != consequence.speakers;
+            let assignments_changed = assigned.names != consequence.assigned.names;
+            *speakers = consequence.speakers;
+            assigned = consequence.assigned;
+
+            // Written in a fixed order -- the database, then this session's names, then the
+            // transcript -- and only where something changed, so a skipped write leaves a file
+            // byte-identical rather than merely equivalent.
+            if speakers_changed {
+                speakers.write(paths)?;
+            }
+            if assignments_changed {
+                assigned.write(&session.paths)?;
+            }
+
+            // Re-identified against the updated database rather than assumed: naming one voice
+            // can also name a second cluster in this session, if clustering split that person in
+            // two, and a `--force` re-transcribe would name both.
+            let now = effective_labels(&clusters.clusters, &unknown, speakers, &assigned.names);
+            if relabel(&mut transcript, &now) {
+                transcript.write(
+                    &session.paths,
+                    rules.template,
+                    &TranscriptContext::now(&metadata),
+                )?;
+            }
+            // Only on the timestamp path. A user who pointed at a moment did not choose the voice,
+            // so how far the rename reached is the one thing they cannot infer -- whereas the queue
+            // and `--voice` both showed them the voice first, and several tests pin their output
+            // exactly as it is.
+            if matches!(rules.selector, Some(Selection::At(_))) {
+                report_rename(&transcript, &shown, &now, name, session, notes)?;
+            }
+            shown = now;
         }
 
-        // Everything this answer wrote, as one note rather than as the four to six lines it
-        // used to print, because that is the block an interface lays out together.
+        // The fixed point: a pass that moved nobody out of the deferred set. Every other pass
+        // leaves `deferred.len() < asked`, and the set can only shrink, so this terminates.
         //
-        // Narrated *before* the copies are taken out of the consequence below: nothing between
-        // here and there writes a byte, so the order the user sees is unchanged, and a
-        // partially moved `Consequence` can no longer be borrowed.
-        after(
-            notes,
-            &session.id,
-            AnswerNote::Committed {
-                name,
-                speech_seconds: cluster.speech_seconds,
-                consequence: &consequence,
-            },
-        )?;
-        // A sub-count of `named`, and now read off the type rather than off the two arms of
-        // the match that used to print those two sentences -- which is what
-        // `Consequence::session_only` is documented to be.
-        if consequence.session_only() {
-            report.session_only += 1;
+        // The size of the set and not "no answer other than `Later` came back", because the
+        // in-run guard above takes a voice out of a pass without any answer being given -- an
+        // earlier answer named it -- and that is progress too. Counting answers would end a
+        // session while there were still questions the user had not been asked.
+        if deferred.len() == asked {
+            // Deferred with no later left is the skip -- or the kept identification -- it has
+            // turned out to be, counted through the same test the `Skip` arm uses above so the
+            // two cannot disagree about which bucket a named voice belongs in.
+            for (_, cluster) in &deferred {
+                if shown[&cluster.id].is_named() {
+                    report.kept += 1;
+                } else {
+                    report.skipped += 1;
+                }
+            }
+            break;
         }
-        report.named += 1;
-
-        // Committed by taking the copies the dry run produced, so what lands on disk is the
-        // state that was checked rather than a second construction of it.
-        let speakers_changed = *speakers != consequence.speakers;
-        let assignments_changed = assigned.names != consequence.assigned.names;
-        *speakers = consequence.speakers;
-        assigned = consequence.assigned;
-
-        // Written in a fixed order -- the database, then this session's names, then the
-        // transcript -- and only where something changed, so a skipped write leaves a file
-        // byte-identical rather than merely equivalent.
-        if speakers_changed {
-            speakers.write(paths)?;
-        }
-        if assignments_changed {
-            assigned.write(&session.paths)?;
-        }
-
-        // Re-identified against the updated database rather than assumed: naming one voice
-        // can also name a second cluster in this session, if clustering split that person in
-        // two, and a `--force` re-transcribe would name both.
-        let now = effective_labels(&clusters.clusters, &unknown, speakers, &assigned.names);
-        if relabel(&mut transcript, &now) {
-            transcript.write(
-                &session.paths,
-                rules.template,
-                &TranscriptContext::now(&metadata),
-            )?;
-        }
-        // Only on the timestamp path. A user who pointed at a moment did not choose the voice,
-        // so how far the rename reached is the one thing they cannot infer -- whereas the queue
-        // and `--voice` both showed them the voice first, and several tests pin their output
-        // exactly as it is.
-        if matches!(rules.selector, Some(Selection::At(_))) {
-            report_rename(&transcript, &shown, &now, name, session, notes)?;
-        }
-        shown = now;
+        pending = deferred;
     }
 
     Ok(Outcome::Finished)
@@ -1167,6 +1378,7 @@ fn queue<'c>(
     order: &[&'c SpeakerCluster],
     shown: &BTreeMap<u32, Attribution>,
     offer: Offer,
+    sessions: Sessions,
     session: &DiscoveredSession,
     notes: &mut dyn Narrator,
     report: &mut EnrollReport,
@@ -1179,7 +1391,21 @@ fn queue<'c>(
         .copied()
         .filter(|c| offer.named || !shown[&c.id].is_named())
         .collect();
-    if candidates.is_empty() {
+    // The two halves of the pass-over, which used to be one: a session with no candidates at
+    // all, and a session whose candidates are all already named. Only the second is
+    // [`Sessions`]'s to overrule -- a session with no clusters in it has nothing to draw
+    // however hard a caller asks -- which is why the emptiness test stays rather than folding
+    // into the count.
+    //
+    // A strict superset of the single `candidates.is_empty()` gate this replaces, for both of
+    // the combinations that reach it: with `offer.named` false every candidate is unresolved,
+    // so `unresolved == 0` holds exactly when the list is empty, and with it true the caller
+    // that sets it also passes `Sessions::Every`.
+    let unresolved = candidates
+        .iter()
+        .filter(|c| !shown[&c.id].is_named())
+        .count();
+    if candidates.is_empty() || (unresolved == 0 && sessions == Sessions::Unresolved) {
         // A session whose voices are all identified is exactly where somebody stands when one
         // of those identifications is wrong, and this note is the only thing it produces -- so
         // it carries the count that reaches the escape, the way the held-back one names `--all`.
@@ -1690,6 +1916,19 @@ mod tests {
 
     use super::*;
 
+    /// One row of the queue a prompt was shown, owned so it can outlive the call.
+    ///
+    /// The whole [`Attribution`] rather than its label, because what a queue pane needs is the
+    /// basis as well as the name -- "identified at 0.91" and "named for this session" are two
+    /// different rows however identically they read.
+    #[derive(Debug, PartialEq)]
+    struct Row {
+        number: String,
+        attribution: Attribution,
+        speech_seconds: f64,
+        below_floor: bool,
+    }
+
     /// A voice recorded exactly as it was shown, so a test can assert on what the user would
     /// have been looking at rather than only on what they answered.
     #[derive(Debug, PartialEq)]
@@ -1702,13 +1941,22 @@ mod tests {
         /// way a test can check that a correction prompt asked "is this right" rather than
         /// "who is this", and that a voice named for one session says so.
         attribution: Attribution,
+        /// The handle the prompt was given, which is the only way a test can check that it does
+        /// not move when the voice is named.
+        number: String,
         speech_seconds: f64,
+        /// Every voice of the session as the prompt was shown them, so a test can check both
+        /// what a queue pane would hold and that it is current.
+        queue: Vec<Row>,
         snippets: Vec<String>,
         clip_samples: usize,
         /// Who the prompt was told this voice resembles, in the order it was handed them --
         /// which is the only way a test can check that an [`Interviewer`] can offer names
         /// without ever reading `speakers.json`.
         resembles: Vec<Resemblance>,
+        /// Every enrolled name the prompt was handed -- the universe [`resolve()`] requires,
+        /// which is not the same list as `resembles`.
+        enrolled: Vec<String>,
     }
 
     impl Shown {
@@ -1718,6 +1966,22 @@ mod tests {
 
         fn confidence(&self) -> Option<f32> {
             self.attribution.confidence()
+        }
+
+        /// The queue as a pane would list it: the handle, what the row reads as, and whether
+        /// the floor held it back. For the assertions that are about the shape of the queue
+        /// rather than about the basis of one row.
+        fn rows(&self) -> Vec<(&str, &str, bool)> {
+            self.queue
+                .iter()
+                .map(|row| {
+                    (
+                        row.number.as_str(),
+                        row.attribution.label(),
+                        row.below_floor,
+                    )
+                })
+                .collect()
         }
 
         /// The ranking as a prompt would list it: who, and how many recordings of them.
@@ -1763,10 +2027,22 @@ mod tests {
                 session: voice.session.to_string(),
                 position: voice.position,
                 attribution: voice.attribution.clone(),
+                number: voice.number.to_string(),
                 speech_seconds: voice.speech_seconds,
+                queue: voice
+                    .queue
+                    .iter()
+                    .map(|row| Row {
+                        number: row.number.to_string(),
+                        attribution: row.attribution.clone(),
+                        speech_seconds: row.speech_seconds,
+                        below_floor: row.below_floor,
+                    })
+                    .collect(),
                 snippets: voice.snippets.iter().map(|s| s.to_string()).collect(),
                 clip_samples: voice.clip.len(),
                 resembles: voice.resembles.clone(),
+                enrolled: voice.enrolled.iter().map(|n| n.to_string()).collect(),
             });
             self.answers.pop_front().unwrap_or(Answer::Skip)
         }
@@ -1984,7 +2260,26 @@ mod tests {
         enrolment: Enrolment,
         interviewer: &mut Scripted,
     ) -> (EnrollReport, String) {
-        run_over(paths, ids, None, offer, enrolment, interviewer)
+        run_over(
+            paths,
+            ids,
+            None,
+            offer,
+            visits(offer),
+            enrolment,
+            interviewer,
+        )
+    }
+
+    /// Which sessions the CLI visits for a given [`Offer`], so the helpers above stay the plain
+    /// command: both halves come off `--correct` there, and a test that wants them apart -- the
+    /// one about [`Sessions`] being separately decidable -- goes through [`run_over`] directly.
+    fn visits(offer: Offer) -> Sessions {
+        if offer.named {
+            Sessions::Every
+        } else {
+            Sessions::Unresolved
+        }
     }
 
     /// `run`, aimed at one voice. One helper per axis, like the two above, so that the tests
@@ -2002,6 +2297,8 @@ mod tests {
             ids,
             Some(Selection::Voice(&selector)),
             Offer::default(),
+            // Irrelevant beside a selector, which stands in for the queue and its gates alike.
+            Sessions::default(),
             Enrolment::default(),
             interviewer,
         )
@@ -2021,6 +2318,7 @@ mod tests {
             ids,
             Some(Selection::At(at.parse().unwrap())),
             Offer::default(),
+            Sessions::default(),
             Enrolment::default(),
             interviewer,
         )
@@ -2031,11 +2329,13 @@ mod tests {
         run_at(paths, ids, at, &mut GivenName::new(name))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_over(
         paths: &Paths,
         ids: &[&str],
         selection: Option<Selection<'_>>,
         offer: Offer,
+        sessions: Sessions,
         enrolment: Enrolment,
         interviewer: &mut dyn Interviewer,
     ) -> (EnrollReport, String) {
@@ -2048,6 +2348,7 @@ mod tests {
             EnrollRules {
                 selector: selection,
                 offer,
+                sessions,
                 enrolment,
                 // Resolved from the root, exactly as the CLI does, so a test that puts a
                 // template there is testing the path a user takes.
@@ -3896,6 +4197,7 @@ mod tests {
             EnrollRules {
                 selector: None,
                 offer: Offer::default(),
+                sessions: Sessions::default(),
                 enrolment: Enrolment::default(),
                 template: &TranscriptTemplate::builtin(),
             },
@@ -4430,18 +4732,26 @@ mod tests {
             session,
             position,
             attribution,
+            number,
             speech_seconds,
+            queue,
             snippets,
             clip_samples,
             resembles,
+            enrolled,
         } = &aimed.seen[0];
         let queued = &queued.seen[1];
         assert_eq!(session, &queued.session);
         assert_eq!(attribution, &queued.attribution);
+        assert_eq!(number, &queued.number);
         assert_eq!(speech_seconds, &queued.speech_seconds);
+        // A targeted prompt sees the whole session too: narrowing decides which voices are
+        // *asked about*, and the queue is what the session holds.
+        assert_eq!(queue, &queued.queue);
         assert_eq!(snippets, &queued.snippets);
         assert_eq!(clip_samples, &queued.clip_samples);
         assert_eq!(resembles, &queued.resembles);
+        assert_eq!(enrolled, &queued.enrolled);
         assert_eq!(
             (position.to_string(), queued.position.to_string()),
             ("1/1".to_string(), "2/2".to_string()),
@@ -4500,6 +4810,7 @@ mod tests {
             &["20260809-052600"],
             Some(Selection::Voice(&second)),
             Offer::default(),
+            Sessions::default(),
             Enrolment::Always,
             &mut forcing,
         );
@@ -4820,6 +5131,7 @@ mod tests {
             &["20260809-052600"],
             Some(Selection::At("00:03".parse().unwrap())),
             Offer::default(),
+            Sessions::default(),
             Enrolment::Always,
             &mut GivenName::new("Silas"),
         );
@@ -4952,6 +5264,7 @@ mod tests {
             &["20260809-052600"],
             None,
             Offer::default(),
+            Sessions::default(),
             Enrolment::default(),
             &mut GivenName::new("Alice"),
         );
@@ -5142,6 +5455,7 @@ mod tests {
             &[],
             None,
             Offer::default(),
+            Sessions::default(),
             Enrolment::default(),
             interviewer,
         )
@@ -5312,6 +5626,329 @@ mod tests {
                 passed_over: 1,
                 failed: 0,
             }
+        );
+    }
+    /// TASK-046.06.01 acceptance criterion #1: a prompt is handed the whole session, not only
+    /// the voice it is about -- which is what a queue pane is drawn from.
+    #[test]
+    fn a_prompt_carries_every_voice_of_its_session() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::default();
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        // Both voices, in first-appearance order -- the order the transcript reads in -- with
+        // the basis and not only the label, and neither of them under the floor.
+        assert_eq!(
+            interviewer.seen[0].queue,
+            vec![
+                Row {
+                    number: "Unknown 1".to_string(),
+                    attribution: Attribution::Unknown("Unknown 1".to_string()),
+                    speech_seconds: 10.0,
+                    below_floor: false,
+                },
+                Row {
+                    number: "Unknown 2".to_string(),
+                    attribution: Attribution::Unknown("Unknown 2".to_string()),
+                    speech_seconds: 11.0,
+                    below_floor: false,
+                },
+            ],
+            "{output}"
+        );
+    }
+
+    /// TASK-046.06.01 acceptance criterion #1, the half a queue pane needs to explain itself:
+    /// the voices this run did *not* offer are in the queue, and say why.
+    #[test]
+    fn the_queue_holds_the_voices_the_floor_held_back_and_marks_them() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_fragmented_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::default();
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        // One question, three voices held back -- and all four rows on the prompt.
+        assert_eq!(interviewer.seen.len(), 1, "{output}");
+        assert_eq!(report.held_back, 3, "{output}");
+        assert_eq!(
+            interviewer.seen[0].rows(),
+            [
+                ("Unknown 1", "Unknown 1", false),
+                ("Unknown 2", "Unknown 2", true),
+                ("Unknown 3", "Unknown 3", true),
+                ("Unknown 4", "Unknown 4", true),
+            ],
+            "{output}"
+        );
+    }
+
+    /// TASK-046.06.01 acceptance criterion #2: the queue is rebuilt per question, so it shows
+    /// what this run has already done rather than what the session looked like when it opened.
+    #[test]
+    fn the_queue_shows_a_voice_an_earlier_answer_named() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(
+            interviewer.seen[0].queue[0].attribution,
+            Attribution::Unknown("Unknown 1".to_string()),
+            "{output}"
+        );
+        assert_eq!(
+            interviewer.seen[1].queue[0].attribution,
+            Attribution::Identified {
+                name: "Alice".to_string(),
+                similarity: 1.0
+            },
+            "the second question must see the first one's answer: {output}"
+        );
+        // And the handle did not move with the name -- acceptance criterion #3 in its in-run
+        // form, which is the one a cursor depends on.
+        assert_eq!(interviewer.seen[1].queue[0].number, "Unknown 1", "{output}");
+    }
+
+    /// TASK-046.06.01 acceptance criterion #3: the handle a state machine keys on is the
+    /// "Unknown N", and it stays put when the label does not.
+    #[test]
+    fn a_voice_carries_a_number_that_a_name_does_not_move() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        enrolled(&[("Alice", voice(0))], &paths);
+
+        let mut interviewer = Scripted::default();
+        let (_, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+        assert_eq!(interviewer.seen[0].label(), "Alice", "{output}");
+        assert_eq!(
+            interviewer.seen[0].number, "Unknown 1",
+            "the label is the name and the number is the handle: {output}"
+        );
+    }
+
+    /// TASK-046.06.01 acceptance criteria #4 and #6: a deferred voice is asked about again in
+    /// the same session, with the number it was first offered with.
+    #[test]
+    fn a_deferred_voice_comes_back_with_the_position_it_had() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        // Defer the first voice, answer the second, then answer the first on the second pass.
+        let mut interviewer =
+            Scripted::answering(vec![Answer::Later, named("Bob"), named("Alice")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(
+            interviewer.labels(),
+            ["Unknown 1", "Unknown 2", "Unknown 1"],
+            "{output}"
+        );
+        assert_eq!(
+            interviewer.positions(),
+            ["1/2", "2/2", "1/2"],
+            "a deferred voice is the same question, so it keeps its number: {output}"
+        );
+        assert_eq!(report.named, 2, "{output}");
+
+        // And the second pass's answer landed on the voice it was asked about.
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        let stored: Vec<(&str, &[f32])> = speakers
+            .speakers
+            .iter()
+            .map(|s| (s.name.as_str(), s.embedding.as_slice()))
+            .collect();
+        assert_eq!(
+            stored,
+            [("Bob", voice(1).as_slice()), ("Alice", voice(0).as_slice())],
+            "{output}"
+        );
+    }
+
+    /// TASK-046.06.01 acceptance criterion #5: a pass that produces no answer at all is where
+    /// a session ends, and the voices still deferred are the skips they turned out to be.
+    #[test]
+    fn deferring_every_voice_ends_the_session_and_counts_skips() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        let before = files_under(root.path());
+
+        let mut interviewer = Scripted::answering(vec![Answer::Later, Answer::Later]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(
+            interviewer.labels(),
+            ["Unknown 1", "Unknown 2"],
+            "one pass, and no second one: nothing moved: {output}"
+        );
+        assert_eq!(report.skipped, 2, "{output}");
+        assert_eq!(report.kept, 0, "{output}");
+        assert_eq!(report.named, 0, "{output}");
+        assert_eq!(
+            files_under(root.path()),
+            before,
+            "deferring writes nothing, however many times it is answered"
+        );
+    }
+
+    /// TASK-046.06.01 acceptance criterion #5, the other bucket: a deferred voice that already
+    /// had a name is a kept identification, exactly as pressing Enter on it would be.
+    #[test]
+    fn a_deferred_voice_that_was_named_is_kept_rather_than_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        // Only the first voice is enrolled, so `--correct` offers one named and one unnamed.
+        enrolled(&[("Alice", voice(0))], &paths);
+
+        let mut interviewer = Scripted::answering(vec![Answer::Later, Answer::Later]);
+        let (report, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Alice", "Unknown 2"], "{output}");
+        assert_eq!(report.kept, 1, "{output}");
+        assert_eq!(report.skipped, 1, "{output}");
+    }
+
+    /// TASK-046.06.01 acceptance criterion #5, against the in-run guard: a voice somebody
+    /// else's answer named while it sat deferred is passed over on the next pass rather than
+    /// asked twice -- and counted in neither bucket, because it was answered.
+    #[test]
+    fn a_deferred_voice_another_answer_named_is_not_asked_again() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        // One person clustering split in two: naming either half names the other.
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
+
+        let mut interviewer = Scripted::answering(vec![Answer::Later, named("Alice")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(
+            interviewer.labels(),
+            ["Unknown 1", "Unknown 2"],
+            "the deferred voice was named by the other answer, so there is nothing to ask: \
+             {output}"
+        );
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(report.skipped, 0, "{output}");
+        assert_eq!(report.kept, 0, "{output}");
+    }
+
+    /// TASK-046.06.01 acceptance criterion #7: which voices a session offers and whether a
+    /// session with nothing unresolved is visited are two decisions, decidable apart.
+    #[test]
+    fn visiting_a_resolved_session_is_decided_apart_from_which_voices_it_offers() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        // Nothing is unresolved: both voices are identified before the run starts.
+        enrolled(&[("Alice", voice(0)), ("Bob", voice(1))], &paths);
+
+        // Offer the named voices, but do not visit a session that has nothing unresolved.
+        let mut skipping = Scripted::default();
+        let (report, output) = run_over(
+            &paths,
+            &[],
+            None,
+            CORRECT,
+            Sessions::Unresolved,
+            Enrolment::default(),
+            &mut skipping,
+        );
+        assert!(skipping.seen.is_empty(), "{output}");
+        assert_eq!(report.passed_over, 1, "{output}");
+
+        // Same offer, visited anyway -- which is what the full-screen frame needs and what
+        // `--correct` asks for today.
+        let mut asking = Scripted::default();
+        let (report, output) = run_over(
+            &paths,
+            &[],
+            None,
+            CORRECT,
+            Sessions::Every,
+            Enrolment::default(),
+            &mut asking,
+        );
+        assert_eq!(asking.labels(), ["Alice", "Bob"], "{output}");
+        assert_eq!(report.passed_over, 0, "{output}");
+
+        // And visiting cannot manufacture a question: with the named voices left out there are
+        // no candidates at all, so the session is still passed over.
+        let mut empty_handed = Scripted::default();
+        let (report, output) = run_over(
+            &paths,
+            &[],
+            None,
+            Offer::default(),
+            Sessions::Every,
+            Enrolment::default(),
+            &mut empty_handed,
+        );
+        assert!(empty_handed.seen.is_empty(), "{output}");
+        assert_eq!(report.passed_over, 1, "{output}");
+    }
+
+    /// TASK-046.06.01 acceptance criterion #9: every snippet crosses the seam, so the cap
+    /// belongs to whatever is displaying them.
+    #[test]
+    fn a_voice_carries_every_snippet_it_has() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_turns(
+            &paths,
+            &session,
+            "20260809-052600",
+            (0..5)
+                .map(|i| speaker_turn(f64::from(i), 0, "Unknown 1", &format!("line {i}")))
+                .collect(),
+        );
+
+        let mut interviewer = Scripted::default();
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(
+            interviewer.seen[0].snippets,
+            ["line 0", "line 1", "line 2", "line 3", "line 4"],
+            "{output}"
+        );
+    }
+
+    /// TASK-046.06.01 acceptance criterion #10: the universe `resolve()` requires is carried
+    /// across the seam, and it is not the ranking -- which is exactly the failure that doc
+    /// names, reproduced here.
+    #[test]
+    fn a_voice_carries_every_enrolled_name_and_not_only_the_ranked_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        // "Stale" holds one reference of a dimension nothing in this session can be compared
+        // to, so the ranking drops them -- and a typed "Stale" must still find them.
+        enrolled(&[("Alice", voice(0)), ("Stale", vec![1.0; 8])], &paths);
+
+        let mut interviewer = Scripted::default();
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(
+            interviewer.seen[0].offered(),
+            [("Alice", 1)],
+            "an incomparable reference cannot be ranked: {output}"
+        );
+        assert_eq!(
+            interviewer.seen[0].enrolled,
+            ["Alice", "Stale"],
+            "but both people are enrolled, and resolving a name is about who is there: {output}"
         );
     }
 }

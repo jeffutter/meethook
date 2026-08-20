@@ -26,7 +26,9 @@ use std::f32::consts::TAU;
 use std::path::{Path, PathBuf};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
-use meethook_enroll::{Answer, EnrollRules, Enrolment, Interviewer, Offer, Voice, run_enroll};
+use meethook_enroll::{
+    Answer, EnrollRules, Enrolment, Interviewer, Offer, Sessions, Voice, run_enroll,
+};
 use meethook_session::{
     EnrolledSpeakers, Paths, RepresentativeSegment, SessionId, SpeakerCluster, SpeakerClusters,
     Transcript, TranscriptTemplate,
@@ -218,6 +220,7 @@ fn a_session_built_from_a_wav_file_transcribes_enrolls_and_stores_that_audio() {
         EnrollRules {
             selector: None,
             offer: Offer::default(),
+            sessions: Sessions::default(),
             enrolment: Enrolment::default(),
             template: &TranscriptTemplate::resolve(&paths, None).unwrap(),
         },
@@ -322,6 +325,7 @@ fn building_and_transcribing_touches_only_the_root_it_was_given() {
         EnrollRules {
             selector: None,
             offer: Offer::default(),
+            sessions: Sessions::default(),
             enrolment: Enrolment::default(),
             template: &TranscriptTemplate::resolve(&paths, None).unwrap(),
         },
