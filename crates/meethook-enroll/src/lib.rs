@@ -51,6 +51,16 @@
 //! user has confirmed. See the `forget` module for the ordering and the wording. It is the last
 //! thing in the tool that used to require a text editor.
 //!
+//! # And it decides what a *typed name* means
+//!
+//! [`resolve()`] is the counterpart to those two aimed at the moment before a write: a name matches
+//! exactly and case-sensitively everywhere in this tool, so a typo silently enrols a second
+//! person rather than adding a recording to the first. It turns typed text into an enrolled
+//! person, a shortlist of the people it might mean, or a genuinely new name -- and it never picks
+//! between two candidates, because on a real database `Ivan` and `Owen` are two colleagues.
+//! Showing the shortlist and taking the confirmation belongs to the interface; the decision is
+//! here because it is what lands on disk. See the `resolve` module for the fold and the ranking.
+//!
 //! # And it corrects the *meeting* a session was labelled with
 //!
 //! [`run_meeting`] is this crate's premise -- an automatic guess, a human correction, a
@@ -64,10 +74,12 @@
 mod forget;
 mod meeting;
 mod references;
+mod resolve;
 
 pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
 pub use meeting::{Labelled, MeetingChoice, MeetingSource, Relabelling, run_meeting};
 pub use references::{Enrolled, Reference, Scan, Unreadable, VoiceChange, run_speakers, scan};
+pub use resolve::{Likeness, Match, Resolution, resolve};
 
 use std::collections::BTreeMap;
 use std::io::Write;
