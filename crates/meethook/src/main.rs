@@ -6,6 +6,7 @@
 //! [`meethook_session`] and to nothing else.
 
 mod commands;
+mod screen;
 
 use std::path::PathBuf;
 

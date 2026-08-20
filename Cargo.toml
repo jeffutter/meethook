@@ -77,6 +77,50 @@ mach2 = "0.6"
 # `transcript::yaml_filter`. Pure Rust either way: no build script, no C, so `flake.nix` needs
 # nothing.
 minijinja = { version = "2" }
+# The full-screen `enroll` frame (`meethook/src/screen/`). The line prompt asks about one voice
+# at a time in a fixed order and cannot show a ranking, a filter, or what an answer would do
+# before it is given; those are the whole of TASK-046.06.02, and none of them is expressible in
+# scrollback. Written by hand against raw crossterm this would be the same widgets plus a
+# double-buffered diff, which is precisely the part with no interesting decisions in it.
+#
+# ## What it costs, measured on aarch64-apple-darwin, 2026-08-19
+#
+# 44 crates, 149 -> 193 in `cargo tree -p meethook -e normal,build`. Measured on that graph and
+# not on `cargo metadata`, which counts registry crates' own dev-dependencies and so reports 61
+# (182 -> 243) -- 17 crates nothing here ever compiles. From a cold target directory the 44 build
+# in 6.6s wall / 28s
+# CPU at this workspace's `opt-level = 2`.
+#
+# Two duplicate majors arrive with them: hashbrown 0.16 alongside 0.17, and itertools 0.13
+# alongside 0.14. Both are transitive on either side, neither is in a public signature this
+# workspace touches, so they cost compile time and nothing else.
+#
+# Pure Rust, no build scripts, no C: `flake.nix` is unchanged.
+#
+# ## Which features, and why not the defaults
+#
+# `default-features = false` plus `crossterm` saves 8 of what would be 52 crates (201 in that
+# same tree). What goes:
+#
+# - `all-widgets` -> `widget-calendar` -> `ratatui-widgets/calendar` -> `time` and its four
+#   companions (deranged, num-conv, num_threads, powerfmt). A month grid, for a list of voices.
+# - `macros` -> `ratatui-macros`, sugar for building `Layout`s this crate builds three of.
+# - `layout-cache` -> `critical-section`. See below.
+# - `underline-color`, which is a `ratatui-core` cfg rather than a dependency and which nothing
+#   here sets an underline colour to need.
+#
+# No direct `crossterm` entry to go with it: the backend re-exports the version it was built
+# against as `ratatui::crossterm`, and naming crossterm 0.29 separately would be a second place
+# for that pairing to be got wrong.
+#
+# `layout-cache` was measured rather than guessed, because it is the one dropped feature that
+# trades a crate for speed and this frame redraws on every keystroke. Over 5000 draws of all
+# five panes at 110x30, release: 195us per draw without it, 105us with. Left off. Both are three
+# orders of magnitude under a keystroke, so the cache buys nothing anybody can perceive, and one
+# crate for an imperceptible gain is the wrong side of the trade this file keeps making. The
+# numbers are here so that a frame which grows enough panes to change them can be re-measured
+# rather than re-argued.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The sha256 behind `ModelSpec::sha256` and `stream_and_hash`. `meethook-models` is its only

@@ -22,6 +22,7 @@ use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, pr
 use meethook_session::{Paths, SessionId, TranscriptTemplate};
 
 use crate::EnrollArgs;
+use crate::screen::{Interface, Shared};
 use meethook_transcribe::{
     Attribution, EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, SILERO_VAD_MODEL,
     WHISPER_MODEL, WhisperEngine, run_batch,
@@ -679,66 +680,11 @@ impl DownloadProgress {
 pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Result<()> {
     let requested = parse_session_ids(&args.session_ids)?;
     let template = TranscriptTemplate::resolve(paths, template)?;
-    // Which answerer this run has, by the rule in `answerer`. `--name` is refused without a
-    // selector by `run_enroll`, which is where both halves of that rule are in hand.
-    //
-    // A tuple match rather than `given.as_mut().expect(..)`: `answerer` returns `Given` only
-    // when `named` is true, and `named` is `args.name.is_some()`, so the pairing cannot fail --
-    // and were it ever to, falling through to the line prompt is today's behaviour rather than
-    // a panic in a command that may already have written names to disk.
-    let mut terminal = Terminal::default();
-    let mut given = args.name.as_deref().map(GivenName::new);
+    // Which answerer this run has, by the rule in `answerer`. Decided here and passed in so that
+    // this function's only remaining job is the summary below -- which has to print with nothing
+    // of `ask`'s still holding the screen.
     let chosen = answerer(args.name.is_some(), args.plain, Tty::current());
-    let interviewer: &mut dyn Interviewer = match (chosen, &mut given) {
-        (Answerer::Given, Some(given)) => given,
-        // TASK-046.06 splits this arm: `Answerer::Screen` builds the full-screen interface,
-        // `Answerer::Prompt` keeps the line-based `Terminal`. This is its single wiring point.
-        // Until then both are the line prompt, which is what makes this a pure decision change
-        // with no behavioural difference to find. The narrator below is the other half of that
-        // change -- a frame cannot share stdout with `Lines` -- so it stays where it is here.
-        _ => &mut terminal,
-    };
-    // Unlike a session id there is nothing to validate about a `--voice`: a selector that matches
-    // nothing is answered against the session's actual voices, which is a better message than
-    // anything this edge could produce without having read them. `--at` is the other way round --
-    // a malformed timestamp has nothing to be compared against -- so clap has already parsed it.
-    let selector = args.voice.as_deref().map(VoiceSelector::from);
-    let rules = EnrollRules {
-        selector: match (&selector, args.at) {
-            (Some(selector), _) => Some(Selection::Voice(selector)),
-            (None, Some(at)) => Some(Selection::At(at)),
-            (None, None) => None,
-        },
-        // Which flag answers which question, readable here rather than positional.
-        offer: Offer {
-            quiet: args.all,
-            named: args.correct,
-        },
-        // The other half of what `--correct` means, and a separate axis from `offer` for the
-        // reason `Sessions` gives: `offer` says which voices a session asks about, this says
-        // whether a session with nothing unresolved is opened at all. Both come off the same
-        // flag today, which is why this is not a behaviour change.
-        sessions: if args.correct {
-            Sessions::Every
-        } else {
-            Sessions::Unresolved
-        },
-        // A separate axis from `offer`: that one decides which voices are asked about, this
-        // one what an answer to a quiet voice writes.
-        enrolment: if args.force_reference {
-            Enrolment::Always
-        } else {
-            Enrolment::AboveTheFloor
-        },
-        template: &template,
-    };
-    let report = run_enroll(
-        paths,
-        &requested,
-        rules,
-        interviewer,
-        &mut Lines::new(&mut io::stdout()),
-    )?;
+    let report = ask(paths, &requested, args, &template, chosen)?;
 
     println!(
         "\n{} named, {} skipped, {} session(s) passed over",
@@ -786,6 +732,103 @@ pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Resu
         bail!("{} enroll request(s) could not be served", report.failed);
     }
     Ok(())
+}
+
+/// Runs the questions and returns what they came to, with nothing on the screen afterwards.
+///
+/// Split out of [`enroll`] rather than inlined for one reason: the full-screen answerer holds the
+/// terminal for as long as it is alive, and the run summary has to land on the restored screen
+/// below the narration. A function boundary is what makes that ordering structural -- the frame
+/// cannot outlive this call -- instead of a `drop` somebody has to remember not to move.
+fn ask(
+    paths: &Paths,
+    requested: &[SessionId],
+    args: &EnrollArgs,
+    template: &TranscriptTemplate,
+    chosen: Answerer,
+) -> Result<meethook_enroll::EnrollReport> {
+    // Unlike a session id there is nothing to validate about a `--voice`: a selector that matches
+    // nothing is answered against the session's actual voices, which is a better message than
+    // anything this edge could produce without having read them. `--at` is the other way round --
+    // a malformed timestamp has nothing to be compared against -- so clap has already parsed it.
+    let selector = args.voice.as_deref().map(VoiceSelector::from);
+    // The frame navigates rather than being fed a queue, so it takes every voice the session has
+    // and decides for itself which to show; `--all` and `--correct` are how the *line* prompt
+    // widens what it is offered, and AC #2 is that the frame needs neither.
+    let screen = chosen == Answerer::Screen;
+    let rules = EnrollRules {
+        selector: match (&selector, args.at) {
+            (Some(selector), _) => Some(Selection::Voice(selector)),
+            (None, Some(at)) => Some(Selection::At(at)),
+            (None, None) => None,
+        },
+        // Which flag answers which question, readable here rather than positional.
+        offer: Offer {
+            quiet: args.all || screen,
+            named: args.correct || screen,
+        },
+        // The other half of what `--correct` means, and a separate axis from `offer` for the
+        // reason `Sessions` gives: `offer` says which voices a session asks about, this says
+        // whether a session with nothing unresolved is opened at all. Not widened for the frame:
+        // a session with nothing left to answer is one the user did not ask to revisit, and
+        // opening it would put an empty queue on the screen for every finished meeting on disk.
+        sessions: if args.correct {
+            Sessions::Every
+        } else {
+            Sessions::Unresolved
+        },
+        // A separate axis from `offer`: that one decides which voices are asked about, this
+        // one what an answer to a quiet voice writes.
+        enrolment: if args.force_reference {
+            Enrolment::Always
+        } else {
+            Enrolment::AboveTheFloor
+        },
+        template,
+    };
+
+    // `--name` is refused without a selector by `run_enroll`, which is where both halves of that
+    // rule are in hand. A match rather than `expect(..)`: `answerer` returns `Given` only when
+    // `named` is true, and `named` is `args.name.is_some()`, so the pairing cannot fail -- and
+    // were it ever to, falling through to the line prompt is better than a panic in a command
+    // that may already have written names to disk.
+    match (chosen, args.name.as_deref()) {
+        (Answerer::Given, Some(name)) => Ok(run_enroll(
+            paths,
+            requested,
+            rules,
+            &mut GivenName::new(name),
+            &mut Lines::new(&mut io::stdout()),
+        )?),
+        (Answerer::Screen, _) => {
+            // A frame cannot share stdout with `Lines`, so the two share a buffer instead and
+            // the frame draws the narration in a pane. `finish` writes the whole buffer out once
+            // the terminal is back, so a full-screen run leaves the same scrollback a plain one
+            // does -- and it runs whether or not the run itself succeeded, because narration
+            // already written describes work already done to the disk.
+            let narration = Shared::default();
+            let mut narrator = narration.clone();
+            let mut frame = Interface::new(narration);
+            let outcome = run_enroll(
+                paths,
+                requested,
+                rules,
+                &mut frame,
+                &mut Lines::new(&mut narrator),
+            );
+            let flushed = frame.finish(&mut io::stdout());
+            let report = outcome?;
+            flushed?;
+            Ok(report)
+        }
+        _ => Ok(run_enroll(
+            paths,
+            requested,
+            rules,
+            &mut Terminal::default(),
+            &mut Lines::new(&mut io::stdout()),
+        )?),
+    }
 }
 
 /// Reports who is enrolled and what each of their stored recordings is currently naming.
@@ -1007,6 +1050,48 @@ fn answerer(named: bool, plain: bool, tty: Tty) -> Answerer {
 /// takes a different number.
 const SNIPPETS: usize = 3;
 
+/// Playing a voice's audio, for whichever answerer is asking.
+///
+/// Both of them need this and neither of them needs it differently: the samples are the same
+/// samples and `afplay` is the same `afplay`. What they do *not* share is where the words go --
+/// the line prompt prints a parenthetical under the snippets, the frame puts a status line in a
+/// pane -- so this returns what went wrong rather than saying it, and the empty-clip case stays
+/// with the callers for the same reason.
+#[derive(Default)]
+pub(crate) struct Clips {
+    /// Where clips are written for the player, created on first use and removed when the run
+    /// ends. `afplay` has no start offset, so playing part of a recording means handing it a
+    /// file that contains only that part.
+    dir: Option<tempfile::TempDir>,
+}
+
+impl Clips {
+    /// Plays a clip and waits for it to finish.
+    ///
+    /// Never fatal to a run. A missing `afplay`, a full temp directory, a truncated
+    /// `speaker.wav` -- none of them are a reason to stop asking, because the snippets are often
+    /// enough to recognise somebody on their own. Hence `Result` and not `?` at the call sites.
+    ///
+    /// An empty `clip` is a successful no-op here and the caller's sentence to write: it is not a
+    /// failure of anything, and the two answerers word it differently.
+    pub(crate) fn play(&mut self, clip: &[f32]) -> Result<()> {
+        if clip.is_empty() {
+            return Ok(());
+        }
+        let dir = match &self.dir {
+            Some(dir) => dir,
+            None => self.dir.insert(tempfile::tempdir()?),
+        };
+        let path = dir.path().join("clip.wav");
+        write_clip(&path, clip)?;
+        let status = Command::new("afplay").arg(&path).status()?;
+        if !status.success() {
+            bail!("afplay exited with {status}");
+        }
+        Ok(())
+    }
+}
+
 /// The interactive half of `enroll`: what a prompt looks like, and how a clip gets played.
 ///
 /// Everything about *which* voice is asked about, and what an answer writes, is on the other
@@ -1014,38 +1099,17 @@ const SNIPPETS: usize = 3;
 /// front of it, so none of it is tested; keeping it this small is what makes that acceptable.
 #[derive(Default)]
 struct Terminal {
-    /// Where clips are written for the player, created on first use and removed when the run
-    /// ends. `afplay` has no start offset, so playing part of a recording means handing it a
-    /// file that contains only that part.
-    clips: Option<tempfile::TempDir>,
+    clips: Clips,
 }
 
 impl Terminal {
-    /// Plays a clip and waits for it to finish, reporting anything that stopped it.
-    ///
-    /// Never fatal. A missing `afplay`, a full temp directory, a truncated `speaker.wav` --
-    /// none of them are a reason to stop asking, because the snippets above the prompt are
-    /// often enough to recognise somebody on their own.
+    /// Plays a clip, reporting anything that stopped it under the snippets.
     fn play(&mut self, clip: &[f32]) {
         if clip.is_empty() {
             println!("    (no audio for this voice)");
             return;
         }
-
-        let played = || -> Result<()> {
-            let dir = match &self.clips {
-                Some(dir) => dir,
-                None => self.clips.insert(tempfile::tempdir()?),
-            };
-            let path = dir.path().join("clip.wav");
-            write_clip(&path, clip)?;
-            let status = Command::new("afplay").arg(&path).status()?;
-            if !status.success() {
-                bail!("afplay exited with {status}");
-            }
-            Ok(())
-        }();
-        if let Err(e) = played {
+        if let Err(e) = self.clips.play(clip) {
             println!("    (could not play the clip: {e})");
         }
     }

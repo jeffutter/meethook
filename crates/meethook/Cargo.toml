@@ -21,6 +21,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 ctrlc = { workspace = true }
 jiff = { workspace = true }
+ratatui = { workspace = true }
 # For the scratch directory `enroll` extracts clips into: `afplay` cannot seek, so playing
 # part of a recording means writing that part out first.
 tempfile = { workspace = true }
