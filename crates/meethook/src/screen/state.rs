@@ -2,7 +2,7 @@
 //!
 //! Everything the full-screen interface *decides* is here: which voice the cursor is on, which
 //! voice the user is steering toward, what has been typed into the filter, which candidate is
-//! highlighted, how far the snippets are scrolled, and what this run has already done to each
+//! highlighted, which transcript line is selected, and what this run has already done to each
 //! voice. It takes typed [`Event`]s and returns either "still going" or an
 //! [`Answer`].
 //!
@@ -91,11 +91,17 @@ pub enum Event {
     /// Answer with the typed text as somebody new. Its own key, never the fallback for
     /// unrecognised text.
     NewPerson,
+    /// Move the selected transcript line, which is also the row the pane scrolls to: one index,
+    /// not a cursor and an offset.
     SnippetUp,
     SnippetDown,
     /// Play the clip. Handled by the shell, which is the only thing holding the samples; here for
     /// the sake of one total `match`.
     Play,
+    /// Play the selected transcript line -- the footer's "line", and the row `SnippetUp` and
+    /// `SnippetDown` move to. Handled by the shell for the same reason [`Event::Play`] is: the
+    /// samples are the shell's, and this is here so the `match` over events stays total.
+    PlaySnippet,
     Skip,
     Quit,
 }
@@ -189,6 +195,9 @@ pub struct View<'a> {
     pub consequence: Vec<String>,
     /// Every snippet, with the pane scrolled to [`View::snippet`].
     pub snippets: &'a [Snippet<'a>],
+    /// Index into [`View::snippets`] of the selected line -- the row the pane marks, the row at
+    /// the top of it, and the line [`Event::PlaySnippet`] would play. Always the same index
+    /// [`Screen::selected`] returns, because both come off `selected_index`.
     pub snippet: usize,
     pub clip_is_empty: bool,
     /// One line about what just happened -- a clip that would not play, a voice that turned out
@@ -217,6 +226,10 @@ pub struct Screen {
     awaited: BTreeSet<String>,
     filter: String,
     candidate: usize,
+    /// Which transcript line is selected: the row the pane marks and the line the play-the-line
+    /// key hands over. Unclamped here and clamped on the way out by
+    /// [`Screen::selected_index`], which is the only place that knows how many lines this voice
+    /// actually has.
     snippet: usize,
     decided: BTreeMap<String, Mark>,
     /// Memo for [`Costs::of`], keyed by name and **cleared on every arrival**. One `Costs::of` is
@@ -272,7 +285,7 @@ impl Screen {
             None => {}
         }
 
-        // A filter, a candidate highlight and a scroll offset are all about the voice that was on
+        // A filter, a candidate highlight and a line selection are all about the voice that was on
         // the screen, so none of them survives the question changing.
         self.filter.clear();
         self.candidate = 0;
@@ -383,15 +396,16 @@ impl Screen {
                 self.snippet = self.snippet.saturating_sub(1);
             }
             Event::SnippetDown => {
-                // Clamped so that the last snippet can reach the top of the pane and no further.
-                // Clamping is how this scroll is defined out of existence rather than
+                // Clamped so that the last snippet can be selected and no further. Clamping is
+                // how the out-of-range case is defined out of existence rather than
                 // bounds-checked at every use.
                 let last = view.snippets.len().saturating_sub(1);
                 self.snippet = (self.snippet + 1).min(last);
             }
-            // The shell holds the samples, so it intercepts this before the state machine sees
-            // it. Here so that the `match` is total and adding a key cannot silently do nothing.
-            Event::Play => {}
+            // The shell holds the samples, so it intercepts both of these before the state
+            // machine sees them. Here so that the `match` is total and adding a key cannot
+            // silently do nothing.
+            Event::Play | Event::PlaySnippet => {}
             Event::Skip => {
                 self.decided.insert(view.number.to_string(), Mark::Skipped);
                 return Step::Answered(Answer::Skip);
@@ -399,6 +413,30 @@ impl Screen {
             Event::Quit => return Step::Answered(Answer::Quit),
         }
         Step::Waiting
+    }
+
+    /// Which line the pane has selected: the state's index, clamped to the lines this voice has.
+    ///
+    /// One rule rather than two, because [`Screen::selected`] and [`View::snippet`] must not be
+    /// able to disagree about which row is the selected one -- a mark on one row and audio from
+    /// another is the failure this ticket exists to prevent.
+    fn selected_index(&self, view: &VoiceView<'_>) -> usize {
+        self.snippet.min(view.snippets.len().saturating_sub(1))
+    }
+
+    /// The line [`Event::PlaySnippet`] would play, and where it sits in the pane.
+    ///
+    /// `None` only for a voice with nothing transcribed. The index comes back with the snippet
+    /// because playback has to be *marked* on the row it started from, and the user may page the
+    /// pane while it sounds -- so the mark is the index at the spawn, not wherever the selection
+    /// has since moved to.
+    ///
+    /// A [`Snippet`] by value: it is `Copy`, four words of borrowed text and borrowed samples, so
+    /// this hands over no audio and copies none. That is the same trade
+    /// [`VoiceView::clip_is_empty`] documents from the other side.
+    pub fn selected<'a>(&self, view: &VoiceView<'a>) -> Option<(usize, Snippet<'a>)> {
+        let index = self.selected_index(view);
+        Some((index, *view.snippets.get(index)?))
     }
 
     /// Everything the panes draw, derived from the state and this voice.
@@ -460,7 +498,7 @@ impl Screen {
             candidates,
             consequence,
             snippets: view.snippets,
-            snippet: self.snippet.min(view.snippets.len().saturating_sub(1)),
+            snippet: self.selected_index(view),
             clip_is_empty: view.clip_is_empty,
             status: self.status.as_deref(),
         }
@@ -598,6 +636,17 @@ pub(crate) mod tests {
             start: 0.0,
             duration: 0.0,
             audio: &[],
+        }
+    }
+
+    /// A snippet as a real voice carries one: said at a moment, with samples of its own. What
+    /// [`snippet`] leaves out, for the tests that are about which line would be played.
+    pub(crate) fn heard<'a>(text: &'a str, start: f64, audio: &'a [f32]) -> Snippet<'a> {
+        Snippet {
+            text,
+            start,
+            duration: 1.0,
+            audio,
         }
     }
 
@@ -1063,6 +1112,105 @@ pub(crate) mod tests {
             4,
             "clamped with the last snippet at the top"
         );
+        // The one-rule claim `selected_index` exists for: the marked row and the row that would
+        // play are the same row at both clamps.
+        let derived = screen.view(&voice, &Free).snippet;
+        assert_eq!(screen.selected(&voice).map(|(i, _)| i), Some(derived));
+        for _ in 0..10 {
+            screen.answer(&voice, Event::SnippetUp, &Free);
+        }
+        let derived = screen.view(&voice, &Free).snippet;
+        assert_eq!(derived, 0);
+        assert_eq!(screen.selected(&voice).map(|(i, _)| i), Some(derived));
+    }
+
+    /// The selection is the unit of listening: whichever line is selected is the line whose
+    /// samples the shell would be handed, so every turn the voice took is reachable rather than
+    /// only the longest representative one.
+    #[test]
+    fn the_selected_line_is_the_one_that_would_play() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false)]);
+        let queue = queue(&owned);
+        let audio: [[f32; 1]; 5] = [[0.1], [0.2], [0.3], [0.4], [0.5]];
+        let snippets = [
+            heard("one", 0.0, &audio[0]),
+            heard("two", 12.0, &audio[1]),
+            heard("three", 47.5, &audio[2]),
+            heard("four", 61.0, &audio[3]),
+            heard("five", 90.0, &audio[4]),
+        ];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &snippets,
+            &[],
+            &[],
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        assert_eq!(
+            screen.selected(&voice).map(|(i, s)| (i, s.text)),
+            Some((0, "one"))
+        );
+        screen.answer(&voice, Event::SnippetDown, &Free);
+        screen.answer(&voice, Event::SnippetDown, &Free);
+        let (index, snippet) = screen.selected(&voice).expect("five lines to choose from");
+        assert_eq!(index, 2);
+        assert_eq!(snippet.text, "three");
+        assert_eq!(snippet.start, 47.5);
+        assert_eq!(
+            snippet.audio, &audio[2],
+            "the third line's samples, not the first's"
+        );
+    }
+
+    /// A voice with nothing transcribed has no line to play, which is what lets the shell say so
+    /// rather than spawn a player over no samples at all.
+    #[test]
+    fn a_voice_with_no_transcript_has_no_line_to_play() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false)]);
+        let queue = queue(&owned);
+        let voice = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        assert!(screen.selected(&voice).is_none());
+        // And moving the selection over nothing stays nothing rather than becoming an index.
+        screen.answer(&voice, Event::SnippetDown, &Free);
+        assert!(screen.selected(&voice).is_none());
+    }
+
+    /// A selected line whose samples are missing -- a truncated or absent `speaker.wav` -- is
+    /// still a selected line. The emptiness is what the shell reports on rather than something
+    /// that hides the row.
+    #[test]
+    fn a_selected_line_with_no_samples_is_still_the_selected_line() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false)]);
+        let queue = queue(&owned);
+        let snippets = [heard("one", 0.0, &[]), heard("two", 3.0, &[])];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &snippets,
+            &[],
+            &[],
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        let (index, snippet) = screen.selected(&voice).expect("two lines to choose from");
+        assert_eq!(index, 0);
+        assert!(snippet.audio.is_empty());
     }
 
     /// The session changing resets everything the state holds, so a cursor left on session A's

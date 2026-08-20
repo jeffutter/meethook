@@ -30,7 +30,7 @@ use std::io::{self, Write};
 use std::rc::Rc;
 use std::time::Duration;
 
-use meethook_enroll::{Answer, Consequence, Interviewer, Preview, Voice, speech};
+use meethook_enroll::{Answer, Consequence, Interviewer, Preview, Snippet, Voice, speech};
 use meethook_session::{Displaced, Stored};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -56,6 +56,18 @@ const TICK: Duration = Duration::from_millis(250);
 /// differently, so it blocks rather than waking four times a second to find that out.
 fn wait(playing: Option<Progress>) -> Option<Duration> {
     playing.map(|_| TICK)
+}
+
+/// What is sounding right now, as the frame needs to draw it.
+///
+/// One value rather than a progress and a line index side by side: the index is meaningless
+/// unless something is playing, and `Option<Sounding>` is that sentence in the type. `progress`
+/// is the player's report ([`Progress`]); `line` is the shell's own record of which transcript
+/// line it handed over, `None` for the whole-voice clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sounding {
+    pub progress: Progress,
+    pub line: Option<usize>,
 }
 
 /// A narration buffer two owners can hold at once.
@@ -230,6 +242,12 @@ impl Interface {
             return Answer::Quit;
         };
 
+        // Which transcript line the last successful spawn came from, `None` for the whole voice.
+        // A loop-local rather than a field because "what was handed to `afplay`" is a fact about
+        // a spawn, and this loop is exactly as long as a spawn is allowed to live: `clips.stop()`
+        // runs the moment `ask` returns.
+        let mut line: Option<usize> = None;
+
         loop {
             // A clip that will not play is only knowable here, once the child has been reaped, so
             // the report lands an iteration after the key that started it rather than at the spawn.
@@ -243,8 +261,11 @@ impl Interface {
             {
                 let derived = state.view(view, &voice.preview);
                 let lines = narration.lines();
+                // `playing` is the poll's answer, so a clip that has finished takes the row's
+                // mark with it without anything having to clear `line`.
+                let sounding = playing.map(|progress| Sounding { progress, line });
                 if let Err(e) =
-                    terminal.draw(|frame| render::draw(frame, &derived, &lines, playing))
+                    terminal.draw(|frame| render::draw(frame, &derived, &lines, sounding))
                 {
                     *trouble = Some(format!("the frame could not be drawn ({e})"));
                     return Answer::Quit;
@@ -281,20 +302,44 @@ impl Interface {
                 continue;
             };
             // Playback is intercepted here because the samples are the shell's: the state machine
-            // deliberately holds no audio.
+            // deliberately holds no audio. Two keys, two sources of samples, and the same
+            // say/hush tail -- deliberately not merged, because they differ in every other line:
+            // where the samples come from, all three sentences, and whether a line was played.
             if event == Event::Play {
                 let problem = if voice.clip.is_empty() {
                     Some("there is no audio for this voice".to_string())
                 } else {
-                    clips
-                        .start(voice.clip)
-                        .err()
-                        .map(|e| format!("could not play the clip: {e}"))
+                    match clips.start(voice.clip) {
+                        // The whole voice, so no row is the one that is sounding. A stale index
+                        // here would mark a line that is not what is being heard.
+                        Ok(()) => {
+                            line = None;
+                            None
+                        }
+                        Err(e) => Some(format!("could not play the clip: {e}")),
+                    }
                 };
                 match problem {
                     Some(problem) => state.say(problem),
                     // A play that has now worked takes back what the last failed one said.
                     // Nothing else clears the footer for a key the state machine never sees.
+                    None => state.hush(),
+                }
+                continue;
+            }
+            if event == Event::PlaySnippet {
+                let problem = match line_to_play(state.selected(view)) {
+                    Err(sentence) => Some(sentence),
+                    Ok((index, audio)) => match clips.start(audio) {
+                        Ok(()) => {
+                            line = Some(index);
+                            None
+                        }
+                        Err(e) => Some(format!("could not play that line: {e}")),
+                    },
+                };
+                match problem {
+                    Some(problem) => state.say(problem),
                     None => state.hush(),
                 }
                 continue;
@@ -372,6 +417,25 @@ fn would(consequence: &Consequence) -> Vec<String> {
     lines
 }
 
+/// What the play-the-line key should do about the selection it found: hand these samples over, or
+/// say this instead.
+///
+/// A function beside [`event`] rather than three cases inside the loop, and for the same reason:
+/// which sentence the key produces is then decidable in `cargo test`, with no terminal and no
+/// audio device. The middle case is the one that needs it most, because it cannot be seen from
+/// the outside at all -- [`Clips::start`] treats no samples as a successful no-op, so a line whose
+/// `audio` is empty has to be refused *here* or the key silently does nothing while the frame says
+/// nothing about it.
+fn line_to_play(selected: Option<(usize, Snippet<'_>)>) -> Result<(usize, &[f32]), String> {
+    match selected {
+        None => Err("nothing was transcribed for this voice".to_string()),
+        Some((_, snippet)) if snippet.audio.is_empty() => {
+            Err("there is no audio for that line".to_string())
+        }
+        Some((index, snippet)) => Ok((index, snippet.audio)),
+    }
+}
+
 /// Which key means what.
 ///
 /// Two cursors and a filter that swallows typing, so the queue, the candidates and the snippets
@@ -380,6 +444,10 @@ fn would(consequence: &Consequence) -> Vec<String> {
 ///
 /// Ctrl-C and Ctrl-D are both `Quit`: raw mode means no SIGINT arrives, and the line prompt
 /// already treats end of input as stopping rather than as a failure.
+///
+/// Two play keys, because there are two things to hear: Ctrl-P is the whole voice and Ctrl-L is
+/// the selected transcript line ("l for line"). Ctrl-L is conventionally "redraw", which this
+/// frame does at the top of every iteration anyway, so nothing is being displaced.
 ///
 /// A free function taking a `KeyEvent` because a `KeyEvent` is constructible without a terminal,
 /// which is what makes this whole rule testable -- and it is where a stray Ctrl or a paste-shaped
@@ -395,6 +463,7 @@ fn event(key: KeyEvent) -> Option<Event> {
         (KeyCode::Char('c' | 'd'), true) => Some(Event::Quit),
         (KeyCode::Char('n'), true) => Some(Event::NewPerson),
         (KeyCode::Char('p'), true) => Some(Event::Play),
+        (KeyCode::Char('l'), true) => Some(Event::PlaySnippet),
         (KeyCode::Char('s'), true) => Some(Event::Skip),
         (KeyCode::Up, false) => Some(Event::Up),
         (KeyCode::Down, false) => Some(Event::Down),
@@ -424,7 +493,8 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     use super::state::Event;
-    use super::{Interface, Progress, Shared, TICK, event, wait};
+    use super::state::tests::heard;
+    use super::{Interface, Progress, Shared, TICK, event, line_to_play, wait};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
@@ -452,6 +522,11 @@ mod tests {
             (KeyCode::Esc, KeyModifiers::NONE, Event::ClearFilter),
             (KeyCode::Char('n'), KeyModifiers::CONTROL, Event::NewPerson),
             (KeyCode::Char('p'), KeyModifiers::CONTROL, Event::Play),
+            (
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL,
+                Event::PlaySnippet,
+            ),
             (KeyCode::Char('s'), KeyModifiers::CONTROL, Event::Skip),
             (KeyCode::Char('a'), KeyModifiers::NONE, Event::Filter('a')),
             (KeyCode::Char(' '), KeyModifiers::NONE, Event::Filter(' ')),
@@ -480,6 +555,26 @@ mod tests {
         assert!(
             TICK >= Duration::from_millis(50) && TICK <= Duration::from_millis(500),
             "{TICK:?} is either a spin or a position that jumps"
+        );
+    }
+
+    /// AC #5: a line with nothing behind it says so rather than appearing to play. Both refusals
+    /// have to happen before the spawn -- `Clips::start` would treat either as a success and leave
+    /// the key looking like it did nothing at all.
+    #[test]
+    fn a_line_with_no_audio_says_so_rather_than_appearing_to_play() {
+        static AUDIO: [f32; 3] = [0.1, 0.2, 0.3];
+        let line = heard("right, next week", 107.0, &AUDIO);
+        assert_eq!(line_to_play(Some((1, line))), Ok((1, &AUDIO[..])));
+
+        let silent = heard("right, next week", 107.0, &[]);
+        assert_eq!(
+            line_to_play(Some((1, silent))),
+            Err("there is no audio for that line".to_string())
+        );
+        assert_eq!(
+            line_to_play(None),
+            Err("nothing was transcribed for this voice".to_string())
         );
     }
 

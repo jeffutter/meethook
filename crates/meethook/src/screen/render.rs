@@ -22,15 +22,17 @@ use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
+use super::Sounding;
 use super::state::{Candidate, Mark, Row, View};
 use crate::commands::Progress;
 
 /// Places every pane for one frame.
 ///
-/// `playing` is a parameter rather than a [`View`] field on purpose: it is derived from a clock,
-/// and [`state`](super::state) is documented as having none in it. A fourth argument says in the
-/// signature that the shell computed this and the state machine did not.
-pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String], playing: Option<Progress>) {
+/// `sounding` is a parameter rather than a [`View`] field on purpose: it is derived from a clock
+/// and from what the shell handed to the player, and [`state`](super::state) is documented as
+/// having neither in it. A fourth argument says in the signature that the shell computed this and
+/// the state machine did not.
+pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String], sounding: Option<Sounding>) {
     let whole = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -57,9 +59,9 @@ pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String], playing: O
     question(frame, right[0], view);
     candidates(frame, right[1], view);
     consequence(frame, right[2], view);
-    snippets(frame, whole[1], view);
+    snippets(frame, whole[1], view, sounding.and_then(|s| s.line));
     log(frame, whole[2], narration);
-    footer(frame, whole[3], view, playing);
+    footer(frame, whole[3], view, sounding);
 }
 
 /// The voice queue: every voice the session has, with the quiet ones under a separator.
@@ -254,17 +256,48 @@ fn consequence(frame: &mut Frame, area: Rect, view: &View<'_>) {
     );
 }
 
-/// What this voice said, scrolled. Every snippet is here; the offset is the state machine's.
-fn snippets(frame: &mut Frame, area: Rect, view: &View<'_>) {
+/// What this voice said, with the selected line marked and timed. Every snippet is here; which
+/// one is selected is the state machine's, and which one is sounding is the shell's.
+///
+/// The selected line is the row at the top of the pane, so the marker is always on the first
+/// visible row -- one index rather than a cursor and an offset, which is what keeps the clamping
+/// to a single rule in `state`.
+///
+/// The time is spelled with [`speech`], which is what the question, the queue and the footer
+/// already use for a duration, so no second time formatter appears in this binary. It reads as
+/// "said this far in" rather than as a clock, and it rounds -- two lines less than a second apart
+/// can show the same time. That is fine: the marker says which row is selected, and the time is
+/// orientation rather than an index.
+fn snippets(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<usize>) {
     let title = match view.snippets.len() {
         0 => " said  (nothing was transcribed for this voice) ".to_string(),
-        total => format!(" said  {}-{total} of {total} ", view.snippet + 1),
+        total => format!(
+            " said  line {} of {total}  pgup/pgdn moves ",
+            view.snippet + 1
+        ),
     };
     let lines: Vec<Line> = view
         .snippets
         .iter()
+        .enumerate()
         .skip(view.snippet)
-        .map(|snippet| Line::from(format!("\"{}\"", snippet.text)))
+        .map(|(index, snippet)| {
+            let selected = index == view.snippet;
+            let mut spans = vec![
+                // The same marker the voices and the candidates panes use for their selections,
+                // so a third selectable pane looks like the other two.
+                Span::raw(if selected { "> " } else { "  " }),
+                Span::raw(format!("{:>7}  ", speech(snippet.start))).dim(),
+            ];
+            let text = Span::raw(format!("\"{}\"", snippet.text));
+            spans.push(if selected { text.bold() } else { text });
+            // Two different facts about a row -- which one is selected, which one is being heard
+            // -- each a suffixed clause, in the shape `voice_line` uses for "<- asking".
+            if sounding == Some(index) {
+                spans.push(Span::raw("  <- playing").dim());
+            }
+            Line::from(spans)
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
@@ -295,13 +328,27 @@ fn log(frame: &mut Frame, area: Rect, narration: &[String]) {
 /// The position is spelled with [`speech`], which is already what the question and the queue use
 /// for a duration, so "playing 12s of 1m 47s" reads the way the rest of the frame does and no
 /// second time formatter appears in this binary. Only the three keys that mean something mid-clip
-/// are kept: the full list is already wider than 80 columns without them.
-fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, playing: Option<Progress>) {
-    let text = match (playing, view.status) {
-        (Some(Progress { elapsed, length }), _) => format!(
-            "playing {} of {}  ^P restart  ^S skip  ^C quit",
+/// are kept: the full list -- now with both play keys on it -- passes 100 columns, and it was
+/// already wider than 80 before the second one was added.
+///
+/// The restart key follows what is sounding rather than naming one of the two: saying "^P restart"
+/// while a line is playing would name a key that starts something else.
+fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sounding>) {
+    let text = match (sounding, view.status) {
+        (
+            Some(Sounding {
+                progress: Progress { elapsed, length },
+                line,
+            }),
+            _,
+        ) => format!(
+            "playing {} of {}  {} restart  ^S skip  ^C quit",
             speech(elapsed.as_secs_f64()),
-            speech(length.as_secs_f64())
+            speech(length.as_secs_f64()),
+            match line {
+                Some(_) => "^L",
+                None => "^P",
+            }
         ),
         (None, Some(status)) => status.to_string(),
         (None, None) => {
@@ -309,9 +356,19 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, playing: Option<Progre
                 true => "^P no audio",
                 false => "^P play",
             };
+            // `view.snippet` is already clamped by `Screen::view`, so this is a lookup and not a
+            // bounds check. Both play keys say what they would do *now*, which is what stops ^L
+            // from looking like a key that did nothing.
+            let line = match view.snippets.get(view.snippet) {
+                Some(snippet) if !snippet.audio.is_empty() => "  ^L line",
+                Some(_) => "  ^L no audio",
+                // Nothing transcribed. The pane says so, and a key for it would be a key that
+                // cannot work.
+                None => "",
+            };
             format!(
                 "up/down voice  right work on it  tab candidate  enter choose  \
-                 ^N new  {clip}  ^S skip  ^C quit"
+                 ^N new  {clip}{line}  ^S skip  ^C quit"
             )
         }
     };
@@ -328,9 +385,11 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use super::super::state::tests::snippet;
+    use meethook_enroll::Snippet;
+
+    use super::super::state::tests::heard;
     use super::super::state::{Cost, Costs, Event, Screen, VoiceView};
-    use super::{Progress, draw};
+    use super::{Progress, Sounding, draw};
 
     struct Free;
 
@@ -356,22 +415,33 @@ mod tests {
         }
     }
 
+    /// The lines the fixture voice said, as a real voice arrives with them: each said at a moment
+    /// in the recording, each with samples of its own.
+    fn said() -> [Snippet<'static>; 2] {
+        static AUDIO: [f32; 2] = [0.1, 0.2];
+        [
+            heard("so where did we land on the migration", 12.0, &AUDIO),
+            heard("right, next week", 107.0, &AUDIO),
+        ]
+    }
+
     /// The whole frame as text, one string per terminal row, so an assertion can name what it
     /// expects to see rather than pinning every cell.
     fn painted(width: u16, height: u16, costs: &dyn Costs, keys: &[Event]) -> Vec<String> {
-        painted_with(width, height, costs, keys, None, None)
+        painted_with(width, height, costs, keys, &said(), None, None)
     }
 
-    /// [`painted`], plus the two things only the footer's tests vary: what is playing, and what
-    /// the frame last had to say. Both reach the footer from different directions -- one is a
-    /// parameter to `draw`, the other a field of the view -- which is exactly what the precedence
-    /// between them has to be pinned against.
+    /// [`painted`], plus the three things only the snippet and footer tests vary: what this voice
+    /// said, what is sounding, and what the frame last had to say. The last two reach the footer
+    /// from different directions -- one is a parameter to `draw`, the other a field of the view --
+    /// which is exactly what the precedence between them has to be pinned against.
     fn painted_with(
         width: u16,
         height: u16,
         costs: &dyn Costs,
         keys: &[Event],
-        playing: Option<Progress>,
+        snippets: &[Snippet<'_>],
+        sounding: Option<Sounding>,
         status: Option<&str>,
     ) -> Vec<String> {
         let session = SessionId::parse("20260819-100000").expect("a well-formed session id");
@@ -419,7 +489,6 @@ mod tests {
                 references: 1,
             },
         ];
-        let snippets = ["so where did we land on the migration", "right, next week"].map(snippet);
         let enrolled = ["Milo", "Ivan"];
         let voice = VoiceView {
             session: &session,
@@ -428,7 +497,7 @@ mod tests {
             speech_seconds: 95.0,
             attribution: &labels[1].1,
             queue: &queue,
-            snippets: &snippets,
+            snippets,
             resembles: &resembles,
             enrolled: &enrolled,
             clip_is_empty: false,
@@ -449,7 +518,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
         terminal
-            .draw(|frame| draw(frame, &view, &narration, playing))
+            .draw(|frame| draw(frame, &view, &narration, sounding))
             .expect("drawing into a buffer cannot fail");
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -503,11 +572,14 @@ mod tests {
     /// duration, and gives the line over to the keys that still mean something mid-clip.
     #[test]
     fn a_playing_clip_says_how_far_through_it_is() {
-        let playing = Some(Progress {
-            elapsed: Duration::from_secs(12),
-            length: Duration::from_secs(107),
+        let sounding = Some(Sounding {
+            progress: Progress {
+                elapsed: Duration::from_secs(12),
+                length: Duration::from_secs(107),
+            },
+            line: None,
         });
-        let whole = painted_with(110, 30, &Free, &[], playing, None).join("\n");
+        let whole = painted_with(110, 30, &Free, &[], &said(), sounding, None).join("\n");
         assert!(whole.contains("playing 12s of 1m 47s"), "{whole}");
         assert!(whole.contains("^P restart"), "{whole}");
         assert!(
@@ -521,19 +593,148 @@ mod tests {
     /// what it had to say.
     #[test]
     fn a_playing_clip_outranks_the_status_line() {
-        let playing = Some(Progress {
-            elapsed: Duration::from_secs(3),
-            length: Duration::from_secs(30),
+        let sounding = Some(Sounding {
+            progress: Progress {
+                elapsed: Duration::from_secs(3),
+                length: Duration::from_secs(30),
+            },
+            line: None,
         });
         let status = Some("could not play the clip: afplay exited with exit status: 1");
 
-        let over = painted_with(110, 30, &Free, &[], playing, status).join("\n");
+        let over = painted_with(110, 30, &Free, &[], &said(), sounding, status).join("\n");
         assert!(over.contains("playing 3s of 30s"), "{over}");
         assert!(!over.contains("could not play the clip"), "{over}");
 
-        let stopped = painted_with(110, 30, &Free, &[], None, status).join("\n");
+        let stopped = painted_with(110, 30, &Free, &[], &said(), None, status).join("\n");
         assert!(stopped.contains("could not play the clip"), "{stopped}");
         assert!(!stopped.contains("playing 3s"), "{stopped}");
+    }
+
+    /// AC #1: the pane says which line is selected and when in the recording it was said, and the
+    /// keys that move the selection are named where the selection is.
+    #[test]
+    fn the_said_pane_marks_the_selected_line_and_when_it_was_said() {
+        let first = painted(110, 30, &Free, &[]).join("\n");
+        assert!(
+            first.contains("said  line 1 of 2  pgup/pgdn moves"),
+            "{first}"
+        );
+        assert!(
+            first.contains(">     12s  \"so where did we land"),
+            "the selected row, marked and timed\n{first}"
+        );
+        assert!(
+            first.contains("  1m 47s  \"right, next week\""),
+            "the unselected row keeps its time and loses the marker\n{first}"
+        );
+
+        let second = painted(110, 30, &Free, &[Event::SnippetDown]).join("\n");
+        assert!(
+            second.contains("said  line 2 of 2  pgup/pgdn moves"),
+            "{second}"
+        );
+        assert!(
+            second.contains(">  1m 47s  \"right, next week\""),
+            "the marker moved with the selection\n{second}"
+        );
+        assert!(
+            !second.contains("so where did we land"),
+            "the selection is the top of the pane\n{second}"
+        );
+    }
+
+    /// AC #4: the row that is sounding says so while it sounds, and no row says so when nothing
+    /// is.
+    #[test]
+    fn the_line_that_is_sounding_says_so() {
+        let progress = Progress {
+            elapsed: Duration::from_secs(1),
+            length: Duration::from_secs(4),
+        };
+        let playing = painted_with(
+            110,
+            30,
+            &Free,
+            &[],
+            &said(),
+            Some(Sounding {
+                progress,
+                line: Some(0),
+            }),
+            None,
+        )
+        .join("\n");
+        assert!(
+            playing.contains("\"so where did we land on the migration\"  <- playing"),
+            "{playing}"
+        );
+
+        // The whole-voice clip: something is playing, but no transcript line is.
+        let voice = painted_with(
+            110,
+            30,
+            &Free,
+            &[],
+            &said(),
+            Some(Sounding {
+                progress,
+                line: None,
+            }),
+            None,
+        )
+        .join("\n");
+        assert!(!voice.contains("<- playing"), "{voice}");
+
+        // And nothing playing at all marks nothing.
+        let quiet = painted(110, 30, &Free, &[]).join("\n");
+        assert!(!quiet.contains("<- playing"), "{quiet}");
+    }
+
+    /// AC #7 and AC #5 from the footer's side: the key that plays the selected line is named, and
+    /// it says what it would actually do -- nothing at all when there is no line, and "no audio"
+    /// when the line has none behind it.
+    #[test]
+    fn the_footer_names_the_key_that_plays_the_selected_line() {
+        let with_audio = painted(120, 30, &Free, &[]).join("\n");
+        assert!(with_audio.contains("^L line"), "{with_audio}");
+
+        static NONE: [f32; 0] = [];
+        let silent = [
+            heard("so where did we land on the migration", 12.0, &NONE),
+            heard("right, next week", 107.0, &NONE),
+        ];
+        let no_audio = painted_with(120, 30, &Free, &[], &silent, None, None).join("\n");
+        assert!(no_audio.contains("^L no audio"), "{no_audio}");
+
+        let nothing_said = painted_with(120, 30, &Free, &[], &[], None, None).join("\n");
+        assert!(
+            !nothing_said.contains("^L"),
+            "a key that cannot work is not offered\n{nothing_said}"
+        );
+        assert!(
+            nothing_said.contains("nothing was transcribed for this voice"),
+            "{nothing_said}"
+        );
+    }
+
+    /// AC #6, the half a test can reach: the restart key names whichever key started what is
+    /// sounding, so a line mid-play is restarted by the key that played it.
+    #[test]
+    fn a_playing_line_restarts_with_the_key_that_started_it() {
+        let sounding = Some(Sounding {
+            progress: Progress {
+                elapsed: Duration::from_secs(1),
+                length: Duration::from_secs(4),
+            },
+            line: Some(1),
+        });
+        let whole = painted_with(110, 30, &Free, &[], &said(), sounding, None).join("\n");
+        assert!(whole.contains("^L restart"), "{whole}");
+        assert!(
+            !whole.contains("^P restart"),
+            "naming ^P would name a key that starts something else\n{whole}"
+        );
     }
 
     /// The minimum this frame claims to work at. Every pane still has a border and a title, which
