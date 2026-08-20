@@ -562,6 +562,32 @@ pub enum Answer {
     /// outcome as skipping every voice, which is what makes "not yet" safe to answer with when
     /// there turns out to be no later.
     Later,
+    /// End this session here and open the next one.
+    ///
+    /// Three answers and three scopes: [`Skip`](Self::Skip) is one voice, this is the rest of
+    /// this session, [`Quit`](Self::Quit) is the run. Saying so here is what stops the middle
+    /// one from being read as either of its neighbours -- the run carries on to the next
+    /// session on disk, and the last session being left this way ends the run exactly as
+    /// finishing it would.
+    ///
+    /// It exists because the queue's tail is usually clustering fragments and passers-by, and
+    /// the user who has named the colleagues wants out of the session rather than out of the
+    /// program: without it, leaving eight voices behind is eight more keypresses on the one
+    /// screen where a stray Enter types a name onto the wrong person.
+    ///
+    /// Answering it writes nothing, and everything accepted in this session is already on
+    /// disk -- writes happen per accepted name, which is what makes both early exits cost
+    /// nothing that was answered.
+    ///
+    /// The voices left behind are counted as the skips -- or kept identifications -- they have
+    /// turned out to be, by the rule [`Later`](Self::Later) already describes. So "leave the
+    /// rest" and "defer everything and stop" report identically, and the summary still
+    /// accounts for every voice the queue offered.
+    ///
+    /// Not the fixed point: this is an answer, given while a voice was on the screen, so it
+    /// returns before a pass can stall and [`Interviewer::still_working`] is never consulted
+    /// on this path. That method can neither suppress this exit nor be defeated by it.
+    Leave,
     /// End the run here. A variant rather than an error because stopping early is an
     /// ordinary outcome -- everything accepted so far is already on disk.
     Quit,
@@ -1239,7 +1265,12 @@ fn enroll_session(
         let asked = pending.len();
         let mut deferred: Vec<(usize, &SpeakerCluster)> = Vec::new();
 
-        for (nth, cluster) in pending {
+        // Iterated by reference rather than consumed, because [`Answer::Leave`] has to reach the
+        // tail of the queue -- the voices this pass has not asked about yet -- from inside the
+        // body, and a consuming `for` has thrown them away by then. `(usize, &SpeakerCluster)` is
+        // `Copy`, so the pattern costs nothing, and nothing in the body mutates `pending`: it is
+        // reassigned only below the loop.
+        for (index, &(nth, cluster)) in pending.iter().enumerate() {
             // A voice an answer given earlier in this run has already put a name to: clustering
             // that split one person in two must not ask about them twice. Only an in-run answer
             // can have moved a label since `baseline` was taken, so "named, and not the name it
@@ -1319,19 +1350,28 @@ fn enroll_session(
                 })
             };
 
-            // Leaving an already-named voice alone is keeping that identification, which is an
-            // answer; leaving an unnamed one alone is the question going unanswered. Same write --
-            // none -- and different enough that the summary must not conflate them.
-            let left_alone = if shown[&cluster.id].is_named() {
-                &mut report.kept
-            } else {
-                &mut report.skipped
-            };
-
             let (name, anyway) = match answer {
                 Answer::Quit => return Ok(Outcome::Quit),
+                // The rest of this session, in the three groups it comes in and no fourth: the
+                // voice that was on the screen when the key was pressed -- asked about, and
+                // decided against, which is the same thing a deferral with no later turns out to
+                // be -- then the ones this pass has not reached, then the ones it has already
+                // deferred. Voices the guard above took out of the pass are in none of them,
+                // which is what makes the counts add up.
+                //
+                // Returning from inside the loop is the whole implementation of leaving: every
+                // write already happened per accepted name, and there is nothing between here and
+                // the end of the function, so nothing is skipped by going early.
+                Answer::Leave => {
+                    let rest = std::iter::once(cluster)
+                        .chain(pending[index + 1..].iter().map(|&(_, c)| c))
+                        .chain(deferred.iter().map(|&(_, c)| c));
+                    let left = left_unanswered(rest, &shown, &baseline, report);
+                    about(notes, &session.id, SessionNote::Left { left })?;
+                    return Ok(Outcome::Finished);
+                }
                 Answer::Skip => {
-                    *left_alone += 1;
+                    left_unanswered(std::iter::once(cluster), &shown, &baseline, report);
                     continue;
                 }
                 // Back into the queue with the number it already has, and counted as nothing:
@@ -1369,7 +1409,7 @@ fn enroll_session(
                 rules.enrolment,
             )
             .of(&name) else {
-                *left_alone += 1;
+                left_unanswered(std::iter::once(cluster), &shown, &baseline, report);
                 continue;
             };
             let name = name.trim();
@@ -1496,23 +1536,67 @@ fn enroll_session(
         // the user being done. An empty queue is decided here rather than there -- nothing is
         // left to offer, so no further prompt could change the answer or carry an
         // [`Answer::Quit`], and consulting the answerer could only spin.
+        //
+        // Still only about a pass that produced no answer: [`Answer::Leave`] is an answer and
+        // returns above this, so leaving a session never reaches the question this asks.
         if deferred.len() == asked && (asked == 0 || !interviewer.still_working()) {
             // Deferred with no later left is the skip -- or the kept identification -- it has
-            // turned out to be, counted through the same test the `Skip` arm uses above so the
-            // two cannot disagree about which bucket a named voice belongs in.
-            for (_, cluster) in &deferred {
-                if shown[&cluster.id].is_named() {
-                    report.kept += 1;
-                } else {
-                    report.skipped += 1;
-                }
-            }
+            // turned out to be, counted through the same rule every other unanswered voice goes
+            // through so no two of them can disagree about which bucket a named voice is in.
+            left_unanswered(
+                deferred.iter().map(|&(_, cluster)| cluster),
+                &shown,
+                &baseline,
+                report,
+            );
             break;
         }
         pending = deferred;
     }
 
     Ok(Outcome::Finished)
+}
+
+/// Counts voices that were offered and not answered into the buckets they have turned out to
+/// belong in, and says how many that was.
+///
+/// Leaving an already-named voice alone is keeping that identification, which is an answer;
+/// leaving an unnamed one alone is the question going unanswered. Same write -- none -- and
+/// different enough that the summary must not conflate them. One function rather than the rule
+/// written out at each of the four places that needs it -- a skip, a name of nothing but spaces,
+/// [`Answer::Leave`]'s tail, and the pass loop's fixed point -- so none of them can disagree
+/// with the others about which bucket a voice belongs in.
+///
+/// `shown` is what each voice reads now and `baseline` what it read when the queue was built. A
+/// voice that is named and has *moved* since the baseline was taken was named by an answer given
+/// earlier in this run -- clustering split one person in two, so naming one half named the other
+/// -- and has already been counted under `named`. It is counted here as nothing at all, because
+/// reporting it as an identification this run left alone would put one voice in two buckets.
+///
+/// That guard is load-bearing only for [`Answer::Leave`], whose tail can hold a voice this same
+/// pass has just named. Everywhere else it cannot fire -- the pass loop's own guard takes such a
+/// voice out before it can be asked about or deferred -- which is what keeps every existing
+/// count byte-identical.
+fn left_unanswered<'c>(
+    voices: impl IntoIterator<Item = &'c SpeakerCluster>,
+    shown: &BTreeMap<u32, Attribution>,
+    baseline: &BTreeMap<u32, Attribution>,
+    report: &mut EnrollReport,
+) -> usize {
+    let mut counted = 0;
+    for cluster in voices {
+        let named = shown[&cluster.id].is_named();
+        if named && shown[&cluster.id] != baseline[&cluster.id] {
+            continue;
+        }
+        counted += 1;
+        if named {
+            report.kept += 1;
+        } else {
+            report.skipped += 1;
+        }
+    }
+    counted
 }
 
 /// The voices one session's run will ask about, in first-appearance order, and the line
@@ -6550,6 +6634,177 @@ mod tests {
         assert_eq!(report.named, 1, "{output}");
         assert_eq!(report.skipped, 0, "{output}");
         assert_eq!(report.kept, 0, "{output}");
+    }
+
+    /// TASK-049 acceptance criteria #1 and #2: one answer ends the session's questions, and the
+    /// voices left behind are still counted -- so the report accounts for the whole queue
+    /// without a keypress per voice in it.
+    #[test]
+    fn leaving_a_session_ends_it_without_asking_about_the_rest() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_fragmented_session(&paths, "20260809-052600");
+
+        // Four offered under `--all`: one voice worth naming and a tail of fragments.
+        let mut interviewer = Scripted::answering(vec![named("Alice"), Answer::Leave]);
+        let (report, output) = run_asking(&paths, &[], ALL, &mut interviewer);
+
+        assert_eq!(
+            interviewer.labels(),
+            ["Unknown 1", "Unknown 2"],
+            "two questions for four voices: the rest are left without being asked: {output}"
+        );
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(
+            report.skipped, 3,
+            "the voice on the screen and the two behind it are all left: {output}"
+        );
+        assert_eq!(report.kept, 0, "{output}");
+        assert!(
+            output.contains("left early, 3 voice(s) left as they were"),
+            "the run says why the skips outnumber the answers: {output}"
+        );
+    }
+
+    /// TASK-049 acceptance criterion #2, the case where the arithmetic can go quietly wrong: a
+    /// voice this same pass has already named by naming its other half is not also reported as
+    /// one the run left alone.
+    #[test]
+    fn a_left_voice_named_earlier_in_the_pass_is_not_counted_twice() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_fragmented_session(&paths, "20260809-052600");
+        // The first and third voices are one person clustering split in two, so the first
+        // answer names a voice still sitting in the queue behind the one being asked about.
+        with_embeddings(&session, &[nearly(0.0), voice(1), nearly(20.0), voice(3)]);
+
+        let mut interviewer = Scripted::answering(vec![named("Alice"), Answer::Leave]);
+        let (report, output) = run_asking(&paths, &[], ALL, &mut interviewer);
+
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(
+            report.kept, 0,
+            "the split half was named by this run, not left as it was found: {output}"
+        );
+        assert_eq!(
+            report.skipped, 2,
+            "the two genuinely unanswered voices, and not the one already counted: {output}"
+        );
+    }
+
+    /// TASK-049 acceptance criteria #1 and #4: leaving one session opens the next, which is the
+    /// whole difference between this and quitting.
+    #[test]
+    fn leaving_one_session_opens_the_next() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        make_session(&paths, "20260810-052600");
+
+        let mut interviewer = Scripted::answering(vec![Answer::Leave, named("Bob"), Answer::Skip]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        let asked: Vec<(&str, &str)> = interviewer
+            .seen
+            .iter()
+            .map(|shown| (shown.session.as_str(), shown.number.as_str()))
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                ("20260809-052600", "Unknown 1"),
+                ("20260810-052600", "Unknown 1"),
+                ("20260810-052600", "Unknown 2"),
+            ],
+            "one question in the session that was left, and the next session ran in full: \
+             {output}"
+        );
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(
+            report.skipped, 3,
+            "both voices of the first session and the one skipped in the second: {output}"
+        );
+    }
+
+    /// TASK-049 acceptance criterion #3: leaving writes nothing of its own, and what was
+    /// answered before it is already on disk.
+    #[test]
+    fn a_name_accepted_before_leaving_stays_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::answering(vec![named("Alice"), Answer::Leave]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!((report.named, report.skipped), (1, 1), "{output}");
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(
+            speakers
+                .speakers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alice"],
+            "the accepted name survives the session being left: {output}"
+        );
+        assert_eq!(
+            said(&transcript_of(&session))
+                .iter()
+                .map(|(speaker, _, _)| *speaker)
+                .collect::<Vec<_>>(),
+            ["Alice", "You", "Unknown 2", "Alice"],
+            "the voice left behind is untouched, and the named one is written: {output}"
+        );
+    }
+
+    /// TASK-049 acceptance criterion #4: leaving the last session on disk ends the run rather
+    /// than looping over it again or erroring.
+    #[test]
+    fn leaving_the_last_session_ends_the_run() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        let before = files_under(root.path());
+
+        let mut interviewer = Scripted::answering(vec![Answer::Leave]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(
+            interviewer.labels(),
+            ["Unknown 1"],
+            "one question, and the run returned rather than coming round again: {output}"
+        );
+        assert_eq!(report.skipped, 2, "{output}");
+        assert_eq!(report.named, 0, "{output}");
+        assert_eq!(
+            files_under(root.path()),
+            before,
+            "leaving writes nothing at all"
+        );
+    }
+
+    /// TASK-049 acceptance criterion #5: leaving is an answer, not a stalled pass, so
+    /// [`Interviewer::still_working`] is never consulted on this path -- it can neither
+    /// suppress the exit nor be defeated by it.
+    #[test]
+    fn leaving_is_not_a_stalled_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        // An answerer that would keep five further stalled passes open. The session ends anyway.
+        let mut interviewer = Scripted::answering(vec![Answer::Leave]).working_for(5);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Unknown 1"], "{output}");
+        assert_eq!(report.skipped, 2, "{output}");
+        assert_eq!(
+            interviewer.working_passes.get(),
+            5,
+            "the countdown is untouched, so the exit never went through the fixed point: \
+             {output}"
+        );
     }
 
     /// TASK-046.06.01 acceptance criterion #7: which voices a session offers and whether a

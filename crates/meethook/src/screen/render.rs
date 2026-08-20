@@ -438,9 +438,10 @@ fn log(frame: &mut Frame, area: Rect, narration: &[String]) {
 ///
 /// The position is spelled with [`speech`], which is already what the question and the queue use
 /// for a duration, so "playing 12s of 1m 47s" reads the way the rest of the frame does and no
-/// second time formatter appears in this binary. Only the three keys that mean something mid-clip
+/// second time formatter appears in this binary. Only the four keys that mean something mid-clip
 /// are kept: the full list -- now with both play keys on it -- passes 100 columns, and it was
-/// already wider than 80 before the second one was added.
+/// already wider than 80 before the second one was added. Leaving the session is on that short
+/// list because it is as meaningful with a clip sounding as skipping one voice is.
 ///
 /// The restart key follows what is sounding rather than naming one of the two: saying "^P restart"
 /// while a line is playing would name a key that starts something else.
@@ -457,7 +458,7 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sound
             }),
             _,
         ) => format!(
-            "playing {} of {}  {} restart  ^S skip  ^C quit",
+            "playing {} of {}  {} restart  ^S skip  ^G leave  ^C quit",
             speech(elapsed.as_secs_f64()),
             speech(length.as_secs_f64()),
             match line {
@@ -491,7 +492,7 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sound
             };
             format!(
                 "up/down voice  right work on it  tab candidate  {choose}  \
-                 ^N new  {clip}{line}  ^S skip  ^C quit"
+                 ^N new  {clip}{line}  ^S skip  ^G leave  ^C quit"
             )
         }
     };
@@ -753,6 +754,41 @@ mod tests {
         assert!(
             !whole.contains("right work on it"),
             "the key list gives way to the position\n{whole}"
+        );
+    }
+
+    /// TASK-049 acceptance criterion #6: the key that leaves the session is named, both idle and
+    /// mid-clip, and it reads as its own scope beside the two it sits between -- skip one voice,
+    /// leave this session, quit the run.
+    ///
+    /// Painted at 120 columns, as the candidate-and-cost tests are: the key list is past 100 and
+    /// a narrower frame is measuring truncation rather than the footer's wording.
+    #[test]
+    fn the_footer_names_the_key_that_leaves_the_session() {
+        let idle = painted(120, 30, &Free, &[]).join("\n");
+        assert!(idle.contains("^S skip  ^G leave  ^C quit"), "{idle}");
+
+        let sounding = Some(Sounding {
+            progress: Progress {
+                elapsed: Duration::from_secs(12),
+                length: Duration::from_secs(107),
+            },
+            line: None,
+        });
+        let playing = painted_with(
+            120,
+            30,
+            &Free,
+            &[],
+            &said(),
+            sounding,
+            None,
+            Context::Reading,
+        )
+        .join("\n");
+        assert!(
+            playing.contains("^S skip  ^G leave  ^C quit"),
+            "leaving is as meaningful with a clip sounding as skipping is\n{playing}"
         );
     }
 

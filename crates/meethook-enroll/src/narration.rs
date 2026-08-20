@@ -132,6 +132,17 @@ pub enum SessionNote<'a> {
         held_back: usize,
     },
 
+    /// The user left the session before its queue ran out, and the run moved on to the next one.
+    ///
+    /// Its own line because the summary would otherwise report a skip count larger than the
+    /// questions the user answered with nothing behind it, and because every other way a
+    /// session can end already says so.
+    Left {
+        /// How many voices were left as they were, which is exactly what was added to the skips
+        /// and the kept identifications.
+        left: usize,
+    },
+
     /// A selector or a timestamp arrived at exactly one voice.
     Selected {
         /// The moment it was reached by, on the `--at` path only.
@@ -431,6 +442,13 @@ impl Lines<'_> {
                     )?;
                 }
             }
+            // "Left as they were" rather than "unanswered", because under `--correct` some of
+            // them are kept identifications -- and that is already the wording the summary uses
+            // for those.
+            SessionNote::Left { left } => writeln!(
+                out,
+                "{session}  left early, {left} voice(s) left as they were"
+            )?,
             // The literal 1 is this run's whole queue, so the one prompt below reads `1/1`. On
             // the timestamp path the moment comes too: the user named a time and gets told
             // which voice that turned out to be, which is the one thing they did not know.

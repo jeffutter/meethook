@@ -494,10 +494,10 @@ impl Interface {
 /// Whether an answer can have moved what the "who is this" pane reports, and so whether the scan
 /// behind it is now one answer behind.
 ///
-/// A function beside [`wait`] and [`event`], for the same reason: a rule about which of five
+/// A function beside [`wait`] and [`event`], for the same reason: a rule about which of the
 /// answers costs a re-scan is then decidable in `cargo test` with no terminal in front of it.
 ///
-/// A name is the only answer that writes to `speakers.json`; the other four write nothing at all.
+/// A name is the only answer that writes to `speakers.json`; the others write nothing at all.
 /// A `Named` can still be refused by the veto and write nothing either, so this over-triggers --
 /// deliberately, because an extra background scan nobody waits for is cheaper than a wrong number
 /// on the screen.
@@ -609,6 +609,14 @@ fn line_to_play(selected: Option<(usize, Snippet<'_>)>) -> Result<(usize, &[f32]
 /// rather than Enter, because a key that means "and I know what it costs" must not be reachable
 /// by the reflex that means "that one".
 ///
+/// Ctrl-G ("g for go on to the next meeting") leaves the rest of this session's voices. It is
+/// the middle of three scopes -- Ctrl-S is one voice, this is the session, Ctrl-C is the run --
+/// and it is placed where no reflex reaches it and it reaches nothing: `f`, `h`, `t`, `y`, `v`
+/// and `b` are all unbound. Not Ctrl-X, which sits beside the key that ends the whole run; not
+/// Left, because Right is the harmless "work on that voice" and pairing the two by direction
+/// pairs them by accident too; and not Ctrl-E or Ctrl-K, since `e` is beside `s` and `k` beside
+/// both `l` and `o`.
+///
 /// A free function taking a `KeyEvent` because a `KeyEvent` is constructible without a terminal,
 /// which is what makes this whole rule testable -- and it is where a stray Ctrl or a paste-shaped
 /// burst of characters would otherwise go wrong.
@@ -625,6 +633,7 @@ fn event(key: KeyEvent) -> Option<Event> {
         (KeyCode::Char('p'), true) => Some(Event::Play),
         (KeyCode::Char('l'), true) => Some(Event::PlaySnippet),
         (KeyCode::Char('s'), true) => Some(Event::Skip),
+        (KeyCode::Char('g'), true) => Some(Event::Leave),
         (KeyCode::Char('o'), true) => Some(Event::Anyway),
         (KeyCode::Up, false) => Some(Event::Up),
         (KeyCode::Down, false) => Some(Event::Down),
@@ -742,9 +751,13 @@ mod tests {
                 Event::PlaySnippet,
             ),
             (KeyCode::Char('s'), KeyModifiers::CONTROL, Event::Skip),
+            (KeyCode::Char('g'), KeyModifiers::CONTROL, Event::Leave),
             (KeyCode::Char('o'), KeyModifiers::CONTROL, Event::Anyway),
             (KeyCode::Char('a'), KeyModifiers::NONE, Event::Filter('a')),
             (KeyCode::Char(' '), KeyModifiers::NONE, Event::Filter(' ')),
+            // The non-regression that matters for a new letter key: without the modifier it is
+            // still text, because printable characters type into the candidate filter.
+            (KeyCode::Char('g'), KeyModifiers::NONE, Event::Filter('g')),
         ];
         for (code, modifiers, expected) in bound {
             assert_eq!(
@@ -809,15 +822,15 @@ mod tests {
     }
 
     /// Which answers cost a re-read. A name is the only answer that writes to `speakers.json`, so
-    /// it is the only one that can move what the pane says -- and a deferral, a skip or a quit
-    /// re-reading the whole root would be half a second of work per keypress for nothing.
+    /// it is the only one that can move what the pane says -- and a deferral, a skip, a leave or
+    /// a quit re-reading the whole root would be half a second of work per keypress for nothing.
     #[test]
     fn an_answer_re_reads_the_sessions_and_a_skip_does_not() {
         assert!(rewrites(&Answer::Named {
             name: "Milo".to_string(),
             anyway: false,
         }));
-        for quiet in [Answer::Skip, Answer::Later, Answer::Quit] {
+        for quiet in [Answer::Skip, Answer::Later, Answer::Leave, Answer::Quit] {
             assert!(!rewrites(&quiet), "{quiet:?} writes nothing");
         }
 

@@ -28,6 +28,10 @@
 //! the frame has no candidate list, no snippets and no consequence for a voice it was not asked
 //! about, so there would be nothing for the user to decide *with*. Steering is the whole
 //! mechanism, and saying so is what stops a later reader from adding the map.
+//!
+//! [`Answer::Leave`] is the one answer outside all of that: it ends the session outright rather
+//! than deferring, so it neither sets a target nor depends on [`Screen::still_working`], and the
+//! fixed point that bounds a steer does not bound it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -120,6 +124,13 @@ pub enum Event {
     /// samples are the shell's, and this is here so the `match` over events stays total.
     PlaySnippet,
     Skip,
+    /// Leave the rest of this session's voices and open the next meeting.
+    ///
+    /// The middle of the three scopes -- [`Skip`](Self::Skip) is one voice, this is the session,
+    /// [`Quit`](Self::Quit) is the run -- and the one event that ends a session without
+    /// deferring anything: [`Answer::Leave`] returns out of the pass loop rather than putting
+    /// the voice back, so nothing here waits to be asked again.
+    Leave,
     Quit,
 }
 
@@ -579,6 +590,14 @@ impl Screen {
                 self.decided.insert(view.number.to_string(), Mark::Skipped);
                 return Step::Answered(Answer::Skip);
             }
+            // No mark and no touching `target` or `awaited`: this session is never drawn again,
+            // and `arrive` resets the whole `Screen` when the session changes. A [`Mark`]
+            // nothing can render would be state that exists to be believed and never read.
+            //
+            // `still_working` is already false here rather than being cleared: whenever a steer
+            // is outstanding, `arrive` defers without drawing, so a key is only ever read with
+            // no target set.
+            Event::Leave => return Step::Answered(Answer::Leave),
             Event::Quit => return Step::Answered(Answer::Quit),
         }
         Step::Waiting
@@ -1462,6 +1481,32 @@ pub(crate) mod tests {
         assert_eq!(
             screen.answer(&voice, Event::Quit, &Free),
             Step::Answered(Answer::Quit)
+        );
+    }
+
+    /// TASK-049 acceptance criterion #5, from the frame's side: leaving a session is an answer
+    /// given while a voice is on the screen, so no steer is outstanding when the key is read and
+    /// none is left behind by it -- the frame cannot make the exit look like a stalled pass.
+    #[test]
+    fn leaving_a_session_is_an_answer_and_not_a_steer() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false), ("Unknown 2", 30.0, false)]);
+        let queue = queue(&owned);
+        let voice = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        assert!(
+            !screen.still_working(),
+            "a key is only ever read with no target set"
+        );
+        assert_eq!(
+            screen.answer(&voice, Event::Leave, &Free),
+            Step::Answered(Answer::Leave)
+        );
+        assert!(
+            !screen.still_working(),
+            "leaving sets no target, so the loop is not told to keep the session open"
         );
     }
 
