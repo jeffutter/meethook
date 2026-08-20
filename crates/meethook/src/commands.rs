@@ -5,7 +5,7 @@
 //! What is left here is the terminal itself -- printing, prompting, and playing audio --
 //! which is exactly the part no test can decide.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -679,13 +679,24 @@ impl DownloadProgress {
 pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Result<()> {
     let requested = parse_session_ids(&args.session_ids)?;
     let template = TranscriptTemplate::resolve(paths, template)?;
-    // Which of the two answerers this run has. `--name` is refused without a selector by
-    // `run_enroll`, which is where both halves of that rule are in hand.
+    // Which answerer this run has, by the rule in `answerer`. `--name` is refused without a
+    // selector by `run_enroll`, which is where both halves of that rule are in hand.
+    //
+    // A tuple match rather than `given.as_mut().expect(..)`: `answerer` returns `Given` only
+    // when `named` is true, and `named` is `args.name.is_some()`, so the pairing cannot fail --
+    // and were it ever to, falling through to the line prompt is today's behaviour rather than
+    // a panic in a command that may already have written names to disk.
     let mut terminal = Terminal::default();
     let mut given = args.name.as_deref().map(GivenName::new);
-    let interviewer: &mut dyn Interviewer = match &mut given {
-        Some(given) => given,
-        None => &mut terminal,
+    let chosen = answerer(args.name.is_some(), args.plain, Tty::current());
+    let interviewer: &mut dyn Interviewer = match (chosen, &mut given) {
+        (Answerer::Given, Some(given)) => given,
+        // TASK-046.06 splits this arm: `Answerer::Screen` builds the full-screen interface,
+        // `Answerer::Prompt` keeps the line-based `Terminal`. This is its single wiring point.
+        // Until then both are the line prompt, which is what makes this a pure decision change
+        // with no behavioural difference to find. The narrator below is the other half of that
+        // change -- a frame cannot share stdout with `Lines` -- so it stays where it is here.
+        _ => &mut terminal,
     };
     // Unlike a session id there is nothing to validate about a `--voice`: a selector that matches
     // nothing is answered against the session's actual voices, which is a better message than
@@ -911,6 +922,72 @@ impl MeetingSource for Calendar {
     }
 }
 
+/// Whether the run is attached to a person, as the two streams `enroll` actually uses.
+///
+/// A struct rather than two bools passed positionally, for the reason [`crate::EnrollArgs`] gives
+/// for itself: adjacent bools transpose silently, and a transposed one here would open a
+/// full-screen interface onto a pipe.
+///
+/// Not stderr. Narration goes to stdout, through `Lines::new(&mut io::stdout())` in [`enroll`],
+/// and [`Terminal::identify`] asks its question with `println!` -- so stdout is the stream a
+/// full-screen frame would have to fight over, and stderr says nothing about whether it could.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tty {
+    stdin: bool,
+    stdout: bool,
+}
+
+impl Tty {
+    /// What this process is actually attached to. The one line of this decision no test can
+    /// decide, which is why it is the only thing in here that reads the process.
+    fn current() -> Tty {
+        Tty {
+            stdin: io::stdin().is_terminal(),
+            stdout: io::stdout().is_terminal(),
+        }
+    }
+}
+
+/// Which of `enroll`'s answerers a run gets.
+///
+/// `Screen` and `Prompt` are the same answerer today -- the line-based [`Terminal`] -- because
+/// the full-screen interface does not exist yet. Keeping them apart here is what makes building
+/// it a change to one arm of one `match` rather than a change to this rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answerer {
+    /// `--name`: the answer was given up front, so nothing is asked at all.
+    Given,
+    /// The line-based prompt: a question printed to stdout, an answer read from stdin.
+    Prompt,
+    /// The full-screen interface.
+    Screen,
+}
+
+/// Which answerer a run gets, given `--name`, `--plain`, and what the streams are attached to.
+///
+/// The order is the rule, and it is deliberate:
+///
+/// 1. `--name` wins over everything. A name given up front is never shown the voice it lands
+///    on, so there is no question to ask on any path and no interface to open.
+/// 2. A pipe on *either* end is the line prompt. Both streams, not either: the prompt writes
+///    the question and the snippets to stdout and reads the answer from stdin, so a run being
+///    driven -- by CI, by a shell pipeline, by a subprocess -- must not write escape sequences
+///    into a captured buffer, and must not wait for a keypress that a script cannot send.
+/// 3. `--plain` is the explicit override, for somebody on a real terminal who wants the old
+///    prompt back, or who needs the interface out of a reproduction.
+///
+/// A function rather than an inline `if` for the reason [`meeting_line`] is one: the rule is
+/// then decidable in `cargo test` with no terminal in front of it.
+fn answerer(named: bool, plain: bool, tty: Tty) -> Answerer {
+    if named {
+        Answerer::Given
+    } else if !tty.stdin || !tty.stdout || plain {
+        Answerer::Prompt
+    } else {
+        Answerer::Screen
+    }
+}
+
 /// The interactive half of `enroll`: what a prompt looks like, and how a clip gets played.
 ///
 /// Everything about *which* voice is asked about, and what an answer writes, is on the other
@@ -1065,7 +1142,84 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{Capture, Event, Outcome, Timing, await_end, meeting_line, record_loop};
+    use super::{
+        Answerer, Capture, Event, Outcome, Timing, Tty, answerer, await_end, meeting_line,
+        record_loop,
+    };
+
+    /// Every shape the two streams can be in, so a rule is asserted over all of them rather
+    /// than at the one point a spot check happened to pick.
+    const STREAMS: [Tty; 4] = [
+        Tty {
+            stdin: true,
+            stdout: true,
+        },
+        Tty {
+            stdin: true,
+            stdout: false,
+        },
+        Tty {
+            stdin: false,
+            stdout: true,
+        },
+        Tty {
+            stdin: false,
+            stdout: false,
+        },
+    ];
+
+    /// A terminal at both ends: the only shape a full-screen interface may be opened onto.
+    const ATTACHED: Tty = Tty {
+        stdin: true,
+        stdout: true,
+    };
+
+    /// The whole of `--name`'s guarantee: it is answered up front on *every* combination of
+    /// the other two inputs, so no stream shape and no flag can route it into an interface.
+    #[test]
+    fn a_name_given_up_front_is_never_asked_for_again() {
+        for tty in STREAMS {
+            for plain in [false, true] {
+                assert_eq!(
+                    answerer(true, plain, tty),
+                    Answerer::Given,
+                    "--name lost to plain={plain} {tty:?}"
+                );
+            }
+        }
+    }
+
+    /// A pipe on either end is a run being driven rather than used: escape sequences would go
+    /// into somebody's captured buffer, and a keypress the driver cannot send would be waited
+    /// for. Both ends are checked because guarding only one is the usual way this goes wrong.
+    #[test]
+    fn a_pipe_on_either_end_is_the_line_prompt() {
+        for tty in STREAMS {
+            if tty == ATTACHED {
+                continue;
+            }
+            assert_eq!(
+                answerer(false, false, tty),
+                Answerer::Prompt,
+                "a full-screen interface was chosen for {tty:?}"
+            );
+        }
+    }
+
+    /// The override, which is the only reason the flag exists: a person at a real terminal
+    /// asking for the plain prompt gets it.
+    #[test]
+    fn plain_forces_the_line_prompt_on_a_terminal() {
+        assert_eq!(answerer(false, true, ATTACHED), Answerer::Prompt);
+    }
+
+    /// The arm that has nothing behind it yet, and the one assertion that would go quiet if
+    /// somebody deleted it: without this, dropping the interactive decision entirely would
+    /// still pass every other test in this file.
+    #[test]
+    fn a_terminal_with_no_flags_is_the_interactive_arm() {
+        assert_eq!(answerer(false, false, ATTACHED), Answerer::Screen);
+    }
 
     /// Long enough that scheduling noise cannot be mistaken for a timeout, short enough
     /// that the suite stays fast.

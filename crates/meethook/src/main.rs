@@ -258,7 +258,7 @@ enum Command {
 
 /// `enroll`'s options.
 ///
-/// A struct rather than fields on the variant because there are seven of them and three are
+/// A struct rather than fields on the variant because there are eight of them and four are
 /// bools: named at the one call site below, they cannot be transposed, which two adjacent
 /// `Option<String>`s passed positionally certainly could be.
 #[derive(Debug, Args)]
@@ -307,6 +307,15 @@ pub struct EnrollArgs {
     /// reliable one; without this a quiet voice is named in its own session only
     #[arg(long)]
     force_reference: bool,
+
+    /// Ask line by line, never opening the full-screen interface
+    ///
+    /// What you get anyway when either end of the command is a pipe rather than a terminal,
+    /// so a script, a shell pipeline or CI needs nothing here. Give it on a real terminal to
+    /// keep the plain question-and-answer prompt, or to leave the interface out of a bug
+    /// report. --name outranks it: a name given up front is not asked about at all.
+    #[arg(long)]
+    plain: bool,
 }
 
 fn main() -> Result<()> {
@@ -395,6 +404,14 @@ mod tests {
     fn refused(args: &[&str]) -> String {
         let error = Cli::try_parse_from(args).expect_err("should have been refused");
         error.to_string()
+    }
+
+    /// The options `meethook enroll` would run with, given these arguments.
+    fn enroll_args(args: &[&str]) -> EnrollArgs {
+        match Cli::try_parse_from(args).expect("should parse").command {
+            Command::Enroll(args) => args,
+            other => panic!("expected an enroll command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -570,5 +587,77 @@ mod tests {
     fn a_meeting_command_needs_a_session() {
         let message = refused(&["meethook", "meeting"]);
         assert!(message.contains("SESSION_ID"), "{message}");
+    }
+
+    /// Typing the least still means exactly what it meant before `--plain` existed. Every
+    /// field is asserted rather than the new one alone, so a stray `default_value` or a
+    /// reordering that changed what a bare `enroll` does would be caught here.
+    #[test]
+    fn a_bare_enroll_is_unchanged_by_the_plain_flag_existing() {
+        let args = enroll_args(&["meethook", "enroll", "20260809-052600"]);
+        assert_eq!(args.session_ids, ["20260809-052600"]);
+        assert_eq!(args.voice, None);
+        assert_eq!(args.at, None);
+        assert_eq!(args.name, None);
+        assert!(!args.all);
+        assert!(!args.correct);
+        assert!(!args.force_reference);
+        assert!(!args.plain, "--plain is on without being asked for");
+    }
+
+    /// `--plain` is compatible with everything, deliberately: `--plain --name Alice` is
+    /// contradictory but harmless -- the name wins and nothing prompts -- and refusing it
+    /// would break a driver that passes `--plain` unconditionally for safety and adds
+    /// `--name` when it happens to know the answer, which is the caller this flag is for.
+    #[test]
+    fn plain_sits_alongside_every_other_enroll_flag() {
+        let args = enroll_args(&[
+            "meethook",
+            "enroll",
+            "20260809-052600",
+            "--voice",
+            "Unknown 2",
+            "--name",
+            "Alice",
+            "--all",
+            "--correct",
+            "--force-reference",
+            "--plain",
+        ]);
+        assert_eq!(args.voice.as_deref(), Some("Unknown 2"));
+        assert_eq!(args.name.as_deref(), Some("Alice"));
+        assert!(args.all);
+        assert!(args.correct);
+        assert!(args.force_reference);
+        assert!(args.plain);
+
+        // `--at` is the other selector, so it gets its own run rather than sharing that one.
+        let args = enroll_args(&[
+            "meethook",
+            "enroll",
+            "20260809-052600",
+            "--at",
+            "12:34",
+            "--plain",
+        ]);
+        assert!(args.at.is_some(), "--at did not survive --plain");
+        assert!(args.plain);
+    }
+
+    /// The one conflict `enroll` does have, pinned so that adding a flag beside it did not
+    /// quietly drop it: two selectors would name two different voices.
+    #[test]
+    fn a_voice_and_a_timestamp_at_once_is_still_refused() {
+        let message = refused(&[
+            "meethook",
+            "enroll",
+            "20260809-052600",
+            "--voice",
+            "2",
+            "--at",
+            "12:34",
+        ]);
+        assert!(message.contains("--voice"), "{message}");
+        assert!(message.contains("--at"), "{message}");
     }
 }
