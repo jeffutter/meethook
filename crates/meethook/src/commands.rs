@@ -1313,7 +1313,14 @@ impl Interviewer for Terminal {
         match io::stdin().read_line(&mut line) {
             Ok(0) | Err(_) => Answer::Quit,
             Ok(_) if line.trim().is_empty() => Answer::Skip,
-            Ok(_) => Answer::Named(line.trim().to_string()),
+            // Never insists. This prompt reports what an answer did after the fact and shows no
+            // cost before it, so a user typing here has not been shown the third voice an
+            // override would cost -- the frame is the interface that has, and it is the one
+            // that can set `anyway`.
+            Ok(_) => Answer::Named {
+                name: line.trim().to_string(),
+                anyway: false,
+            },
         }
     }
 }

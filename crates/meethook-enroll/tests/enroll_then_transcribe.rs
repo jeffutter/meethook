@@ -181,7 +181,10 @@ impl Interviewer for AsksOnce {
         self.asked
             .push(format!("{} {}", voice.session, voice.attribution.label()));
         match self.answer.take() {
-            Some(name) => Answer::Named(name),
+            Some(name) => Answer::Named {
+                name,
+                anyway: false,
+            },
             None => Answer::Skip,
         }
     }

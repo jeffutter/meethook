@@ -502,7 +502,7 @@ impl Interface {
 /// deliberately, because an extra background scan nobody waits for is cheaper than a wrong number
 /// on the screen.
 fn rewrites(answer: &Answer) -> bool {
-    matches!(answer, Answer::Named(_))
+    matches!(answer, Answer::Named { .. })
 }
 
 /// What a candidate costs, off the run's own dry run.
@@ -602,6 +602,13 @@ fn line_to_play(selected: Option<(usize, Snippet<'_>)>) -> Result<(usize, &[f32]
 /// the selected transcript line ("l for line"). Ctrl-L is conventionally "redraw", which this
 /// frame does at the top of every iteration anyway, so nothing is being displaced.
 ///
+/// Ctrl-O ("o for override") is this frame's `forget --yes`: it answers with a candidate the
+/// library would otherwise refuse for taking a name off a third voice, which is a decision the
+/// user can only have made because the cost pane named that voice first. A control key for the
+/// reason choosing and creating are -- printable characters go to the filter -- and its own key
+/// rather than Enter, because a key that means "and I know what it costs" must not be reachable
+/// by the reflex that means "that one".
+///
 /// A free function taking a `KeyEvent` because a `KeyEvent` is constructible without a terminal,
 /// which is what makes this whole rule testable -- and it is where a stray Ctrl or a paste-shaped
 /// burst of characters would otherwise go wrong.
@@ -618,6 +625,7 @@ fn event(key: KeyEvent) -> Option<Event> {
         (KeyCode::Char('p'), true) => Some(Event::Play),
         (KeyCode::Char('l'), true) => Some(Event::PlaySnippet),
         (KeyCode::Char('s'), true) => Some(Event::Skip),
+        (KeyCode::Char('o'), true) => Some(Event::Anyway),
         (KeyCode::Up, false) => Some(Event::Up),
         (KeyCode::Down, false) => Some(Event::Down),
         (KeyCode::Right, false) => Some(Event::Select),
@@ -734,6 +742,7 @@ mod tests {
                 Event::PlaySnippet,
             ),
             (KeyCode::Char('s'), KeyModifiers::CONTROL, Event::Skip),
+            (KeyCode::Char('o'), KeyModifiers::CONTROL, Event::Anyway),
             (KeyCode::Char('a'), KeyModifiers::NONE, Event::Filter('a')),
             (KeyCode::Char(' '), KeyModifiers::NONE, Event::Filter(' ')),
         ];
@@ -804,7 +813,10 @@ mod tests {
     /// re-reading the whole root would be half a second of work per keypress for nothing.
     #[test]
     fn an_answer_re_reads_the_sessions_and_a_skip_does_not() {
-        assert!(rewrites(&Answer::Named("Milo".to_string())));
+        assert!(rewrites(&Answer::Named {
+            name: "Milo".to_string(),
+            anyway: false,
+        }));
         for quiet in [Answer::Skip, Answer::Later, Answer::Quit] {
             assert!(!rewrites(&quiet), "{quiet:?} writes nothing");
         }

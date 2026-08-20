@@ -127,7 +127,10 @@ impl Interviewer for AsksOnce {
             "a constructed session must still yield a playable clip"
         );
         match self.answer.take() {
-            Some(name) => Answer::Named(name),
+            Some(name) => Answer::Named {
+                name,
+                anyway: false,
+            },
             None => Answer::Skip,
         }
     }

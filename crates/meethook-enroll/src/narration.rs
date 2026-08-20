@@ -279,6 +279,30 @@ pub enum AnswerNote<'a> {
         refusal: &'a Refusal,
     },
 
+    /// The answer was honoured even though it took a name off a voice the user was not asked
+    /// about, because the answer said to.
+    ///
+    /// The mirror of [`Refused`](Self::Refused): same cost, same voice paying for it, opposite
+    /// outcome. It exists as its own note rather than as a field on
+    /// [`Committed`](Self::Committed) so that every path that does not override prints exactly
+    /// the bytes it printed before -- and so that the one new sentence lives in one place.
+    ///
+    /// Only [`Refusal::Taken`] can be overridden, so this carries that variant's two halves
+    /// rather than a `Refusal`: the type cannot describe a veto that was overridden, which is
+    /// the guarantee the enum would leave to a comment.
+    Overrode {
+        /// The name that was given, trimmed.
+        name: &'a str,
+        /// The voice it was given for, by its "Unknown N". Named separately from `voice`
+        /// because the two are different voices and one word must not mean both.
+        answered: &'a str,
+        /// The voice that pays, by its "Unknown N" -- [`Refusal::Taken::voice`].
+        voice: &'a str,
+        /// What that voice reads now and will not read afterwards --
+        /// [`Refusal::Taken::losing`].
+        losing: &'a str,
+    },
+
     /// The answer was honoured, and this is everything it wrote.
     ///
     /// One note for the whole outcome rather than one per line: the displacements, the surviving
@@ -505,6 +529,12 @@ impl Lines<'_> {
                 voice,
                 refusal,
             } => self.refused(session, name, voice, refusal),
+            AnswerNote::Overrode {
+                name,
+                answered,
+                voice,
+                losing,
+            } => self.overrode(session, name, answered, voice, losing),
             AnswerNote::Committed {
                 name,
                 speech_seconds,
@@ -546,6 +576,29 @@ impl Lines<'_> {
                  meethook enroll --correct --voice {voice} if {voice} is not {losing}"
             )?,
         }
+        Ok(())
+    }
+
+    /// The same cost the refusal line names, in a run where it was paid rather than declined.
+    ///
+    /// Printed before the [`AnswerNote::Committed`] block, which is the order
+    /// [`committed`](Self::committed) already prints in: what the answer took off other people
+    /// first, then where the name landed. It names the voice that paid, so a user reading the
+    /// scrollback afterwards -- rather than the pane that warned them -- can still see who lost
+    /// a name and reach for the command that gives it back.
+    fn overrode(
+        &mut self,
+        session: &SessionId,
+        name: &str,
+        answered: &str,
+        voice: &str,
+        losing: &str,
+    ) -> Result<()> {
+        writeln!(
+            self.out,
+            "{session}  named {name} for {answered} anyway: {voice} no longer reads {losing} -- \
+             meethook enroll --correct --voice {voice} to give it a name again"
+        )?;
         Ok(())
     }
 

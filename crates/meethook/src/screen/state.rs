@@ -93,6 +93,18 @@ pub enum Event {
     CandidateDown,
     /// Answer with the highlighted candidate.
     Choose,
+    /// Answer with the highlighted candidate even though it takes a name off another voice.
+    ///
+    /// Live only where that candidate's refusal is [`Refusal::Taken`], which is the only refusal
+    /// an answer can override -- [`Answer::Named::anyway`] says why, and why a
+    /// [`Refusal::Vetoed`] stays refused however the key is pressed.
+    ///
+    /// Its own key rather than [`Event::Choose`] doing double duty on a refused row. The two
+    /// mean different things -- "that one" and "that one, and I know what it costs" -- and a
+    /// single key would make the more consequential of them the one nobody chose, reachable by
+    /// the same reflex as the harmless one. It is what makes the cost pane load-bearing: the
+    /// frame prints which voice pays and what it loses before this key exists to be pressed.
+    Anyway,
     /// Answer with the typed text as somebody new. Its own key, never the fallback for
     /// unrecognised text.
     NewPerson,
@@ -328,6 +340,18 @@ pub struct View<'a> {
     pub status: Option<&'a str>,
 }
 
+impl View<'_> {
+    /// The candidate under the highlight, or `None` where there are none.
+    ///
+    /// [`View::candidate`] is an index into [`View::candidates`] and every pane that cares about
+    /// the highlighted row -- its consequence, who it already is, whether the footer can offer
+    /// the override -- wants the candidate rather than the index. One lookup so those panes
+    /// cannot come to disagree about which row is highlighted.
+    pub fn highlighted(&self) -> Option<&Candidate> {
+        self.candidates.get(self.candidate?)
+    }
+}
+
 /// The frame's whole state, keyed on "Unknown N" throughout.
 ///
 /// Keyed on the number and never on the label, because a label moves the moment its voice is
@@ -494,17 +518,36 @@ impl Screen {
                 self.candidate = (self.candidate + 1).min(last);
             }
             Event::Choose => {
-                let names = self.candidates(view);
-                let Some(name) = names.get(self.candidate).cloned() else {
+                let Some((name, refusal)) = self.chosen(view, costs) else {
                     // Unrecognised text, or nothing enrolled at all. Deliberately nothing: the
                     // only way to create somebody is the key that says so.
                     return Step::Waiting;
                 };
-                if self.cost(&name, costs).refusal.is_some() {
+                // Unchanged by the override: *every* refusal refuses this key, the overridable
+                // one included. Insisting is the other key's job.
+                if refusal.is_some() {
                     return Step::Waiting;
                 }
                 self.decided.insert(view.number.to_string(), Mark::Answered);
-                return Step::Answered(Answer::Named(name));
+                return Step::Answered(Answer::Named {
+                    name,
+                    anyway: false,
+                });
+            }
+            Event::Anyway => {
+                let Some((name, refusal)) = self.chosen(view, costs) else {
+                    return Step::Waiting;
+                };
+                // Nothing on a row this key cannot help with, in either direction: a candidate
+                // nothing refuses is answered by Enter and not by insisting, and the
+                // heard-at-once veto is refused however insistent the answer is -- the library
+                // enforces that second half too, and this mirror is what keeps the frame from
+                // offering a key the library would then refuse.
+                if !matches!(refusal, Some(Refusal::Taken { .. })) {
+                    return Step::Waiting;
+                }
+                self.decided.insert(view.number.to_string(), Mark::Answered);
+                return Step::Answered(Answer::Named { name, anyway: true });
             }
             Event::NewPerson => {
                 let typed = self.filter.trim();
@@ -513,7 +556,10 @@ impl Screen {
                 }
                 let name = typed.to_string();
                 self.decided.insert(view.number.to_string(), Mark::Answered);
-                return Step::Answered(Answer::Named(name));
+                return Step::Answered(Answer::Named {
+                    name,
+                    anyway: false,
+                });
             }
             Event::SnippetUp => {
                 self.snippet = self.snippet.saturating_sub(1);
@@ -653,6 +699,24 @@ impl Screen {
         }
     }
 
+    /// The candidate under the highlight and why it cannot be chosen, or `None` where there is
+    /// no candidate at all -- unrecognised text, or nobody enrolled.
+    ///
+    /// One implementation because two keys answer with this row and they must never disagree
+    /// about which row it is: [`Event::Choose`] refuses every refusal and [`Event::Anyway`]
+    /// proceeds on one of them, and a second lookup is how those two come to act on different
+    /// candidates. The refusal is cloned rather than borrowed so the caller can go on to touch
+    /// the rest of the state -- the memo behind [`Screen::cost`] holds it by `&mut self`.
+    fn chosen(
+        &mut self,
+        view: &VoiceView<'_>,
+        costs: &dyn Costs,
+    ) -> Option<(String, Option<Refusal>)> {
+        let name = self.candidates(view).get(self.candidate).cloned()?;
+        let refusal = self.cost(&name, costs).refusal.clone();
+        Some((name, refusal))
+    }
+
     /// What one candidate costs, computed at most once per name per question.
     fn cost(&mut self, name: &str, costs: &dyn Costs) -> &Cost {
         if !self.costs.contains_key(name) {
@@ -695,6 +759,23 @@ pub(crate) mod tests {
             Cost {
                 refusal: (name == self.0).then(|| meethook_enroll::Refusal::Vetoed {
                     holder: Some("Unknown 2".to_string()),
+                }),
+                summary: vec![format!("would name this voice {name}")],
+            }
+        }
+    }
+
+    /// One named candidate is refused for taking a name off another voice, which is the only
+    /// refusal an answer can override. [`Vetoes`]'s counterpart, so the two keys can be pressed
+    /// against both refusals and told apart.
+    struct Takes(&'static str);
+
+    impl Costs for Takes {
+        fn of(&self, name: &str) -> Cost {
+            Cost {
+                refusal: (name == self.0).then(|| meethook_enroll::Refusal::Taken {
+                    voice: "Unknown 2".to_string(),
+                    losing: "Bob".to_string(),
                 }),
                 summary: vec![format!("would name this voice {name}")],
             }
@@ -1135,7 +1216,10 @@ pub(crate) mod tests {
         }
         assert_eq!(
             screen.answer(&voice, Event::Choose, &Free),
-            Step::Answered(Answer::Named("Marco".to_string()))
+            Step::Answered(Answer::Named {
+                name: "Marco".to_string(),
+                anyway: false,
+            })
         );
     }
 
@@ -1171,6 +1255,113 @@ pub(crate) mod tests {
         );
     }
 
+    /// A candidate refused for taking a name off another voice can still be answered with -- by
+    /// its own key, never by the one that chooses an unrefused candidate. The frame has already
+    /// printed which voice pays and what it loses in the pane beside this row, which is what the
+    /// second key means and Enter does not.
+    #[test]
+    fn a_taken_candidate_can_be_chosen_anyway_by_its_own_key() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false)]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Milo", 0.71, 3)]);
+        let enrolled = ["Milo"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let takes = Takes("Milo");
+
+        assert_eq!(
+            screen.answer(&voice, Event::Choose, &takes),
+            Step::Waiting,
+            "the ordinary key must go on refusing, or the two keys mean the same thing"
+        );
+        assert_eq!(
+            screen.answer(&voice, Event::Anyway, &takes),
+            Step::Answered(Answer::Named {
+                name: "Milo".to_string(),
+                anyway: true,
+            })
+        );
+        assert_eq!(
+            screen.view(&voice, &takes, Context::Reading).rows[0].mark,
+            Some(Mark::Answered),
+            "an answered voice is marked answered however it was answered"
+        );
+    }
+
+    /// The heard-at-once veto is a different claim -- segmentation proved two voices are
+    /// different people -- and this key is not the way to assert otherwise. Refused here as well
+    /// as in the library, so the frame never offers a key the library would then refuse.
+    #[test]
+    fn the_heard_at_once_veto_is_refused_by_the_override_key_too() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false)]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Milo", 0.71, 3)]);
+        let enrolled = ["Milo"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let vetoes = Vetoes("Milo");
+
+        for key in [Event::Choose, Event::Anyway] {
+            assert_eq!(
+                screen.answer(&voice, key, &vetoes),
+                Step::Waiting,
+                "{key:?} must not defeat the heard-at-once veto"
+            );
+        }
+    }
+
+    /// And nothing on a row nothing refuses: the two keys are not interchangeable in either
+    /// direction, which is what makes the override a decision rather than a second Enter.
+    #[test]
+    fn the_override_key_does_nothing_where_nothing_is_refused() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false)]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Milo", 0.71, 3)]);
+        let enrolled = ["Milo"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        assert_eq!(screen.answer(&voice, Event::Anyway, &Free), Step::Waiting);
+        assert_eq!(
+            screen.view(&voice, &Free, Context::Reading).rows[0].mark,
+            None,
+            "a key that did nothing may not mark the voice as answered"
+        );
+    }
+
     /// AC #8: unrecognised text with Choose pressed does nothing at all, and creating somebody is
     /// its own key. Trimmed on the way out, matching how a name given up front is normalised.
     #[test]
@@ -1198,7 +1389,10 @@ pub(crate) mod tests {
         assert_eq!(screen.answer(&voice, Event::Choose, &Free), Step::Waiting);
         assert_eq!(
             screen.answer(&voice, Event::NewPerson, &Free),
-            Step::Answered(Answer::Named("Maya".to_string()))
+            Step::Answered(Answer::Named {
+                name: "Maya".to_string(),
+                anyway: false,
+            })
         );
 
         // And a name of nothing but spaces is not a person either.

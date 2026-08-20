@@ -246,8 +246,7 @@ fn new_person(view: &View<'_>) -> Vec<Span<'static>> {
 /// them ever has an answer: a refused candidate would do nothing at all.
 fn consequence(frame: &mut Frame, area: Rect, view: &View<'_>) {
     let highlighted = view
-        .candidate
-        .and_then(|index| view.candidates.get(index))
+        .highlighted()
         .and_then(|candidate| candidate.refusal.as_ref());
     let (title, lines): (&str, Vec<Line>) = match (highlighted, view.consequence.is_empty()) {
         (Some(refusal), _) => (" cannot ", vec![Line::from(refused(refusal))]),
@@ -286,10 +285,7 @@ fn consequence(frame: &mut Frame, area: Rect, view: &View<'_>) {
 /// Not wrapped, for the reason `log` is not: a row per fact, clipped at the pane's edge, so a long
 /// session list cannot push the incompleteness line off the bottom.
 fn who(frame: &mut Frame, area: Rect, view: &View<'_>) {
-    let highlighted = view
-        .candidate
-        .and_then(|index| view.candidates.get(index))
-        .map(|candidate| candidate.name.as_str());
+    let highlighted = view.highlighted().map(|candidate| candidate.name.as_str());
     // Dynamic like the candidates pane's title already is: the pane is about one person, and
     // naming them in the border is what stops the rows below reading as being about the voice.
     let title = match highlighted {
@@ -448,6 +444,10 @@ fn log(frame: &mut Frame, area: Rect, narration: &[String]) {
 ///
 /// The restart key follows what is sounding rather than naming one of the two: saying "^P restart"
 /// while a line is playing would name a key that starts something else.
+///
+/// The choose key follows the highlighted candidate for the same reason: where that candidate is
+/// refused for taking a name off another voice, the key that works is Ctrl-O and Enter is the one
+/// that would do nothing.
 fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sounding>) {
     let text = match (sounding, view.status) {
         (
@@ -481,8 +481,16 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sound
                 // cannot work.
                 None => "",
             };
+            // Enter genuinely does nothing on a refused row, and Ctrl-O does nothing on any
+            // other, so the two are swapped rather than both offered: the frame's rule is that a
+            // key which cannot work is not advertised, and swapping also leaves the line the
+            // width it already was.
+            let choose = match view.highlighted().and_then(|c| c.refusal.as_ref()) {
+                Some(Refusal::Taken { .. }) => "^O anyway",
+                _ => "enter choose",
+            };
             format!(
-                "up/down voice  right work on it  tab candidate  enter choose  \
+                "up/down voice  right work on it  tab candidate  {choose}  \
                  ^N new  {clip}{line}  ^S skip  ^C quit"
             )
         }
@@ -524,6 +532,22 @@ mod tests {
             Cost {
                 refusal: Some(Refusal::Vetoed {
                     holder: Some("Unknown 2".to_string()),
+                }),
+                summary: Vec::new(),
+            }
+        }
+    }
+
+    /// Everything is refused for taking a name off another voice: the one refusal an answer can
+    /// override, and so the one the footer offers a key for.
+    struct Takes;
+
+    impl Costs for Takes {
+        fn of(&self, _name: &str) -> Cost {
+            Cost {
+                refusal: Some(Refusal::Taken {
+                    voice: "Unknown 2".to_string(),
+                    losing: "Bob".to_string(),
                 }),
                 summary: Vec::new(),
             }
@@ -906,27 +930,58 @@ mod tests {
         );
     }
 
+    /// The override key is advertised exactly where it would work, and the key it displaces is
+    /// not advertised where it would not. Enter does nothing on a refused row and Ctrl-O does
+    /// nothing on any other, so they are swapped rather than both shown -- the frame's rule being
+    /// that a key which cannot work is not offered.
+    #[test]
+    fn the_override_key_is_offered_only_where_it_would_work() {
+        let taken = painted(120, 30, &Takes, &[]).join("\n");
+        assert!(taken.contains("^O anyway"), "{taken}");
+        assert!(
+            !taken.contains("enter choose"),
+            "enter does nothing on a refused row\n{taken}"
+        );
+
+        for (what, costs) in [
+            ("nothing refused", &Free as &dyn Costs),
+            ("the heard-at-once veto", &Vetoes),
+        ] {
+            let whole = painted(120, 30, costs, &[]).join("\n");
+            assert!(whole.contains("enter choose"), "{what}\n{whole}");
+            assert!(
+                !whole.contains("^O anyway"),
+                "the override is not offered where it would be refused: {what}\n{whole}"
+            );
+        }
+    }
+
     /// The minimum this frame claims to work at. Every pane still has a border and a title, which
-    /// is what says nothing was laid out at a negative height.
+    /// is what says nothing was laid out at a negative height. Painted with each cost the footer
+    /// now varies on, since the override swaps the widest key on the line.
     #[test]
     fn every_pane_survives_eighty_by_twenty_four() {
-        let painted = painted(80, 24, &Free, &[]);
-        assert_eq!(painted.len(), 24);
-        let whole = painted.join("\n");
-        for title in [
-            " voices ",
-            " resembles ",
-            " would ",
-            // The one title that names its subject, so "who" alone would also match the question
-            // line above it.
-            " who Milo is ",
-            " said ",
-            " run ",
-        ] {
-            assert!(
-                whole.contains(title.trim()),
-                "{title} missing from\n{whole}"
-            );
+        // The consequence pane is the one title that follows the cost: what an answer would do,
+        // or why it cannot.
+        for (costs, consequence) in [(&Free as &dyn Costs, " would "), (&Takes, " cannot ")] {
+            let painted = painted(80, 24, costs, &[]);
+            assert_eq!(painted.len(), 24);
+            let whole = painted.join("\n");
+            for title in [
+                " voices ",
+                " resembles ",
+                consequence,
+                // The one title that names its subject, so "who" alone would also match the
+                // question line above it.
+                " who Milo is ",
+                " said ",
+                " run ",
+            ] {
+                assert!(
+                    whole.contains(title.trim()),
+                    "{title} missing from\n{whole}"
+                );
+            }
         }
     }
 

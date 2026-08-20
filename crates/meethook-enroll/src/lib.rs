@@ -518,7 +518,32 @@ pub struct Voice<'a> {
 /// What the user said when asked who a voice is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
-    Named(String),
+    /// Who this voice is.
+    Named {
+        /// The name, trimmed the same way [`GivenName`] trims one supplied up front.
+        name: String,
+
+        /// Honour the name even though it takes a name off a voice the user was not asked
+        /// about -- [`Refusal::Taken`], and that refusal only.
+        ///
+        /// The refusal exists because a third party silently losing their name is a surprise,
+        /// and an answerer that has already *shown* the user which voice pays and what it loses
+        /// has removed the surprise. That is `forget --yes`'s argument reached from the other
+        /// side: see `forget.rs`'s "Nothing is ever refused". So this is not a way to answer
+        /// harder; it is an answer given by somebody who was shown the cost first, which is why
+        /// the only interface that sets it is the one with a pane for the cost.
+        ///
+        /// Carried on the answer rather than decided by the interface because the interface is
+        /// not on every path: a line prompt and any scripted answerer reach the library's guard
+        /// without passing through the frame's state machine, so an override the frame merely
+        /// *knew about* would be refused for them. The answer is the one thing every path has.
+        ///
+        /// [`Refusal::Vetoed`] is out of reach whatever this says. That refusal is a different
+        /// claim -- segmentation heard the two voices at once and so proved they are different
+        /// people -- and overriding it means asserting several voices are one person, which is
+        /// TASK-046.09's question and not this field's.
+        anyway: bool,
+    },
     Skip,
     /// Not this voice, not yet: put it back in the queue and ask again later in this session.
     ///
@@ -614,7 +639,14 @@ impl GivenName {
 
 impl Interviewer for GivenName {
     fn identify(&mut self, _voice: &Voice<'_>) -> Answer {
-        Answer::Named(self.0.clone())
+        // Never insists. A name supplied up front is never shown the voice it lands on -- which
+        // is the whole reason `needs_one_voice` exists below -- so it has certainly not been
+        // shown the third voice an override would cost, and the premise the override rests on
+        // does not hold here.
+        Answer::Named {
+            name: self.0.clone(),
+            anyway: false,
+        }
     }
 
     fn needs_one_voice(&self) -> bool {
@@ -1296,7 +1328,7 @@ fn enroll_session(
                 &mut report.skipped
             };
 
-            let name = match answer {
+            let (name, anyway) = match answer {
                 Answer::Quit => return Ok(Outcome::Quit),
                 Answer::Skip => {
                     *left_alone += 1;
@@ -1309,7 +1341,7 @@ fn enroll_session(
                     deferred.push((nth, cluster));
                     continue;
                 }
-                Answer::Named(name) => name,
+                Answer::Named { name, anyway } => (name, anyway),
             };
             // Everything this answer would write, worked out on copies first -- the dry run the
             // `consequence` module holds, and the same one an [`Interviewer`] may have already run
@@ -1343,22 +1375,48 @@ fn enroll_session(
             let name = name.trim();
 
             // The refusal. An answer that would take a name off a voice the user is not answering
-            // about is not honoured at all -- see `Refusal` for the three ways that can happen and
-            // why one check covers them. Nothing is written, the voice keeps whatever it read, and
-            // the note names the voice that would have paid.
-            if let Some(refusal) = &consequence.refused {
-                let answered = handle(cluster.id, &unknown);
-                after(
-                    notes,
-                    &session.id,
-                    AnswerNote::Refused {
-                        name,
-                        voice: &answered,
-                        refusal,
-                    },
-                )?;
-                report.refused += 1;
-                continue;
+            // about is not honoured -- see `Refusal` for the three ways that can happen and why
+            // one check covers them -- unless the answer itself says otherwise. Written as one
+            // total match rather than as a guard plus an exception, because the rule is which of
+            // the three cases an answer falls into and reading it should not require holding a
+            // negation.
+            match &consequence.refused {
+                // Shown what it costs and asked for it anyway. `Answer::anyway` is only ever set
+                // by an interface that displayed the paying voice and what it loses before a key
+                // was pressed, which makes this `forget --yes`'s argument reached from the other
+                // side: see `forget.rs`'s "Nothing is ever refused". Everything below runs
+                // exactly as it does for an answer nothing refused -- honouring an override is
+                // skipping this guard, not a second write path.
+                Some(Refusal::Taken { voice, losing }) if anyway => {
+                    after(
+                        notes,
+                        &session.id,
+                        AnswerNote::Overrode {
+                            name,
+                            answered: &handle(cluster.id, &unknown),
+                            voice,
+                            losing,
+                        },
+                    )?;
+                }
+                // Every other refusal: a `Taken` nobody insisted on, and a `Vetoed` however
+                // insistent the answer was. Nothing is written, the voice keeps whatever it
+                // read, and the note names the voice that would have paid.
+                Some(refusal) => {
+                    let answered = handle(cluster.id, &unknown);
+                    after(
+                        notes,
+                        &session.id,
+                        AnswerNote::Refused {
+                            name,
+                            voice: &answered,
+                            refusal,
+                        },
+                    )?;
+                    report.refused += 1;
+                    continue;
+                }
+                None => {}
             }
 
             // Everything this answer wrote, as one note rather than as the four to six lines it
@@ -2218,7 +2276,20 @@ mod tests {
     }
 
     fn named(name: &str) -> Answer {
-        Answer::Named(name.to_string())
+        Answer::Named {
+            name: name.to_string(),
+            anyway: false,
+        }
+    }
+
+    /// The same answer, insisted on: honour it even where it takes a name off a voice the user
+    /// was not asked about. Only [`Refusal::Taken`] is in reach, which is what the veto tests
+    /// below use this to pin.
+    fn named_anyway(name: &str) -> Answer {
+        Answer::Named {
+            name: name.to_string(),
+            anyway: true,
+        }
     }
 
     /// A distinct unit vector per cluster id, so enrolling one of these voices matches that
@@ -4444,6 +4515,153 @@ mod tests {
         );
     }
 
+    /// The other side of theft by argmax: the same answer, insisted on. An interface that showed
+    /// the user which voice pays and what it loses before a key was pressed has removed the
+    /// surprise the refusal exists to prevent, so the answer is honoured -- and everything a
+    /// name ordinarily writes is written, this session's transcript included.
+    #[test]
+    fn naming_a_voice_anyway_takes_the_name_off_the_voice_that_had_it() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
+        enrolled(&[("Bob", nearly(60.0))], &paths);
+        let before = std::fs::read(paths.speakers_json()).unwrap();
+
+        let mut interviewer = Scripted::answering(vec![named_anyway("Alice")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(report.refused, 0, "{output}");
+        assert_eq!(report.named, 1, "{output}");
+        assert!(
+            output.contains(
+                "named Alice for Unknown 1 anyway: Unknown 2 no longer reads Bob -- \
+                 meethook enroll --correct --voice Unknown 2 to give it a name again"
+            ),
+            "the voice that paid has to be named where the run is read afterwards, not only in \
+             the pane that warned about it: {output}"
+        );
+        assert_ne!(
+            std::fs::read(paths.speakers_json()).unwrap(),
+            before,
+            "an honoured answer writes the name it was given"
+        );
+        let said = transcript_of(&session);
+        assert_eq!(said.turns[0].speaker, "Alice", "{output}");
+        assert_ne!(
+            said.turns[2].speaker, "Bob",
+            "the transcript has to agree with the cost that was accepted: {output}"
+        );
+    }
+
+    /// The heard-at-once veto is not reachable from here however insistent the answer is.
+    /// Segmentation *heard* these two voices at once and so proved they are different people;
+    /// overriding that is the claim that several voices are one person, which is a different
+    /// question with a ticket of its own. Byte for byte the refusal an ordinary answer gets.
+    #[test]
+    fn the_heard_at_once_veto_is_refused_however_insistent_the_answer_is() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        heard_at_once(&session, 0, 1);
+
+        let mut interviewer =
+            Scripted::answering(vec![named_anyway("Alice"), named_anyway("Alice")]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(report.refused, 1, "{output}");
+        assert!(
+            output.contains(
+                "refused Alice for Unknown 2: Unknown 1 already has that name and the two \
+                 were heard speaking at once"
+            ),
+            "insisting must not change the sentence, let alone the outcome: {output}"
+        );
+        let said = transcript_of(&session);
+        assert_eq!(
+            (
+                said.turns[0].speaker.as_str(),
+                said.turns[2].speaker.as_str()
+            ),
+            ("Alice", "Unknown 2"),
+            "{output}"
+        );
+    }
+
+    /// The override is at the label level, like the check it overrides: it does not depend on
+    /// which of the three mechanisms produced the loss. Here no reference is stored or removed
+    /// at all -- a hand-given name on a quiet fragment simply beats the identification on the
+    /// voice it overlaps -- and insisting takes Alice off the voice that had her all the same.
+    #[test]
+    fn the_quiet_fragment_path_can_be_overridden_too() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_speech_seconds(&session, &[40.0, 1.5]);
+        heard_at_once(&session, 0, 1);
+        enrolled(&[("Alice", voice(0))], &paths);
+
+        let mut interviewer = Scripted::answering(vec![named_anyway("Alice")]);
+        let (report, output) = run_asking(&paths, &[], ALL, &mut interviewer);
+
+        assert_eq!(report.refused, 0, "{output}");
+        assert_eq!(report.named, 1, "{output}");
+        assert!(
+            output.contains("named Alice for Unknown 2 anyway: Unknown 1 no longer reads Alice"),
+            "{output}"
+        );
+        assert_eq!(
+            assigned_in(&session, "20260809-052600").names.len(),
+            1,
+            "an honoured answer records the name against the session: {output}"
+        );
+        assert_ne!(
+            transcript_of(&session).turns[0].speaker,
+            "Alice",
+            "the voice that lost the name keeps it in the transcript otherwise: {output}"
+        );
+    }
+
+    /// A name supplied up front never overrides anything. `--name` is never shown the voice it
+    /// lands on -- which is why it needs a selector at all -- so it has certainly not been shown
+    /// the third voice an override would cost, and the premise the override rests on does not
+    /// hold for it.
+    #[test]
+    fn a_name_given_up_front_cannot_override_a_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
+        enrolled(&[("Bob", nearly(60.0))], &paths);
+        let before = std::fs::read(paths.speakers_json()).unwrap();
+
+        let selector = VoiceSelector::from("Unknown 1");
+        let (report, output) = run_over(
+            &paths,
+            // `--voice` needs the one session it is about, exactly as the CLI insists.
+            &["20260809-052600"],
+            Some(Selection::Voice(&selector)),
+            Offer::default(),
+            Sessions::default(),
+            Enrolment::default(),
+            &mut GivenName::new("Alice"),
+        );
+
+        assert_eq!(report.refused, 1, "{output}");
+        assert_eq!(report.named, 0, "{output}");
+        assert!(
+            output.contains("refused Alice for Unknown 1: it would take Bob off Unknown 2"),
+            "{output}"
+        );
+        assert_eq!(
+            std::fs::read(paths.speakers_json()).unwrap(),
+            before,
+            "a refused answer writes nothing"
+        );
+        assert_eq!(transcript_of(&session).turns[2].speaker, "Bob", "{output}");
+    }
+
     /// A database written before this schema bump. References cannot be regenerated -- the audio
     /// they were built from may be long deleted -- so a v1 file must be migrated rather than
     /// refused: the names in it still identify their voices, and the file is upgraded by the
@@ -5924,6 +6142,38 @@ mod tests {
             "{output}"
         );
     }
+
+    /// The override crosses the seam on the answer, with no interface anywhere in the test.
+    ///
+    /// [`Previewing`] holds no [`Paths`], no database and no session directory, so a refusal it
+    /// can read came through [`Voice::preview`] and an answer the library honoured came back
+    /// through [`Interviewer::identify`]. That is the whole claim: the answerer saw the cost and
+    /// said to pay it, and the library needed to know nothing about who was asking. Which is why
+    /// the line prompt and any scripted driver reach the same behaviour as the frame does --
+    /// nothing about it is decided in the frame.
+    #[test]
+    fn an_override_crosses_the_seam_on_the_answer() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
+        enrolled(&[("Bob", nearly(60.0))], &paths);
+
+        let mut interviewer = Previewing::asking("Alice", named_anyway("Alice"));
+        let (report, output) = run_previewing(&paths, &mut interviewer);
+
+        assert_eq!(
+            interviewer.first().refused,
+            Some(Refusal::Taken {
+                voice: "Unknown 2".to_string(),
+                losing: "Bob".to_string(),
+            }),
+            "the answerer has to be able to see the cost, or insisting is uninformed: {output}"
+        );
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(report.refused, 0, "{output}");
+    }
+
     /// One run's narration, whole and in order, as [`Lines`] renders it.
     ///
     /// Every other test here asserts a substring, which cannot see a line that moved, a blank
