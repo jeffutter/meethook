@@ -515,6 +515,31 @@ pub trait Interviewer {
     fn needs_one_voice(&self) -> bool {
         false
     }
+
+    /// Whether this answerer still has work left after a pass over the queue that produced no
+    /// answer at all.
+    ///
+    /// The session loop cannot decide this for itself. It knows how many voices a pass deferred
+    /// and not why any of them was deferred, and for an answerer with a cursor those are
+    /// different facts: such an interface defers a voice in order to *reach* another one, so
+    /// "this pass produced no answer" is what moving the cursor backwards looks like, not what
+    /// finishing looks like. Answering `true` there keeps the session open and offers the same
+    /// voices again, with the same numbers.
+    ///
+    /// This is the contract, and it is the answerer's: this method is what bounds the loop. An
+    /// answerer that defers every voice and always returns `true` is never finished and the
+    /// session never ends, so anything that returns `true` must be able to reach
+    /// [`Answer::Quit`] -- which every interface has, and which is the exit a user reaches for.
+    /// The one case the loop still decides alone is an empty queue: with nothing left to offer
+    /// there is no next prompt to change the answer or carry a `Quit`, so a pass with nothing
+    /// to ask about ends the session whatever this returns.
+    ///
+    /// `false` for an answerer that never defers, which is both of the ones in this crate:
+    /// [`GivenName`] answers once, and a line prompt has no cursor to move, so for them the
+    /// question never arises.
+    fn still_working(&self) -> bool {
+        false
+    }
 }
 
 /// A name decided before the run started, for the one voice a [`Selection`] picked out.
@@ -1342,14 +1367,23 @@ fn enroll_session(
             shown = now;
         }
 
-        // The fixed point: a pass that moved nobody out of the deferred set. Every other pass
-        // leaves `deferred.len() < asked`, and the set can only shrink, so this terminates.
+        // The fixed point: a pass that moved nobody out of the deferred set, *and* an answerer
+        // that says it has nothing left to do. Every other pass leaves `deferred.len() < asked`,
+        // and the set can only shrink, so the first half terminates on its own; the second is
+        // [`Interviewer::still_working`]'s contract to keep bounded.
         //
         // The size of the set and not "no answer other than `Later` came back", because the
         // in-run guard above takes a voice out of a pass without any answer being given -- an
         // earlier answer named it -- and that is progress too. Counting answers would end a
         // session while there were still questions the user had not been asked.
-        if deferred.len() == asked {
+        //
+        // And the answerer as well as the set, because a stalled pass is not the same fact as a
+        // finished session for an interface with a cursor: it defers voices in order to reach
+        // another one, so a pass where the user only moved around produces no answer and is not
+        // the user being done. An empty queue is decided here rather than there -- nothing is
+        // left to offer, so no further prompt could change the answer or carry an
+        // [`Answer::Quit`], and consulting the answerer could only spin.
+        if deferred.len() == asked && (asked == 0 || !interviewer.still_working()) {
             // Deferred with no later left is the skip -- or the kept identification -- it has
             // turned out to be, counted through the same test the `Skip` arm uses above so the
             // two cannot disagree about which bucket a named voice belongs in.
@@ -1904,6 +1938,7 @@ pub fn write_clip(path: &Path, clip: &[f32]) -> Result<()> {
 /// needs a real recording and a real person.
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
 
     use meethook_session::{
@@ -2000,6 +2035,10 @@ mod tests {
     struct Scripted {
         answers: VecDeque<Answer>,
         seen: Vec<Shown>,
+        /// How many more stalled passes this answerer claims to still be working through. A
+        /// countdown rather than a flag so that a test which gets the arithmetic wrong fails
+        /// instead of hanging: once it reaches zero the session ends however the script reads.
+        working_passes: Cell<usize>,
     }
 
     impl Scripted {
@@ -2007,6 +2046,16 @@ mod tests {
             Scripted {
                 answers: answers.into(),
                 seen: Vec::new(),
+                working_passes: Cell::new(0),
+            }
+        }
+
+        /// Say "still working" for the next `passes` stalled passes and finished after that,
+        /// standing in for the cursor of a full-screen frame.
+        fn working_for(self, passes: usize) -> Scripted {
+            Scripted {
+                working_passes: Cell::new(passes),
+                ..self
             }
         }
 
@@ -2045,6 +2094,12 @@ mod tests {
                 enrolled: voice.enrolled.iter().map(|n| n.to_string()).collect(),
             });
             self.answers.pop_front().unwrap_or(Answer::Skip)
+        }
+
+        fn still_working(&self) -> bool {
+            let left = self.working_passes.get();
+            self.working_passes.set(left.saturating_sub(1));
+            left > 0
         }
     }
 
@@ -5801,8 +5856,83 @@ mod tests {
         );
     }
 
+    /// TASK-046.06.02.01 acceptance criterion #1: an answerer that says it is still working
+    /// keeps the session open across a pass that produced no answer, and is asked about the
+    /// same voices again with the same numbers.
+    ///
+    /// This is the hole a full-screen frame falls into and a line prompt cannot. A frame with a
+    /// cursor defers a voice in order to *reach* another one, so moving the cursor backwards is
+    /// a pass in which nothing was answered -- and before this method existed that ended the
+    /// run, which from the user's side is the frame closing because they pressed Up.
+    #[test]
+    fn a_still_working_answerer_is_offered_the_deferred_voices_again() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        // Pass one defers both voices, which on its own is where a session ends. The answerer
+        // says otherwise for that one pass, so pass two happens and lands a name.
+        let mut interviewer = Scripted::answering(vec![
+            Answer::Later,
+            Answer::Later,
+            named("Alice"),
+            Answer::Skip,
+        ])
+        .working_for(1);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(
+            interviewer.labels(),
+            ["Unknown 1", "Unknown 2", "Unknown 1", "Unknown 2"],
+            "the stalled pass kept the session open, so both voices come back: {output}"
+        );
+        assert_eq!(
+            interviewer.positions(),
+            ["1/2", "2/2", "1/2", "2/2"],
+            "a re-offered voice is the same question, so it keeps its number: {output}"
+        );
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(report.skipped, 1, "{output}");
+
+        // And the second pass's answer landed on the voice it was asked about.
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        let stored: Vec<(&str, &[f32])> = speakers
+            .speakers
+            .iter()
+            .map(|s| (s.name.as_str(), s.embedding.as_slice()))
+            .collect();
+        assert_eq!(stored, [("Alice", voice(0).as_slice())], "{output}");
+    }
+
+    /// TASK-046.06.02.01 acceptance criterion #4, the half of the termination contract the loop
+    /// keeps for itself: a pass with nothing left to offer ends the session without asking the
+    /// answerer, because there is no next prompt through which it could change its mind or
+    /// reach [`Answer::Quit`].
+    #[test]
+    fn an_empty_queue_ends_the_session_without_consulting_the_answerer() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        // Both voices answered on the first pass, so the second pass has nothing to ask about.
+        let mut interviewer =
+            Scripted::answering(vec![named("Alice"), named("Bob")]).working_for(1);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Unknown 1", "Unknown 2"], "{output}");
+        assert_eq!(report.named, 2, "{output}");
+        assert_eq!(
+            interviewer.working_passes.get(),
+            1,
+            "the countdown is untouched, so the empty pass never asked: {output}"
+        );
+    }
+
     /// TASK-046.06.01 acceptance criterion #5, the other bucket: a deferred voice that already
     /// had a name is a kept identification, exactly as pressing Enter on it would be.
+    ///
+    /// And TASK-046.06.02.01 acceptance criterion #2: a session that stayed open over a
+    /// still-working pass ends by the same counting when the answerer does say it is finished.
     #[test]
     fn a_deferred_voice_that_was_named_is_kept_rather_than_skipped() {
         let root = tempfile::tempdir().unwrap();
@@ -5817,6 +5947,29 @@ mod tests {
         assert_eq!(interviewer.labels(), ["Alice", "Unknown 2"], "{output}");
         assert_eq!(report.kept, 1, "{output}");
         assert_eq!(report.skipped, 1, "{output}");
+
+        // The same run, but the answerer works through one stalled pass before it agrees it is
+        // finished. Deferring writes nothing, so the second run is offered exactly what the
+        // first one was.
+        let mut later = Scripted::answering(vec![
+            Answer::Later,
+            Answer::Later,
+            Answer::Later,
+            Answer::Later,
+        ])
+        .working_for(1);
+        let (report, output) = run_asking(&paths, &[], CORRECT, &mut later);
+
+        assert_eq!(
+            later.labels(),
+            ["Alice", "Unknown 2", "Alice", "Unknown 2"],
+            "{output}"
+        );
+        assert_eq!(
+            (report.kept, report.skipped, report.named),
+            (1, 1, 0),
+            "the terminal deferred set is counted once, into the same buckets: {output}"
+        );
     }
 
     /// TASK-046.06.01 acceptance criterion #5, against the in-run guard: a voice somebody
