@@ -61,6 +61,17 @@
 //! Showing the shortlist and taking the confirmation belongs to the interface; the decision is
 //! here because it is what lands on disk. See the `resolve` module for the fold and the ranking.
 //!
+//! # And it says what an answer *would* do, before it does it
+//!
+//! [`Voice::preview`] carries the other half of that moment across the seam: given a candidate
+//! name, what accepting it would write -- an enrollment, another recording, a replacement of the
+//! shortest one somebody held, a refusal at the cap, a name for this session alone -- and what
+//! it would cost, including a reference taken off somebody else and an answer the heard-at-once
+//! veto will not honour. Nothing is written by asking. It is the pre-flight `enroll_session` has
+//! always run on copies before committing, made addressable rather than reimplemented, so a
+//! preview and a write cannot drift apart. See the `consequence` module for the dry run and its
+//! cost, which is per *answer* and emphatically not per keystroke.
+//!
 //! # And it corrects the *meeting* a session was labelled with
 //!
 //! [`run_meeting`] is this crate's premise -- an automatic guess, a human correction, a
@@ -71,11 +82,14 @@
 //! machine with no calendar grant. See the `meeting` module for what a correction may print,
 //! which is deliberately less than it holds.
 
+mod consequence;
 mod forget;
 mod meeting;
 mod references;
 mod resolve;
 
+use consequence::handle;
+pub use consequence::{Consequence, Preview, Refusal};
 pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
 pub use meeting::{Labelled, MeetingChoice, MeetingSource, Relabelling, run_meeting};
 pub use references::{Enrolled, Reference, Scan, Unreadable, VoiceChange, run_speakers, scan};
@@ -216,7 +230,7 @@ const PROMPT_FLOOR_SECONDS: f64 = 5.0;
 /// Two floors on one value must also agree about their own boundary, or a cluster of exactly
 /// 5.0 s would be asked about and then have its answer refused. The comparison here is
 /// `speech_seconds >= REFERENCE_FLOOR_SECONDS`, matching both neighbours.
-const REFERENCE_FLOOR_SECONDS: f64 = 5.0;
+pub(crate) const REFERENCE_FLOOR_SECONDS: f64 = 5.0;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -341,6 +355,26 @@ pub struct Voice<'a> {
     ///   accident: clustering splits one person in two, and the second half should offer the
     ///   name the first half was just given.
     pub resembles: Vec<Resemblance>,
+
+    /// What answering with a given name *would* do, asked without writing anything.
+    ///
+    /// [`resembles`](Voice::resembles) says who this voice sounds like; this says what happens
+    /// if you say so. An [`Interviewer`] holding it can show the consequence of the name under
+    /// the cursor -- that it enrols somebody new, that it takes a reference off Milo, that the
+    /// veto will refuse it -- before the user commits to it, which is the whole difference
+    /// between a prompt that reports what it did and one that can be answered.
+    ///
+    /// The three things the type cannot say:
+    ///
+    /// - **Asking writes nothing.** Not `speakers.json`, not this session's
+    ///   `speaker_names.json`, not the transcript. It runs on copies, which is why an
+    ///   `Interviewer` may ask about as many candidates as it likes.
+    /// - **One call is one answer's worth of work**, not one keystroke's: a database clone and
+    ///   two full labellings of the session. Preview the candidate the user has settled on;
+    ///   [`resolve()`] is the cheap thing to run per keystroke.
+    /// - **An answerer that never asks pays nothing.** [`GivenName`] does not, and neither does
+    ///   a line prompt that only reports outcomes after the fact.
+    pub preview: Preview<'a>,
 }
 
 /// What the user said when asked who a voice is.
@@ -630,7 +664,7 @@ pub struct EnrollRules<'a> {
 /// keeps using `named`, which is what makes it a sub-count rather than an eighth bucket.
 ///
 /// `refused` is answers that were not honoured because honouring them would have taken a name
-/// off another voice -- see `cost_of`. Not a `skipped`: the user answered, and the answer was
+/// off another voice -- see [`Refusal`]. Not a `skipped`: the user answered, and the answer was
 /// declined rather than absent. Not a `failed` either, since nothing went wrong and the run
 /// carries on; it is counted so the summary can say a question was answered and came to
 /// nothing, which is the one outcome a silent revert used to hide.
@@ -992,6 +1026,17 @@ fn enroll_session(
                 snippets,
                 clip: clip_for(&track, cluster),
                 resembles: rank_enrolled(&cluster.embedding, speakers),
+                // Six borrows and no work: what an answer would do is computed only if the
+                // answerer asks. Nothing is written by asking, so this is safe to hand out
+                // even though it holds the database -- see `Voice::preview`.
+                preview: Preview::new(
+                    &clusters.clusters,
+                    &unknown,
+                    speakers,
+                    &assigned,
+                    cluster,
+                    rules.enrolment,
+                ),
             })
         };
 
@@ -1012,94 +1057,45 @@ fn enroll_session(
             }
             Answer::Named(name) => name,
         };
-        // A name of nothing but spaces is somebody pressing Enter with a stray keystroke in
-        // the buffer, not a request for an entry called "".
-        let name = name.trim();
-        if name.is_empty() {
+        // Everything this answer would write, worked out on copies first -- the dry run the
+        // `consequence` module holds, and the same one an [`Interviewer`] may have already run
+        // through `Voice::preview`. Two files can carry a name and both feed the same
+        // labelling, so the only way to know what an answer *does* is to build the state it
+        // would leave and label the session through it; and the answer is not simply written
+        // and inspected afterwards because undoing a write that turned out to cost somebody
+        // their name means writing three files back, with a run interrupted mid-undo leaving
+        // exactly the mess this prevents.
+        //
+        // Built here rather than held from the prompt above because the commit below needs
+        // `speakers` mutably and a live `Preview` would keep it borrowed. It is the same six
+        // references and the same `of`, so the preview an answerer saw and the write cannot
+        // disagree.
+        //
+        // `None` is a name of nothing but spaces: somebody pressing Enter with a stray
+        // keystroke in the buffer, not a request for an entry called "". Where that is decided
+        // is `of`, so this path and a preview agree about it too.
+        let Some(consequence) = Preview::new(
+            &clusters.clusters,
+            &unknown,
+            speakers,
+            &assigned,
+            cluster,
+            rules.enrolment,
+        )
+        .of(&name) else {
             *left_alone += 1;
             continue;
-        }
-
-        // Naming a voice and storing a reference built from it are two different acts, and
-        // this is where they come apart. Below the floor the name is recorded against the
-        // session and `speakers.json` is not touched at all -- see `REFERENCE_FLOOR_SECONDS`
-        // for what a reference built from two seconds of speech does to every future meeting.
-        let session_only = cluster.speech_seconds < REFERENCE_FLOOR_SECONDS
-            && rules.enrolment != Enrolment::Always;
-
-        // Everything this answer would write, applied to copies first.
-        //
-        // Two files can carry a name -- `speakers.json` and this session's
-        // `speaker_names.json` -- and both feed the same labelling, so the only way to know
-        // what an answer *does* is to build the state it would leave and label the session
-        // through it. That is what these copies are for, and the pre-flight below is why the
-        // answer is not simply written and inspected afterwards: undoing a write that turned
-        // out to cost somebody their name means writing three files back, and a run
-        // interrupted mid-undo would leave exactly the mess this is here to prevent.
-        let mut candidate = speakers.clone();
-        let mut candidate_assigned = assigned.clone();
-
-        // The correction, on the above-floor path only: a reference identical to this cluster
-        // was built from this voice, and the user has just told us this voice is somebody
-        // else, so it is a stored claim about a person it is not of and it competes as an
-        // argmax in every future meeting -- winning whenever its name sorts first
-        // (`identify::best_match`'s tie-break).
-        let displaced = if session_only {
-            Vec::new()
-        } else {
-            candidate.forget_reference(&cluster.embedding, name)
         };
-
-        // What every voice reads once the correction alone has been applied. The baseline the
-        // pre-flight measures against, and the reason it is two labellings rather than one: a
-        // name lost *here* is the correction's documented consequence -- the user has just
-        // said that reference was of somebody else -- and refusing it would undo the guarantee
-        // the correction exists to keep.
-        let corrected = effective_labels(
-            &clusters.clusters,
-            &unknown,
-            &candidate,
-            &candidate_assigned.names,
-        );
-
-        // The addition. `None` on the below-floor path, where no reference is stored at all.
-        let stored = if session_only {
-            candidate_assigned.assign(cluster.id, name, cluster.embedding.clone());
-            None
-        } else {
-            let stored =
-                candidate.store_reference(name, cluster.embedding.clone(), cluster.speech_seconds);
-            if matches!(stored, Stored::AtCapacity { .. }) {
-                // At the cap with nothing shorter than this recording to displace, so it is not
-                // stored and the answer falls back to the session-only path rather than being
-                // lost: the transcript still reads the right person, and nothing already stored
-                // is dropped for a recording that is no better than it.
-                candidate_assigned.assign(cluster.id, name, cluster.embedding.clone());
-            } else {
-                // One voice, one record. A voice named for this session only and then enrolled
-                // properly -- the same fragment reached again with `--force-reference`, or a
-                // later clustering that gave it enough speech -- must stop also being an
-                // assignment, or the two could be made to disagree about who it is.
-                candidate_assigned.forget(cluster.id);
-            }
-            Some(stored)
-        };
-
-        let after = effective_labels(
-            &clusters.clusters,
-            &unknown,
-            &candidate,
-            &candidate_assigned.names,
-        );
+        let name = name.trim();
 
         // The refusal. An answer that would take a name off a voice the user is not answering
-        // about is not honoured at all -- see `cost_of` for the three ways that can happen and
+        // about is not honoured at all -- see `Refusal` for the three ways that can happen and
         // why one check covers them. Nothing is written, the voice keeps whatever it read, and
         // the user gets a line naming the voice that would have paid.
-        if let Some(cost) = cost_of(cluster.id, name, &unknown, &corrected, &after) {
+        if let Some(refusal) = consequence.refused {
             let answered = handle(cluster.id, &unknown);
-            match cost {
-                Cost::Vetoed {
+            match refusal {
+                Refusal::Vetoed {
                     holder: Some(holder),
                 } => writeln!(
                     out,
@@ -1108,12 +1104,12 @@ fn enroll_session(
                      meethook enroll --correct --voice {holder} if that is the wrong one",
                     session.id
                 )?,
-                Cost::Vetoed { holder: None } => writeln!(
+                Refusal::Vetoed { holder: None } => writeln!(
                     out,
                     "{}  refused {name} for {answered}: that name will not apply to this voice",
                     session.id
                 )?,
-                Cost::Taken { voice, losing } => writeln!(
+                Refusal::Taken { voice, losing } => writeln!(
                     out,
                     "{}  refused {name} for {answered}: it would take {losing} off {voice} -- \
                      meethook enroll --correct --voice {voice} if {voice} is not {losing}",
@@ -1124,14 +1120,14 @@ fn enroll_session(
             continue;
         }
 
-        // Committed by taking the copies the pre-flight ran against, so what lands on disk is
-        // the state that was checked rather than a second construction of it.
-        let speakers_changed = *speakers != candidate;
-        let assignments_changed = assigned.names != candidate_assigned.names;
-        *speakers = candidate;
-        assigned = candidate_assigned;
+        // Committed by taking the copies the dry run produced, so what lands on disk is the
+        // state that was checked rather than a second construction of it.
+        let speakers_changed = *speakers != consequence.speakers;
+        let assignments_changed = assigned.names != consequence.assigned.names;
+        *speakers = consequence.speakers;
+        assigned = consequence.assigned;
 
-        for who in &displaced {
+        for who in &consequence.displaced {
             // An enrollment that vanishes without a line about it is worse than the bug. Two
             // wordings, because "Nate no longer has a reference" is a lie when Nate has three
             // recordings and lost one.
@@ -1151,7 +1147,7 @@ fn enroll_session(
             }
         }
 
-        match stored {
+        match &consequence.stored {
             None => {
                 // The case being given up by not touching the database here: a legacy
                 // reference that *is* this exact fragment (built before the floor existed)
@@ -1159,13 +1155,7 @@ fn enroll_session(
                 // Reported rather than silently left, with the override that fixes it, because
                 // an enrollment that is wrong and unmentioned is worse than one that is wrong
                 // and named.
-                let stale: Vec<&str> = speakers
-                    .speakers
-                    .iter()
-                    .filter(|s| s.name != name && s.embedding == cluster.embedding)
-                    .map(|s| s.name.as_str())
-                    .collect();
-                for who in stale {
+                for who in &consequence.stale {
                     writeln!(
                         out,
                         "{}  {who} still has a reference built from this voice -- \
@@ -1701,104 +1691,6 @@ pub(crate) fn effective_labels(
         unknown,
         Naming::new(clusters, &identify_clusters(clusters, speakers), assigned),
     )
-}
-
-/// What honouring an answer would have taken away from a voice the user was not asked about.
-///
-/// Both variants name that voice by its "Unknown N" rather than by what it currently reads,
-/// because that is the one handle which reaches a voice whatever it is called and is exactly
-/// what [`VoiceSelector`] accepts -- so a refusal is a line the user can act on rather than
-/// only read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Cost {
-    /// The answered voice would not have ended up with the name at all: the heard-at-once veto
-    /// refuses to put one name on two voices segmentation proved are different people, and
-    /// `holder` is the voice it left the name on instead.
-    ///
-    /// `None` is "the answer simply did not take, and nobody else has that name" -- which the
-    /// veto makes unreachable in practice, since something has to have won the name for the
-    /// answered voice to have lost it. Refused just as firmly, because writing a reference that
-    /// then names nobody is not an outcome to accept silently.
-    Vetoed { holder: Option<String> },
-
-    /// The answer would have moved a name off another voice: `voice` is the voice, `losing` is
-    /// the name it reads now and would not read afterwards.
-    Taken { voice: String, losing: String },
-}
-
-/// How a voice is named in a refusal line: the "Unknown N" its first appearance earned it.
-///
-/// Every id reaching here is a key of `unknown`, which is built over every cluster in the
-/// session -- so the fallback is unreachable and exists only so this cannot panic on a
-/// hand-edited clusters file.
-fn handle(id: u32, unknown: &BTreeMap<u32, String>) -> String {
-    unknown
-        .get(&id)
-        .cloned()
-        .unwrap_or_else(|| "that voice".to_string())
-}
-
-/// Whether honouring an answer would cost some *other* voice its name, and how.
-///
-/// `corrected` is what the session reads once the correction the answer implies has been
-/// applied and nothing else; `after` is what it reads once the whole answer has been. Both are
-/// full labellings, produced by the same [`effective_labels`] the transcript is written
-/// through, which is the point: a guard reading anything else could disagree with what the
-/// transcript will say.
-///
-/// # Why the check is here rather than inside identification
-///
-/// Three different paths can take a name off a voice the user never mentioned, and all three
-/// resolve into one labelling before anything is written:
-///
-/// 1. **The heard-at-once veto.** Name two voices the segmenter heard overlapping with one
-///    name and the veto must refuse one -- by design. Which one it refuses is decided by
-///    similarity then cluster id, so it can be the *earlier* answer that loses.
-/// 2. **Theft by argmax.** A reference stored for one person can be nearer to some third voice
-///    than that voice's current name's references are, moving a name the user never asked
-///    about.
-/// 3. **An assignment beating an identification.** A hand-given name always wins over a match
-///    on a voice it overlaps, so naming a quiet fragment can drop that name off the voice that
-///    had it.
-///
-/// A check at this level covers all three at once, and cannot be inconsistent with the outcome
-/// the way three checks inside the three mechanisms could be.
-///
-/// # What is *not* a cost
-///
-/// A name lost between the labels shown before the answer and `corrected` is the correction's
-/// documented consequence: the user has just said that reference was of somebody else, and it
-/// goes with a line of its own. Collapsing the two labellings into one would refuse exactly the
-/// corrections the tool exists to accept.
-///
-/// A voice that *gains* a name is never a cost either -- that is one person's clustering split
-/// in two being named by one answer, which is the behaviour the split-voice guard relies on.
-fn cost_of(
-    answered: u32,
-    name: &str,
-    unknown: &BTreeMap<u32, String>,
-    corrected: &BTreeMap<u32, Attribution>,
-    after: &BTreeMap<u32, Attribution>,
-) -> Option<Cost> {
-    if after.get(&answered).map(Attribution::label) != Some(name) {
-        return Some(Cost::Vetoed {
-            holder: after
-                .iter()
-                .find(|&(&id, label)| id != answered && label.label() == name)
-                .map(|(&id, _)| handle(id, unknown)),
-        });
-    }
-    corrected
-        .iter()
-        .find(|&(&id, label)| {
-            id != answered
-                && label.is_named()
-                && after.get(&id).map(Attribution::label) != Some(label.label())
-        })
-        .map(|(&id, label)| Cost::Taken {
-            voice: handle(id, unknown),
-            losing: label.label().to_string(),
-        })
 }
 
 /// Rewrites every speaker-track turn to what `labels` says its voice should now be called,
@@ -4148,136 +4040,6 @@ mod tests {
         );
     }
 
-    /// The refusal rule, exercised as the pure comparison it is: two labellings in, and either
-    /// nothing or the voice that would have paid. Cheaper and more direct than reaching each
-    /// branch through a session on disk, which the tests above do for the paths that produce
-    /// these maps.
-    mod cost {
-        use super::*;
-
-        fn identified(name: &str) -> Attribution {
-            Attribution::Identified {
-                name: name.to_string(),
-                similarity: 0.9,
-            }
-        }
-
-        fn numbers(ids: &[u32]) -> BTreeMap<u32, String> {
-            ids.iter()
-                .enumerate()
-                .map(|(nth, &id)| (id, unknown_speaker(nth + 1)))
-                .collect()
-        }
-
-        #[test]
-        fn an_answer_that_costs_nobody_anything_is_free() {
-            let labels = |zero: Attribution| BTreeMap::from([(0, zero), (1, identified("Bob"))]);
-
-            assert_eq!(
-                cost_of(
-                    0,
-                    "Alice",
-                    &numbers(&[0, 1]),
-                    &labels(Attribution::Unknown("Unknown 1".to_string())),
-                    &labels(identified("Alice")),
-                ),
-                None
-            );
-        }
-
-        /// The answered voice did not get the name, and another voice has it: the veto, which
-        /// is the one loss the reference set cannot design away.
-        #[test]
-        fn an_answer_the_veto_took_names_the_voice_that_kept_the_name() {
-            let corrected = BTreeMap::from([
-                (0, identified("Alice")),
-                (1, Attribution::Unknown("Unknown 2".to_string())),
-            ]);
-            let after = BTreeMap::from([
-                (0, identified("Alice")),
-                (1, Attribution::Unknown("Unknown 2".to_string())),
-            ]);
-
-            assert_eq!(
-                cost_of(1, "Alice", &numbers(&[0, 1]), &corrected, &after),
-                Some(Cost::Vetoed {
-                    holder: Some("Unknown 1".to_string())
-                })
-            );
-        }
-
-        /// An answer that simply did not take, with nobody else holding the name. Unreachable
-        /// through the veto -- something has to have won the name for this voice to have lost
-        /// it -- and refused anyway, because a reference that then names nobody is not a state
-        /// to write silently.
-        #[test]
-        fn an_answer_that_did_not_take_at_all_is_refused_with_nobody_to_name() {
-            let labels = BTreeMap::from([(0, Attribution::Unknown("Unknown 1".to_string()))]);
-
-            assert_eq!(
-                cost_of(0, "Alice", &numbers(&[0]), &labels, &labels),
-                Some(Cost::Vetoed { holder: None })
-            );
-        }
-
-        /// Theft: the answered voice gets the name, and another voice's name goes with it.
-        #[test]
-        fn an_answer_that_moves_another_voices_name_reports_that_voice_and_the_name() {
-            let corrected = BTreeMap::from([
-                (0, Attribution::Unknown("Unknown 1".to_string())),
-                (1, identified("Bob")),
-            ]);
-            let after = BTreeMap::from([(0, identified("Alice")), (1, identified("Alice"))]);
-
-            assert_eq!(
-                cost_of(0, "Alice", &numbers(&[0, 1]), &corrected, &after),
-                Some(Cost::Taken {
-                    voice: "Unknown 2".to_string(),
-                    losing: "Bob".to_string()
-                })
-            );
-        }
-
-        /// A voice that *gains* a name is not a cost: that is one person whose clustering split
-        /// in two being named by one answer, which is behaviour the split-voice guard depends
-        /// on rather than something to refuse.
-        #[test]
-        fn a_voice_that_gains_a_name_costs_nothing() {
-            let corrected = BTreeMap::from([
-                (0, Attribution::Unknown("Unknown 1".to_string())),
-                (1, Attribution::Unknown("Unknown 2".to_string())),
-            ]);
-            let after = BTreeMap::from([(0, identified("Alice")), (1, identified("Alice"))]);
-
-            assert_eq!(
-                cost_of(0, "Alice", &numbers(&[0, 1]), &corrected, &after),
-                None
-            );
-        }
-
-        /// The distinction the two labellings exist for. A name the *correction* removed is
-        /// already gone in `corrected`, so it is not a refusal -- the user has just said that
-        /// reference was of somebody else, and it gets a line of its own instead.
-        #[test]
-        fn a_name_the_correction_itself_removed_is_not_a_refusal() {
-            // Nate held cluster 1 before the answer; the correction dropped the reference that
-            // did it, so `corrected` already reads "Unknown 2" there.
-            let corrected = BTreeMap::from([
-                (0, Attribution::Unknown("Unknown 1".to_string())),
-                (1, Attribution::Unknown("Unknown 2".to_string())),
-            ]);
-            let after = BTreeMap::from([
-                (0, identified("Ryan")),
-                (1, Attribution::Unknown("Unknown 2".to_string())),
-            ]);
-
-            assert_eq!(
-                cost_of(0, "Ryan", &numbers(&[0, 1]), &corrected, &after),
-                None
-            );
-        }
-    }
-
     /// The prompt finds its lines by the cluster the turns came from, not by what they read.
     /// Two voices under one enrolled name is exactly the case a correction is for, and keyed
     /// on the label text both prompts would show the same person's words.
@@ -5454,6 +5216,165 @@ mod tests {
         assert_eq!(
             interviewer.seen[1].offered(),
             [("Zoe", 1), ("Alice", 1)],
+            "{output}"
+        );
+    }
+
+    /// An [`Interviewer`] that asks what one name would do before deciding what to answer, and
+    /// keeps every answer it got back.
+    ///
+    /// The type is the point. It holds no [`EnrolledSpeakers`], no [`Paths`], no session
+    /// directory and no `&mut` anything -- a [`Voice`] is the whole of what it is handed -- so a
+    /// test that reads a [`Consequence`] out of it has shown that the seam carries the preview
+    /// rather than that this module went and computed one.
+    ///
+    /// It answers the first voice it is shown and skips the rest, because these tests are about
+    /// one answer landing and the fixture session has two voices.
+    struct Previewing {
+        asking: String,
+        answer: Answer,
+        previews: Vec<Option<Consequence>>,
+    }
+
+    impl Previewing {
+        fn asking(name: &str, answer: Answer) -> Previewing {
+            Previewing {
+                asking: name.to_string(),
+                answer,
+                previews: Vec::new(),
+            }
+        }
+
+        /// What the first voice's preview said, which is the one every test here asserts on.
+        fn first(&self) -> &Consequence {
+            self.previews[0]
+                .as_ref()
+                .expect("a name that is not blank has a consequence")
+        }
+    }
+
+    impl Interviewer for Previewing {
+        fn identify(&mut self, voice: &Voice<'_>) -> Answer {
+            self.previews.push(voice.preview.of(&self.asking));
+            if self.previews.len() == 1 {
+                self.answer.clone()
+            } else {
+                Answer::Skip
+            }
+        }
+    }
+
+    fn run_previewing(paths: &Paths, interviewer: &mut Previewing) -> (EnrollReport, String) {
+        run_over(
+            paths,
+            &[],
+            None,
+            Offer::default(),
+            Enrolment::default(),
+            interviewer,
+        )
+    }
+
+    /// Acceptance criterion #1, at the strongest available reading of "writes nothing": not
+    /// "`speakers.json` is unchanged" but "no file under the root changed by one byte", over a
+    /// run that previewed a name for every voice it was shown and then answered none of them.
+    #[test]
+    fn asking_what_a_name_would_do_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        let before = files_under(root.path());
+
+        let mut interviewer = Previewing::asking("Alice", Answer::Skip);
+        let (report, output) = run_previewing(&paths, &mut interviewer);
+
+        assert_eq!(report.named, 0, "{output}");
+        assert_eq!(report.skipped, 2, "{output}");
+        assert_eq!(interviewer.previews.len(), 2, "{output}");
+        assert_eq!(
+            interviewer.first().stored,
+            Some(Stored::Enrolled),
+            "{output}"
+        );
+        assert_eq!(
+            files_under(root.path()),
+            before,
+            "asking what an answer would do may not write one byte: {output}"
+        );
+    }
+
+    /// Acceptance criterion #5: the outcome a preview reported is the outcome the write
+    /// produced. Agreement is structural -- the commit takes the copies the dry run built -- so
+    /// what this pins is that a later refactor cannot go back to deriving the two separately.
+    #[test]
+    fn a_preview_of_an_enrollment_is_what_the_answer_then_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        let mut interviewer = Previewing::asking("Alice", named("Alice"));
+        let (report, output) = run_previewing(&paths, &mut interviewer);
+
+        assert_eq!(
+            interviewer.first().stored,
+            Some(Stored::Enrolled),
+            "{output}"
+        );
+        assert!(!interviewer.first().session_only(), "{output}");
+        assert!(output.contains("enrolled Alice"), "{output}");
+        assert_eq!(report.named, 1, "{output}");
+        assert_eq!(report.session_only, 0, "{output}");
+        assert_eq!(
+            EnrolledSpeakers::read_or_empty(&paths)
+                .unwrap()
+                .references("Alice"),
+            1,
+            "{output}"
+        );
+    }
+
+    /// The same agreement over the outcome that is easiest to get wrong, because the name still
+    /// lands while nothing is stored: at the cap, the preview must say so *before* the user
+    /// commits to a name that will not help recognise anybody next time.
+    #[test]
+    fn a_preview_at_the_reference_cap_is_the_session_only_name_that_follows() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let axes = MAX_REFERENCES_PER_SPEAKER + 2;
+        let session = make_session(&paths, "20260809-052600");
+        // Every voice on its own axis, so nothing Alice holds is within reach of the voice being
+        // asked about and the question really is asked.
+        with_embeddings(&session, &[axis(axes - 2, axes), axis(axes - 1, axes)]);
+        let held: Vec<(&str, Vec<f32>)> = (0..MAX_REFERENCES_PER_SPEAKER)
+            .map(|i| ("Alice", axis(i, axes)))
+            .collect();
+        enrolled(&held, &paths);
+
+        let mut interviewer = Previewing::asking("Alice", named("Alice"));
+        let (report, output) = run_previewing(&paths, &mut interviewer);
+
+        assert_eq!(
+            interviewer.first().stored,
+            Some(Stored::AtCapacity {
+                held: MAX_REFERENCES_PER_SPEAKER,
+                shortest: None,
+            }),
+            "{output}"
+        );
+        assert!(interviewer.first().session_only(), "{output}");
+        assert!(
+            output.contains(&format!(
+                "named Alice in this session only: Alice already holds \
+                 {MAX_REFERENCES_PER_SPEAKER} reference(s)"
+            )),
+            "{output}"
+        );
+        assert_eq!(report.session_only, 1, "{output}");
+        assert_eq!(
+            EnrolledSpeakers::read_or_empty(&paths)
+                .unwrap()
+                .references("Alice"),
+            MAX_REFERENCES_PER_SPEAKER,
             "{output}"
         );
     }
