@@ -85,6 +85,7 @@
 mod consequence;
 mod forget;
 mod meeting;
+mod narration;
 mod references;
 mod resolve;
 
@@ -92,18 +93,22 @@ use consequence::handle;
 pub use consequence::{Consequence, Preview, Refusal};
 pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
 pub use meeting::{Labelled, MeetingChoice, MeetingSource, Relabelling, run_meeting};
+pub use narration::{
+    AnswerNote, Lines, Narrator, Nearest, NotSelected, Note, PassedOver, RunNote, SessionFile,
+    SessionNote, VoiceDescription,
+};
+use narration::{about, after};
 pub use references::{Enrolled, Reference, Scan, Unreadable, VoiceChange, run_speakers, scan};
 pub use resolve::{Likeness, Match, Resolution, resolve};
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use meethook_session::{
     AssignedName, Classification, DiscoveredSession, EnrolledSpeakers, Paths, SessionId,
-    SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Stored, Transcript,
-    TranscriptContext, TranscriptTemplate, TranscriptTime, VoiceAt, discover_sessions,
-    unknown_labels, unknown_speaker,
+    SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Transcript, TranscriptContext,
+    TranscriptTemplate, TranscriptTime, VoiceAt, discover_sessions, unknown_labels,
+    unknown_speaker,
 };
 use meethook_transcribe::{
     Attribution, Naming, Resemblance, TARGET_RATE, attributions, identify_clusters, rank_enrolled,
@@ -716,7 +721,7 @@ pub fn run_enroll(
     requested: &[SessionId],
     rules: EnrollRules<'_>,
     interviewer: &mut dyn Interviewer,
-    out: &mut dyn Write,
+    notes: &mut dyn Narrator,
 ) -> Result<EnrollReport> {
     let mut report = EnrollReport::default();
 
@@ -727,12 +732,7 @@ pub fn run_enroll(
     if let Some(selection) = rules.selector
         && requested.len() != 1
     {
-        writeln!(
-            out,
-            "{} needs exactly one session id: {}",
-            selection.flag(),
-            selection.why_one_session()
-        )?;
+        notes.note(Note::Run(RunNote::SelectionNeedsOneSession { selection }))?;
         report.failed += 1;
         return Ok(report);
     }
@@ -742,11 +742,7 @@ pub fn run_enroll(
     // the one place that can see both the answerer and the selection, and a library caller
     // wiring up a [`GivenName`] gets the same protection the CLI does.
     if rules.selector.is_none() && interviewer.needs_one_voice() {
-        writeln!(
-            out,
-            "--name needs a voice to put that name on: pass --at <MM:SS> or --voice <VOICE>, \
-             since a name given up front is never shown the voice it is answering about"
-        )?;
+        notes.note(Note::Run(RunNote::NameNeedsAVoice))?;
         report.failed += 1;
         return Ok(report);
     }
@@ -755,7 +751,7 @@ pub fn run_enroll(
 
     for id in requested {
         if !discovered.iter().any(|session| &session.id == id) {
-            writeln!(out, "{id}  not found")?;
+            notes.note(Note::Run(RunNote::SessionNotFound { id }))?;
             report.failed += 1;
         }
     }
@@ -770,11 +766,9 @@ pub fn run_enroll(
     };
 
     if selected.is_empty() && requested.is_empty() {
-        writeln!(
-            out,
-            "No sessions found in {}",
-            paths.sessions_dir().display()
-        )?;
+        notes.note(Note::Run(RunNote::NoSessionsFound {
+            dir: &paths.sessions_dir(),
+        }))?;
         return Ok(report);
     }
 
@@ -787,7 +781,7 @@ pub fn run_enroll(
             rules,
             &mut speakers,
             interviewer,
-            out,
+            notes,
             &mut report,
         )? {
             Outcome::Finished => {}
@@ -815,21 +809,25 @@ fn enroll_session(
     rules: EnrollRules<'_>,
     speakers: &mut EnrolledSpeakers,
     interviewer: &mut dyn Interviewer,
-    out: &mut dyn Write,
+    notes: &mut dyn Narrator,
     report: &mut EnrollReport,
 ) -> Result<Outcome> {
     match session.classification {
         Classification::Orphaned => {
-            writeln!(
-                out,
-                "{}  passed over: no session.json (the recorder crashed mid-session)",
-                session.id
+            about(
+                notes,
+                &session.id,
+                SessionNote::PassedOver(PassedOver::Orphaned),
             )?;
             report.passed_over += 1;
             return Ok(Outcome::Finished);
         }
         Classification::Valid => {
-            writeln!(out, "{}  passed over: not transcribed yet", session.id)?;
+            about(
+                notes,
+                &session.id,
+                SessionNote::PassedOver(PassedOver::NotTranscribed),
+            )?;
             report.passed_over += 1;
             return Ok(Outcome::Finished);
         }
@@ -842,11 +840,7 @@ fn enroll_session(
         // appearances were recorded: without them an "Unknown 2" cannot be mapped back to a
         // voice at all, so the file is refused rather than read with a defaulted zero.
         Err(e) => {
-            writeln!(
-                out,
-                "{}  failed: {e} -- re-transcribe this session with --force",
-                session.id
-            )?;
+            unreadable(notes, session, SessionFile::Clusters, &e)?;
             report.failed += 1;
             return Ok(Outcome::Finished);
         }
@@ -862,7 +856,7 @@ fn enroll_session(
         // marker that this directory is a session at all, so the only honest instruction is to
         // go and look at it.
         Err(e) => {
-            writeln!(out, "{}  failed: {e} -- fix that file", session.id)?;
+            unreadable(notes, session, SessionFile::Metadata, &e)?;
             report.failed += 1;
             return Ok(Outcome::Finished);
         }
@@ -873,11 +867,7 @@ fn enroll_session(
         // from before turns recorded which cluster they came from. A user told only "missing
         // field `cluster`" has been given a diagnosis with no next step.
         Err(e) => {
-            writeln!(
-                out,
-                "{}  failed: {e} -- re-transcribe this session with --force",
-                session.id
-            )?;
+            unreadable(notes, session, SessionFile::Transcript, &e)?;
             report.failed += 1;
             return Ok(Outcome::Finished);
         }
@@ -892,11 +882,7 @@ fn enroll_session(
         // names a person typed and nothing else can regenerate them, so the only honest
         // instruction is to go and look at it.
         Err(e) => {
-            writeln!(
-                out,
-                "{}  failed: {e} -- fix or delete that file",
-                session.id
-            )?;
+            unreadable(notes, session, SessionFile::Names, &e)?;
             report.failed += 1;
             return Ok(Outcome::Finished);
         }
@@ -926,7 +912,7 @@ fn enroll_session(
             rules.template,
             &TranscriptContext::now(&metadata),
         )?;
-        writeln!(out, "{}  transcript brought up to date", session.id)?;
+        about(notes, &session.id, SessionNote::BroughtUpToDate)?;
     }
 
     // First-appearance order, which is "Unknown 1, Unknown 2, ..." -- the order the user
@@ -945,7 +931,7 @@ fn enroll_session(
     // about a shorter list. `None` is a session that is finished and has said why.
     let offered = match rules.selector {
         Some(Selection::Voice(selector)) => {
-            targeted(selector, &order, &unknown, &shown, session, out, report)?
+            targeted(selector, &order, &unknown, &shown, session, notes, report)?
         }
         Some(Selection::At(at)) => at_timestamp(
             at,
@@ -954,10 +940,10 @@ fn enroll_session(
             &unknown,
             &shown,
             session,
-            out,
+            notes,
             report,
         )?,
-        None => queue(&order, &shown, rules.offer, session, out, report)?,
+        None => queue(&order, &shown, rules.offer, session, notes, report)?,
     };
     let Some(offered) = offered else {
         return Ok(Outcome::Finished);
@@ -1091,34 +1077,44 @@ fn enroll_session(
         // The refusal. An answer that would take a name off a voice the user is not answering
         // about is not honoured at all -- see `Refusal` for the three ways that can happen and
         // why one check covers them. Nothing is written, the voice keeps whatever it read, and
-        // the user gets a line naming the voice that would have paid.
-        if let Some(refusal) = consequence.refused {
+        // the note names the voice that would have paid.
+        if let Some(refusal) = &consequence.refused {
             let answered = handle(cluster.id, &unknown);
-            match refusal {
-                Refusal::Vetoed {
-                    holder: Some(holder),
-                } => writeln!(
-                    out,
-                    "{}  refused {name} for {answered}: {holder} already has that name and the \
-                     two were heard speaking at once, so they are not one person -- \
-                     meethook enroll --correct --voice {holder} if that is the wrong one",
-                    session.id
-                )?,
-                Refusal::Vetoed { holder: None } => writeln!(
-                    out,
-                    "{}  refused {name} for {answered}: that name will not apply to this voice",
-                    session.id
-                )?,
-                Refusal::Taken { voice, losing } => writeln!(
-                    out,
-                    "{}  refused {name} for {answered}: it would take {losing} off {voice} -- \
-                     meethook enroll --correct --voice {voice} if {voice} is not {losing}",
-                    session.id
-                )?,
-            }
+            after(
+                notes,
+                &session.id,
+                AnswerNote::Refused {
+                    name,
+                    voice: &answered,
+                    refusal,
+                },
+            )?;
             report.refused += 1;
             continue;
         }
+
+        // Everything this answer wrote, as one note rather than as the four to six lines it
+        // used to print, because that is the block an interface lays out together.
+        //
+        // Narrated *before* the copies are taken out of the consequence below: nothing between
+        // here and there writes a byte, so the order the user sees is unchanged, and a
+        // partially moved `Consequence` can no longer be borrowed.
+        after(
+            notes,
+            &session.id,
+            AnswerNote::Committed {
+                name,
+                speech_seconds: cluster.speech_seconds,
+                consequence: &consequence,
+            },
+        )?;
+        // A sub-count of `named`, and now read off the type rather than off the two arms of
+        // the match that used to print those two sentences -- which is what
+        // `Consequence::session_only` is documented to be.
+        if consequence.session_only() {
+            report.session_only += 1;
+        }
+        report.named += 1;
 
         // Committed by taking the copies the dry run produced, so what lands on disk is the
         // state that was checked rather than a second construction of it.
@@ -1126,102 +1122,6 @@ fn enroll_session(
         let assignments_changed = assigned.names != consequence.assigned.names;
         *speakers = consequence.speakers;
         assigned = consequence.assigned;
-
-        for who in &consequence.displaced {
-            // An enrollment that vanishes without a line about it is worse than the bug. Two
-            // wordings, because "Nate no longer has a reference" is a lie when Nate has three
-            // recordings and lost one.
-            if who.remaining == 0 {
-                writeln!(
-                    out,
-                    "{}  {} no longer has a reference: that voice is {name}",
-                    session.id, who.name
-                )?;
-            } else {
-                writeln!(
-                    out,
-                    "{}  {} no longer has that reference: that voice is {name} -- {} keeps {} \
-                     other(s)",
-                    session.id, who.name, who.name, who.remaining
-                )?;
-            }
-        }
-
-        match &consequence.stored {
-            None => {
-                // The case being given up by not touching the database here: a legacy
-                // reference that *is* this exact fragment (built before the floor existed)
-                // stays, and goes on competing as an argmax under somebody else's name.
-                // Reported rather than silently left, with the override that fixes it, because
-                // an enrollment that is wrong and unmentioned is worse than one that is wrong
-                // and named.
-                for who in &consequence.stale {
-                    writeln!(
-                        out,
-                        "{}  {who} still has a reference built from this voice -- \
-                         meethook enroll --force-reference to replace it with {name}",
-                        session.id
-                    )?;
-                }
-                writeln!(
-                    out,
-                    "{}  named {name} in this session only: {:.1} s of speech is under the \
-                     {REFERENCE_FLOOR_SECONDS} s reference floor -- \
-                     meethook enroll --force-reference to store a reference anyway",
-                    session.id, cluster.speech_seconds
-                )?;
-                report.session_only += 1;
-            }
-            Some(Stored::Enrolled) => writeln!(out, "{}  enrolled {name}", session.id)?,
-            Some(Stored::Added { held }) => writeln!(
-                out,
-                "{}  enrolled another recording of {name}: {held} reference(s) now",
-                session.id
-            )?,
-            Some(Stored::AlreadyHeld) => writeln!(
-                out,
-                "{}  {name} already has a reference built from this voice",
-                session.id
-            )?,
-            Some(Stored::Replaced {
-                held,
-                evicted_seconds,
-            }) => writeln!(
-                out,
-                "{}  enrolled a better recording of {name}: {:.1} s replaces the shortest of \
-                 their {held}, which was {evicted_seconds:.1} s -- that one may have been \
-                 naming a voice in another session, and meethook enroll over it says so",
-                session.id, cluster.speech_seconds
-            )?,
-            Some(Stored::AtCapacity { held, shortest }) => {
-                // Why it was refused, not just that it was: at the cap the answer turns on this
-                // clip's length, and a user who is not told that cannot tell "come back with a
-                // longer recording" from "this person is full forever".
-                let why = match shortest {
-                    Some(shortest) => format!(
-                        "{:.1} s of speech is no longer than the shortest of them, at {shortest:.1} s",
-                        cluster.speech_seconds
-                    ),
-                    None => "none of them records how long a recording it was built from, so \
-                             there is nothing to say this one is better"
-                        .to_string(),
-                };
-                // Both commands, and in this order: the line cannot know which reference should
-                // go -- that is the question `speakers` exists to answer -- and naming only
-                // `forget` would send the user to pick a number blind.
-                writeln!(
-                    out,
-                    "{}  named {name} in this session only: {name} already holds {held} \
-                     reference(s), the most meethook keeps for one person, and {why}, so this \
-                     recording is not stored and does not help recognise them -- meethook \
-                     speakers shows what each of them is naming, meethook forget {name} \
-                     --reference N removes the one you pick",
-                    session.id
-                )?;
-                report.session_only += 1;
-            }
-        }
-        report.named += 1;
 
         // Written in a fixed order -- the database, then this session's names, then the
         // transcript -- and only where something changed, so a skipped write leaves a file
@@ -1249,7 +1149,7 @@ fn enroll_session(
         // and `--voice` both showed them the voice first, and several tests pin their output
         // exactly as it is.
         if matches!(rules.selector, Some(Selection::At(_))) {
-            report_rename(&transcript, &shown, &now, name, session, out)?;
+            report_rename(&transcript, &shown, &now, name, session, notes)?;
         }
         shown = now;
     }
@@ -1268,7 +1168,7 @@ fn queue<'c>(
     shown: &BTreeMap<u32, Attribution>,
     offer: Offer,
     session: &DiscoveredSession,
-    out: &mut dyn Write,
+    notes: &mut dyn Narrator,
     report: &mut EnrollReport,
 ) -> Result<Option<Vec<&'c SpeakerCluster>>> {
     // The one place "already named" is decided. Everything below -- the floor, the in-run
@@ -1281,19 +1181,14 @@ fn queue<'c>(
         .collect();
     if candidates.is_empty() {
         // A session whose voices are all identified is exactly where somebody stands when one
-        // of those identifications is wrong, and this line is the only thing it prints -- so
-        // it names the escape, the way the held-back line already names `--all`.
+        // of those identifications is wrong, and this note is the only thing it produces -- so
+        // it carries the count that reaches the escape, the way the held-back one names `--all`.
         let named = shown.values().filter(|label| label.is_named()).count();
-        if named == 0 {
-            writeln!(out, "{}  passed over: nothing unresolved", session.id)?;
-        } else {
-            writeln!(
-                out,
-                "{}  passed over: nothing unresolved ({named} named voice(s) -- \
-                 meethook enroll --correct)",
-                session.id
-            )?;
-        }
+        about(
+            notes,
+            &session.id,
+            SessionNote::PassedOver(PassedOver::NothingUnresolved { named }),
+        )?;
         report.passed_over += 1;
         return Ok(None);
     }
@@ -1325,32 +1220,23 @@ fn queue<'c>(
     let held_back = queued - offered.len();
     report.held_back += held_back;
 
-    // "Unresolved" is false under `--correct`, where most of the queue is resolved and the
-    // point is to review it. The default wording is left exactly as it was.
-    //
     // `offered.len()` here is the same number every prompt below carries as its [`Position`]
     // total, because both read this list. Anything that computes this count independently
     // breaks that.
-    let counted = if offer.named {
-        let already = offered.iter().filter(|c| shown[&c.id].is_named()).count();
-        format!(
-            "{} voice(s) to review, {already} of them already named",
-            offered.len()
-        )
-    } else {
-        format!("{} unresolved voice(s)", offered.len())
-    };
-    if held_back == 0 {
-        writeln!(out, "{}  {counted}", session.id)?;
-    } else {
-        // Naming the escape rather than only the count: a voice nobody is told about is not
-        // reachable, which is what AC #3 asks for.
-        writeln!(
-            out,
-            "{}  {counted}, {held_back} quieter voice(s) not offered -- meethook enroll --all",
-            session.id
-        )?;
-    }
+    //
+    // `already_named` is `Some` exactly under `--correct`, which is what makes the queue a
+    // review rather than a list of unknowns -- and so is what picks between the two wordings.
+    about(
+        notes,
+        &session.id,
+        SessionNote::Queue {
+            offered: offered.len(),
+            already_named: offer
+                .named
+                .then(|| offered.iter().filter(|c| shown[&c.id].is_named()).count()),
+            held_back,
+        },
+    )?;
 
     Ok(Some(offered))
 }
@@ -1369,7 +1255,7 @@ fn targeted<'c>(
     unknown: &BTreeMap<u32, String>,
     shown: &BTreeMap<u32, Attribution>,
     session: &DiscoveredSession,
-    out: &mut dyn Write,
+    notes: &mut dyn Narrator,
     report: &mut EnrollReport,
 ) -> Result<Option<Vec<&'c SpeakerCluster>>> {
     let matched: Vec<&SpeakerCluster> = order
@@ -1382,51 +1268,40 @@ fn targeted<'c>(
 
     match matched.len() {
         1 => {
-            // The literal 1 is this run's whole queue, so the one prompt below reads `1/1`.
-            writeln!(
-                out,
-                "{}  1 voice selected: {}",
-                session.id,
-                describe(matched[0])
+            about(
+                notes,
+                &session.id,
+                SessionNote::Selected {
+                    at: None,
+                    voice: describe(matched[0]),
+                },
             )?;
             Ok(Some(matched))
         }
         0 => {
-            // The voices are listed rather than merely counted, quiet ones included, because a
-            // miss is usually a number off by one or a name spelled as the user remembers it
-            // rather than as the transcript has it -- and the quiet voices are exactly what
-            // somebody is reaching for when they miss. Fifty-odd lines on a real session is
-            // still far cheaper than fifty-odd prompts.
-            writeln!(
-                out,
-                "{}  no voice matched {selector} -- this session has {}:",
-                session.id,
-                order.len()
+            // Every voice, quiet ones included: a miss is usually a number off by one or a name
+            // spelled as the user remembers it rather than as the transcript has it -- and the
+            // quiet voices are exactly what somebody is reaching for when they miss. Fifty-odd
+            // lines on a real session is still far cheaper than fifty-odd prompts.
+            about(
+                notes,
+                &session.id,
+                SessionNote::NotSelected(NotSelected::NoVoiceMatched {
+                    selector,
+                    voices: order.iter().copied().map(describe).collect(),
+                }),
             )?;
-            for cluster in order {
-                writeln!(out, "    {}", describe(cluster))?;
-            }
             report.failed += 1;
             Ok(None)
         }
         _ => {
-            // Two voices under one enrolled name is the false accept `--correct` exists to
-            // fix, so the message has to hand back the thing that tells them apart, which is
-            // the number. Quoted as a whole label rather than as a bare digit so it can be
-            // pasted straight back: both forms are accepted, and only one of them survives
-            // being read off a line that also contains a name.
-            let voices: Vec<String> = matched.iter().map(|c| describe(c)).collect();
-            let numbers: Vec<String> = matched
-                .iter()
-                .map(|c| format!("--voice \"{}\"", unknown[&c.id]))
-                .collect();
-            writeln!(
-                out,
-                "{}  {selector} matches {} voices: {} -- pass one of {}",
-                session.id,
-                matched.len(),
-                voices.join(", "),
-                numbers.join(" or ")
+            about(
+                notes,
+                &session.id,
+                SessionNote::NotSelected(NotSelected::SeveralVoicesMatched {
+                    selector,
+                    voices: matched.iter().copied().map(describe).collect(),
+                }),
             )?;
             report.failed += 1;
             Ok(None)
@@ -1434,22 +1309,21 @@ fn targeted<'c>(
     }
 }
 
-/// How one voice reads in a message about several: the number it is reachable by, plus the name
-/// it currently carries when that is not the number itself.
+/// How one voice reads in a message about several: the number it is reachable by, the name it
+/// currently carries, and how much it spoke.
 ///
 /// Shared by both selectors so that a list of candidates reads the same however the user missed:
-/// the number is what the message hands back, and it has to be the same number in both.
+/// the number is what the message hands back, and it has to be the same number in both. Which of
+/// the three fields end up in a sentence, and in what order, belongs to the `narration` module.
 fn describe(
     cluster: &SpeakerCluster,
     unknown: &BTreeMap<u32, String>,
     shown: &BTreeMap<u32, Attribution>,
-) -> String {
-    let number = &unknown[&cluster.id];
-    let label = shown[&cluster.id].label();
-    if label == number {
-        format!("{number} ({:.1} s)", cluster.speech_seconds)
-    } else {
-        format!("{number} -- {label} ({:.1} s)", cluster.speech_seconds)
+) -> VoiceDescription {
+    VoiceDescription {
+        number: unknown[&cluster.id].clone(),
+        label: shown[&cluster.id].label().to_string(),
+        speech_seconds: cluster.speech_seconds,
     }
 }
 
@@ -1476,7 +1350,7 @@ fn at_timestamp<'c>(
     unknown: &BTreeMap<u32, String>,
     shown: &BTreeMap<u32, Attribution>,
     session: &DiscoveredSession,
-    out: &mut dyn Write,
+    notes: &mut dyn Narrator,
     report: &mut EnrollReport,
 ) -> Result<Option<Vec<&'c SpeakerCluster>>> {
     // Each non-answer says which of them it was and what to do about it: they are four
@@ -1484,24 +1358,11 @@ fn at_timestamp<'c>(
     let voice = match transcript.voice_at(at) {
         VoiceAt::Cluster(id) => id,
         VoiceAt::LocalSpeaker => {
-            writeln!(
-                out,
-                "{}  {at} is on the microphone track: that is you, and enroll names the voices \
-                 it heard rather than the person holding the machine",
-                session.id
-            )?;
-            report.failed += 1;
+            missed(notes, session, NotSelected::OnTheMicrophone { at }, report)?;
             return Ok(None);
         }
         VoiceAt::NoCluster => {
-            writeln!(
-                out,
-                "{}  the turn at {at} records no voice: diarization found no speakers in this \
-                 session, so its turns have nothing to hang a name on -- re-transcribe this \
-                 session with --force",
-                session.id
-            )?;
-            report.failed += 1;
+            missed(notes, session, NotSelected::NoClusters { at }, report)?;
             return Ok(None);
         }
         VoiceAt::Silence => {
@@ -1510,28 +1371,24 @@ fn at_timestamp<'c>(
             let nearest = transcript
                 .turns
                 .iter()
-                .min_by(|a, b| gap_to(a, at).total_cmp(&gap_to(b, at)));
-            match nearest {
-                Some(turn) => writeln!(
-                    out,
-                    "{}  nobody was speaking at {at}: the nearest turn is {} at {}",
-                    session.id,
-                    turn.speaker,
-                    TranscriptTime::of(turn.start)
-                )?,
-                None => writeln!(out, "{}  nobody was speaking at {at}", session.id)?,
-            }
-            report.failed += 1;
+                .min_by(|a, b| gap_to(a, at).total_cmp(&gap_to(b, at)))
+                .map(|turn| Nearest {
+                    speaker: turn.speaker.clone(),
+                    at: TranscriptTime::of(turn.start),
+                });
+            missed(notes, session, NotSelected::Silence { at, nearest }, report)?;
             return Ok(None);
         }
         VoiceAt::PastEnd { last } => {
-            writeln!(
-                out,
-                "{}  {at} is past the end of this session, which ends at {}",
-                session.id,
-                TranscriptTime::of(last)
+            missed(
+                notes,
+                session,
+                NotSelected::PastEnd {
+                    at,
+                    last: TranscriptTime::of(last),
+                },
+                report,
             )?;
-            report.failed += 1;
             return Ok(None);
         }
     };
@@ -1542,51 +1399,73 @@ fn at_timestamp<'c>(
     // exactly as an ambiguous `--voice` does.
     let candidates = transcript.clusters_at(at);
     if candidates.len() > 1 {
-        let voices: Vec<String> = candidates
-            .iter()
-            .filter_map(|id| order.iter().find(|c| c.id == *id))
-            .map(|c| describe(c, unknown, shown))
-            .collect();
-        let numbers: Vec<String> = candidates
-            .iter()
-            .filter_map(|id| unknown.get(id))
-            .map(|number| format!("--voice \"{number}\""))
-            .collect();
-        writeln!(
-            out,
-            "{}  {at} is the label of {} turns, by different voices: {} -- pass one of {}",
-            session.id,
-            candidates.len(),
-            voices.join(", "),
-            numbers.join(" or ")
+        // The count comes off the transcript rather than off the voices below, which are looked
+        // up in `speaker_clusters.json`: a transcript naming a cluster that file no longer has
+        // would otherwise be reported as fewer turns than it has.
+        missed(
+            notes,
+            session,
+            NotSelected::SeveralVoicesAt {
+                at,
+                count: candidates.len(),
+                voices: candidates
+                    .iter()
+                    .filter_map(|id| order.iter().find(|c| c.id == *id))
+                    .map(|c| describe(c, unknown, shown))
+                    .collect(),
+            },
+            report,
         )?;
-        report.failed += 1;
         return Ok(None);
     }
 
     // A voice the transcript names and the clusters file does not is the stale-file failure the
     // rest of this crate already has wording for, reached from the other side.
     let Some(cluster) = order.iter().copied().find(|c| c.id == voice) else {
-        writeln!(
-            out,
-            "{}  failed: the turn at {at} came from a voice speaker_clusters.json does not have \
-             -- re-transcribe this session with --force",
-            session.id
+        missed(
+            notes,
+            session,
+            NotSelected::VoiceNotInClusters { at },
+            report,
         )?;
-        report.failed += 1;
         return Ok(None);
     };
 
-    // The same line [`targeted`] prints, plus the moment it was reached by: the user named a
+    // The same note [`targeted`] produces, plus the moment it was reached by: the user named a
     // timestamp and gets told which voice that turned out to be, which is the one thing they
     // did not already know.
-    writeln!(
-        out,
-        "{}  1 voice selected at {at}: {}",
-        session.id,
-        describe(cluster, unknown, shown)
+    about(
+        notes,
+        &session.id,
+        SessionNote::Selected {
+            at: Some(at),
+            voice: describe(cluster, unknown, shown),
+        },
     )?;
     Ok(Some(vec![cluster]))
+}
+
+/// A request that could not be served: the reason, and the one counter every one of them lands
+/// in. Together, because the two have never come apart -- see [`EnrollReport::failed`].
+fn missed(
+    notes: &mut dyn Narrator,
+    session: &DiscoveredSession,
+    why: NotSelected<'_>,
+    report: &mut EnrollReport,
+) -> Result<()> {
+    about(notes, &session.id, SessionNote::NotSelected(why))?;
+    report.failed += 1;
+    Ok(())
+}
+
+/// A session file that would not read, reported against the remedy its kind has.
+fn unreadable(
+    notes: &mut dyn Narrator,
+    session: &DiscoveredSession,
+    file: SessionFile,
+    error: &meethook_session::Error,
+) -> Result<()> {
+    about(notes, &session.id, SessionNote::Unreadable { file, error })
 }
 
 /// How far a turn is from an instant: zero while the instant is inside it.
@@ -1615,7 +1494,7 @@ fn report_rename(
     after: &BTreeMap<u32, Attribution>,
     name: &str,
     session: &DiscoveredSession,
-    out: &mut dyn Write,
+    notes: &mut dyn Narrator,
 ) -> Result<()> {
     let mut renamed: Vec<u32> = Vec::new();
     for (id, label) in after {
@@ -1634,23 +1513,16 @@ fn report_rename(
             (count + 1, total + (turn.end - turn.start))
         });
 
-    if turns == 0 {
-        // Not "0 turn(s)", which reads as a failure. The ordinary way to get here is answering
-        // a voice with the name it already reads as.
-        writeln!(
-            out,
-            "{}  no turns changed: that voice already read as {name}",
-            session.id
-        )?;
-    } else {
-        writeln!(
-            out,
-            "{}  renamed {turns} turn(s), {} of speech, to {name}",
-            session.id,
-            speech(seconds)
-        )?;
-    }
-    Ok(())
+    // Spelled out because `after` is also the name of this function's label map.
+    narration::after(
+        notes,
+        &session.id,
+        AnswerNote::Renamed {
+            name,
+            turns,
+            seconds,
+        },
+    )
 }
 
 /// How much somebody said, in the units a person would say it in.
@@ -1810,7 +1682,7 @@ mod tests {
 
     use meethook_session::{
         EnrolledSpeaker, MAX_REFERENCES_PER_SPEAKER, RepresentativeSegment, SPEAKER_YOU,
-        SessionMetadata, SessionPaths, TRANSCRIPT_SCHEMA_VERSION, TrackSync, Turn,
+        SessionMetadata, SessionPaths, Stored, TRANSCRIPT_SCHEMA_VERSION, TrackSync, Turn,
     };
     // The cut the ranking is deliberately *not* made at, named rather than spelled 0.40, so
     // the fixtures below still mean "outside identification's reach" if it moves.
@@ -2182,7 +2054,7 @@ mod tests {
                 template: &TranscriptTemplate::resolve(paths, None).unwrap(),
             },
             interviewer,
-            &mut out,
+            &mut Lines::new(&mut out),
         )
         .unwrap();
         (report, String::from_utf8(out).unwrap())
@@ -4028,7 +3900,7 @@ mod tests {
                 template: &TranscriptTemplate::builtin(),
             },
             &mut interviewer,
-            &mut out,
+            &mut Lines::new(&mut out),
         )
         .unwrap_err();
 
@@ -5376,6 +5248,70 @@ mod tests {
                 .references("Alice"),
             MAX_REFERENCES_PER_SPEAKER,
             "{output}"
+        );
+    }
+    /// One run's narration, whole and in order, as [`Lines`] renders it.
+    ///
+    /// Every other test here asserts a substring, which cannot see a line that moved, a blank
+    /// line that appeared, or a pair that swapped -- and the notes the run now emits are placed
+    /// by a renderer rather than by the statement that computed them, so line order is exactly
+    /// what wants pinning. The fixture is built to reach one of each tier in one run: a session
+    /// passed over before anything is read, a queue header with its held-back clause, a
+    /// transcript brought into line before a question is asked, an enrollment, a reference taken
+    /// off somebody else, and an answer refused.
+    ///
+    /// `--correct` for the whole run, so the second session's already-named voice is asked
+    /// about; that is also why both headers read "to review" rather than "unresolved", which
+    /// the tests above cover.
+    #[test]
+    fn one_runs_narration_reads_as_these_lines_in_this_order() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+
+        // The recorder died mid-session: nothing to read, and the first line of the run.
+        let orphan = paths.session(&SessionId::parse("20260809-052500").unwrap());
+        std::fs::create_dir_all(orphan.dir()).unwrap();
+
+        // One voice worth a question and three fragments under the floor. Its voices sit on the
+        // two axes Nate and the second session's voices do not, so enrolling here changes
+        // nothing there and the two sessions' lines stay independent.
+        let fragmented = make_fragmented_session(&paths, "20260809-052600");
+        with_embeddings(&fragmented, &[voice(2), voice(3), voice(3), voice(3)]);
+
+        let session = make_session(&paths, "20260809-052700");
+        heard_at_once(&session, 0, 1);
+        enrolled(&[("Nate", voice(0))], &paths);
+
+        let mut interviewer =
+            Scripted::answering(vec![named("Alice"), named("Aaron"), named("Aaron")]);
+        let (report, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+        assert_eq!(
+            output,
+            "20260809-052500  passed over: no session.json (the recorder crashed mid-session)\n\
+             20260809-052600  1 voice(s) to review, 0 of them already named, 3 quieter voice(s) \
+             not offered -- meethook enroll --all\n\
+             20260809-052600  enrolled Alice\n\
+             20260809-052700  transcript brought up to date\n\
+             20260809-052700  2 voice(s) to review, 1 of them already named\n\
+             20260809-052700  Nate no longer has a reference: that voice is Aaron\n\
+             20260809-052700  enrolled Aaron\n\
+             20260809-052700  refused Aaron for Unknown 2: Unknown 1 already has that name and \
+             the two were heard speaking at once, so they are not one person -- meethook enroll \
+             --correct --voice Unknown 1 if that is the wrong one\n"
+        );
+        assert_eq!(
+            report,
+            EnrollReport {
+                named: 2,
+                session_only: 0,
+                skipped: 0,
+                kept: 0,
+                held_back: 3,
+                refused: 1,
+                passed_over: 1,
+                failed: 0,
+            }
         );
     }
 }

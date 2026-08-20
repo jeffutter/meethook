@@ -210,7 +210,7 @@ fn enroll_offering(paths: &Paths, offer: Offer, interviewer: &mut dyn Interviewe
             template: &TranscriptTemplate::resolve(paths, None).unwrap(),
         },
         interviewer,
-        &mut std::io::sink(),
+        &mut meethook_enroll::Lines::new(&mut std::io::sink()),
     )
     .unwrap()
 }

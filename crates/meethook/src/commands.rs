@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use meethook_enroll::{
-    Answer, Confirm, EnrollRules, Enrolment, Forgotten, GivenName, Interviewer, Labelled,
+    Answer, Confirm, EnrollRules, Enrolment, Forgotten, GivenName, Interviewer, Labelled, Lines,
     MeetingChoice, MeetingSource, Offer, Selection, Target, Voice, VoiceSelector, run_enroll,
     run_forget, run_meeting, run_speakers, speech, write_clip,
 };
@@ -712,7 +712,13 @@ pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Resu
         },
         template: &template,
     };
-    let report = run_enroll(paths, &requested, rules, interviewer, &mut io::stdout())?;
+    let report = run_enroll(
+        paths,
+        &requested,
+        rules,
+        interviewer,
+        &mut Lines::new(&mut io::stdout()),
+    )?;
 
     println!(
         "\n{} named, {} skipped, {} session(s) passed over",
