@@ -55,7 +55,9 @@ pub use attribution::{Attribution, Naming, attributions};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
 pub use gpu::NoMetalDevice;
-pub use identify::{IDENTIFY_DISTANCE, Identification, identify_clusters};
+pub use identify::{
+    IDENTIFY_DISTANCE, Identification, Resemblance, identify_clusters, rank_enrolled,
+};
 pub use import::{BuiltSession, ImportedSource, MIC_SILENCE_S, SPLICE_GAP_S, build_session};
 pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
 // The measurement only, not the module: `loudness` stays private because its constants and

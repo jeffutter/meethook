@@ -155,6 +155,34 @@ pub struct Identification {
     pub similarity: f32,
 }
 
+/// How much one voice sounds like one enrolled person.
+///
+/// Not an [`Identification`]. That is a *decision* -- argmax, then a threshold -- and its
+/// existence is the claim that this cluster is this person. This is an observation with no
+/// decision in it: one row of a ranked list a person is being shown so that *they* can decide.
+/// See [`rank_enrolled`] for why the list is not cut anywhere.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resemblance {
+    /// The enrolled name, exactly as `speakers.json` spells it, so answering with it stores
+    /// another reference against the person already there rather than creating a near-duplicate.
+    pub name: String,
+
+    /// Cosine similarity to this person's *nearest* comparable reference, in `[-1, 1]`.
+    ///
+    /// The number worth reading is the gap to the next entry rather than the value itself:
+    /// 0.71 against 0.38 is confident, 0.52 against 0.51 means go and listen.
+    pub similarity: f32,
+
+    /// How many recordings of this person `speakers.json` holds -- **all** of them, including
+    /// any that `similarity` could not be taken from.
+    ///
+    /// [`EnrolledSpeakers::references`], not a local count, so this is the same multiplicity
+    /// [`meethook_session::MAX_REFERENCES_PER_SPEAKER`] caps and the same one `meethook
+    /// speakers` prints. It distinguishes somebody with 12 stored recordings from somebody
+    /// with 1, which is most of what tells a well-established name from a guess made once.
+    pub references: usize,
+}
+
 /// Matches each cluster against the enrolled database, keyed by cluster id.
 ///
 /// A cluster appears in the result only if it matched somebody: absence *is* "nobody we
@@ -289,19 +317,9 @@ pub(crate) fn heard_at_once(a: &SpeakerCluster, b: &SpeakerCluster) -> bool {
 fn best_match(embedding: &[f32], enrolled: &EnrolledSpeakers) -> Option<Identification> {
     let mut best: Option<(&str, f32)> = None;
     for speaker in &enrolled.speakers {
-        // A reference of a different length came from a different embedding model, so the
-        // two vectors describe different spaces and are not comparable. `zip` would happily
-        // truncate and return a plausible-looking cosine; the honest answer is no opinion.
-        // Skipped rather than fatal, so one stale entry cannot stop the rest from matching.
-        if speaker.embedding.len() != embedding.len() {
+        let Some(similarity) = comparable_cosine(&speaker.embedding, embedding) else {
             continue;
-        }
-        let similarity: f32 = speaker
-            .embedding
-            .iter()
-            .zip(embedding)
-            .map(|(a, b)| a * b)
-            .sum();
+        };
 
         // Strictly greater, then the lexicographically first name, so an exact tie between
         // two references resolves the same way on every rerun rather than by iteration order.
@@ -321,6 +339,115 @@ fn best_match(embedding: &[f32], enrolled: &EnrolledSpeakers) -> Option<Identifi
             name: name.to_string(),
             similarity,
         })
+}
+
+/// The cosine between two voices, or `None` when they are not two measurements of one thing.
+///
+/// The one place the arithmetic and the comparability rule live, shared by [`best_match`] and
+/// [`rank_enrolled`] so that a threshold decision and a ranked list cannot come to disagree
+/// about which pairs are even comparable.
+///
+/// Both sides are unit vectors by contract, so the dot product *is* the cosine and nothing
+/// here renormalizes -- see [`best_match`] for where that contract is written down.
+///
+/// Two refusals, both silent rather than fatal, so that one bad row cannot stop the rest of a
+/// database from being compared:
+///
+/// - **Different lengths** came from different embedding models, so the two vectors describe
+///   different spaces. `zip` would happily truncate and return a plausible-looking cosine
+///   between unrelated spaces; the honest answer is no opinion.
+/// - **Either side empty** has no direction to compare. The arithmetic would return 0.0, which
+///   reads as "orthogonal" -- a measurement -- when nothing was measured. `best_match` can
+///   afford to let its threshold reject that one line later; a ranking has no threshold to hide
+///   behind, so the refusal is made here and both callers get it. This is the same rule
+///   [`crate::stored_reference_distances`] already applies to a pair of references.
+fn comparable_cosine(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    Some(a.iter().zip(b).map(|(x, y)| x * y).sum())
+}
+
+/// Every enrolled person one voice could be, nearest first.
+///
+/// What [`identify_clusters`] throws away. That function computes an argmax and then discards
+/// everything that failed [`IDENTIFY_DISTANCE`], so a caller that wants to *ask* who a voice is
+/// has no way to offer names -- and offering names is the difference between a prompt somebody
+/// can answer and one that demands a name be typed from memory.
+///
+/// This is also where the "ambiguous" middle tier that [`identify_clusters`] deliberately
+/// refuses to have belongs. Its own reason says so: a three-way outcome needs a UI to resolve
+/// it, and this is the shape that UI reads.
+///
+/// # Unthresholded, on purpose
+///
+/// Nothing here compares against [`IDENTIFY_DISTANCE`]. That cut exists to keep the
+/// *automatic* pass conservative -- a false match puts one person's words under another's name
+/// in a transcript nobody will re-read. A human reading a ranked list is precisely the case it
+/// was biased against serving: a cut here would hide the near-miss the user is being asked to
+/// adjudicate, which is the only entry the question was worth asking about.
+///
+/// A caller that wants the automatic answer should call [`identify_clusters`] and get the
+/// decision, not re-derive one by comparing the first entry here against the constant.
+///
+/// # One entry per person, not per stored reference
+///
+/// A person is every row bearing their name (see [`EnrolledSpeakers`]), and this database runs
+/// to tens of references over a couple of dozen people, so a list of rows would name somebody
+/// with 12 recordings 12 times.
+///
+/// - One entry per distinct name, scored at the **nearest** of that person's comparable
+///   references. That is the rule [`EnrolledSpeakers`] states for itself, not a new policy.
+/// - `references` counts **every** row under the name, from
+///   [`EnrolledSpeakers::references`] -- including rows no similarity could be taken from.
+/// - So somebody holding three rows of which one is stale appears once, with
+///   `references: 3` and a similarity from the two comparable ones. Somebody **all** of whose
+///   rows are incomparable does not appear at all: there is no similarity to order them by, and
+///   inventing one would be the fabricated comparison `comparable_cosine` refuses to make.
+///
+/// # Order
+///
+/// Descending similarity, ties by ascending name -- the same tie-break `best_match` makes, so
+/// the head of this list is the person [`identify_clusters`] would award. `total_cmp` is total
+/// even over NaN, so no input can panic the sort. Names are distinct after grouping, so this is
+/// a total order and two runs over one database produce one order regardless of the order the
+/// rows sit in the file.
+///
+/// An empty database ranks nobody, which is the normal state of every install before anyone has
+/// been enrolled, and is not an error.
+pub fn rank_enrolled(embedding: &[f32], enrolled: &EnrolledSpeakers) -> Vec<Resemblance> {
+    // Best comparable similarity per name. Grouping by name is this module's knowledge; how
+    // many rows a name holds is `speakers.rs`'s, and is asked for below rather than counted
+    // here, because a local count would report the comparable rows and not the person's.
+    let mut nearest: BTreeMap<&str, f32> = BTreeMap::new();
+    for speaker in &enrolled.speakers {
+        let Some(similarity) = comparable_cosine(&speaker.embedding, embedding) else {
+            continue;
+        };
+        nearest
+            .entry(&speaker.name)
+            .and_modify(|held| {
+                if similarity > *held {
+                    *held = similarity;
+                }
+            })
+            .or_insert(similarity);
+    }
+
+    let mut ranked: Vec<Resemblance> = nearest
+        .into_iter()
+        .map(|(name, similarity)| Resemblance {
+            name: name.to_string(),
+            similarity,
+            references: enrolled.references(name),
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.similarity
+            .total_cmp(&a.similarity)
+            .then(a.name.cmp(&b.name))
+    });
+    ranked
 }
 
 #[cfg(test)]
@@ -653,5 +780,197 @@ mod tests {
         );
 
         assert!(identified.is_empty(), "{identified:?}");
+    }
+
+    /// The names in a ranking, which is what a prompt would print and what every ordering
+    /// assertion below is actually about.
+    fn names(ranked: &[Resemblance]) -> Vec<&str> {
+        ranked.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    /// Acceptance criterion #1: every comparable person comes back, nearest first. The rows are
+    /// deliberately in the reverse of the answer, so this fails on a function that returns the
+    /// file's order.
+    #[test]
+    fn every_comparable_speaker_is_ranked_by_descending_similarity() {
+        let ranked = rank_enrolled(
+            &voice(0.0),
+            &enrolled(&[
+                ("Carol", voice(80.0)),
+                ("Alice", voice(40.0)),
+                ("Bob", voice(5.0)),
+            ]),
+        );
+
+        assert_eq!(names(&ranked), ["Bob", "Alice", "Carol"]);
+        assert!(
+            ranked
+                .windows(2)
+                .all(|pair| pair[0].similarity >= pair[1].similarity),
+            "{ranked:?}"
+        );
+    }
+
+    /// Acceptance criterion #2, and the whole reason this exists beside [`identify_clusters`]:
+    /// the person a voice failed to match is the entry the user most needs to see.
+    ///
+    /// 80 degrees is a cosine distance of 0.83, twice the cut. Asserted against
+    /// [`IDENTIFY_DISTANCE`] by name rather than against 0.40, so this still means "outside the
+    /// cut" if the constant moves.
+    #[test]
+    fn the_ranking_is_not_cut_at_the_identify_distance() {
+        let database = enrolled(&[("Alice", voice(80.0))]);
+
+        let ranked = rank_enrolled(&voice(0.0), &database);
+
+        assert_eq!(names(&ranked), ["Alice"]);
+        assert!(1.0 - ranked[0].similarity > IDENTIFY_DISTANCE, "{ranked:?}");
+        // The same voice against the same database, decided rather than ranked, names nobody.
+        assert!(
+            identify_clusters(&[cluster(0, voice(0.0))], &database).is_empty(),
+            "the fixture has to be outside the cut for this test to mean anything"
+        );
+    }
+
+    /// Acceptance criterion #3: all three numbers a prompt prints, and the similarity is the
+    /// arithmetic the fixture's angle implies rather than merely some float.
+    #[test]
+    fn an_entry_carries_the_name_the_similarity_and_the_reference_count() {
+        let ranked = rank_enrolled(
+            &voice(0.0),
+            &enrolled(&[
+                ("Alice", voice(25.0)),
+                ("Alice", voice(60.0)),
+                ("Bob", voice(70.0)),
+            ]),
+        );
+
+        assert_eq!(ranked[0].name, "Alice");
+        assert!(
+            (ranked[0].similarity - 25.0f32.to_radians().cos()).abs() < 1e-6,
+            "{ranked:?}"
+        );
+        assert_eq!(ranked[0].references, 2);
+        assert_eq!(ranked[1].references, 1);
+    }
+
+    /// Acceptance criterion #8: entries are people, not rows. A list of rows would name
+    /// somebody with three recordings three times, and this database holds tens of rows over a
+    /// couple of dozen people.
+    #[test]
+    fn a_person_with_several_references_appears_once_scored_at_their_nearest() {
+        let ranked = rank_enrolled(
+            &voice(0.0),
+            &enrolled(&[
+                ("Alice", voice(70.0)),
+                ("Alice", voice(20.0)),
+                ("Alice", voice(45.0)),
+            ]),
+        );
+
+        assert_eq!(names(&ranked), ["Alice"]);
+        assert_eq!(ranked[0].references, 3);
+        assert!(
+            (ranked[0].similarity - 20.0f32.to_radians().cos()).abs() < 1e-6,
+            "{ranked:?}"
+        );
+    }
+
+    /// Acceptance criterion #4, and #8's second half. A four-dimensional row against a
+    /// two-dimensional voice is not a distant match, it is not a comparison: truncating
+    /// `Stale`'s leading 1.0 would have scored it 1.0 and put it top of the list.
+    ///
+    /// So `Stale` is absent entirely, while `Mixed` -- one stale row and one good one --
+    /// appears, scored on the good one and reporting **both** rows, because `references` is the
+    /// person's multiplicity and not a count of what happened to be comparable.
+    #[test]
+    fn a_reference_of_the_wrong_dimension_is_excluded_from_the_ranking() {
+        let stale = vec![1.0, 0.0, 0.0, 0.0];
+
+        let ranked = rank_enrolled(
+            &voice(0.0),
+            &enrolled(&[
+                ("Stale", stale.clone()),
+                ("Mixed", stale),
+                ("Mixed", voice(30.0)),
+            ]),
+        );
+
+        assert_eq!(names(&ranked), ["Mixed"]);
+        assert_eq!(ranked[0].references, 2);
+        assert!(
+            (ranked[0].similarity - 30.0f32.to_radians().cos()).abs() < 1e-6,
+            "{ranked:?}"
+        );
+    }
+
+    /// Acceptance criterion #5. Two people exactly equidistant from one voice have to be listed
+    /// in the same order on every run and under either file order, or a prompt would offer two
+    /// names in an order that moved with nothing having changed -- and the first entry is the
+    /// one a UI will default to.
+    #[test]
+    fn an_exact_tie_in_the_ranking_goes_to_the_lexicographically_first_name() {
+        for order in [["Zoe", "Andrew"], ["Andrew", "Zoe"]] {
+            let one_voice = voice(10.0);
+            let ranked = rank_enrolled(
+                &voice(0.0),
+                &enrolled(&[(order[0], one_voice.clone()), (order[1], one_voice)]),
+            );
+
+            assert_eq!(names(&ranked), ["Andrew", "Zoe"], "file order {order:?}");
+        }
+    }
+
+    /// Acceptance criterion #6, and the state of every install before anybody has run `enroll`:
+    /// nobody to offer is an empty list, not an error and not a failure to prompt.
+    #[test]
+    fn an_empty_database_ranks_nobody_without_failing() {
+        assert!(rank_enrolled(&voice(0.0), &enrolled(&[])).is_empty());
+    }
+
+    /// A voice with no embedding cannot be compared to anything, and an empty reference is not
+    /// a comparison either. Both would arithmetically produce 0.0, which reads as "measured,
+    /// and orthogonal" -- a claim about a comparison that never happened. [`best_match`] can
+    /// let its threshold reject that; a ranking has no threshold, so the refusal is explicit.
+    #[test]
+    fn an_empty_embedding_on_either_side_is_excluded_rather_than_ranked_at_zero() {
+        assert!(
+            rank_enrolled(
+                &[],
+                &enrolled(&[("Alice", voice(0.0)), ("Empty", Vec::new())])
+            )
+            .is_empty()
+        );
+
+        let ranked = rank_enrolled(
+            &voice(0.0),
+            &enrolled(&[("Empty", Vec::new()), ("Alice", voice(10.0))]),
+        );
+
+        assert_eq!(names(&ranked), ["Alice"]);
+    }
+
+    /// The two must not drift: the head of the ranking is the person identification awards,
+    /// with the same number beside it, or one screen would show a name and a ranking that
+    /// disagree.
+    ///
+    /// Asserted through [`identify_clusters`] because that is the public behaviour which must
+    /// not change, and with the winner holding several references -- the case where a per-row
+    /// argmax and a per-person argmax could plausibly diverge.
+    #[test]
+    fn the_first_ranked_entry_is_the_person_identification_awards() {
+        let database = enrolled(&[
+            ("Bob", voice(35.0)),
+            ("Alice", voice(60.0)),
+            ("Alice", voice(12.0)),
+            ("Carol", voice(85.0)),
+        ]);
+
+        let identified = identify_clusters(&[cluster(0, voice(0.0))], &database);
+        let ranked = rank_enrolled(&voice(0.0), &database);
+
+        assert_eq!(ranked[0].name, identified[&0].name);
+        assert_eq!(ranked[0].similarity, identified[&0].similarity);
+        assert_eq!(ranked[0].references, 2);
     }
 }

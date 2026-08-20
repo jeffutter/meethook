@@ -80,7 +80,8 @@ use meethook_session::{
     unknown_labels, unknown_speaker,
 };
 use meethook_transcribe::{
-    Attribution, Naming, TARGET_RATE, attributions, identify_clusters, read_track_16k_mono,
+    Attribution, Naming, Resemblance, TARGET_RATE, attributions, identify_clusters, rank_enrolled,
+    read_track_16k_mono,
 };
 
 /// How many of a voice's lines to show before asking who it is.
@@ -303,6 +304,31 @@ pub struct Voice<'a> {
     /// Empty when `speaker.wav` is missing or unreadable, which is a voice that can still be
     /// named from its snippets rather than a session that has to fail.
     pub clip: &'a [f32],
+
+    /// Who this voice sounds like, nearest first, so a prompt can offer names instead of
+    /// demanding one be typed.
+    ///
+    /// This is what makes an [`Interviewer`] able to answer without any access to
+    /// `speakers.json`: the names and the numbers are already here, owned, and the database
+    /// stays on this side of the seam where the writes are.
+    ///
+    /// Four things a reader cannot get from the type, all of them [`rank_enrolled`]'s
+    /// decisions rather than this field's:
+    ///
+    /// - **Unthresholded.** Every comparable enrolled person is here, including ones far
+    ///   outside `IDENTIFY_DISTANCE`. That cut keeps `transcribe`'s automatic pass
+    ///   conservative; a person reading a list is the case it was biased against serving, and
+    ///   cutting here would hide the near-miss they are being asked to adjudicate.
+    /// - **Entries are people, not references.** Somebody holding several recordings appears
+    ///   once, scored at their nearest, with `references` saying how many they hold.
+    /// - **Order** is descending similarity, ties by ascending name, so the first entry is the
+    ///   person `identify_clusters` would have awarded had it cleared the cut. Empty for an
+    ///   install where nobody is enrolled yet.
+    /// - **As the database stands now**, not as it stood when the run began. A name given
+    ///   earlier in this same run is in here, which is the useful behaviour rather than an
+    ///   accident: clustering splits one person in two, and the second half should offer the
+    ///   name the first half was just given.
+    pub resembles: Vec<Resemblance>,
 }
 
 /// What the user said when asked who a voice is.
@@ -939,6 +965,13 @@ fn enroll_session(
                 .take(SNIPPETS)
                 .collect();
 
+            // Computed eagerly for every voice, including on the `--name` path where nothing
+            // reads it, and deliberately not deferred behind a closure: two dozen people at
+            // 256 dimensions is a few thousand multiply-adds, against a run that has already
+            // read and resampled the whole speaker track a few lines above. An owned `Vec`
+            // rather than a borrow of the database, so the reborrow ends here and nothing
+            // downstream -- least of all an `Interviewer` -- has to reason about the write
+            // that replaces `speakers` once this answer is accepted.
             interviewer.identify(&Voice {
                 session: &session.id,
                 position: Position { nth: index + 1, of },
@@ -946,6 +979,7 @@ fn enroll_session(
                 speech_seconds: cluster.speech_seconds,
                 snippets,
                 clip: clip_for(&track, cluster),
+                resembles: rank_enrolled(&cluster.embedding, speakers),
             })
         };
 
@@ -1874,6 +1908,9 @@ mod tests {
         EnrolledSpeaker, MAX_REFERENCES_PER_SPEAKER, RepresentativeSegment, SPEAKER_YOU,
         SessionMetadata, SessionPaths, TRANSCRIPT_SCHEMA_VERSION, TrackSync, Turn,
     };
+    // The cut the ranking is deliberately *not* made at, named rather than spelled 0.40, so
+    // the fixtures below still mean "outside identification's reach" if it moves.
+    use meethook_transcribe::IDENTIFY_DISTANCE;
 
     use super::*;
 
@@ -1892,6 +1929,10 @@ mod tests {
         speech_seconds: f64,
         snippets: Vec<String>,
         clip_samples: usize,
+        /// Who the prompt was told this voice resembles, in the order it was handed them --
+        /// which is the only way a test can check that an [`Interviewer`] can offer names
+        /// without ever reading `speakers.json`.
+        resembles: Vec<Resemblance>,
     }
 
     impl Shown {
@@ -1901,6 +1942,14 @@ mod tests {
 
         fn confidence(&self) -> Option<f32> {
             self.attribution.confidence()
+        }
+
+        /// The ranking as a prompt would list it: who, and how many recordings of them.
+        fn offered(&self) -> Vec<(&str, usize)> {
+            self.resembles
+                .iter()
+                .map(|r| (r.name.as_str(), r.references))
+                .collect()
         }
     }
 
@@ -1941,6 +1990,7 @@ mod tests {
                 speech_seconds: voice.speech_seconds,
                 snippets: voice.snippets.iter().map(|s| s.to_string()).collect(),
                 clip_samples: voice.clip.len(),
+                resembles: voice.resembles.clone(),
             });
             self.answers.pop_front().unwrap_or(Answer::Skip)
         }
@@ -4737,6 +4787,7 @@ mod tests {
             speech_seconds,
             snippets,
             clip_samples,
+            resembles,
         } = &aimed.seen[0];
         let queued = &queued.seen[1];
         assert_eq!(session, &queued.session);
@@ -4744,6 +4795,7 @@ mod tests {
         assert_eq!(speech_seconds, &queued.speech_seconds);
         assert_eq!(snippets, &queued.snippets);
         assert_eq!(clip_samples, &queued.clip_samples);
+        assert_eq!(resembles, &queued.resembles);
         assert_eq!(
             (position.to_string(), queued.position.to_string()),
             ("1/1".to_string(), "2/2".to_string()),
@@ -5271,5 +5323,126 @@ mod tests {
         let long = "é".repeat(SNIPPET_CHARS * 2);
         assert_eq!(snippet(&long).chars().count(), SNIPPET_CHARS);
         assert_eq!(snippet("  short  "), "short");
+    }
+
+    /// Acceptance criterion #7: the prompt is handed everybody enrolled, nearest first, so an
+    /// [`Interviewer`] can offer names without ever opening `speakers.json`.
+    ///
+    /// All three references are outside `IDENTIFY_DISTANCE` of cluster 0 -- 60, 75 and 85
+    /// degrees, against a cut at 0.40 of cosine distance -- which is exactly the voice
+    /// identification gave up on and the one whose prompt has something to offer. The names run
+    /// against the ranking alphabetically, so a list in name order would fail this.
+    #[test]
+    fn a_prompt_is_handed_every_enrolled_person_nearest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_embeddings(&session, &[voice(0), voice(1)]);
+        enrolled(
+            &[
+                ("Zoe", nearly(60.0)),
+                ("Alice", nearly(75.0)),
+                ("Mona", nearly(85.0)),
+            ],
+            &paths,
+        );
+
+        let mut interviewer = Scripted::answering(vec![Answer::Skip]);
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        // Cluster 1 sits close to the 60-degree reference, so it is identified and not asked
+        // about; cluster 0 is the one question this run has.
+        assert_eq!(interviewer.labels(), ["Unknown 1"], "{output}");
+        let shown = &interviewer.seen[0];
+        assert_eq!(
+            shown.offered(),
+            [("Zoe", 1), ("Alice", 1), ("Mona", 1)],
+            "{output}"
+        );
+        assert!(
+            (shown.resembles[0].similarity - 60.0f32.to_radians().cos()).abs() < 1e-6,
+            "{:?}",
+            shown.resembles
+        );
+        // Every one of them is past the cut identification applies, and still offered.
+        for candidate in &shown.resembles {
+            assert!(
+                1.0 - candidate.similarity > IDENTIFY_DISTANCE,
+                "{candidate:?} should be outside the cut for this test to mean anything"
+            );
+        }
+    }
+
+    /// The ranking reflects the database as it stands at the prompt, not as it stood when the
+    /// run began -- so a name given a moment ago is offered for the next voice, which is the
+    /// case that matters when clustering has split one person in two.
+    #[test]
+    fn a_name_given_earlier_in_the_run_is_offered_for_a_later_voice() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::answering(vec![named("Alice"), Answer::Skip]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(report.named, 1, "{output}");
+        // Nobody was enrolled when the first question was asked.
+        assert_eq!(interviewer.seen[0].offered(), [], "{output}");
+        assert_eq!(interviewer.seen[1].offered(), [("Alice", 1)], "{output}");
+    }
+
+    /// Acceptance criterion #6 at the seam, and the state of every install before anybody has
+    /// been enrolled: nobody to offer is an empty list, and the question is still asked.
+    #[test]
+    fn an_empty_database_offers_nobody_and_still_prompts() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::answering(vec![Answer::Skip, Answer::Skip]);
+        let (report, output) = run(&paths, &[], &mut interviewer);
+
+        assert_eq!(report.skipped, 2, "{output}");
+        assert_eq!(interviewer.labels(), ["Unknown 1", "Unknown 2"], "{output}");
+        assert!(
+            interviewer.seen.iter().all(|v| v.resembles.is_empty()),
+            "{output}"
+        );
+    }
+
+    /// A correction prompt shows a name and a ranking on one screen, and the two must not
+    /// disagree: the first entry is the person the identification already named, carrying the
+    /// same number the label does.
+    #[test]
+    fn an_identified_voices_ranking_leads_with_the_name_it_was_given() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_embeddings(&session, &[voice(0), voice(1)]);
+        enrolled(&[("Alice", nearly(10.0)), ("Zoe", nearly(70.0))], &paths);
+
+        let mut interviewer = Scripted::answering(vec![Answer::Skip, Answer::Skip]);
+        let (_, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+        assert_eq!(interviewer.labels(), ["Alice", "Zoe"], "{output}");
+        for shown in &interviewer.seen {
+            assert_eq!(shown.resembles[0].name, shown.label(), "{output}");
+            assert_eq!(
+                Some(shown.resembles[0].similarity),
+                shown.confidence(),
+                "{output}"
+            );
+        }
+        // Both people are offered for both voices; only the order differs.
+        assert_eq!(
+            interviewer.seen[0].offered(),
+            [("Alice", 1), ("Zoe", 1)],
+            "{output}"
+        );
+        assert_eq!(
+            interviewer.seen[1].offered(),
+            [("Zoe", 1), ("Alice", 1)],
+            "{output}"
+        );
     }
 }
