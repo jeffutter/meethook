@@ -98,7 +98,9 @@ pub use narration::{
     SessionNote, VoiceDescription,
 };
 use narration::{about, after};
-pub use references::{Enrolled, Reference, Scan, Unreadable, VoiceChange, run_speakers, scan};
+pub use references::{
+    Enrolled, Reference, Scan, Unreadable, VoiceChange, incomplete, run_speakers, scan,
+};
 pub use resolve::{Likeness, Match, Resolution, resolve};
 
 use std::collections::BTreeMap;

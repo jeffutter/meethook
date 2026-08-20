@@ -28,17 +28,20 @@ pub mod state;
 use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
-use meethook_enroll::{Answer, Consequence, Interviewer, Preview, Snippet, Voice, speech};
-use meethook_session::{Displaced, Stored};
+use meethook_enroll::{Answer, Consequence, Interviewer, Preview, Scan, Snippet, Voice, speech};
+use meethook_session::{Displaced, Paths, Stored};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
 };
 
 use crate::commands::{Clips, Progress};
-use state::{Cost, Costs, Event, Screen, Step, VoiceView};
+use state::{Context, Cost, Costs, Event, Screen, Step, VoiceView};
 
 /// How often a frame with a clip playing redraws itself, and so how fast the position moves and
 /// how promptly it disappears when the clip ends.
@@ -51,11 +54,128 @@ const TICK: Duration = Duration::from_millis(250);
 /// How long the frame should wait for a key before redrawing -- `None` to block until one arrives.
 ///
 /// The whole of the rule, in a function next to [`event`] and for the same reason: it is then
-/// decidable in `cargo test` with no terminal in front of it. Playback is the only thing that puts
-/// a clock on this frame, and only while it lasts. An idle frame has nothing that would redraw
-/// differently, so it blocks rather than waking four times a second to find that out.
-fn wait(playing: Option<Progress>) -> Option<Duration> {
-    playing.map(|_| TICK)
+/// decidable in `cargo test` with no terminal in front of it. An idle frame has nothing that would
+/// redraw differently, so it blocks rather than waking four times a second to find that out.
+///
+/// Two things put a clock on this frame, and each only while it lasts. Playback is one: the
+/// position moves and then disappears. An outstanding [`Background`] scan is the other, and
+/// without it the "who is this" pane would sit on `reading the sessions...` until the user
+/// happened to press a key. That scan is bounded at well under a second, so the
+/// idle-frame-blocks property survives everywhere it mattered: a frame with nothing playing and
+/// nothing outstanding still waits for its next key.
+fn wait(playing: Option<Progress>, scanning: bool) -> Option<Duration> {
+    (playing.is_some() || scanning).then_some(TICK)
+}
+
+/// What reading every session's speakers *is*, so a test can supply one that counts or one that
+/// fails.
+///
+/// An [`Arc`] rather than a `Box` because each scan's thread needs its own handle on it: [`Paths`]
+/// is cloned per scan and [`Scan`] is plain data, so both cross the boundary, and flattening the
+/// error to a `String` there means [`Background`] carries no `meethook_enroll::Error` and the frame
+/// has nothing to propagate.
+type Scanner = Arc<dyn Fn(&Paths) -> Result<Scan, String> + Send + Sync>;
+
+/// The cross-session scan, gathered off the thread that draws frames.
+///
+/// One scan of the whole root is 0.47 s over 53 sessions and 49 references on the machine this was
+/// built against -- dominated by the JSON reads rather than by the dot products, and linear in
+/// sessions times references. That single measurement decides the whole shape here, in both
+/// directions: far too slow to pay per keystroke or to pay before the first frame appears, and far
+/// too fast to be worth progress reporting, cancellation, incremental delivery or a scan that
+/// reads only the sessions it needs. So: one scan on one thread, delivered whole, polled from the
+/// event loop exactly the way [`Clips`] already is.
+///
+/// The `scanner` indirection is the seam that makes "not once per keystroke" decidable in
+/// `cargo test` -- the same move [`Costs`] is, for the same reason -- so a test can hand over a
+/// counting closure and assert what a hundred keys cost.
+struct Background {
+    scanner: Scanner,
+    paths: Paths,
+    /// The last scan delivered, `None` until the first one arrives.
+    latest: Option<Result<Scan, String>>,
+    /// The one in flight, if any. At most one ever is.
+    pending: Option<Receiver<Result<Scan, String>>>,
+    /// Whether an answer has moved the database since the in-flight scan started, and so whether
+    /// another is owed once it lands.
+    stale: bool,
+}
+
+impl Background {
+    /// A scanner over the real root, with nothing read yet.
+    fn new(paths: Paths) -> Background {
+        Background {
+            scanner: Arc::new(|paths| meethook_enroll::scan(paths).map_err(|e| e.to_string())),
+            paths,
+            latest: None,
+            pending: None,
+            stale: false,
+        }
+    }
+
+    /// Starts a scan unless one is already in flight, in which case the one in flight will be
+    /// followed by another when it lands.
+    ///
+    /// The thread is detached and never joined: if the frame goes away the [`Receiver`] drops, the
+    /// send fails, and the thread ends on its own.
+    fn start(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (deliver, delivered) = mpsc::channel();
+        let scanner = Arc::clone(&self.scanner);
+        let paths = self.paths.clone();
+        thread::spawn(move || {
+            // A receiver that has gone away is a frame that has finished, which is not a failure.
+            let _ = deliver.send(scanner(&paths));
+        });
+        self.pending = Some(delivered);
+        // Whatever this scan finds is being read now, so it already includes every answer written
+        // before this moment.
+        self.stale = false;
+    }
+
+    /// Takes delivery of a finished scan, and says whether one is still outstanding -- which is
+    /// what [`wait`] needs in order to keep the frame awake until the pane can fill in.
+    fn poll(&mut self) -> bool {
+        if let Some(pending) = self.pending.as_ref() {
+            match pending.try_recv() {
+                Ok(found) => {
+                    self.latest = Some(found);
+                    self.pending = None;
+                    if self.stale {
+                        self.start();
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                // The thread ended without sending, which needs a panic inside `scan` to happen
+                // at all. Nothing is outstanding and whatever was last read still stands.
+                Err(TryRecvError::Disconnected) => self.pending = None,
+            }
+        }
+        self.pending.is_some()
+    }
+
+    /// Says the database has moved, so the scan on the screen is about to be one answer behind.
+    ///
+    /// Re-scans rather than labelling the pane "as this run began", because the candidate rows
+    /// already show a live reference count off `Resemblance`: a stale count in the pane beside a
+    /// live one in the list is a bug a reviewer would file. Between the answer and the next
+    /// delivery the pane shows the previous scan, which is old rather than false -- nothing it
+    /// says claims to be "now" -- and it converges within about half a second.
+    fn invalidate(&mut self) {
+        self.stale = true;
+        self.start();
+    }
+
+    /// What the pane has to go on: nothing yet, the last scan, or why there is none.
+    fn context(&self) -> Context<'_> {
+        match &self.latest {
+            None => Context::Reading,
+            Some(Ok(found)) => Context::Read(found),
+            Some(Err(why)) => Context::Failed(why),
+        }
+    }
 }
 
 /// What is sounding right now, as the frame needs to draw it.
@@ -116,6 +236,8 @@ pub struct Interface {
     state: Screen,
     narration: Shared,
     clips: Clips,
+    /// What every enrolled name currently names, gathered off this thread.
+    background: Background,
     /// `Some` once the terminal has been acquired, and the flag that says a restore is owed.
     terminal: Option<DefaultTerminal>,
     /// Why the frame stopped, when it stopped for a reason the user has to be told about.
@@ -128,12 +250,17 @@ pub struct Interface {
 }
 
 impl Interface {
-    /// A frame sharing `narration` with the run's [`Lines`](meethook_enroll::Lines).
-    pub fn new(narration: Shared) -> Interface {
+    /// A frame sharing `narration` with the run's [`Lines`](meethook_enroll::Lines), over the
+    /// root the run itself is reading.
+    ///
+    /// `paths` is here rather than inside the state machine because the scan behind the "who is
+    /// this" pane is I/O, and [`state`] is documented as having none.
+    pub fn new(narration: Shared, paths: Paths) -> Interface {
         Interface {
             state: Screen::default(),
             narration,
             clips: Clips::default(),
+            background: Background::new(paths),
             terminal: None,
             trouble: None,
         }
@@ -207,6 +334,10 @@ impl Interviewer for Interface {
                     return Answer::Quit;
                 }
             }
+            // Lazily and here for the same reason the terminal is: a run that passes over every
+            // session should do no work at all, and this is the first point known not to be such
+            // a run. The first frame draws before it lands, saying so in the pane.
+            self.background.start();
         }
 
         // One call site, and one stop after it: answered, skipped, deferred, quit and a frame that
@@ -214,6 +345,9 @@ impl Interviewer for Interface {
         // audio behind. `Drop for Clips` covers the paths that never come back through here.
         let answer = self.ask(&view, voice);
         self.clips.stop();
+        if rewrites(&answer) {
+            self.background.invalidate();
+        }
         answer
     }
 
@@ -235,6 +369,7 @@ impl Interface {
             state,
             narration,
             clips,
+            background,
             terminal,
             trouble,
         } = self;
@@ -258,8 +393,11 @@ impl Interface {
                     None
                 }
             };
+            // Beside the clip poll, and for the same reason: what the frame draws is whatever has
+            // arrived by the time it draws it.
+            let scanning = background.poll();
             {
-                let derived = state.view(view, &voice.preview);
+                let derived = state.view(view, &voice.preview, background.context());
                 let lines = narration.lines();
                 // `playing` is the poll's answer, so a clip that has finished takes the row's
                 // mark with it without anything having to clear `line`.
@@ -273,9 +411,10 @@ impl Interface {
             }
 
             // While something is playing, waking on a timeout is what moves the position and what
-            // takes it away when the clip ends; the redraw at the top of the loop does both. With
-            // nothing playing this falls straight through and blocks in `read`.
-            if let Some(timeout) = wait(playing) {
+            // takes it away when the clip ends; while a scan is outstanding it is what fills the
+            // "who is this" pane in without a key being pressed. The redraw at the top of the loop
+            // does all three. With neither, this falls straight through and blocks in `read`.
+            if let Some(timeout) = wait(playing, scanning) {
                 match poll(timeout) {
                     Ok(true) => {}
                     Ok(false) => continue,
@@ -350,6 +489,20 @@ impl Interface {
             }
         }
     }
+}
+
+/// Whether an answer can have moved what the "who is this" pane reports, and so whether the scan
+/// behind it is now one answer behind.
+///
+/// A function beside [`wait`] and [`event`], for the same reason: a rule about which of five
+/// answers costs a re-scan is then decidable in `cargo test` with no terminal in front of it.
+///
+/// A name is the only answer that writes to `speakers.json`; the other four write nothing at all.
+/// A `Named` can still be refused by the veto and write nothing either, so this over-triggers --
+/// deliberately, because an extra background scan nobody waits for is cheaper than a wrong number
+/// on the screen.
+fn rewrites(answer: &Answer) -> bool {
+    matches!(answer, Answer::Named(_))
 }
 
 /// What a candidate costs, off the run's own dry run.
@@ -488,13 +641,20 @@ fn event(key: KeyEvent) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
     use std::time::Duration;
 
+    use meethook_enroll::{Answer, Scan};
+    use meethook_session::Paths;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
-    use super::state::Event;
     use super::state::tests::heard;
-    use super::{Interface, Progress, Shared, TICK, event, line_to_play, wait};
+    use super::state::{Context, Event};
+    use super::{
+        Background, Interface, Progress, Shared, TICK, event, line_to_play, rewrites, wait,
+    };
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
@@ -503,6 +663,52 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    /// A scan that costs nothing and counts how often it was asked for. The root is never read,
+    /// which is the point: what is being measured is how many times the frame asks.
+    fn counting() -> (Background, Arc<AtomicUsize>) {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        let mut background = Background::new(Paths::new("/nowhere"));
+        background.scanner = Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(Scan::default())
+        });
+        (background, asked)
+    }
+
+    /// A scan that does not finish until the test lets it, so "while one is in flight" is a state
+    /// a test can actually be in rather than a race it hopes to win.
+    fn gated() -> (mpsc::Sender<()>, Background, Arc<AtomicUsize>) {
+        let (release, released) = mpsc::channel::<()>();
+        let held = Mutex::new(released);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        let mut background = Background::new(Paths::new("/nowhere"));
+        background.scanner = Arc::new(move |_| {
+            // A dropped sender is a test that has finished with this thread.
+            let _ = held
+                .lock()
+                .expect("no scan panics while holding this")
+                .recv();
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(Scan::default())
+        });
+        (release, background, asked)
+    }
+
+    /// Polls until something becomes true, the way a real frame polls: at the top of an iteration
+    /// it was woken for. A test cannot join a thread the design deliberately detaches, so the
+    /// alternative to a bounded wait is no assertion at all.
+    fn until(what: &str, mut settled: impl FnMut() -> bool) {
+        for _ in 0..2_000 {
+            if settled() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("{what}");
     }
 
     /// Every key this frame binds, in one table, so a rebinding that drops one fails here rather
@@ -540,22 +746,124 @@ mod tests {
         }
     }
 
-    /// Only playback puts a clock on this frame. An idle frame blocks for its next key rather than
-    /// waking four times a second to redraw something that cannot have changed, and the bounds on
-    /// `TICK` are what stop a later edit turning the rule into a spin at one end or a position that
-    /// visibly lurches at the other.
+    /// AC #4, the no-stall half: an outstanding scan wakes the frame, so the "who is this" pane
+    /// fills in on its own rather than waiting for the user to press something. And an idle frame
+    /// -- nothing playing, nothing outstanding -- still blocks for its next key rather than waking
+    /// four times a second to redraw what cannot have changed. All four combinations, because the
+    /// two clocks are independent and either one alone has to be enough.
+    ///
+    /// The bounds on `TICK` are what stop a later edit turning the rule into a spin at one end or a
+    /// position that visibly lurches at the other.
     #[test]
-    fn an_idle_frame_waits_for_its_next_key() {
-        assert_eq!(wait(None), None, "nothing to redraw, so block");
+    fn an_outstanding_scan_wakes_the_frame_and_an_idle_one_still_blocks() {
         let playing = Progress {
             elapsed: Duration::from_secs(3),
             length: Duration::from_secs(30),
         };
-        assert_eq!(wait(Some(playing)), Some(TICK));
+        assert_eq!(wait(None, false), None, "nothing to redraw, so block");
+        assert_eq!(wait(Some(playing), false), Some(TICK));
+        assert_eq!(
+            wait(None, true),
+            Some(TICK),
+            "the pane has to fill in without a key being pressed"
+        );
+        assert_eq!(wait(Some(playing), true), Some(TICK));
         assert!(
             TICK >= Duration::from_millis(50) && TICK <= Duration::from_millis(500),
             "{TICK:?} is either a spin or a position that jumps"
         );
+    }
+
+    /// AC #4, the not-per-keystroke half. One scan of the real root is around half a second, so
+    /// "the frame asks once and then polls" is the whole reason the pane is affordable at all --
+    /// and the only way to assert it is to count how often the scan was asked for.
+    #[test]
+    fn the_scan_runs_once_and_not_once_per_key() {
+        let (mut background, asked) = counting();
+        background.start();
+        // A hundred keys, each with the poll a real loop does at the top of its iteration.
+        for _ in 0..100 {
+            background.poll();
+        }
+        until("the scan never arrived", || !background.poll());
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "one scan for a hundred keys"
+        );
+
+        // And a hundred more keys after it landed ask for nothing further.
+        for _ in 0..100 {
+            background.poll();
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// Which answers cost a re-read. A name is the only answer that writes to `speakers.json`, so
+    /// it is the only one that can move what the pane says -- and a deferral, a skip or a quit
+    /// re-reading the whole root would be half a second of work per keypress for nothing.
+    #[test]
+    fn an_answer_re_reads_the_sessions_and_a_skip_does_not() {
+        assert!(rewrites(&Answer::Named("Milo".to_string())));
+        for quiet in [Answer::Skip, Answer::Later, Answer::Quit] {
+            assert!(!rewrites(&quiet), "{quiet:?} writes nothing");
+        }
+
+        let (mut background, asked) = counting();
+        background.start();
+        until("the scan never arrived", || !background.poll());
+        background.invalidate();
+        until("the re-scan never arrived", || !background.poll());
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "the answer moved the file");
+    }
+
+    /// At most one scan is ever in flight, however many answers land while one is running. Two
+    /// invalidations during a scan owe exactly one re-scan -- not two, and not none.
+    #[test]
+    fn only_one_scan_is_ever_outstanding() {
+        let (release, mut background, asked) = gated();
+        background.start();
+        background.invalidate();
+        background.invalidate();
+        assert!(background.poll(), "the first scan is still running");
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "and has not been let go");
+
+        release.send(()).expect("the scanner is waiting on this");
+        until("the first scan never landed", || {
+            background.poll();
+            background.latest.is_some()
+        });
+        assert!(
+            background.pending.is_some(),
+            "two answers during one scan owe one more"
+        );
+
+        release.send(()).expect("the re-scan is waiting on this");
+        until("the re-scan never landed", || {
+            background.poll();
+            background.pending.is_none()
+        });
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "two invalidations, one re-scan"
+        );
+    }
+
+    /// AC #5 for the database rather than for one session: a scan that fails at all leaves the
+    /// pane saying so and the frame still answering questions, because every answer already given
+    /// is on disk and stopping the run would not put any of it back.
+    #[test]
+    fn a_scan_that_fails_leaves_the_frame_answering() {
+        let mut background = Background::new(Paths::new("/nowhere"));
+        background.scanner = Arc::new(|_| Err("speakers.json is not valid JSON".to_string()));
+        background.start();
+        until("the failure never arrived", || !background.poll());
+
+        match background.context() {
+            Context::Failed(why) => assert_eq!(why, "speakers.json is not valid JSON"),
+            other => panic!("a failed scan is a failed context, not {other:?}"),
+        }
     }
 
     /// AC #5: a line with nothing behind it says so rather than appearing to play. Both refusals
@@ -650,7 +958,7 @@ mod tests {
         let mut narrator = narration.clone();
         writeln!(narrator, "20260819-100000  named Milo").expect("a buffer cannot fail");
 
-        let mut frame = Interface::new(narration);
+        let mut frame = Interface::new(narration, Paths::new("/nowhere"));
         assert!(frame.terminal.is_none(), "nothing has asked for a frame");
         frame.trouble = Some("the terminal stopped being readable".to_string());
 

@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use meethook_enroll::{
     Answer, Confirm, EnrollRules, Enrolment, Forgotten, GivenName, Interviewer, Labelled, Lines,
     MeetingChoice, MeetingSource, Offer, Selection, Sessions, Target, Voice, VoiceSelector,
-    run_enroll, run_forget, run_meeting, run_speakers, speech, write_clip,
+    incomplete, run_enroll, run_forget, run_meeting, run_speakers, speech, write_clip,
 };
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
@@ -809,7 +809,7 @@ fn ask(
             // already written describes work already done to the disk.
             let narration = Shared::default();
             let mut narrator = narration.clone();
-            let mut frame = Interface::new(narration);
+            let mut frame = Interface::new(narration, paths.clone());
             let outcome = run_enroll(
                 paths,
                 requested,
@@ -843,11 +843,11 @@ pub fn speakers(paths: &Paths) -> Result<()> {
     // not read three sessions. The same rule `enroll` and `transcribe` apply to a request they
     // could not serve, and as there, each one has already printed the line saying which it was
     // -- above the whole listing, which is still printed.
+    //
+    // The sentence itself comes from `meethook-enroll`, not from here: the enrolment frame draws
+    // the same fact about the same scan, and one wording is what stops the two from disagreeing.
     if !scan.unreadable.is_empty() {
-        bail!(
-            "{} session(s) could not be read, so this listing is incomplete",
-            scan.unreadable.len()
-        );
+        bail!("{}", incomplete(scan.unreadable.len()));
     }
     Ok(())
 }

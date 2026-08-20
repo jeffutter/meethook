@@ -1,4 +1,4 @@
-//! The five panes, given a [`View`]. Every widget in this binary is built here and nowhere else.
+//! The six panes, given a [`View`]. Every widget in this binary is built here and nowhere else.
 //!
 //! Nothing in this module decides anything: it takes the derived view the state machine produced
 //! and places it. That is what lets it be exercised through [`ratatui::backend::TestBackend`]
@@ -14,8 +14,15 @@
 //! say". So the consequence lines come off [`Consequence`](meethook_enroll::Consequence) in
 //! `super` (the only place able to read it) and the refusal sentence comes off the fully public
 //! [`Refusal`] here.
+//!
+//! The other exception is the "and N more session(s)" line in [`who`], which is layout rather than
+//! domain prose -- how much of a list fits in a pane is not a fact about enrolment -- but it is
+//! still a sentence invented in this file, so it is named here too. Everything else that pane says
+//! about what a name currently names is either
+//! [`incomplete`] or `run_speakers`' own wording, so the frame and
+//! `meethook speakers` cannot come to describe one scan differently.
 
-use meethook_enroll::{Refusal, Resolution, speech};
+use meethook_enroll::{Refusal, Resolution, incomplete, speech};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
@@ -23,7 +30,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::Sounding;
-use super::state::{Candidate, Mark, Row, View};
+use super::state::{Candidate, Mark, Row, View, Who};
 use crate::commands::Progress;
 
 /// Places every pane for one frame.
@@ -46,12 +53,19 @@ pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String], sounding: 
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(whole[0]);
+    // Four bands in the right column, and the sizes are pinned by the 80x24 floor the tests hold
+    // this frame to: there the top band is 13 rows and `1 + 3 + 4 + 5` fits it exactly, with the
+    // candidate list down to one visible row; at 120x40 it is 29 and the candidates get 19. The
+    // "who" pane is adjacent to the candidate it describes, which is the whole point of it -- a
+    // horizontal split of the `run` band was considered and rejected, because `log` clips rather
+    // than wraps and halving its width would cut narration sentences mid-word.
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(4),
+            Constraint::Length(5),
         ])
         .split(top[1]);
 
@@ -59,6 +73,7 @@ pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String], sounding: 
     question(frame, right[0], view);
     candidates(frame, right[1], view);
     consequence(frame, right[2], view);
+    who(frame, right[3], view);
     snippets(frame, whole[1], view, sounding.and_then(|s| s.line));
     log(frame, whole[2], narration);
     footer(frame, whole[3], view, sounding);
@@ -256,6 +271,106 @@ fn consequence(frame: &mut Frame, area: Rect, view: &View<'_>) {
     );
 }
 
+/// Who the highlighted candidate already is: how many recordings of them the database holds, and
+/// which voices in which meetings read that name because of them.
+///
+/// The pane that makes "who is Ivan again?" answerable without leaving the prompt, which is why it
+/// sits directly under the candidate list rather than anywhere roomier. Three rows of content at
+/// every terminal size, so what fits is decided by [`listed`] rather than by hoping.
+///
+/// Every sentence here is either `run_speakers`' own or [`incomplete`]'s, so the frame and
+/// `meethook speakers` cannot come to describe one scan differently -- including the scope clause
+/// in "naming nothing in any session read", which is what keeps that claim honest about having
+/// read only the sessions under this root.
+///
+/// Not wrapped, for the reason `log` is not: a row per fact, clipped at the pane's edge, so a long
+/// session list cannot push the incompleteness line off the bottom.
+fn who(frame: &mut Frame, area: Rect, view: &View<'_>) {
+    let highlighted = view
+        .candidate
+        .and_then(|index| view.candidates.get(index))
+        .map(|candidate| candidate.name.as_str());
+    // Dynamic like the candidates pane's title already is: the pane is about one person, and
+    // naming them in the border is what stops the rows below reading as being about the voice.
+    let title = match highlighted {
+        Some(name) => format!(" who {name} is "),
+        None => " who ".to_string(),
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    match &view.who {
+        // The exact phrase the " would " pane uses for the same state, because it is the same
+        // state: there is no candidate under the highlight to say anything about.
+        Who::Nobody => lines.push(Line::from(Span::raw("(nothing highlighted)").dim())),
+        Who::Reading => lines.push(Line::from(Span::raw("reading the sessions...").dim())),
+        Who::Failed(why) => lines.push(Line::from(format!(
+            "could not read the enrolled speakers: {why}"
+        ))),
+        Who::Unrecorded => lines.push(Line::from(
+            "enrolled during this run, so nothing has been read for them yet",
+        )),
+        Who::Known {
+            references,
+            voices,
+            sessions,
+            unreadable,
+        } => {
+            lines.push(Line::from(match voices {
+                0 => format!("{references} reference(s), naming nothing in any session read"),
+                voices => format!(
+                    "{references} reference(s), naming {voices} voice(s) in {} session(s)",
+                    sessions.len()
+                ),
+            }));
+            // The incompleteness line is claimed out of the budget before the sessions are, so a
+            // person naming forty voices cannot cost the sentence that says the answer is partial.
+            let room = area.height.saturating_sub(2) as usize;
+            let (shown, more) = listed(sessions.len(), room.saturating_sub(1 + *unreadable));
+            for named in &sessions[..shown] {
+                lines.push(Line::from(format!(
+                    "  {}  {}",
+                    named.session,
+                    named.voices.join(", ")
+                )));
+            }
+            if more {
+                lines.push(Line::from(
+                    Span::raw(format!(
+                        "  ... and {} more session(s)",
+                        sessions.len() - shown
+                    ))
+                    .dim(),
+                ));
+            }
+            if *unreadable > 0 {
+                lines.push(Line::from(Span::raw(incomplete(*unreadable)).dim()));
+            }
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+/// How many sessions the pane lists, and whether it owes a line saying how many it left out.
+///
+/// Its own function because it is the one piece of arithmetic in this file that `cargo test` can
+/// reach, and getting it wrong is a pane that silently drops the last session or spends a row
+/// saying nothing.
+///
+/// With a budget of one row, that row goes to a session rather than to a count: the summary line
+/// above already says how many sessions there are, so "... and 3 more session(s)" over an empty
+/// list would be the same number twice and no session at all.
+fn listed(sessions: usize, budget: usize) -> (usize, bool) {
+    match sessions {
+        sessions if sessions <= budget => (sessions, false),
+        _ if budget <= 1 => (budget, false),
+        _ => (budget - 1, true),
+    }
+}
+
 /// What this voice said, with the selected line marked and timed. Every snippet is here; which
 /// one is selected is the state machine's, and which one is sounding is the shell's.
 ///
@@ -387,9 +502,9 @@ mod tests {
 
     use meethook_enroll::Snippet;
 
-    use super::super::state::tests::heard;
-    use super::super::state::{Cost, Costs, Event, Screen, VoiceView};
-    use super::{Progress, Sounding, draw};
+    use super::super::state::tests::{heard, holding, names, scanned};
+    use super::super::state::{Context, Cost, Costs, Event, Screen, VoiceView};
+    use super::{Progress, Sounding, draw, incomplete, listed};
 
     struct Free;
 
@@ -428,13 +543,30 @@ mod tests {
     /// The whole frame as text, one string per terminal row, so an assertion can name what it
     /// expects to see rather than pinning every cell.
     fn painted(width: u16, height: u16, costs: &dyn Costs, keys: &[Event]) -> Vec<String> {
-        painted_with(width, height, costs, keys, &said(), None, None)
+        painted_with(
+            width,
+            height,
+            costs,
+            keys,
+            &said(),
+            None,
+            None,
+            Context::Reading,
+        )
     }
 
-    /// [`painted`], plus the three things only the snippet and footer tests vary: what this voice
-    /// said, what is sounding, and what the frame last had to say. The last two reach the footer
-    /// from different directions -- one is a parameter to `draw`, the other a field of the view --
-    /// which is exactly what the precedence between them has to be pinned against.
+    /// [`painted`], with a cross-session scan already gathered. The "who" pane is the only thing
+    /// the context reaches, so its tests vary that and nothing else.
+    fn knowing(width: u16, height: u16, keys: &[Event], context: Context<'_>) -> Vec<String> {
+        painted_with(width, height, &Free, keys, &said(), None, None, context)
+    }
+
+    /// [`painted`], plus the four things only the snippet, footer and "who" tests vary: what this
+    /// voice said, what is sounding, what the frame last had to say, and what has been read about
+    /// the enrolled speakers. The middle two reach the footer from different directions -- one is a
+    /// parameter to `draw`, the other a field of the view -- which is exactly what the precedence
+    /// between them has to be pinned against.
+    #[allow(clippy::too_many_arguments)]
     fn painted_with(
         width: u16,
         height: u16,
@@ -443,6 +575,7 @@ mod tests {
         snippets: &[Snippet<'_>],
         sounding: Option<Sounding>,
         status: Option<&str>,
+        context: Context<'_>,
     ) -> Vec<String> {
         let session = SessionId::parse("20260819-100000").expect("a well-formed session id");
         let labels = [
@@ -513,7 +646,7 @@ mod tests {
         if let Some(status) = status {
             screen.say(status.to_string());
         }
-        let view = screen.view(&voice, costs);
+        let view = screen.view(&voice, costs, context);
         let narration = vec!["20260819-100000  3 voice(s) to ask about".to_string()];
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
@@ -532,14 +665,15 @@ mod tests {
             .collect()
     }
 
-    /// The five panes, at a comfortable size: the queue with its talk times and its separator for
-    /// the quiet voices, the ranked candidates with their numbers, the consequence, the snippets
-    /// and the run's own narration.
+    /// The six panes, at a comfortable size: the queue with its talk times and its separator for
+    /// the quiet voices, the ranked candidates with their numbers, the consequence, who the
+    /// highlighted candidate is, the snippets and the run's own narration.
     #[test]
-    fn the_frame_places_all_five_panes() {
+    fn the_frame_places_all_six_panes() {
         let painted = painted(110, 30, &Free, &[]);
         let whole = painted.join("\n");
         assert!(whole.contains("voices  20260819-100000  2/3"), "{whole}");
+        assert!(whole.contains("who Milo is"), "{whole}");
         assert!(whole.contains("Unknown 1"), "{whole}");
         assert!(whole.contains("Milo"), "{whole}");
         assert!(whole.contains("quieter than the prompt floor"), "{whole}");
@@ -579,7 +713,17 @@ mod tests {
             },
             line: None,
         });
-        let whole = painted_with(110, 30, &Free, &[], &said(), sounding, None).join("\n");
+        let whole = painted_with(
+            110,
+            30,
+            &Free,
+            &[],
+            &said(),
+            sounding,
+            None,
+            Context::Reading,
+        )
+        .join("\n");
         assert!(whole.contains("playing 12s of 1m 47s"), "{whole}");
         assert!(whole.contains("^P restart"), "{whole}");
         assert!(
@@ -602,11 +746,22 @@ mod tests {
         });
         let status = Some("could not play the clip: afplay exited with exit status: 1");
 
-        let over = painted_with(110, 30, &Free, &[], &said(), sounding, status).join("\n");
+        let over = painted_with(
+            110,
+            30,
+            &Free,
+            &[],
+            &said(),
+            sounding,
+            status,
+            Context::Reading,
+        )
+        .join("\n");
         assert!(over.contains("playing 3s of 30s"), "{over}");
         assert!(!over.contains("could not play the clip"), "{over}");
 
-        let stopped = painted_with(110, 30, &Free, &[], &said(), None, status).join("\n");
+        let stopped =
+            painted_with(110, 30, &Free, &[], &said(), None, status, Context::Reading).join("\n");
         assert!(stopped.contains("could not play the clip"), "{stopped}");
         assert!(!stopped.contains("playing 3s"), "{stopped}");
     }
@@ -663,6 +818,7 @@ mod tests {
                 line: Some(0),
             }),
             None,
+            Context::Reading,
         )
         .join("\n");
         assert!(
@@ -682,6 +838,7 @@ mod tests {
                 line: None,
             }),
             None,
+            Context::Reading,
         )
         .join("\n");
         assert!(!voice.contains("<- playing"), "{voice}");
@@ -704,10 +861,12 @@ mod tests {
             heard("so where did we land on the migration", 12.0, &NONE),
             heard("right, next week", 107.0, &NONE),
         ];
-        let no_audio = painted_with(120, 30, &Free, &[], &silent, None, None).join("\n");
+        let no_audio =
+            painted_with(120, 30, &Free, &[], &silent, None, None, Context::Reading).join("\n");
         assert!(no_audio.contains("^L no audio"), "{no_audio}");
 
-        let nothing_said = painted_with(120, 30, &Free, &[], &[], None, None).join("\n");
+        let nothing_said =
+            painted_with(120, 30, &Free, &[], &[], None, None, Context::Reading).join("\n");
         assert!(
             !nothing_said.contains("^L"),
             "a key that cannot work is not offered\n{nothing_said}"
@@ -729,7 +888,17 @@ mod tests {
             },
             line: Some(1),
         });
-        let whole = painted_with(110, 30, &Free, &[], &said(), sounding, None).join("\n");
+        let whole = painted_with(
+            110,
+            30,
+            &Free,
+            &[],
+            &said(),
+            sounding,
+            None,
+            Context::Reading,
+        )
+        .join("\n");
         assert!(whole.contains("^L restart"), "{whole}");
         assert!(
             !whole.contains("^P restart"),
@@ -744,11 +913,142 @@ mod tests {
         let painted = painted(80, 24, &Free, &[]);
         assert_eq!(painted.len(), 24);
         let whole = painted.join("\n");
-        for title in [" voices ", " resembles ", " would ", " said ", " run "] {
+        for title in [
+            " voices ",
+            " resembles ",
+            " would ",
+            // The one title that names its subject, so "who" alone would also match the question
+            // line above it.
+            " who Milo is ",
+            " said ",
+            " run ",
+        ] {
             assert!(
                 whole.contains(title.trim()),
                 "{title} missing from\n{whole}"
             );
         }
+    }
+
+    /// AC #1 and AC #2 from the drawing side: how many recordings the highlighted candidate has,
+    /// and which voices in which meetings read that name today -- beside the candidate row, so
+    /// "who is Ivan again?" is answerable without leaving the prompt.
+    #[test]
+    fn the_frame_says_who_the_highlighted_candidate_is() {
+        let scan = scanned(
+            vec![holding(
+                "Milo",
+                &[
+                    &[names("20260810-101500", "Unknown 1", "Milo")],
+                    &[names("20260809-052600", "Unknown 3", "Milo")],
+                    &[],
+                ],
+            )],
+            &[],
+        );
+        let whole = knowing(110, 30, &[], Context::Read(&scan)).join("\n");
+        assert!(whole.contains("who Milo is"), "{whole}");
+        assert!(
+            whole.contains("3 reference(s), naming 2 voice(s) in 2 session(s)"),
+            "{whole}"
+        );
+        assert!(whole.contains("20260810-101500  Unknown 1"), "{whole}");
+        assert!(whole.contains("20260809-052600  Unknown 3"), "{whole}");
+
+        // Somebody the ranking has no count for at all is still described here, which is the whole
+        // reason this pane is not just the "N ref" column read out.
+        let al = knowing(
+            110,
+            30,
+            &[Event::CandidateDown],
+            Context::Read(&scanned(
+                vec![
+                    holding("Milo", &[&[]]),
+                    holding("Ivan", &[&[names("20260810-101500", "Unknown 7", "Ivan")]]),
+                ],
+                &[],
+            )),
+        )
+        .join("\n");
+        assert!(al.contains("who Ivan is"), "{al}");
+        assert!(
+            al.contains("1 reference(s), naming 1 voice(s) in 1 session(s)"),
+            "{al}"
+        );
+
+        // More sessions than the pane has rows: it says how many it left out rather than looking
+        // like the whole answer.
+        let crowded = scanned(
+            vec![holding(
+                "Milo",
+                &[
+                    &[names("20260810-101500", "Unknown 1", "Milo")],
+                    &[names("20260809-052600", "Unknown 3", "Milo")],
+                    &[names("20260808-140000", "Unknown 2", "Milo")],
+                    &[names("20260807-090000", "Unknown 5", "Milo")],
+                ],
+            )],
+            &[],
+        );
+        let clipped = knowing(110, 30, &[], Context::Read(&crowded)).join("\n");
+        assert!(
+            clipped.contains("... and 3 more session(s)"),
+            "three rows hold the summary, one session and the count\n{clipped}"
+        );
+    }
+
+    /// AC #5 from the drawing side: a scan that could not read every session says so on the frame,
+    /// in the same sentence `meethook speakers` fails with, and still reports what it did read.
+    #[test]
+    fn an_incomplete_scan_says_so_on_the_frame() {
+        let scan = scanned(
+            vec![holding(
+                "Milo",
+                &[&[names("20260810-101500", "Unknown 1", "Milo")]],
+            )],
+            &["20260809-052600"],
+        );
+        // Wide enough for the shared sentence to land whole: the pane clips rather than wraps, and
+        // this test is about the wording rather than about the width.
+        let whole = knowing(160, 30, &[], Context::Read(&scan)).join("\n");
+        assert!(
+            whole.contains(&incomplete(1)),
+            "the sentence `meethook speakers` uses, not a second one\n{whole}"
+        );
+        assert!(
+            whole.contains("20260810-101500  Unknown 1"),
+            "what it could read is still reported\n{whole}"
+        );
+    }
+
+    /// The two states that are not an answer yet. A scan still running says so, and one that failed
+    /// says why -- either way the pane is never an empty box that reads as "this name does nothing".
+    #[test]
+    fn a_scan_still_running_says_so_rather_than_looking_empty() {
+        let reading = knowing(110, 30, &[], Context::Reading).join("\n");
+        assert!(reading.contains("reading the sessions..."), "{reading}");
+
+        let failed = knowing(
+            160,
+            30,
+            &[],
+            Context::Failed("no such file or directory (os error 2)"),
+        )
+        .join("\n");
+        assert!(
+            failed.contains("could not read the enrolled speakers: no such file"),
+            "{failed}"
+        );
+    }
+
+    /// The pane's budget, at every size it can be asked for: the last session is never silently
+    /// dropped, and a lone row goes to a session rather than to a count of the ones missing.
+    #[test]
+    fn the_session_list_never_drops_a_session_silently() {
+        assert_eq!(listed(0, 3), (0, false));
+        assert_eq!(listed(3, 3), (3, false), "an exact fit needs no count line");
+        assert_eq!(listed(4, 3), (2, true), "the count line costs a session");
+        assert_eq!(listed(4, 1), (1, false), "one row says more than a count");
+        assert_eq!(listed(4, 0), (0, false), "no room at all is not a panic");
     }
 }

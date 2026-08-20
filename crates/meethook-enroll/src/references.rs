@@ -495,6 +495,20 @@ pub(crate) fn write_change(out: &mut dyn Write, change: &VoiceChange) -> Result<
     Ok(())
 }
 
+/// The scan could not speak for every session, said once for every caller that has to say it.
+///
+/// `meethook speakers` fails with this sentence and the enrolment frame draws it, about the same
+/// incompleteness in the same [`Scan`]. Two callers wording one fact differently is what makes a
+/// user wonder whether they mean the same thing -- the reason `write_nobody_enrolled` exists in
+/// this module, and the reason a caller that has a [`Scan::unreadable`] to report should reach for
+/// this rather than format its own.
+///
+/// A `String` rather than a write, because the two callers put it in different places: one exits
+/// with it, the other draws it as the last line of a pane.
+pub fn incomplete(count: usize) -> String {
+    format!("{count} session(s) could not be read, so this listing is incomplete")
+}
+
 /// Nobody is enrolled at all, said once for every command that has to say it.
 ///
 /// A listing and a removal both reach this state, and two commands wording the same fact
