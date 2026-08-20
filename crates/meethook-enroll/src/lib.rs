@@ -731,9 +731,14 @@ pub enum Sessions {
     #[default]
     Unresolved,
 
-    /// `--correct`, and the full-screen frame: opened anyway. A session where nothing is
-    /// unresolved is exactly where a wrong identification sits, so it is the one a user
-    /// correcting an identification is reaching for.
+    /// `--correct`: opened anyway. A session where nothing is unresolved is exactly where a
+    /// wrong identification sits, so it is the one a user correcting an identification is
+    /// reaching for.
+    ///
+    /// Not what the full-screen frame asks for, which is the whole point of this enum existing
+    /// separately from [`Offer::named`]. The frame widens `Offer` so its queue pane can reach
+    /// every voice in a session it *did* open; widening this as well would open one on every
+    /// finished meeting on disk.
     Every,
 }
 
@@ -1431,10 +1436,14 @@ fn queue<'c>(
     // however hard a caller asks -- which is why the emptiness test stays rather than folding
     // into the count.
     //
-    // A strict superset of the single `candidates.is_empty()` gate this replaces, for both of
-    // the combinations that reach it: with `offer.named` false every candidate is unresolved,
-    // so `unresolved == 0` holds exactly when the list is empty, and with it true the caller
-    // that sets it also passes `Sessions::Every`.
+    // Behaviour is unchanged for the two combinations that predate the split, and the third is
+    // the reason for it. With `offer.named` false -- the plain path -- every candidate is
+    // unresolved, so `unresolved == 0` holds exactly when the list is empty and this is the
+    // `candidates.is_empty()` gate it replaces. With `--correct` it is true alongside
+    // `Sessions::Every`, so the count is not consulted. The full-screen frame is the third: it
+    // sets `offer.named` so its queue pane can reach every voice, but leaves
+    // `Sessions::Unresolved`, and this count is what then keeps it from opening on every
+    // finished meeting on disk.
     let unresolved = candidates
         .iter()
         .filter(|c| !shown[&c.id].is_named())
@@ -6021,8 +6030,9 @@ mod tests {
         assert!(skipping.seen.is_empty(), "{output}");
         assert_eq!(report.passed_over, 1, "{output}");
 
-        // Same offer, visited anyway -- which is what the full-screen frame needs and what
-        // `--correct` asks for today.
+        // Same offer, visited anyway, which is what `--correct` asks for. The pair above and
+        // below is the split itself: the frame takes the first combination and `--correct` the
+        // second, off the same `Offer`.
         let mut asking = Scripted::default();
         let (report, output) = run_over(
             &paths,

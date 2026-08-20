@@ -1002,9 +1002,9 @@ impl Tty {
 
 /// Which of `enroll`'s answerers a run gets.
 ///
-/// `Screen` and `Prompt` are the same answerer today -- the line-based [`Terminal`] -- because
-/// the full-screen interface does not exist yet. Keeping them apart here is what makes building
-/// it a change to one arm of one `match` rather than a change to this rule.
+/// Three distinct answerers: [`GivenName`], the line-based [`Terminal`], and the full-screen
+/// [`Interface`]. Keeping the choice in its own type is what lets [`answerer`] state the rule
+/// once and be tested against it without a terminal, while [`enroll`] does the constructing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answerer {
     /// `--name`: the answer was given up front, so nothing is asked at all.
