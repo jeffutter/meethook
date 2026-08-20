@@ -5,9 +5,10 @@
 //! What is left here is the terminal itself -- printing, prompting, and playing audio --
 //! which is exactly the part no test can decide.
 
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,7 @@ use crate::EnrollArgs;
 use crate::screen::{Interface, Shared};
 use meethook_transcribe::{
     Attribution, EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, SILERO_VAD_MODEL,
-    WHISPER_MODEL, WhisperEngine, run_batch,
+    TARGET_RATE, WHISPER_MODEL, WhisperEngine, run_batch,
 };
 
 /// The four waits the record loop's behaviour depends on.
@@ -1050,6 +1051,42 @@ fn answerer(named: bool, plain: bool, tty: Tty) -> Answerer {
 /// takes a different number.
 const SNIPPETS: usize = 3;
 
+/// How far through a clip playback has got.
+///
+/// Wall time, not a position read off the player: `afplay` reports nothing about where it is --
+/// `-v -t -r -q -d` is the whole of its option set -- so this is how long ago the child was
+/// spawned, measured against the clip's own length. It is therefore approximate, and drifts by
+/// whatever the audio device spent starting up, so the wording that shows it must not pretend to
+/// be a cursor into the audio.
+///
+/// `elapsed` is clamped to `length`: a clip that has run over its own length is one whose child
+/// has not been reaped yet, and "playing 1m 52s of 1m 47s" reads as a bug rather than as latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Progress {
+    /// How long ago playback started, never more than `length`.
+    pub(crate) elapsed: Duration,
+    /// How long the clip runs for, from its sample count.
+    pub(crate) length: Duration,
+}
+
+/// One clip being played, and everything owed when it stops.
+struct Playing {
+    child: Child,
+    /// The clip's own file, unlinked when the child is reaped: fifty replays of a three-minute
+    /// clip would otherwise sit in the scratch directory until the run ended.
+    path: PathBuf,
+    started: Instant,
+    length: Duration,
+}
+
+/// How long a clip runs for, from its sample count.
+///
+/// Its own function because it is the one piece of arithmetic here that `cargo test` can reach,
+/// and a wrong denominator is invisible except as a position that drifts against the audio.
+fn length(clip: &[f32]) -> Duration {
+    Duration::from_secs_f64(clip.len() as f64 / f64::from(TARGET_RATE))
+}
+
 /// Playing a voice's audio, for whichever answerer is asking.
 ///
 /// Both of them need this and neither of them needs it differently: the samples are the same
@@ -1057,15 +1094,110 @@ const SNIPPETS: usize = 3;
 /// the line prompt prints a parenthetical under the snippets, the frame puts a status line in a
 /// pane -- so this returns what went wrong rather than saying it, and the empty-clip case stays
 /// with the callers for the same reason.
+///
+/// What they also do not share is *waiting*. [`Clips::play`] starts and waits, which is right
+/// behind a line prompt; the frame calls [`Clips::start`], [`Clips::poll`] and [`Clips::stop`] so
+/// a three-minute clip does not hold the screen. Both go through the same spawn, so there is one
+/// wording for a failure and not two.
 #[derive(Default)]
 pub(crate) struct Clips {
     /// Where clips are written for the player, created on first use and removed when the run
     /// ends. `afplay` has no start offset, so playing part of a recording means handing it a
     /// file that contains only that part.
     dir: Option<tempfile::TempDir>,
+    /// The child, while there is one.
+    playing: Option<Playing>,
+    /// How many clips this run has written, and so what the next one is called. Unique names
+    /// rather than one `clip.wav`: overwriting the file a live `afplay` is reading is the bug a
+    /// fixed name invites the moment playback stops being synchronous.
+    written: usize,
 }
 
 impl Clips {
+    /// Spawns a player for `clip` and returns immediately.
+    ///
+    /// Anything already playing is stopped first, so pressing play again restarts the clip from
+    /// the beginning whether or not the previous one had finished.
+    ///
+    /// Never fatal to a run, for the reason [`Clips::play`] gives. An empty `clip` is a
+    /// successful no-op and the caller's sentence to write.
+    pub(crate) fn start(&mut self, clip: &[f32]) -> Result<()> {
+        if clip.is_empty() {
+            return Ok(());
+        }
+        self.stop();
+        // Owned, and taken before `written` is bumped: `&self.dir` and the write to `self.written`
+        // cannot both be live.
+        let dir = match &self.dir {
+            Some(dir) => dir.path().to_path_buf(),
+            None => self.dir.insert(tempfile::tempdir()?).path().to_path_buf(),
+        };
+        self.written += 1;
+        let path = dir.join(format!("clip-{}.wav", self.written));
+        write_clip(&path, clip)?;
+        // All three streams closed. Under raw mode and an alternate screen one line of
+        // `AudioQueueStart failed` from the child paints over the frame, and ratatui's diffed
+        // redraw will not clear a cell it never wrote.
+        let child = Command::new("afplay")
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        self.playing = Some(Playing {
+            child,
+            path,
+            started: Instant::now(),
+            length: length(clip),
+        });
+        Ok(())
+    }
+
+    /// Reaps a finished player, and says how far through the clip a running one has got.
+    ///
+    /// `Ok(None)` covers both "nothing is playing" and "it has just finished cleanly", which are
+    /// the same thing to a caller: there is no position to show. `Err` is a player that exited
+    /// non-zero -- a clip that will not play is only knowable here, once the child is reaped --
+    /// and in that case playback has already been torn down.
+    pub(crate) fn poll(&mut self) -> Result<Option<Progress>> {
+        let Some(playing) = self.playing.as_mut() else {
+            return Ok(None);
+        };
+        let reaped = playing.child.try_wait();
+        let progress = Progress {
+            elapsed: playing.started.elapsed().min(playing.length),
+            length: playing.length,
+        };
+        match reaped {
+            Ok(None) => Ok(Some(progress)),
+            Ok(Some(status)) => {
+                self.stop();
+                if status.success() {
+                    Ok(None)
+                } else {
+                    bail!("afplay exited with {status}");
+                }
+            }
+            Err(e) => {
+                self.stop();
+                Err(e).context("waiting on afplay")
+            }
+        }
+    }
+
+    /// Kills whatever is playing, reaps it, and takes its file with it.
+    ///
+    /// Infallible on purpose: there is nothing a caller could do about a kill that failed, and
+    /// this runs on the way out of every question. The reap is the part that matters -- an
+    /// unreaped child is a zombie outliving the question it belongs to.
+    pub(crate) fn stop(&mut self) {
+        if let Some(mut playing) = self.playing.take() {
+            let _ = playing.child.kill();
+            let _ = playing.child.wait();
+            let _ = fs::remove_file(&playing.path);
+        }
+    }
+
     /// Plays a clip and waits for it to finish.
     ///
     /// Never fatal to a run. A missing `afplay`, a full temp directory, a truncated
@@ -1074,21 +1206,28 @@ impl Clips {
     ///
     /// An empty `clip` is a successful no-op here and the caller's sentence to write: it is not a
     /// failure of anything, and the two answerers word it differently.
+    ///
+    /// [`Clips::start`] plus the wait, so the spawn and the wording of a failure are written once.
     pub(crate) fn play(&mut self, clip: &[f32]) -> Result<()> {
-        if clip.is_empty() {
+        self.start(clip)?;
+        let Some(mut playing) = self.playing.take() else {
             return Ok(());
-        }
-        let dir = match &self.dir {
-            Some(dir) => dir,
-            None => self.dir.insert(tempfile::tempdir()?),
         };
-        let path = dir.path().join("clip.wav");
-        write_clip(&path, clip)?;
-        let status = Command::new("afplay").arg(&path).status()?;
+        let status = playing.child.wait()?;
+        let _ = fs::remove_file(&playing.path);
         if !status.success() {
             bail!("afplay exited with {status}");
         }
         Ok(())
+    }
+}
+
+impl Drop for Clips {
+    /// No `afplay` outlives the run, on any path out of it -- and the ordering is the point:
+    /// `drop` runs before any field is dropped, so the child is dead and its file unlinked before
+    /// the `TempDir` removes the directory it was reading from.
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -1228,7 +1367,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Answerer, Capture, Event, Outcome, Timing, Tty, answerer, await_end, meeting_line,
+        Answerer, Capture, Event, Outcome, Timing, Tty, answerer, await_end, length, meeting_line,
         record_loop,
     };
 
@@ -1304,6 +1443,16 @@ mod tests {
     #[test]
     fn a_terminal_with_no_flags_is_the_interactive_arm() {
         assert_eq!(answerer(false, false, ATTACHED), Answerer::Screen);
+    }
+
+    /// The clip's own length, which is the whole denominator of the position the frame shows.
+    /// `afplay` reports nothing, so a wrong rate here is invisible except as an indicator that
+    /// drifts against what is coming out of the speakers.
+    #[test]
+    fn a_clip_is_as_long_as_its_samples_at_sixteen_kilohertz() {
+        assert_eq!(length(&vec![0.0; 16_000]), Duration::from_secs(1));
+        assert_eq!(length(&vec![0.0; 8_000]), Duration::from_millis(500));
+        assert_eq!(length(&[]), Duration::ZERO);
     }
 
     /// Long enough that scheduling noise cannot be mistaken for a timeout, short enough

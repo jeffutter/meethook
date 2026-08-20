@@ -28,16 +28,35 @@ pub mod state;
 use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
+use std::time::Duration;
 
 use meethook_enroll::{Answer, Consequence, Interviewer, Preview, Voice, speech};
 use meethook_session::{Displaced, Stored};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, read,
+    Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
 };
 
-use crate::commands::Clips;
+use crate::commands::{Clips, Progress};
 use state::{Cost, Costs, Event, Screen, Step, VoiceView};
+
+/// How often a frame with a clip playing redraws itself, and so how fast the position moves and
+/// how promptly it disappears when the clip ends.
+///
+/// Four times a second is enough that a seconds-resolution position looks live, and cheap enough
+/// that re-deriving the view that often is not worth measuring: the costs behind it are memoised,
+/// so every redraw after the first of a question is a lookup.
+const TICK: Duration = Duration::from_millis(250);
+
+/// How long the frame should wait for a key before redrawing -- `None` to block until one arrives.
+///
+/// The whole of the rule, in a function next to [`event`] and for the same reason: it is then
+/// decidable in `cargo test` with no terminal in front of it. Playback is the only thing that puts
+/// a clock on this frame, and only while it lasts. An idle frame has nothing that would redraw
+/// differently, so it blocks rather than waking four times a second to find that out.
+fn wait(playing: Option<Progress>) -> Option<Duration> {
+    playing.map(|_| TICK)
+}
 
 /// A narration buffer two owners can hold at once.
 ///
@@ -178,6 +197,27 @@ impl Interviewer for Interface {
             }
         }
 
+        // One call site, and one stop after it: answered, skipped, deferred, quit and a frame that
+        // could not be drawn are five ways out of the loop, and every one of them has to leave the
+        // audio behind. `Drop for Clips` covers the paths that never come back through here.
+        let answer = self.ask(&view, voice);
+        self.clips.stop();
+        answer
+    }
+
+    /// The other half of the deferral contract. `true` exactly while the user is steering toward a
+    /// voice, so a pass that produced no answer is not a finished session.
+    fn still_working(&self) -> bool {
+        self.state.still_working()
+    }
+}
+
+impl Interface {
+    /// Draws and reads keys until the question is answered, or until there is nothing to draw on.
+    ///
+    /// Split out of [`Interviewer::identify`] so playback has exactly one place to be stopped: see
+    /// the comment at the call.
+    fn ask(&mut self, view: &VoiceView<'_>, voice: &Voice<'_>) -> Answer {
         // Field by field, so the state machine and the terminal can be borrowed at once.
         let Interface {
             state,
@@ -191,12 +231,37 @@ impl Interviewer for Interface {
         };
 
         loop {
+            // A clip that will not play is only knowable here, once the child has been reaped, so
+            // the report lands an iteration after the key that started it rather than at the spawn.
+            let playing = match clips.poll() {
+                Ok(playing) => playing,
+                Err(e) => {
+                    state.say(format!("could not play the clip: {e}"));
+                    None
+                }
+            };
             {
-                let derived = state.view(&view, &voice.preview);
+                let derived = state.view(view, &voice.preview);
                 let lines = narration.lines();
-                if let Err(e) = terminal.draw(|frame| render::draw(frame, &derived, &lines)) {
+                if let Err(e) =
+                    terminal.draw(|frame| render::draw(frame, &derived, &lines, playing))
+                {
                     *trouble = Some(format!("the frame could not be drawn ({e})"));
                     return Answer::Quit;
+                }
+            }
+
+            // While something is playing, waking on a timeout is what moves the position and what
+            // takes it away when the clip ends; the redraw at the top of the loop does both. With
+            // nothing playing this falls straight through and blocks in `read`.
+            if let Some(timeout) = wait(playing) {
+                match poll(timeout) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        *trouble = Some(format!("the terminal stopped being readable ({e})"));
+                        return Answer::Quit;
+                    }
                 }
             }
 
@@ -216,33 +281,29 @@ impl Interviewer for Interface {
                 continue;
             };
             // Playback is intercepted here because the samples are the shell's: the state machine
-            // deliberately holds no audio. It blocks, so the frame is frozen for the length of the
-            // clip -- TASK-046.07 is where that stops being true.
+            // deliberately holds no audio.
             if event == Event::Play {
                 let problem = if voice.clip.is_empty() {
                     Some("there is no audio for this voice".to_string())
                 } else {
                     clips
-                        .play(voice.clip)
+                        .start(voice.clip)
                         .err()
                         .map(|e| format!("could not play the clip: {e}"))
                 };
-                if let Some(problem) = problem {
-                    state.say(problem);
+                match problem {
+                    Some(problem) => state.say(problem),
+                    // A play that has now worked takes back what the last failed one said.
+                    // Nothing else clears the footer for a key the state machine never sees.
+                    None => state.hush(),
                 }
                 continue;
             }
-            match state.answer(&view, event, &voice.preview) {
+            match state.answer(view, event, &voice.preview) {
                 Step::Waiting => continue,
                 Step::Answered(answer) => return answer,
             }
         }
-    }
-
-    /// The other half of the deferral contract. `true` exactly while the user is steering toward a
-    /// voice, so a pass that produced no answer is not a finished session.
-    fn still_working(&self) -> bool {
-        self.state.still_working()
     }
 }
 
@@ -358,11 +419,12 @@ fn event(key: KeyEvent) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::time::Duration;
 
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     use super::state::Event;
-    use super::{Interface, Shared, event};
+    use super::{Interface, Progress, Shared, TICK, event, wait};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
@@ -401,6 +463,24 @@ mod tests {
                 "{code:?} with {modifiers:?}"
             );
         }
+    }
+
+    /// Only playback puts a clock on this frame. An idle frame blocks for its next key rather than
+    /// waking four times a second to redraw something that cannot have changed, and the bounds on
+    /// `TICK` are what stop a later edit turning the rule into a spin at one end or a position that
+    /// visibly lurches at the other.
+    #[test]
+    fn an_idle_frame_waits_for_its_next_key() {
+        assert_eq!(wait(None), None, "nothing to redraw, so block");
+        let playing = Progress {
+            elapsed: Duration::from_secs(3),
+            length: Duration::from_secs(30),
+        };
+        assert_eq!(wait(Some(playing)), Some(TICK));
+        assert!(
+            TICK >= Duration::from_millis(50) && TICK <= Duration::from_millis(500),
+            "{TICK:?} is either a spin or a position that jumps"
+        );
     }
 
     /// Both ways out. Raw mode means no SIGINT arrives, so Ctrl-C has to be bound or the frame

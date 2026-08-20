@@ -23,9 +23,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::state::{Candidate, Mark, Row, View};
+use crate::commands::Progress;
 
 /// Places every pane for one frame.
-pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String]) {
+///
+/// `playing` is a parameter rather than a [`View`] field on purpose: it is derived from a clock,
+/// and [`state`](super::state) is documented as having none in it. A fourth argument says in the
+/// signature that the shell computed this and the state machine did not.
+pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String], playing: Option<Progress>) {
     let whole = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -54,7 +59,7 @@ pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String]) {
     consequence(frame, right[2], view);
     snippets(frame, whole[1], view);
     log(frame, whole[2], narration);
-    footer(frame, whole[3], view);
+    footer(frame, whole[3], view, playing);
 }
 
 /// The voice queue: every voice the session has, with the quiet ones under a separator.
@@ -281,11 +286,25 @@ fn log(frame: &mut Frame, area: Rect, narration: &[String]) {
     );
 }
 
-/// One line: whatever just happened, or the keys.
-fn footer(frame: &mut Frame, area: Rect, view: &View<'_>) {
-    let text = match view.status {
-        Some(status) => status.to_string(),
-        None => {
+/// One line: how far through a clip playback has got, else whatever just happened, else the keys.
+///
+/// Playback outranks the status because it is the only one of the three that changes on its own,
+/// and because the two cannot both be true: a play that failed clears the progress and sets the
+/// status in the same iteration.
+///
+/// The position is spelled with [`speech`], which is already what the question and the queue use
+/// for a duration, so "playing 12s of 1m 47s" reads the way the rest of the frame does and no
+/// second time formatter appears in this binary. Only the three keys that mean something mid-clip
+/// are kept: the full list is already wider than 80 columns without them.
+fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, playing: Option<Progress>) {
+    let text = match (playing, view.status) {
+        (Some(Progress { elapsed, length }), _) => format!(
+            "playing {} of {}  ^P restart  ^S skip  ^C quit",
+            speech(elapsed.as_secs_f64()),
+            speech(length.as_secs_f64())
+        ),
+        (None, Some(status)) => status.to_string(),
+        (None, None) => {
             let clip = match view.clip_is_empty {
                 true => "^P no audio",
                 false => "^P play",
@@ -301,6 +320,8 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use meethook_enroll::{Position, Queued, Refusal};
     use meethook_session::SessionId;
     use meethook_transcribe::{Attribution, Resemblance};
@@ -309,7 +330,7 @@ mod tests {
 
     use super::super::state::tests::snippet;
     use super::super::state::{Cost, Costs, Event, Screen, VoiceView};
-    use super::draw;
+    use super::{Progress, draw};
 
     struct Free;
 
@@ -338,6 +359,21 @@ mod tests {
     /// The whole frame as text, one string per terminal row, so an assertion can name what it
     /// expects to see rather than pinning every cell.
     fn painted(width: u16, height: u16, costs: &dyn Costs, keys: &[Event]) -> Vec<String> {
+        painted_with(width, height, costs, keys, None, None)
+    }
+
+    /// [`painted`], plus the two things only the footer's tests vary: what is playing, and what
+    /// the frame last had to say. Both reach the footer from different directions -- one is a
+    /// parameter to `draw`, the other a field of the view -- which is exactly what the precedence
+    /// between them has to be pinned against.
+    fn painted_with(
+        width: u16,
+        height: u16,
+        costs: &dyn Costs,
+        keys: &[Event],
+        playing: Option<Progress>,
+        status: Option<&str>,
+    ) -> Vec<String> {
         let session = SessionId::parse("20260819-100000").expect("a well-formed session id");
         let labels = [
             (
@@ -403,12 +439,17 @@ mod tests {
         for key in keys {
             screen.answer(&voice, *key, costs);
         }
+        // After the keys: `answer` clears the status, which is the behaviour a caller asking for
+        // one is working around.
+        if let Some(status) = status {
+            screen.say(status.to_string());
+        }
         let view = screen.view(&voice, costs);
         let narration = vec!["20260819-100000  3 voice(s) to ask about".to_string()];
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
         terminal
-            .draw(|frame| draw(frame, &view, &narration))
+            .draw(|frame| draw(frame, &view, &narration, playing))
             .expect("drawing into a buffer cannot fail");
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -456,6 +497,43 @@ mod tests {
             whole.contains("Unknown 2 was heard at the same time"),
             "{whole}"
         );
+    }
+
+    /// A clip that is playing says how far through it is, in the frame's own wording for a
+    /// duration, and gives the line over to the keys that still mean something mid-clip.
+    #[test]
+    fn a_playing_clip_says_how_far_through_it_is() {
+        let playing = Some(Progress {
+            elapsed: Duration::from_secs(12),
+            length: Duration::from_secs(107),
+        });
+        let whole = painted_with(110, 30, &Free, &[], playing, None).join("\n");
+        assert!(whole.contains("playing 12s of 1m 47s"), "{whole}");
+        assert!(whole.contains("^P restart"), "{whole}");
+        assert!(
+            !whole.contains("right work on it"),
+            "the key list gives way to the position\n{whole}"
+        );
+    }
+
+    /// The footer's precedence, both ways round: a live clip is the only one of the three that
+    /// moves on its own, so it outranks a status -- and the moment it stops, the same view says
+    /// what it had to say.
+    #[test]
+    fn a_playing_clip_outranks_the_status_line() {
+        let playing = Some(Progress {
+            elapsed: Duration::from_secs(3),
+            length: Duration::from_secs(30),
+        });
+        let status = Some("could not play the clip: afplay exited with exit status: 1");
+
+        let over = painted_with(110, 30, &Free, &[], playing, status).join("\n");
+        assert!(over.contains("playing 3s of 30s"), "{over}");
+        assert!(!over.contains("could not play the clip"), "{over}");
+
+        let stopped = painted_with(110, 30, &Free, &[], None, status).join("\n");
+        assert!(stopped.contains("could not play the clip"), "{stopped}");
+        assert!(!stopped.contains("playing 3s"), "{stopped}");
     }
 
     /// The minimum this frame claims to work at. Every pane still has a border and a title, which

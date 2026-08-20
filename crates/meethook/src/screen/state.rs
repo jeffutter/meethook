@@ -301,6 +301,17 @@ impl Screen {
         self.status = Some(message);
     }
 
+    /// Takes back whatever was last [`said`](Screen::say), for a key that has now succeeded where
+    /// it previously failed.
+    ///
+    /// The counterpart to `say` because the status line is otherwise cleared only by
+    /// [`answer`](Screen::answer), and the keys handled outside the state machine -- playback --
+    /// never reach one. Without this, a failed play leaves its sentence on the footer underneath a
+    /// subsequent successful one.
+    pub fn hush(&mut self) {
+        self.status = None;
+    }
+
     /// Acts on one key, and says whether that answered the question.
     pub fn answer(&mut self, view: &VoiceView<'_>, event: Event, costs: &dyn Costs) -> Step {
         self.status = None;
