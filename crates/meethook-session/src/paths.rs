@@ -18,6 +18,7 @@ const SPEAKER_NAMES_JSON: &str = "speaker_names.json";
 const CLEANING_JSON: &str = "cleaning.json";
 const TRANSCRIPT_JSON: &str = "transcript.json";
 const TRANSCRIPT_MD: &str = "transcript.md";
+const TRANSCRIPT_VTT: &str = "transcript.vtt";
 
 /// The optional user template `transcript.md` is rendered through. Root-level, not
 /// per-session: see [`Paths::transcript_template`].
@@ -142,5 +143,13 @@ impl SessionPaths {
 
     pub fn transcript_md(&self) -> PathBuf {
         self.dir.join(TRANSCRIPT_MD)
+    }
+
+    /// The same turns as WebVTT captions, for players and for tools that read subtitles.
+    ///
+    /// Written beside `transcript.md` by everything that writes one, so a session never holds a
+    /// caption file that disagrees with its transcript about who said what.
+    pub fn transcript_vtt(&self) -> PathBuf {
+        self.dir.join(TRANSCRIPT_VTT)
     }
 }

@@ -2907,6 +2907,13 @@ mod tests {
         );
         assert!(markdown.contains("Alice> let us start\n"), "{markdown}");
         assert!(!markdown.contains("**["), "{markdown}");
+        // The captions are rewritten by the same call, so they cannot be left naming a voice
+        // the transcript beside them no longer calls a stranger. The user's template has no
+        // say here: `transcript.vtt` is a machine format.
+        let vtt = std::fs::read_to_string(session.transcript_vtt()).unwrap();
+        assert_eq!(vtt, transcript_of(&session).render_vtt());
+        assert!(vtt.contains("<v Alice>let us start\n"), "{vtt}");
+        assert!(!vtt.contains("Unknown 1"), "{vtt}");
     }
 
     /// A template that is nothing like the built-in default in either half: different

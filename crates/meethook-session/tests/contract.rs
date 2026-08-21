@@ -726,6 +726,10 @@ fn paths_are_derived_from_the_root_alone() {
         "transcript.md"
     );
     assert_eq!(
+        session.transcript_vtt().file_name().unwrap(),
+        "transcript.vtt"
+    );
+    assert_eq!(
         session.mic_cleaned_wav().file_name().unwrap(),
         "mic.cleaned.wav"
     );

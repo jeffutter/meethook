@@ -182,15 +182,64 @@ impl Transcript {
         template.render(self, ctx)
     }
 
-    /// Writes both transcript files atomically.
+    /// Renders the same turns as WebVTT: the caption format media players, video tools and
+    /// anything else that reads subtitles already understand.
     ///
-    /// Markdown first, JSON second, and the order is load-bearing: `transcript.json`'s
-    /// presence is the "already transcribed" marker, so a crash between the two writes
+    /// Not rendered through a template, deliberately. `transcript.md` is a document whose shape
+    /// is the user's to choose; this is a machine format with a grammar a player rejects when it
+    /// is wrong, so there is nothing here for a template to decide that would not be a way to
+    /// produce a file nothing can read.
+    ///
+    /// Three differences from the markdown rendering, each of them the format's doing rather
+    /// than a choice:
+    ///
+    /// - **A cue per turn, not per block.** The blocks a reader gets collapse a speaker's whole
+    ///   run into one paragraph; as a cue that would hold the screen for minutes.
+    /// - **`HH:MM:SS.mmm`, not `MM:SS`.** WebVTT wants minutes under 60 and reads milliseconds,
+    ///   so [`TranscriptTime`]'s deliberately unwrapped minutes are not a legal cue timing. The
+    ///   turns' own precision goes out, since a player seeks with it.
+    /// - **Cues come out ordered by start.** The rest of this module never assumes the turns are
+    ///   sorted (see `candidates_at`), but WebVTT requires non-decreasing cue starts, so this is
+    ///   the one rendering that does not preserve the file's own order.
+    ///
+    /// Infallible: every turn is representable, so a caller has no error to handle and a
+    /// transcript that writes at all writes its captions too.
+    pub fn render_vtt(&self) -> String {
+        let mut cues: Vec<&Turn> = self.turns.iter().collect();
+        cues.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.end.total_cmp(&b.end)));
+
+        let mut vtt = String::from("WEBVTT\n");
+        for turn in cues {
+            let start = cue_millis(turn.start);
+            // A cue must end strictly after it begins. Clamping in milliseconds rather than in
+            // seconds is what makes that true of the timings actually written: two instants a
+            // tenth of a millisecond apart are one instant at this resolution.
+            let end = cue_millis(turn.end).max(start + 1);
+            vtt.push('\n');
+            vtt.push_str(&cue_timestamp(start));
+            vtt.push_str(" --> ");
+            vtt.push_str(&cue_timestamp(end));
+            // The `<v Name>` voice span rather than a "Name: " prefix: it is the format's own
+            // way to say who is speaking, so a player can style or filter by speaker instead of
+            // showing the label as words somebody said.
+            vtt.push_str("\n<v ");
+            vtt.push_str(&escape_cue_text(&turn.speaker));
+            vtt.push('>');
+            vtt.push_str(&escape_cue_text(&turn.text));
+            vtt.push('\n');
+        }
+        vtt
+    }
+
+    /// Writes all three transcript files atomically.
+    ///
+    /// The readable renderings first, JSON last, and the order is load-bearing:
+    /// `transcript.json`'s presence is the "already transcribed" marker, so a crash partway
     /// leaves a session that still re-transcribes rather than one that is marked done but
-    /// missing its readable rendering.
+    /// missing a rendering.
     ///
-    /// The rendering happens before either write, so a template that fails leaves both files
-    /// exactly as they were rather than truncating the markdown it could not replace.
+    /// The markdown is rendered before any write, so a template that fails leaves all three
+    /// files exactly as they were rather than truncating what it could not replace.
     pub fn write(
         &self,
         paths: &SessionPaths,
@@ -201,6 +250,9 @@ impl Transcript {
 
         let md = paths.transcript_md();
         write_atomic(&md, rendered.as_bytes())?;
+
+        let vtt = paths.transcript_vtt();
+        write_atomic(&vtt, self.render_vtt().as_bytes())?;
 
         let json_path = paths.transcript_json();
         let mut json = serde_json::to_vec_pretty(self).map_err(|e| Error::json(&json_path, e))?;
@@ -769,6 +821,45 @@ impl<'a> RenderBlock<'a> {
         }
         blocks
     }
+}
+
+/// Seconds from session start as whole milliseconds, the resolution a WebVTT cue timing is
+/// written at. Clamps a negative to zero, as [`TranscriptTime::of`] does.
+fn cue_millis(seconds: f64) -> u64 {
+    (seconds.max(0.0) * 1000.0).round() as u64
+}
+
+/// A cue timing: `HH:MM:SS.mmm`, hours always present.
+///
+/// Hours are not optional in the spelling even though WebVTT allows the short form, so every
+/// timing in the file is the same width and a long meeting's cues do not change shape partway
+/// through. Unlike [`TranscriptTime`], minutes and seconds wrap -- the format requires it.
+fn cue_timestamp(millis: u64) -> String {
+    let hours = millis / 3_600_000;
+    let minutes = millis / 60_000 % 60;
+    let seconds = millis / 1_000 % 60;
+    let fraction = millis % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{fraction:03}")
+}
+
+/// A speaker label or a turn's text as it can appear inside a cue.
+///
+/// `&`, `<` and `>` are WebVTT's own markup, so they are escaped -- which also means a `-->` a
+/// speaker said cannot be read back as a cue timing, and a `>` in a name cannot end the voice
+/// span early. Line breaks become spaces: a blank line ends a cue, so text carrying one would
+/// truncate that cue and leave the remainder to be parsed as a malformed one.
+fn escape_cue_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\r' | '\n' => escaped.push(' '),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// An instant as RFC 3339 in the machine's local zone, e.g. `2026-08-05T14:29:21-05:00`.
@@ -1356,6 +1447,10 @@ mod tests {
             !session.transcript_json().exists(),
             "a failed render must not mark the session transcribed"
         );
+        assert!(
+            !session.transcript_vtt().exists(),
+            "a failed render must not leave captions the markdown does not match"
+        );
     }
 
     /// Acceptance criterion #7: `transcript.json` is the machine-readable artifact and templates
@@ -1402,6 +1497,143 @@ mod tests {
         let (lines, body) = frontmatter(&rendered);
         assert_eq!(lines.len(), 2, "{rendered:?}");
         assert_eq!(body, "\n", "{rendered:?}");
+    }
+
+    /// The whole file against a literal, because WebVTT is read by other people's parsers: the
+    /// bytes *are* the contract, and "whatever the renderer currently emits" is not one.
+    ///
+    /// Note the last cue. The same turn is `[90:05]` in the markdown -- see
+    /// [`TranscriptTime`]'s unwrapped minutes -- and `01:30:05.000` here, which is the one
+    /// spelling a player accepts.
+    #[test]
+    fn the_captions_are_one_cue_per_turn_with_the_speaker_as_a_voice_span() {
+        assert_eq!(
+            alternating().render_vtt(),
+            "WEBVTT\n\
+             \n\
+             00:00:12.340 --> 00:00:14.000\n\
+             <v You>first\n\
+             \n\
+             00:00:20.000 --> 00:00:25.000\n\
+             <v Unknown 1>words\n\
+             \n\
+             01:30:05.000 --> 01:30:10.000\n\
+             <v You>much later\n"
+        );
+    }
+
+    /// A file with no cues in it, rather than no file: a transcript of a silent session has been
+    /// rendered, and a player opening it should find an empty caption track rather than an error.
+    #[test]
+    fn a_transcript_of_no_turns_is_still_a_well_formed_vtt_file() {
+        assert_eq!(
+            Transcript::new(session_id(), Vec::new()).render_vtt(),
+            "WEBVTT\n"
+        );
+    }
+
+    /// The rest of this module reads the turns in file order, whatever that is. WebVTT cannot:
+    /// its cues have to be in non-decreasing start order.
+    #[test]
+    fn cues_are_ordered_by_start_however_the_turns_happen_to_be_stored() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![
+                mic_turn(30.0, 31.0, "third"),
+                mic_turn(10.0, 11.0, "first"),
+                mic_turn(20.0, 21.0, "second"),
+            ],
+        );
+        let rendered = transcript.render_vtt();
+        let cues: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("<v "))
+            .collect();
+        assert_eq!(
+            cues,
+            vec!["<v You>first", "<v You>second", "<v You>third"],
+            "{rendered}"
+        );
+    }
+
+    /// Everything a turn's own words could do to the format if they went out verbatim: end a
+    /// voice span, open a tag, or -- the interesting one -- be read back as a cue timing.
+    #[test]
+    fn markup_a_speaker_said_cannot_escape_its_cue() {
+        let mut turn = mic_turn(0.0, 1.0, "revenue --> costs, <b>always</b> & forever");
+        turn.speaker = "Bo>b & co".to_string();
+        let rendered = Transcript::new(session_id(), vec![turn]).render_vtt();
+
+        assert_eq!(
+            rendered,
+            "WEBVTT\n\
+             \n\
+             00:00:00.000 --> 00:00:01.000\n\
+             <v Bo&gt;b &amp; co>revenue --&gt; costs, &lt;b&gt;always&lt;/b&gt; &amp; forever\n"
+        );
+        // The cue holds three lines and the timing line is the only `-->` among them, which is
+        // the whole point of escaping it: a parser splitting on `-->` still finds one cue.
+        assert_eq!(rendered.matches("-->").count(), 1, "{rendered}");
+    }
+
+    /// A blank line is what ends a cue, so text carrying one would truncate its own cue and
+    /// leave the remainder to be parsed as garbage.
+    #[test]
+    fn a_line_break_in_a_turns_text_does_not_split_its_cue() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![mic_turn(0.0, 1.0, "first thought\n\nsecond thought")],
+        );
+        assert_eq!(
+            transcript.render_vtt(),
+            "WEBVTT\n\
+             \n\
+             00:00:00.000 --> 00:00:01.000\n\
+             <v You>first thought  second thought\n"
+        );
+    }
+
+    /// A cue must end strictly after it begins, so the degenerate turn a merge can produce has
+    /// to be widened rather than written as the zero-length cue a strict parser rejects.
+    #[test]
+    fn a_turn_shorter_than_a_millisecond_still_ends_after_it_begins() {
+        let transcript = Transcript::new(
+            session_id(),
+            vec![mic_turn(4.0, 4.0, "oh"), mic_turn(9.0, 9.0004, "ah")],
+        );
+        assert_eq!(
+            transcript.render_vtt(),
+            "WEBVTT\n\
+             \n\
+             00:00:04.000 --> 00:00:04.001\n\
+             <v You>oh\n\
+             \n\
+             00:00:09.000 --> 00:00:09.001\n\
+             <v You>ah\n"
+        );
+    }
+
+    /// Written by the same call that writes the other two, which is what makes it impossible for
+    /// a session to hold captions that disagree with its transcript: `enroll` and `forget`
+    /// re-render through here after a rename without knowing this file exists.
+    #[test]
+    fn writing_a_transcript_puts_the_captions_beside_the_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionPaths::new(dir.path());
+        let md = metadata();
+        let transcript = alternating();
+        transcript
+            .write(
+                &session,
+                &TranscriptTemplate::builtin(),
+                &TranscriptContext::at(&md, rendered_at()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(session.transcript_vtt()).unwrap(),
+            transcript.render_vtt()
+        );
     }
 
     fn speaker_turn(start: f64, end: f64, cluster: Option<u32>) -> Turn {
