@@ -17,8 +17,8 @@
 //! silently.
 //!
 //! Against this install the collisions are real rather than hypothetical: `Ivan` and `Owen`,
-//! `Marco` and `Marcel`, `Nate` and `Nina`, `Jane` and `Jon`. Typing `Ni` or
-//! `Marco` is genuinely ambiguous, and any rule that guesses is picking which of two real people
+//! `Marco` and `Marcel`, `Nate` and `Nina`, `Jane` and `Jon`. Typing `N` or
+//! `Mar` is genuinely ambiguous, and any rule that guesses is picking which of two real people
 //! gets a recording of the other one.
 //!
 //! # The fold
@@ -31,7 +31,7 @@
 //!
 //! # Only an exact fold resolves; a lone inexact match is still a candidate
 //!
-//! `Owen` against an install holding `Owen` returns one candidate, not
+//! `Owe` against an install holding `Owen` returns one candidate, not
 //! `Enrolled("Owen")`. "The only thing it could be" is a claim this module is not entitled
 //! to make: `Ivan` and `Owen` are two real people here, so the same reasoning that forbids
 //! choosing between two candidates forbids promoting one. It is also what makes the resolver safe
@@ -106,15 +106,15 @@ pub enum Likeness {
     /// ever surfaces when two enrolled names fold together -- `alice` and `Alice`. On a sane
     /// database it never appears.
     Same,
-    /// The folded name starts with the folded text: `Ni` -> `Nate`, `Nina`.
+    /// The folded name starts with the folded text: `N` -> `Nate`, `Nina`.
     Prefix,
-    /// Some word of the folded name starts with the folded text: `Owen` -> `Owen`.
+    /// Some word of the folded name starts with the folded text: `Brack` -> `Owen Brack`.
     ///
     /// This tier carries most of the practical value, because the names in `speakers.json` are
     /// `First Last` and the half a user remembers is often the second one.
     WordPrefix,
     /// The folded text is within an edit budget of the whole folded name, or of one of its
-    /// words: `Marclo` and `Montigal` -> `Marco`.
+    /// words: `Marclo` -> `Marco`, `Vancle` -> `Elliot Vance`.
     NearMiss,
 }
 
@@ -182,8 +182,8 @@ pub fn resolve(typed: &str, enrolled: &[&str]) -> Resolution {
 /// independent of the order the enrolled names arrived in. Length is counted in `char`s, and the
 /// tie-break is the one worth justifying: among prefix matches the shorter the name, the larger
 /// the fraction of it the user actually typed, so it is the entry the resolver is guessing least
-/// about. It also orders both real collisions the way a person would, `Ni` -> `Nate`, `Nina` and
-/// `Marco` -> `Marco`, `Marcel`.
+/// about. It also orders both real collisions the way a person would, `N` -> `Nate`, `Nina` and
+/// `Mar` -> `Marco`, `Marcel`.
 fn rank(candidate: &Match) -> (Likeness, usize, &str) {
     (
         candidate.likeness,
@@ -223,8 +223,8 @@ fn likeness(
     if edit_distance(typed_chars, &whole, budget).is_some() {
         return Some(Likeness::NearMiss);
     }
-    // The per-word arm is what catches a misspelt surname typed on its own -- `Montigal` ->
-    // `Marco` -- which neither the whole-string arm nor any prefix tier reaches.
+    // The per-word arm is what catches a misspelt surname typed on its own -- `Vancle` ->
+    // `Elliot Vance` -- which neither the whole-string arm nor any prefix tier reaches.
     for word in folded_name.split(' ') {
         let word: Vec<char> = word.chars().collect();
         if edit_distance(typed_chars, &word, budget).is_some() {
@@ -244,10 +244,10 @@ fn likeness(
 /// | 8+ | 2 |
 ///
 /// The gate at the bottom is the load-bearing half. At three characters or fewer, a budget of
-/// even one edit makes most of the database a candidate for most of the database -- `Ivan` and `Jon`
+/// even one edit makes most of the database a candidate for most of the database -- `Nate` and `Nina`
 /// are two edits apart, `Jane` and `Jon` are two -- while the prefix tiers already cover everything
 /// a user typing two letters could have meant. Above it the budget buys the cases this module
-/// exists for: `Marclo` is one edit from `marco`, and `Jack` one from `Jane`.
+/// exists for: `Marclo` is one edit from `marco`, and `Janet` one from `Jane`.
 const fn near_miss_budget(length: usize) -> Option<usize> {
     match length {
         0..=3 => None,
@@ -320,17 +320,10 @@ mod tests {
     use super::*;
 
     /// This install's real shape, so that every test below is a statement about a hazard that
-    /// exists rather than one invented for the test: `Ivan` sits under `Owen`, `Marco`
-    /// under `Marcel`, `Nate` beside `Nina`, `Jane` beside `Jon`.
+    /// exists rather than one invented for the test: `Marco` and `Marcel` share a prefix,
+    /// `Nate` and `Nina` another, `Jane` and `Jon` a third.
     const ENROLLED: &[&str] = &[
-        "Ivan",
-        "Owen",
-        "Marco",
-        "Marcel",
-        "Nate",
-        "Nina",
-        "Jane",
-        "Jon",
+        "Ivan", "Owen", "Marco", "Marcel", "Nate", "Nina", "Jane", "Jon",
     ];
 
     fn candidates(typed: &str, enrolled: &[&str]) -> Vec<(String, Likeness)> {
@@ -350,7 +343,7 @@ mod tests {
     }
 
     /// The single most important case here: a correct answer must not be turned into a question
-    /// just because a longer name starts the same way. `Ivan` is a person, and `Owen` is
+    /// just because the database holds other people. `Ivan` is a person, and `Owen` is
     /// somebody else.
     #[test]
     fn an_exact_fold_resolves_and_is_not_offered_the_longer_name() {
@@ -362,7 +355,7 @@ mod tests {
 
     #[test]
     fn case_and_surrounding_whitespace_resolve_to_the_enrolled_spelling() {
-        for typed in ["Ivan", "al", "AL", "  Ivan  ", "\tIvan\n"] {
+        for typed in ["Ivan", "ivan", "IVAN", "  Ivan  ", "\tIvan\n"] {
             assert_eq!(
                 resolve(typed, ENROLLED),
                 Resolution::Enrolled("Ivan".to_string()),
@@ -388,16 +381,16 @@ mod tests {
     /// the criterion: the resolver did not choose.
     #[test]
     fn an_ambiguous_prefix_returns_both_people_without_choosing() {
-        assert_eq!(names("Ni", ENROLLED), ["Nate", "Nina"]);
-        assert_eq!(names("Marco", ENROLLED), ["Marco", "Marcel"]);
+        assert_eq!(names("N", ENROLLED), ["Nate", "Nina"]);
+        assert_eq!(names("Mar", ENROLLED), ["Marco", "Marcel"]);
     }
 
     #[test]
     fn a_prefix_carries_the_typed_text_for_the_none_of_these_case() {
         assert_eq!(
-            resolve("  Ni ", ENROLLED),
+            resolve("  N ", ENROLLED),
             Resolution::Candidates {
-                typed: "Ni".to_string(),
+                typed: "N".to_string(),
                 matches: vec![
                     Match {
                         name: "Nate".to_string(),
@@ -421,7 +414,7 @@ mod tests {
             [("Marco".to_string(), Likeness::NearMiss)]
         );
         assert_eq!(
-            candidates("Owen", ENROLLED),
+            candidates("Owe", ENROLLED),
             [("Owen".to_string(), Likeness::Prefix)]
         );
     }
@@ -431,27 +424,27 @@ mod tests {
     #[test]
     fn a_misspelt_word_near_misses_the_name_holding_it() {
         assert_eq!(
-            candidates("Montigal", ENROLLED),
-            [("Marco".to_string(), Likeness::NearMiss)]
+            candidates("Vancle", &["Elliot Vance"]),
+            [("Elliot Vance".to_string(), Likeness::NearMiss)]
         );
     }
 
     #[test]
     fn a_surname_typed_alone_finds_the_person_by_word_prefix() {
         assert_eq!(
-            candidates("Owen", ENROLLED),
-            [("Owen".to_string(), Likeness::WordPrefix)]
+            candidates("Brack", &["Owen Brack", "Braxton"]),
+            [("Owen Brack".to_string(), Likeness::WordPrefix)]
         );
         assert_eq!(
-            candidates("Marcel", ENROLLED),
-            [("Marcel".to_string(), Likeness::WordPrefix)]
+            candidates("Fenn", &["Quill Fenn"]),
+            [("Quill Fenn".to_string(), Likeness::WordPrefix)]
         );
     }
 
     #[test]
     fn a_trailing_keystroke_near_misses_the_shorter_name() {
         assert_eq!(
-            candidates("Jack", ENROLLED),
+            candidates("Janet", ENROLLED),
             [("Jane".to_string(), Likeness::NearMiss)]
         );
     }
@@ -463,7 +456,7 @@ mod tests {
         assert_eq!(names("J", ENROLLED), ["Jon", "Jane"]);
     }
 
-    /// The length gate on the near-miss tier. `Ja` is one edit from `Jon`, and offering it would
+    /// The length gate on the near-miss tier. `Ja` is two edits from `Jon`, and offering it would
     /// make most of this database a candidate for most of it; the prefix tiers already cover what
     /// two letters can mean.
     #[test]
@@ -517,7 +510,7 @@ mod tests {
     /// highlighted candidate could move between runs with nothing having changed.
     #[test]
     fn the_candidate_order_is_independent_of_the_enrolled_order() {
-        for typed in ["Ni", "Marco", "J"] {
+        for typed in ["N", "Mar", "J"] {
             let expected = names(typed, ENROLLED);
             let mut permuted: Vec<&str> = ENROLLED.to_vec();
             for _ in 0..ENROLLED.len() {
@@ -542,7 +535,7 @@ mod tests {
             resolve("Ivan", &["Ivan", "Ivan"]),
             Resolution::Enrolled("Ivan".to_string())
         );
-        assert_eq!(names("A", &["Ivan", "Ivan"]), ["Ivan"]);
+        assert_eq!(names("I", &["Ivan", "Ivan"]), ["Ivan"]);
     }
 
     /// The char-versus-byte regression: folding and the edit distance both walk this name, and
@@ -574,8 +567,8 @@ mod tests {
             edit_distance(&chars("elephant"), &chars("elephant"), 0),
             Some(0)
         );
-        assert_eq!(edit_distance(&chars("elephant"), &chars("mont"), 2), None);
-        assert_eq!(edit_distance(&chars(""), &chars("al"), 2), Some(2));
+        assert_eq!(edit_distance(&chars("elephant"), &chars("elep"), 2), None);
+        assert_eq!(edit_distance(&chars(""), &chars("iv"), 2), Some(2));
     }
 
     fn chars(text: &str) -> Vec<char> {
