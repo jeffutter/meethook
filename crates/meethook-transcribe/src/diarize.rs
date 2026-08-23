@@ -80,7 +80,9 @@ impl OnnxDiarizer {
         })
     }
 
-    /// False when either graph fell back to CPU because CoreML would not take it.
+    /// False when either graph fell back to CPU because CoreML would not take it, and false
+    /// by construction off macOS, where the graphs run on the CPU execution provider and
+    /// there is nothing to decline them.
     ///
     /// Worth reporting: a CPU-only diarization pass is perfectly correct and several times
     /// slower, and a user who is not told will only see a transcribe that mysteriously takes

@@ -2097,8 +2097,9 @@ fn samples_between(track: &[f32], start: f64, end: f64) -> &[f32] {
 
 /// The audio to play for one voice: its longest representative, cut out of the speaker track.
 ///
-/// The clip is sliced rather than seeked to because `afplay` cannot seek -- it has no start
-/// offset at all -- so somebody has to extract it either way. Slicing the 16 kHz track
+/// The clip is sliced rather than seeked to because the plainest players in the search list
+/// (`afplay`, `paplay`, `aplay`) take no start offset at all -- so somebody has to extract it
+/// either way. Slicing the 16 kHz track
 /// diarization itself ran on is what makes the seconds in a [`meethook_session::RepresentativeSegment`]
 /// impossible to misinterpret: they are offsets into exactly this buffer.
 fn clip_for<'a>(track: &'a [f32], cluster: &SpeakerCluster) -> &'a [f32] {
@@ -2835,7 +2836,7 @@ mod tests {
             .collect()
     }
 
-    /// A clip exists to be handed to `afplay`, so its header is part of what it is for: a
+    /// A clip exists to be handed to an audio player, so its header is part of what it is for: a
     /// mono stream tagged `SPEAKER_FRONT_LEFT` reaches the listener in one ear.
     #[test]
     fn a_clip_is_tagged_mono_so_a_player_does_not_put_it_in_one_ear() {

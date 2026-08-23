@@ -378,7 +378,7 @@ impl Interface {
         };
 
         // Which transcript line the last successful spawn came from, `None` for the whole voice.
-        // A loop-local rather than a field because "what was handed to `afplay`" is a fact about
+        // A loop-local rather than a field because "what was handed to the player" is a fact about
         // a spawn, and this loop is exactly as long as a spawn is allowed to live: `clips.stop()`
         // runs the moment `ask` returns.
         let mut line: Option<usize> = None;
