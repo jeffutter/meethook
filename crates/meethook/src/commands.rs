@@ -2298,4 +2298,25 @@ mod tests {
         assert!(choose_player(dir.path().to_str().unwrap()).is_none());
         assert!(choose_player(":").is_none());
     }
+
+    /// The off-macOS calendar seam, pinned at its source: whatever instant is asked about, the
+    /// offer is empty and total -- which is why `meeting <id>` on Linux lists nothing and points
+    /// at `--clear` instead of failing or guessing. Only this side makes the promise: the macOS
+    /// implementation may legitimately find meetings, so the test holds here alone.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_the_calendar_offers_nothing_for_any_instant() {
+        // Local rather than at the module top: the test is gated out on macOS, where the
+        // import would be unused.
+        use meethook_enroll::MeetingSource;
+
+        for at in [
+            "2026-08-09T05:26:00Z",
+            "2026-08-09T00:00:00Z",
+            "2030-01-01T12:00:00Z",
+        ] {
+            let offered = super::Calendar.around(at.parse().unwrap());
+            assert!(offered.is_empty(), "{at}");
+        }
+    }
 }
