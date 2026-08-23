@@ -892,8 +892,6 @@ dependencies = [
  "objc2-event-kit",
  "objc2-foundation",
  "objc2-screen-capture-kit",
- "serde_json",
- "tempfile",
  "thiserror",
 ]
 

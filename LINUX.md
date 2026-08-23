@@ -1,0 +1,69 @@
+# Building and running meethook on Linux
+
+The workspace builds and tests on Linux (x86_64), and `meethook transcribe` runs
+end-to-end there on CPU Whisper (whisper.cpp) and CPU ONNX Runtime. What does not
+come along:
+
+- **`record`** exists only on macOS. The `meethook-record` crate is pure Apple
+  frameworks (ScreenCaptureKit, EventKit, ...) and lives in its own standalone
+  workspace; the binary pulls it in through a target-gated dependency, so on Linux
+  the subcommand simply does not exist.
+- **Calendar-backed halves of `meeting`** are macOS-only too. On Linux
+  `meeting <id>` lists no candidates and points at `--clear`, which never consults
+  the calendar and works everywhere.
+- **Accelerators** (Metal/CoreML) are macOS-only by construction; off macOS the
+  pipeline reports `accelerated = false` and runs on CPU. That is expected, not a
+  failure.
+- **Enroll clip playback** falls back from `afplay` to the first of
+  `paplay`, `aplay`, `ffplay`, `mpv` found on `PATH`; with none of them present,
+  enrollment degrades to text snippets instead of failing.
+
+## The easy way: `nix develop`
+
+The flake defines an `x86_64-linux` devShell alongside the macOS one. It carries
+the whole toolchain -- Rust (with clippy/rustfmt/rust-analyzer), cmake, pkg-config,
+onnxruntime, meson, ninja, clang, plus lefthook, cargo-audit and cargo-outdated --
+and sets the two environment variables the build needs (`LIBCLANG_PATH` for
+bindgen, `LD_LIBRARY_PATH` for the onnxruntime and libstdc++ shared libraries,
+which `nix develop` would otherwise leave unset). Entering the shell also runs
+`lefthook install`, so the pre-commit/pre-push gates activate automatically.
+
+```sh
+nix develop
+cargo test --all-features --workspace
+cargo run -p meethook -- transcribe --help
+```
+
+Model weights are not part of the Nix closure; `transcribe` downloads them on
+first use into `<root>/models/` (default root `~/meethook`).
+
+## Without Nix
+
+The same requirements, by hand:
+
+| Need | Why |
+| --- | --- |
+| A recent Rust toolchain + `clippy`, `rustfmt` | the repo gates are `-D warnings` |
+| `cmake` and a C/C++ toolchain | whisper.cpp compiles from source |
+| `meson`, `ninja`, `clang` | off macOS the `webrtc-audio-processing` crate builds AEC3 from source, and its `meson.build` hard-codes `clang` as the compiler |
+| `libclang` on `LIBCLANG_PATH` | bindgen invokes libclang directly, outside any cc wrapper |
+| `libonnxruntime` findable via `pkg-config` | `ort-sys` probes for it at build time and links it dynamically |
+
+At *run* time the ELF binaries additionally need `libonnxruntime.so.1` and
+`libstdc++.so.6` resolvable; if your package manager does not put both on the
+standard loader path, add their directories to `LD_LIBRARY_PATH`.
+
+Then the usual:
+
+```sh
+cargo build --workspace
+cargo test --all-features --workspace
+cargo run -p meethook -- transcribe [SESSION_ID]...
+```
+
+## Gates
+
+`lefthook.yml` runs the record-crate steps (fmt/clippy/test on
+`crates/meethook-record`) only on Darwin; on Linux those steps print a skip notice
+and pass, and the rest of the chain (fmt, clippy, test, doc, audit) runs as
+usual.

@@ -1,9 +1,10 @@
 //! The `meethook` CLI.
 //!
-//! One binary, five subcommands. The spec describes `record` and `transcribe` as
-//! "two binaries" meaning they share no process, no IPC, and no state -- only the on-disk
-//! session contract. Subcommands preserve that: everything below talks to
-//! [`meethook_session`] and to nothing else.
+//! One binary, five subcommands on macOS, four off it (`record` needs the Apple capture
+//! frameworks and does not exist elsewhere; see the target gate below). The spec describes
+//! `record` and `transcribe` as "two binaries" meaning they share no process, no IPC, and no
+//! state -- only the on-disk session contract. Subcommands preserve that: everything below
+//! talks to [`meethook_session`] and to nothing else.
 
 mod commands;
 mod screen;
@@ -104,6 +105,10 @@ enum Command {
     ///
     /// Watches the default microphone and records each call as a session. Takes no
     /// options: there is nothing to configure that the tool cannot detect itself.
+    ///
+    /// macOS only: the capture backend is built from Apple frameworks that do not compile
+    /// anywhere else, so the subcommand is absent rather than stubbed on other platforms.
+    #[cfg(target_os = "macos")]
     Record,
 
     /// Transcribe recorded sessions
@@ -325,6 +330,7 @@ fn main() -> Result<()> {
     let template = cli.template.as_deref();
 
     match cli.command {
+        #[cfg(target_os = "macos")]
         Command::Record => commands::record(&paths),
         Command::Transcribe {
             session_ids,

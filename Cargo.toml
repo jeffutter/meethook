@@ -4,10 +4,21 @@ members = [
   "crates/meethook",
   "crates/meethook-enroll",
   "crates/meethook-models",
-  "crates/meethook-record",
   "crates/meethook-session",
   "crates/meethook-transcribe",
 ]
+# Physical location is not enough to keep it out: a path dependency into a directory that
+# roots its own workspace is otherwise reported as "multiple workspace roots found in the
+# same workspace", so the exclusion is stated rather than implied.
+exclude = ["crates/meethook-record"]
+# meethook-record is deliberately not a member. It is pure Apple frameworks -- ScreenCaptureKit,
+# Core Audio, EventKit -- and cannot compile off macOS, so it roots its own workspace
+# (see crates/meethook-record/Cargo.toml) and keeps its own lock file. The `meethook` binary
+# still depends on it, target-gated to macOS, which is how `cargo build` from this root keeps
+# working on both platforms without ever asking a non-macOS toolchain to parse the objc2 tree.
+# The cost is accepted rather than papered over: `--workspace` from here does not reach the
+# record crate, so its gates run from its own directory (lefthook.yml does exactly that on
+# Darwin), and its manifest mirrors this file's versions instead of inheriting them.
 
 [workspace.package]
 edition = "2024"
@@ -42,7 +53,6 @@ opt-level = 2
 [workspace.dependencies]
 meethook-enroll = { path = "crates/meethook-enroll" }
 meethook-models = { path = "crates/meethook-models" }
-meethook-record = { path = "crates/meethook-record" }
 meethook-session = { path = "crates/meethook-session" }
 meethook-transcribe = { path = "crates/meethook-transcribe" }
 
@@ -180,9 +190,13 @@ realfft = "3.5"
 ropus = "0.12"
 ogg = "0.9"
 
-# whisper.cpp bindings. `metal` pulls in `_gpu`, which is what makes `use_gpu` default to
-# true; see the assertion in meethook-transcribe::asr that keeps that honest.
-whisper-rs = { version = "0.16", default-features = false, features = ["metal"] }
+# whisper.cpp bindings. Base entry carries no backend feature: `metal` is added by
+# meethook-transcribe under `cfg(target_os = "macos")` only, because the Metal path is the
+# crash-prone one (see meethook-transcribe::gpu) and a CPU-only build elsewhere is the
+# intended Linux shape, not a degraded one. Without any backend feature, whisper-rs compiles
+# whisper.cpp for the CPU, and `WhisperContextParameters::use_gpu` defaults to false -- the
+# assertion in meethook-transcribe::asr pins the macOS half of that pairing.
+whisper-rs = { version = "0.16", default-features = false }
 
 # ONNX Runtime bindings, for diarization and speaker embeddings.
 #
@@ -200,19 +214,26 @@ whisper-rs = { version = "0.16", default-features = false, features = ["metal"] 
 # `api-27` is the ceiling, not an arbitrary choice: `ort-sys` rejects a probed library whose
 # minor version is below the requested API level, and the flake's runtime is 1.27. Asking
 # for `api-28` here would fail the probe and fall through to the download path.
+#
+# `coreml` is absent from the base entry for the same reason `metal` is absent from
+# whisper-rs's: it is added by meethook-transcribe under `cfg(target_os = "macos")` only.
+# On other platforms the diarization graphs run on the CPU EP and there is nothing to try
+# first, so the type `ort::ep::CoreML` itself is not compiled there.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = [
   "std",
-  "coreml",
   "pkg-config",
   "api-27",
 ] }
 
 # WebRTC AEC3, for the echo-cancellation pre-pass. The tilde requirement is what upstream
 # recommends: the crate's major version tracks the PulseAudio-maintained APM major version,
-# so a minor bump is allowed to break the API. `bundled` is deliberately off -- it would
-# compile the vendored C++ here, which does not cross-compile on Apple
+# so a minor bump is allowed to break the API. `bundled` is deliberately off in the base
+# entry -- it would compile the vendored C++ here, which does not cross-compile on Apple
 # (tonarino/webrtc-audio-processing#102); instead the sys crate probes pkg-config and links
-# dynamically against the flake's `webrtc-audio-processing`.
+# dynamically against the flake's `webrtc-audio-processing`. On non-macOS platforms there is
+# no such system library to probe for, so meethook-transcribe turns on `bundled` under
+# `cfg(not(target_os = "macos"))`: the vendored C++ compiles fine with an ordinary C++
+# toolchain off Apple, which is exactly where it is needed.
 webrtc-audio-processing = "~2.1"
 
 # Apple framework bindings. Deliberately one binding family (objc2) for every framework

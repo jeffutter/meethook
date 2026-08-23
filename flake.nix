@@ -1,124 +1,148 @@
 {
-  description = "meethook - local meeting recorder + transcriber (macOS, Apple Silicon)";
+  description = "meethook - local meeting recorder + transcriber (record on macOS Apple Silicon; transcribe on macOS and Linux)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
-  # devShell-only on purpose: meethook is a personal, non-distributed tool, so there is
-  # no buildRustPackage/crane package output to maintain.
+  # DevShells only, by design. This is a personal, non-distributed tool:
   #
-  # Native inputs are added by the slice that actually needs them, never speculatively.
+  #   - there is no deployment story to serve, so no packages.outputs
+  #   - the Whisper / speaker-diarization model weights are deliberately kept OUT
+  #     of the Nix closure. They are large, license-restricted artifacts that
+  #     the app downloads on first use into ~/.cache/meethook/models/. Baking
+  #     them in would bloat every Nix store copy for zero benefit.
+  #   - a devShell is the unit of work here: a single `nix develop` gives a
+  #     shell whose PATH carries the exact toolchain the project builds with.
   #
-  # Model weights are deliberately absent, and not merely unadded: they are fetched at
-  # runtime into ~/meethook/models/ and verified against sha256 hashes embedded in source,
-  # so no checkpoint -- ggml or ONNX -- is ever part of this closure.
+  # Native inputs are added only where the project actually needs them at
+  # build time (see per-system notes below).
   outputs = { self, nixpkgs, rust-overlay }:
     let
-      # Apple Silicon only. Cross-platform support is explicitly out of scope, so the
-      # flake names the one system directly instead of mapping over a system list.
-      system = "aarch64-darwin";
+      # The two supported systems, named explicitly: Apple Silicon hosts the
+      # record crate's Apple frameworks, and x86_64 Linux gets the transcribe-
+      # only toolchain. Each shell builds for its own machine; cross-compiling
+      # between the two stays out of scope. (A host-derived list is impossible:
+      # builtins.currentSystem is unavailable in pure flake evaluation.)
+      systems = [ "aarch64-darwin" "x86_64-linux" ];
 
-      pkgs = import nixpkgs {
-        inherit system;
-        overlays = [ (import rust-overlay) ];
-      };
+      forSystem = system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+          };
 
-      # Rolling stable, not a pinned version; flake.lock is what keeps builds reproducible
-      # between deliberate `nix flake update` runs.
-      rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-        extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
-        targets = [ "aarch64-apple-darwin" ];
-      };
-    in
-    {
-      devShells.${system}.default = pkgs.mkShell {
-        name = "meethook";
+          isMacos = system == "aarch64-darwin";
 
-        # apple-sdk_26 belongs in buildInputs (not nativeBuildInputs): that is where it
-        # sets SDKROOT for the shell, which is how the Darwin frameworks
-        # (ScreenCaptureKit, CoreAudio, AudioToolbox, AVFoundation, Metal) become linkable.
-        #
-        # webrtc-audio-processing is the AEC3 implementation the transcribe pre-pass links
-        # against dynamically; the `webrtc-audio-processing` crate's `bundled` feature,
-        # which would build the vendored C++ instead, is off because it does not
-        # cross-compile on Apple (tonarino/webrtc-audio-processing#102).
-        #
-        # onnxruntime runs the diarization and speaker-embedding graphs. This build is
-        # configured with onnxruntime_USE_COREML, which is what makes the CoreML execution
-        # provider registrable; `ort-sys` finds it by probing pkg-config for the module
-        # named `libonnxruntime`, which is exactly what the dev output's .pc file is called,
-        # so nothing is ever downloaded at build time.
-        buildInputs = [ pkgs.apple-sdk_26 pkgs.onnxruntime pkgs.webrtc-audio-processing ];
 
-        # whisper-rs-sys compiles its own vendored whisper.cpp with the `cmake` crate.
-        # pkgs.whisper-cpp is deliberately *not* here: linking a second, separately built
-        # copy alongside the vendored one is a silent version skew waiting to happen.
-        #
-        # pkg-config is a build-time tool, so it belongs here rather than in buildInputs:
-        # its setup hook is what puts each buildInput's dev output on PKG_CONFIG_PATH,
-        # which is how webrtc-audio-processing-sys finds the library at all.
-        nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
+          # rust-overlay names targets by triple; the two supported systems map
+          # to different ones, and naming both keeps the toolchain honest about
+          # where it runs. An unsupported host system fails loudly here rather
+          # than getting a silently wrong target.
+          rustTarget = nixpkgs.lib.getAttr system {
+            "aarch64-darwin" = "aarch64-apple-darwin";
+            "x86_64-linux" = "x86_64-unknown-linux-gnu";
+          };
 
-        # Developer tooling, not build inputs: none is linked against or invoked by any
-        # crate's build script, so `packages` is the right list for all three.
-        #
-        # lefthook runs the gates in lefthook.yml; the shellHook below installs its git
-        # hooks, so entering the shell is the only setup step a fresh clone needs.
-        #
-        # cargo-audit backs the pre-push advisory scan.
-        #
-        # cargo-outdated backs the periodic dependency sweep. Its Project/Compat/Latest
-        # columns are the distinction that matters here, because Cargo.toml's requirements
-        # are mostly loose carets: `cargo update` moves the lock without ever saying which
-        # *requirement* has fallen behind.
-        #
-        # Read its output with one caveat, measured rather than assumed (0.19.0, on a
-        # scratch workspace with one inherited and one literal dependency, both a major
-        # version behind): it does not see requirements inherited from
-        # `[workspace.dependencies]`. Its "latest" pass rewrites member manifests, and this
-        # workspace's members all say `foo = { workspace = true }`, so there is nothing in
-        # them to rewrite and every crate here is invisible to it. It printed "All
-        # dependencies are up to date, yay!" while mach2 and sha2 were each a major behind.
-        # `cargo update --dry-run --verbose` is what actually lists them -- its "Unchanged
-        # <crate> (available: <ver>)" lines are the real report -- so run both.
-        #
-        # Deliberately not wired into lefthook.yml: being behind on a dependency is not a
-        # push-blocking condition, and unlike cargo-audit there is no advisory to fail on,
-        # so making every push depend on the crates.io index being reachable would buy
-        # nothing.
-        packages = [ rustToolchain pkgs.lefthook pkgs.cargo-audit pkgs.cargo-outdated ];
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
+            targets = [ rustTarget ];
+          };
+        in
+        {
+          devShell = pkgs.mkShell {
+            name = "meethook";
 
-        env = {
-          # bindgen (via whisper-rs-sys) loads libclang at build time rather than linking
-          # it, so it needs the path handed to it explicitly.
-          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            packages = [
+              rustToolchain
+              pkgs.lefthook
+              pkgs.cargo-audit
+              pkgs.cargo-outdated
+            ];
 
-          # whisper.cpp declares `cmake_minimum_required(VERSION 3.5)`, which CMake 4
-          # rejects outright. whisper-rs-sys forwards every CMAKE_*/GGML_*/WHISPER_* env
-          # var straight into the CMake configure, so this restores the old floor without
-          # patching or vendoring whisper.cpp.
-          CMAKE_POLICY_VERSION_MINIMUM = "3.5";
+            # whisper.cpp pins an old CMake policy minimum; without this every
+            # configure step dies before compiling anything.
+            env = {
+              CMAKE_POLICY_VERSION_MINIMUM = "3.5";
+
+              # bindgen invokes libclang directly, outside the cc wrapper that
+              # would otherwise supply the SDK, so the system headers have to be
+              # pointed at by hand.
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            }
+            # nix develop does not set LD_LIBRARY_PATH, and off macOS the ELF
+            # binaries need it twice over: the test binaries link libonnxruntime
+            # dynamically, and the statically linked C++ libraries (AEC3,
+            # whisper.cpp) pull in libstdc++.so.6, which meson's clang-built
+            # sanity executables also need while the build itself is running.
+            # On macOS dyld resolves the .dylibs by absolute install name, so
+            # nothing is needed.
+            // nixpkgs.lib.optionalAttrs (!isMacos) {
+              # The hyphen in the package name keeps it out of plain attribute
+              # syntax, so the reference is bound here rather than inlined into
+              # the string below.
+              LD_LIBRARY_PATH =
+                let gccRuntime = pkgs."gcc-unwrapped".lib; in
+                "${pkgs.onnxruntime}/lib:${gccRuntime}/lib";
+            };
+
+            # On macOS the AEC3 library links dynamically against the flake's
+            # webrtc-audio-processing package, so nothing extra is needed. Off
+            # macOS the crate builds AEC3 from source (the bundled feature):
+            # meson + ninja drive the build, and the compiler must be clang
+            # because AEC3's meson.build hard-codes it. The wrapped clang also
+            # points CC/CXX at itself, so the Rust and whisper.cpp builds
+            # compile and link through clang as well; the repo gates pass
+            # under that.
+            buildInputs =
+              [ pkgs.onnxruntime ]
+              ++ nixpkgs.lib.optionals isMacos [
+                # Frameworks live outside the Nix store, so the SDK has to be on
+                # the search path explicitly.
+                pkgs.apple-sdk_26
+                # Links the flake's libwebrtc_audio_processing.dylib via
+                # pkg-config, which is how the dynamic AEC3 dependency reaches
+                # the linker.
+                pkgs.webrtc-audio-processing
+              ];
+
+            # ort-sys probes pkg-config for libonnxruntime at build time; the
+            # pkg-config wrapper mkShell generates from buildInputs is what
+            # makes the probe find it.
+            nativeBuildInputs =
+              [
+                pkgs.cmake
+                pkgs.pkg-config
+              ]
+              ++ nixpkgs.lib.optionals (!isMacos) [
+                pkgs.meson
+                pkgs.ninja
+                pkgs.clang
+              ];
+
+            shellHook = ''
+              ${nixpkgs.lib.optionalString isMacos ''
+                # bindgen invokes libclang directly, outside the cc wrapper that
+                # would otherwise supply the SDK, so the system headers have to
+                # be pointed at by hand.
+                export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDKROOT"
+              ''}
+              # Rewrites .git/hooks/{pre-commit,pre-push} from lefthook.yml.
+              # Idempotent and safe to re-run on every activation.
+              lefthook install > /dev/null
+              echo "meethook devShell: $(rustc --version)"
+            '';
+          };
+
+          formatter = pkgs.nixpkgs-fmt;
         };
 
-        shellHook = ''
-          # bindgen invokes libclang directly, outside the cc wrapper that would otherwise
-          # supply the SDK, so the system headers have to be pointed at by hand.
-          export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDKROOT"
-
-          # Rewrites .git/hooks/{pre-commit,pre-push} from lefthook.yml. It is idempotent,
-          # so it is unguarded and safe on every direnv reload; only its chatter is
-          # dropped, never its errors.
-          lefthook install > /dev/null
-
-          echo "meethook devShell: $(rustc --version)"
-        '';
-      };
-
-      formatter.${system} = pkgs.nixpkgs-fmt;
+      envs = nixpkgs.lib.genAttrs systems forSystem;
+    in
+    {
+      devShells = nixpkgs.lib.genAttrs systems (system: { default = envs.${system}.devShell; });
+      formatter = nixpkgs.lib.genAttrs systems (system: envs.${system}.formatter);
     };
 }

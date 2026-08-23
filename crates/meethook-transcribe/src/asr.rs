@@ -109,10 +109,12 @@ pub struct WhisperEngine {
 impl WhisperEngine {
     /// Loads a ggml Whisper checkpoint.
     ///
-    /// Metal is used via the `metal` cargo feature, which is also what makes
+    /// On macOS, Metal is used via the `metal` cargo feature, which is also what makes
     /// `WhisperContextParameters::use_gpu` default to true. That default is asserted rather
     /// than set: if the feature is ever dropped, this fails loudly at startup instead of
-    /// quietly transcribing on the CPU at a fraction of the speed.
+    /// quietly transcribing on the CPU at a fraction of the speed. Off macOS the build is
+    /// CPU-only by design, `use_gpu` defaults to false, and there is nothing to assert -- the
+    /// platform *is* the opt-in to slowness, chosen at build time rather than runtime.
     ///
     /// The GPU decision is taken here rather than at CLI entry because this is the exact call
     /// that crashes without a device, and because the CLI opens engines lazily -- a check at
@@ -129,6 +131,11 @@ impl WhisperEngine {
         let vad = SileroVad::load(vad_model_path)?;
 
         let mut params = WhisperContextParameters::default();
+        // Only meaningful where a GPU backend was compiled in. A macOS build without the
+        // `metal` feature would silently run every batch on the CPU at a fraction of the
+        // speed, so the pairing is pinned here; off macOS `false` is the intended default
+        // and asserting it would just restate the build configuration.
+        #[cfg(target_os = "macos")]
         assert!(
             params.use_gpu,
             "whisper-rs was built without a GPU backend; the `metal` feature is required"

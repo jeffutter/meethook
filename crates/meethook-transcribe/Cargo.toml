@@ -15,11 +15,9 @@ hound = { workspace = true }
 # `SessionMetadata` a `Timestamp`. A normal dependency rather than a dev one since that path
 # is compiled into the library.
 jiff = { workspace = true }
-# Solely for `MTLCreateSystemDefaultDevice`, the pre-flight device probe in `gpu`, without
-# which whisper.cpp's Metal path segfaults instead of failing.
-objc2-metal = { workspace = true }
 # A normal dependency, not a dev one: the diarization and speaker-embedding graphs run on
-# the real transcribe path.
+# the real transcribe path. The `coreml` execution provider is added under the macOS target
+# gate below; elsewhere the graphs run on the CPU EP and the type is not compiled at all.
 ort = { workspace = true }
 # The Ogg container and the Opus codec behind `meeting.opus`. Normal dependencies, not dev
 # ones: the mixdown is written on the real transcribe path, next to `mic.cleaned.wav`.
@@ -29,15 +27,40 @@ ropus = { workspace = true }
 rubato = { workspace = true }
 thiserror = { workspace = true }
 
-# `metal` (not `coreml`): Metal alone is fast enough for batch, non-real-time use, and
-# Core ML would need a one-time Python/coremltools conversion step this project exists to
-# avoid. `default-features = false` is stated rather than implied -- whisper-rs's default
-# feature set is empty today, and this keeps it that way if that ever changes.
+# Base entry carries no backend feature: the `metal` feature is added under the macOS target
+# gate below. Off macOS, whisper.cpp compiles for the CPU and `use_gpu` defaults to false --
+# the intended Linux shape, not a degraded one. `default-features = false` is stated rather
+# than implied -- whisper-rs's default feature set is empty today, and this keeps it that way
+# if that ever changes.
 whisper-rs = { workspace = true }
 
 # AEC3 for the echo-cancellation pre-pass. A normal dependency, not a dev one: the pre-pass
-# is on the real transcribe path, not just in tests.
+# is on the real transcribe path, not just in tests. On macOS the sys crate probes pkg-config
+# and links the flake's library dynamically; off macOS there is no such system library, so
+# the `bundled` feature is turned on under the non-macOS target gate below and the vendored
+# C++ is compiled with the local C++ toolchain instead.
 webrtc-audio-processing = { workspace = true }
+
+# Apple-side accelerators, present only where the OS provides them. These are target-gated
+# rather than feature-gated because there is no meaningful "off" build of them on macOS --
+# a Mac that cannot reach its GPU is a broken environment, not a configuration -- and no
+# non-macOS platform has any of them to begin with.
+[target.'cfg(target_os = "macos")'.dependencies]
+# Solely for `MTLCreateSystemDefaultDevice`, the pre-flight device probe in `gpu`, without
+# which whisper.cpp's Metal path segfaults instead of failing.
+objc2-metal = { workspace = true }
+# The CoreML execution provider for the diarization and speaker-embedding graphs.
+ort = { workspace = true, features = ["coreml"] }
+# `metal` (not `coreml`): Metal alone is fast enough for batch, non-real-time use, and
+# Core ML would need a one-time Python/coremltools conversion step this project exists to
+# avoid. This is what makes `WhisperContextParameters::use_gpu` default to true on macOS;
+# see the assertion in `asr` that keeps that honest.
+whisper-rs = { workspace = true, features = ["metal"] }
+
+# The non-macOS half of the AEC3 story: compile the vendored C++ rather than link a system
+# library, because there is no flake-provided `webrtc-audio-processing` to probe for here.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+webrtc-audio-processing = { workspace = true, features = ["bundled"] }
 
 [dev-dependencies]
 # The `speaker-trials` example's `--embeddings` cache, and nothing else. The examples here

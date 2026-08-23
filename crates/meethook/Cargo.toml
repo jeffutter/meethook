@@ -1,7 +1,7 @@
 [package]
 name = "meethook"
 version = "0.1.0"
-description = "Local meeting recorder and transcriber for macOS"
+description = "Local meeting recorder (macOS) and transcriber"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
@@ -13,7 +13,6 @@ path = "src/main.rs"
 [dependencies]
 meethook-enroll = { workspace = true }
 meethook-models = { workspace = true }
-meethook-record = { workspace = true }
 meethook-session = { workspace = true }
 meethook-transcribe = { workspace = true }
 
@@ -22,6 +21,14 @@ clap = { workspace = true }
 ctrlc = { workspace = true }
 jiff = { workspace = true }
 ratatui = { workspace = true }
-# For the scratch directory `enroll` extracts clips into: `afplay` cannot seek, so playing
+# For the scratch directory `enroll` extracts clips into: the player cannot seek, so playing
 # part of a recording means writing that part out first.
 tempfile = { workspace = true }
+
+# The capture backend is pure Apple frameworks and cannot compile off macOS, so it is a
+# target-gated dependency rather than an ordinary one: on non-macOS platforms the `record`
+# subcommand and the calendar-backed halves of `meeting` simply do not exist, and nothing in
+# this crate's build graph ever asks a non-Apple toolchain to parse the objc2 tree. The crate
+# roots its own workspace; see crates/meethook-record/Cargo.toml for the rest of the story.
+[target.'cfg(target_os = "macos")'.dependencies]
+meethook-record = { path = "../meethook-record" }

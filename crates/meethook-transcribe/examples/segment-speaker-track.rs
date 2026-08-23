@@ -53,6 +53,10 @@ fn main() {
             "{e}\nrun `cargo run --example fetch-onnx-models` first"
         ))
     });
+    // Only meaningful where a CoreML EP was compiled in: off macOS `accelerated` is always
+    // false by construction of the build, so printing this there would name a component the
+    // platform never had.
+    #[cfg(target_os = "macos")]
     if !loaded.accelerated {
         eprintln!("note: CoreML declined this graph; running on CPU");
     }

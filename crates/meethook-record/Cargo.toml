@@ -1,34 +1,70 @@
+# Standalone workspace root, on purpose.
+#
+# This crate is pure Apple frameworks -- ScreenCaptureKit, Core Audio, EventKit -- and cannot
+# compile off macOS. The root workspace therefore does not list it as a member: doing so would
+# make every non-macOS `cargo build --workspace`, `clippy --all-targets` and `test` attempt to
+# parse the objc2 tree and fail, which is exactly what keeps the transcribe half of the project
+# from building on Linux. Declaring an (empty) `[workspace]` table makes this directory its own
+# workspace root, so cargo treats it as an external path dependency when the `meethook` binary
+# pulls it in (target-gated to macOS there) instead of as a sibling member.
+#
+# The costs, accepted rather than papered over:
+#
+# - Versions are literals here rather than `workspace = true` inheritance, because inheritance
+#   only resolves inside the workspace that lists you as a member. They mirror the root
+#   workspace's `[workspace.dependencies]`; keep them in step when bumping either side. When
+#   built from the root (macOS), both requirement sets must agree or the root's resolution
+#   fails loudly, which is the drift detector.
+# - This directory carries its own `Cargo.lock`. Building from here resolves against it;
+#   building the `meethook` binary from the root resolves against the root's lock file. Both
+#   graphs contain the same crates at the same versions while the mirrors hold.
+# - Gates run from this directory (`cargo fmt/clippy/test`), not from the root's `--workspace`.
+#   lefthook.yml runs them on Darwin so a push is gated the same way as before.
+
 [package]
 name = "meethook-record"
 version = "0.1.0"
 description = "Dual-track (microphone + system audio) macOS capture into a meethook session directory"
-edition.workspace = true
-rust-version.workspace = true
-publish.workspace = true
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace]
 
 [dependencies]
-meethook-session = { workspace = true }
+meethook-session = { path = "../meethook-session" }
 
-hound = { workspace = true }
-jiff = { workspace = true }
-libc = { workspace = true }
-mach2 = { workspace = true }
-thiserror = { workspace = true }
+hound = "3.5"
+jiff = "0.2"
+libc = "0.2"
+mach2 = "0.6"
+thiserror = "2"
 
-block2 = { workspace = true }
-dispatch2 = { workspace = true }
-objc2 = { workspace = true }
-objc2-av-foundation = { workspace = true }
-objc2-avf-audio = { workspace = true }
-objc2-core-audio = { workspace = true }
-objc2-core-audio-types = { workspace = true }
-objc2-core-foundation = { workspace = true }
-objc2-core-graphics = { workspace = true }
-objc2-core-media = { workspace = true }
-objc2-event-kit = { workspace = true }
-objc2-foundation = { workspace = true }
-objc2-screen-capture-kit = { workspace = true }
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2 = { version = "0.6", features = ["exception"] }
+objc2-av-foundation = "0.3"
+objc2-avf-audio = "0.3"
+objc2-core-audio = "0.3"
+objc2-core-audio-types = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-media = "0.3"
+objc2-event-kit = { version = "0.3", default-features = false, features = [
+  "EKCalendar",
+  "EKCalendarItem",
+  "EKEvent",
+  "EKEventStore",
+  "EKObject",
+  "EKParticipant",
+  "EKSource",
+  "EKTypes",
+  "block2",
+  "std",
+] }
+objc2-foundation = "0.3"
+objc2-screen-capture-kit = "0.3"
 
 [dev-dependencies]
-serde_json = { workspace = true }
-tempfile = { workspace = true }
+serde_json = "1"
+tempfile = "3"

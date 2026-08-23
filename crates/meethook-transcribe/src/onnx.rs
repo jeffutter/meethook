@@ -1,16 +1,18 @@
-//! Opening ONNX Runtime sessions on Apple Silicon.
+//! Opening ONNX Runtime sessions.
 //!
 //! Two graphs run through here -- pyannote segmentation and the WeSpeaker embedder -- and
-//! both want the same thing: CoreML where the ops allow it, CPU everywhere else. That
-//! policy lives in one function rather than at each call site, so a future change to how
-//! this machine is driven is one edit rather than two.
+//! both want the same thing: CoreML where the ops allow it (macOS), CPU everywhere else.
+//! That policy lives in one function rather than at each call site, so a future change to
+//! how this machine is driven is one edit rather than two.
 //!
 //! The ONNX Runtime itself is not vendored and not downloaded. `ort-sys` probes pkg-config
-//! for `libonnxruntime` and links the flake's copy; see the `ort` entry in the workspace
-//! `Cargo.toml` for why that path was chosen over the (now deleted) dynamic-load one.
+//! for `libonnxruntime` and links the system's copy -- the flake's on macOS, a package such
+// as `libonnxruntime-dev` elsewhere -- see the `ort` entry in the workspace `Cargo.toml`
+//! for why that path was chosen over the (now deleted) dynamic-load one.
 
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
 use ort::ep::CoreML;
 use ort::session::Session;
 
@@ -29,30 +31,32 @@ pub struct Loaded {
     pub accelerated: bool,
 }
 
-/// Loads an ONNX graph, preferring CoreML and falling back to CPU.
+/// Loads an ONNX graph. On macOS it prefers CoreML and falls back to CPU; on other
+/// platforms there is no accelerator compiled into the runtime, so it goes straight to CPU.
 ///
-/// The fallback is a real retry, not `error_on_failure(false)`. That flag governs only
-/// whether *registering* the provider may fail; the interesting failures happen later, when
-/// ONNX Runtime hands a partition to CoreML and Apple's compiler refuses it -- which
+/// On macOS the fallback is a real retry, not `error_on_failure(false)`. That flag governs
+/// only whether *registering* the provider may fail; the interesting failures happen later,
+/// when ONNX Runtime hands a partition to CoreML and Apple's compiler refuses it -- which
 /// surfaces from `commit_from_file` as a hard error and takes the whole load down with it.
 /// pyannote's segmentation graph is exactly the kind of model that provokes this, so the
 /// second attempt is what keeps a working slow path from becoming no path at all.
 ///
 /// Nothing about the successful CoreML path is assumed to be all-or-nothing: ONNX Runtime
 /// partitions the graph and runs the ops CoreML declines on CPU regardless. `accelerated`
-/// distinguishes "some of this is on the ANE" from "none of it could be".
+/// distinguishes "some of this is on the ANE" from "none of it could be". Off macOS it is
+/// always false, and callers word their notes accordingly rather than implying a decline.
 pub fn open_session(model_path: &Path) -> Result<Loaded> {
     // Split out so the several ort failures -- environment, provider registration, model
     // parse, CoreML compile -- collapse into one `?`-chain per attempt.
-    fn load(model_path: &Path, coreml: bool) -> ort::Result<Session> {
-        let mut builder = Session::builder()?;
-        if coreml {
-            builder = builder.with_execution_providers([CoreML::default().build()])?;
-        }
-        builder.commit_from_file(model_path)
+    #[cfg(target_os = "macos")]
+    fn load_with_coreml(model_path: &Path) -> ort::Result<Session> {
+        Session::builder()?
+            .with_execution_providers([CoreML::default().build()])?
+            .commit_from_file(model_path)
     }
 
-    if let Ok(session) = load(model_path, true) {
+    #[cfg(target_os = "macos")]
+    if let Ok(session) = load_with_coreml(model_path) {
         return Ok(Loaded {
             session,
             accelerated: true,
@@ -62,7 +66,14 @@ pub fn open_session(model_path: &Path) -> Result<Loaded> {
     // Only the CPU attempt's error is reported. A CoreML error here would name a compiler
     // that the user cannot act on, in place of the parse or permission failure that is the
     // actual reason nothing loaded.
-    load(model_path, false)
+    //
+    // Its own helper for the same reason `load_with_coreml` is one: the `?`-chain stays
+    // inside `ort::Result`, so no `From<ort::Error>` for the crate error is needed.
+    fn load_cpu(model_path: &Path) -> ort::Result<Session> {
+        Session::builder()?.commit_from_file(model_path)
+    }
+
+    load_cpu(model_path)
         .map(|session| Loaded {
             session,
             accelerated: false,

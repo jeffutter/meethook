@@ -9,7 +9,14 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+// The channel types exist only where the record loop does: on Linux production builds the
+// loop is excluded by its `any(macos, test)` gate, and an import nothing names is a warning.
+// The bare `mpsc` path is narrower still -- its one production use is inside `record`, which
+// is macOS-only, so even the test build leaves it unused off macOS.
+#[cfg(target_os = "macos")]
+use std::sync::mpsc;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +26,9 @@ use meethook_enroll::{
     incomplete, run_enroll, run_forget, run_meeting, run_speakers, speech, write_clip,
 };
 use meethook_models::{ModelSpec, ensure_model};
+// The capture backend exists only where its Apple frameworks compile; the platform-neutral
+// sequencing in `record_loop` below stays ungated and keeps testing without it.
+#[cfg(target_os = "macos")]
 use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
 use meethook_session::{Paths, SessionId, TranscriptTemplate};
 
@@ -29,6 +39,11 @@ use meethook_transcribe::{
     TARGET_RATE, WHISPER_MODEL, WhisperEngine, run_batch,
 };
 
+// The sequencing machinery below is platform-neutral on purpose -- it is what makes the
+// record loop testable without a microphone -- but on non-macOS builds the only production
+// caller of any of it is macOS's `record`, so it compiles for tests there rather than
+// sitting dead in the binary and tripping the no-dead-code gate.
+#[cfg(any(target_os = "macos", test))]
 /// The four waits the record loop's behaviour depends on.
 ///
 /// Gathered into one value so the sequencing can be exercised at millisecond scale. The live
@@ -71,7 +86,11 @@ struct Timing {
     recheck: Duration,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl Timing {
+    // The live figures are what `record` runs on; the tests run on `LOOP_TIMING` instead, so
+    // off macOS -- where `record` does not compile -- this constant has no user at all.
+    #[cfg(target_os = "macos")]
     const LIVE: Timing = Timing {
         grace: Duration::from_secs(3),
         retry: Duration::from_secs(2),
@@ -83,6 +102,7 @@ impl Timing {
     };
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// Anything the record loop waits on.
 ///
 /// One enum, one channel: a Ctrl-C during a recording has to be seen at the same instant
@@ -97,6 +117,7 @@ enum Event {
     Interrupt,
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// What the record loop needs from a capture backend.
 ///
 /// The loop's whole responsibility is sequencing -- when to open a session, when to hold on
@@ -119,6 +140,7 @@ trait Capture {
 }
 
 /// The live backend: one session at a time, plus the user-facing report of it.
+#[cfg(target_os = "macos")]
 struct SessionCapture<'a> {
     recorder: &'a Recorder,
     paths: &'a Paths,
@@ -126,6 +148,7 @@ struct SessionCapture<'a> {
     running: Option<RunningSession>,
 }
 
+#[cfg(target_os = "macos")]
 impl Capture for SessionCapture<'_> {
     fn start(&mut self) -> Result<()> {
         let started_at = Instant::now();
@@ -210,6 +233,7 @@ impl Capture for SessionCapture<'_> {
 ///
 /// Everything past the setup lives in [`record_loop`], which is where the sequencing is and
 /// where it can be tested without a microphone.
+#[cfg(target_os = "macos")]
 pub fn record(paths: &Paths) -> Result<()> {
     let authorized = preflight()?;
     let recorder = Recorder::new(authorized)?;
@@ -267,10 +291,12 @@ pub fn record(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn announce_watching() {
     println!("Watching the default microphone. Press Ctrl-C to stop.");
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// Sequences one session per detected call until the process is interrupted.
 ///
 /// `recheck` recomputes the activity level from the world, delivering any edge it finds
@@ -417,6 +443,7 @@ fn record_loop(
 
 /// How the inner recording loop ended.
 ///
+#[cfg(any(target_os = "macos", test))]
 /// An enum rather than the `interrupted` boolean it replaced, so that the one finalize point
 /// after the loop stays the only one: three ways out of a recording, three answers to "what
 /// happens after `finish`", and a single place where the audio is written.
@@ -435,6 +462,7 @@ enum Recording {
     MicStalled,
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// How the attempt to open a session for the call that just started resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Begin {
@@ -446,6 +474,7 @@ enum Begin {
     Interrupted,
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// Opens a session, retrying for as long as the call is still up.
 ///
 /// The retry is driven by the *level*, not by edges, and that is the whole point. Capture
@@ -509,6 +538,7 @@ fn begin(
     Begin::Abandoned
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// What the grace period after a stop edge resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
@@ -520,6 +550,7 @@ enum Outcome {
     Interrupted,
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// Waits out the grace period following a stop edge.
 ///
 /// A receive timeout rather than a cancellable timer: the thing that would cancel a timer
@@ -576,6 +607,10 @@ pub fn transcribe(
             let whisper = fetch(&models_dir, &WHISPER_MODEL)?;
 
             let diarizer = OnnxDiarizer::load(&segmentation, &embedding)?;
+            // Only meaningful where a CoreML EP was compiled in: off macOS `accelerated` is
+            // always false by construction of the build, and printing "CoreML declined"
+            // there would name a component the platform never had.
+            #[cfg(target_os = "macos")]
             if !diarizer.accelerated() {
                 // Correct but several times slower. Worth a line: the alternative is a user
                 // wondering why transcribing a meeting suddenly takes minutes.
@@ -583,6 +618,9 @@ pub fn transcribe(
             }
 
             let asr = WhisperEngine::load(&whisper, &silero)?;
+            // Same reasoning: off macOS the CPU is the only path, so a non-accelerated
+            // engine is not a reportable choice -- it is the build.
+            #[cfg(target_os = "macos")]
             if !asr.accelerated() {
                 // Only reachable via MEETHOOK_CPU, so this confirms an explicit choice rather
                 // than reporting a surprise -- and says out loud what that choice costs.
@@ -934,6 +972,12 @@ pub fn meeting(
         (false, None) => MeetingChoice::Show,
     };
 
+    // The grant is asked for only when a listing is needed, and only where a calendar exists
+    // to grant access to: off macOS there is no backend at all, so the prompt would ask for
+    // nothing. `--clear` reaching a calendar prompt anywhere would be the opposite of the
+    // point: it is the path for the user whose calendar is refused, unreadable, or simply
+    // does not contain the meeting they were in.
+    #[cfg(target_os = "macos")]
     if !matches!(choice, MeetingChoice::Clear)
         && let Some(problem) = meethook_record::request_calendar_access()
     {
@@ -969,9 +1013,21 @@ pub fn meeting(
 /// empty list, so no correction fails because the calendar was unavailable.
 struct Calendar;
 
+#[cfg(target_os = "macos")]
 impl MeetingSource for Calendar {
     fn around(&self, at: jiff::Timestamp) -> Vec<meethook_session::Meeting> {
         meethook_record::meetings_around(at)
+    }
+}
+
+// Off macOS there is no calendar backend at all -- EventKit is one of the frameworks the
+// capture crate cannot compile without -- so the seam answers the total-by-construction
+// empty list rather than an error: `meeting <id>` lists nothing and points at `--clear`,
+// which remains fully functional because clearing never consults the calendar.
+#[cfg(not(target_os = "macos"))]
+impl MeetingSource for Calendar {
+    fn around(&self, _at: jiff::Timestamp) -> Vec<meethook_session::Meeting> {
+        Vec::new()
     }
 }
 
@@ -1029,7 +1085,7 @@ enum Answerer {
 /// 3. `--plain` is the explicit override, for somebody on a real terminal who wants the old
 ///    prompt back, or who needs the interface out of a reproduction.
 ///
-/// A function rather than an inline `if` for the reason [`meeting_line`] is one: the rule is
+/// A function rather than an inline `if` for the reason `meeting_line` is one: the rule is
 /// then decidable in `cargo test` with no terminal in front of it.
 fn answerer(named: bool, plain: bool, tty: Tty) -> Answerer {
     if named {
@@ -1075,6 +1131,8 @@ struct Playing {
     /// The clip's own file, unlinked when the child is reaped: fifty replays of a three-minute
     /// clip would otherwise sit in the scratch directory until the run ended.
     path: PathBuf,
+    /// Which player owns the child, so a failure names the program that actually ran.
+    player: &'static str,
     started: Instant,
     length: Duration,
 }
@@ -1085,6 +1143,76 @@ struct Playing {
 /// and a wrong denominator is invisible except as a position that drifts against the audio.
 fn length(clip: &[f32]) -> Duration {
     Duration::from_secs_f64(clip.len() as f64 / f64::from(TARGET_RATE))
+}
+
+/// The player this platform plays clips with, and the arguments it takes before the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Player {
+    program: &'static str,
+    /// Verbosity/display flags that keep the player from painting over the terminal or
+    /// opening a video window for what is a bare WAV.
+    args: &'static [&'static str],
+}
+
+/// What the refusal names when no player is found, so the message and the search agree.
+#[cfg(target_os = "macos")]
+const PLAYER_SEARCH_LIST: &str = "afplay";
+#[cfg(not(target_os = "macos"))]
+const PLAYER_SEARCH_LIST: &str = "paplay, aplay, ffplay, mpv";
+
+/// Which of the known players the given PATH actually contains, first match winning.
+///
+/// Pure over the PATH string rather than reading the environment itself, so the choice --
+/// and the order in which players are preferred -- is decidable in `cargo test`.
+#[cfg(target_os = "macos")]
+fn choose_player(_path_env: &str) -> Option<Player> {
+    // `afplay` ships with every Mac and takes nothing but the file.
+    Some(Player {
+        program: "afplay",
+        args: &[],
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn choose_player(path_env: &str) -> Option<Player> {
+    // Native WAV players first -- the clip is a WAV and neither of them has to decode
+    // anything -- then the general players, quietest flags first, so a headless box with
+    // only ffmpeg still gets playback without a video window or a wall of log lines.
+    let candidates = [
+        Player {
+            program: "paplay",
+            args: &[],
+        },
+        Player {
+            program: "aplay",
+            args: &[],
+        },
+        Player {
+            program: "ffplay",
+            args: &["-nodisp", "-autoexit", "-loglevel", "quiet"],
+        },
+        Player {
+            program: "mpv",
+            args: &["--really-quiet", "--no-video"],
+        },
+    ];
+    // Empty entries are skipped: a bare ":" in PATH would otherwise be read as the current
+    // directory, where a file named `mpv` is a plausible coincidence.
+    let dirs: Vec<&str> = path_env.split(':').filter(|dir| !dir.is_empty()).collect();
+    candidates.into_iter().find(|candidate| {
+        dirs.iter()
+            .any(|dir| Path::new(dir).join(candidate.program).is_file())
+    })
+}
+
+/// [`choose_player`] pointed at this process's real PATH. A missing PATH means no player can
+/// be found at all, which is the same answer as an empty one.
+fn resolve_player() -> Option<Player> {
+    let path = std::env::var_os("PATH")?;
+    // Bound rather than chained: `to_string_lossy` may borrow its input, and a temporary
+    // `Cow` would be dropped while `choose_player` still held it.
+    let path_env = path.to_string_lossy();
+    choose_player(&path_env)
 }
 
 /// Playing a voice's audio, for whichever answerer is asking.
@@ -1135,11 +1263,18 @@ impl Clips {
         self.written += 1;
         let path = dir.join(format!("clip-{}.wav", self.written));
         write_clip(&path, clip)?;
+        // A missing player is a reportable condition, not a crash: enrollment degrades to
+        // reading the snippets, which is often enough to recognise somebody.
+        let player = resolve_player().ok_or_else(|| {
+            anyhow::anyhow!("no audio player found on PATH (looked for {PLAYER_SEARCH_LIST})")
+        })?;
         // All three streams closed. Under raw mode and an alternate screen one line of
         // `AudioQueueStart failed` from the child paints over the frame, and ratatui's diffed
         // redraw will not clear a cell it never wrote.
-        let child = Command::new("afplay")
-            .arg(&path)
+        let mut command = Command::new(player.program);
+        command.args(player.args);
+        command.arg(&path);
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1147,6 +1282,7 @@ impl Clips {
         self.playing = Some(Playing {
             child,
             path,
+            player: player.program,
             started: Instant::now(),
             length: length(clip),
         });
@@ -1168,6 +1304,7 @@ impl Clips {
             elapsed: playing.started.elapsed().min(playing.length),
             length: playing.length,
         };
+        let player = playing.player;
         match reaped {
             Ok(None) => Ok(Some(progress)),
             Ok(Some(status)) => {
@@ -1175,12 +1312,12 @@ impl Clips {
                 if status.success() {
                     Ok(None)
                 } else {
-                    bail!("afplay exited with {status}");
+                    bail!("{player} exited with {status}");
                 }
             }
             Err(e) => {
                 self.stop();
-                Err(e).context("waiting on afplay")
+                Err(e).context(format!("waiting on {player}"))
             }
         }
     }
@@ -1214,9 +1351,10 @@ impl Clips {
             return Ok(());
         };
         let status = playing.child.wait()?;
+        let player = playing.player;
         let _ = fs::remove_file(&playing.path);
         if !status.success() {
-            bail!("afplay exited with {status}");
+            bail!("{player} exited with {status}");
         }
         Ok(())
     }
@@ -1338,6 +1476,7 @@ fn parse_session_ids(raw: &[String]) -> Result<Vec<SessionId>> {
     Ok(ids)
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// What `record` prints about the meeting a finished session was matched to.
 ///
 /// The title only, and only the title. It is the sole user-visible evidence that the calendar
@@ -1374,8 +1513,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Answerer, Capture, Event, Outcome, Timing, Tty, answerer, await_end, length, meeting_line,
-        record_loop,
+        Answerer, Capture, Event, Outcome, Timing, Tty, answerer, await_end, choose_player, length,
+        meeting_line, record_loop,
     };
 
     /// Every shape the two streams can be in, so a rule is asserted over all of them rather
@@ -2103,5 +2242,60 @@ mod tests {
             Some(0),
             "the idle wait recomputed the activity level"
         );
+    }
+
+    /// A directory that presents exactly the players named, so the choice is decided by
+    /// presence rather than by whatever happens to be on the machine running the test.
+    fn fake_path(dir: &std::path::Path, present: &[&str]) {
+        for program in present {
+            std::fs::write(dir.join(*program), b"fake").unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_always_uses_afplay() {
+        let player = choose_player("").expect("afplay is part of every macOS");
+        assert_eq!(player.program, "afplay");
+        assert!(player.args.is_empty(), "afplay takes nothing but the file");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_player_is_chosen_from_what_the_path_actually_contains() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_path(dir.path(), &["ffplay", "mpv"]);
+        let path = dir.path().to_str().unwrap();
+
+        // Neither native WAV player present, so the first general player found wins -- with
+        // its quieting flags pinned, since a visible video window or log wall would defeat
+        // the purpose of playing a clip behind a prompt.
+        let player = choose_player(path).expect("ffplay should be found");
+        assert_eq!(player.program, "ffplay");
+        assert_eq!(player.args, ["-nodisp", "-autoexit", "-loglevel", "quiet"]);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn native_wav_players_are_preferred_over_general_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_path(dir.path(), &["mpv", "paplay"]);
+        let path = dir.path().to_str().unwrap();
+
+        let player = choose_player(path).expect("paplay should be found");
+        assert_eq!(player.program, "paplay");
+        assert!(player.args.is_empty());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_empty_path_finds_no_player_and_empty_entries_are_not_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file named like a player in the *current* directory must not count: empty PATH
+        // entries are skipped rather than read as ".".
+        std::fs::write("mpv", b"fake").unwrap();
+        std::fs::remove_file("mpv").unwrap();
+        assert!(choose_player(dir.path().to_str().unwrap()).is_none());
+        assert!(choose_player(":").is_none());
     }
 }

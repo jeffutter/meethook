@@ -34,6 +34,16 @@ pre-commit:
       # snapshot: a partially staged file is checked in full. Accepted.
       glob: "*.rs"
       run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+    record-clippy:
+      priority: 3
+      # meethook-record is its own workspace (its Apple-framework dependencies cannot
+      # compile off macOS, so it is excluded from the root one), which means the command
+      # above never lints it. Lefthook has no platform filter, so the guard lives in the
+      # script: off macOS it reports and exits clean rather than failing a commit.
+      glob: "crates/meethook-record/**/*.rs"
+      run: |
+        [ "$(uname -s)" = "Darwin" ] || { echo "record-clippy skipped (not macOS)"; exit 0; }
+        cd crates/meethook-record && cargo clippy --all-targets --workspace -- -D warnings
 
 pre-push:
   # Cheapest gate first, and stop at the first failure, so a formatting slip does not
@@ -55,8 +65,20 @@ pre-push:
       env:
         RUSTDOCFLAGS: "-D warnings"
       run: cargo doc --no-deps --document-private-items --all-features --workspace
-    audit:
+    record-crate:
       priority: 5
+      # Same reason as `record-clippy`: the record crate sits outside this workspace, so
+      # the gates above never touch it. On macOS its full gate runs here, keeping the
+      # push-time promise that every Rust in the repo passed its own checks. Lefthook has
+      # no platform filter, so the guard lives in the script.
+      run: |
+        [ "$(uname -s)" = "Darwin" ] || { echo "record-crate skipped (not macOS)"; exit 0; }
+        cd crates/meethook-record &&
+        cargo fmt --all --check &&
+        cargo clippy --all-targets --workspace -- -D warnings &&
+        cargo test --workspace
+    audit:
+      priority: 6
       # Default DB location ($CARGO_HOME/advisory-db, fetched on each run) is deliberate.
       # It does not work from an agent sandbox -- $CARGO_HOME is read-only there and the
       # TLS interception breaks cargo-audit's fetch -- but a real `git push`, which is

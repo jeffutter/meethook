@@ -1,7 +1,7 @@
-//! Whether this process can actually reach a Metal device.
+//! Whether this process can actually reach a Metal device, on the platforms that have one.
 //!
-//! whisper.cpp is built with the `metal` feature, so `WhisperContext::new_with_params` goes
-//! straight to the GPU. In an environment where `MTLCreateSystemDefaultDevice()` returns
+//! whisper.cpp is built with the `metal` feature on macOS, so `WhisperContext::new_with_params`
+//! goes straight to the GPU. In an environment where `MTLCreateSystemDefaultDevice()` returns
 //! NULL -- a seatbelt sandbox, CI, a headless SSH session, a VM without GPU passthrough --
 //! ggml's Metal buffer allocation fails, and ggml does not null-check that failure: it hands
 //! the NULL buffer to `ggml_metal_buffer_is_shared`, which dereferences it. The process dies
@@ -18,6 +18,11 @@
 //! thinks it is. Silently moving a 1.6 GB Whisper checkpoint onto the CPU inside an
 //! unattended batch turns that into a ~20x slowdown nobody chose and nobody can see.
 //!
+//! Off macOS there is no Metal at all: whisper.cpp is compiled for the CPU, `use_gpu` reports
+//! that, and neither the probe nor the error exists in the build. `MEETHOOK_CPU=1` still
+//! parses and still means "run on the CPU" -- it is just the only path rather than an opt-out,
+//! which keeps the variable meaningful on every platform rather than half of them.
+//!
 //! The env var is what keeps the error from being a dead end: it names a way forward, and it
 //! already has a consumer -- verification work under the agent sandbox has to run Whisper on
 //! the CPU for exactly this reason. `MEETHOOK_TIMING_DEBUG` and `MEETHOOK_ACTIVITY_DEBUG` in
@@ -25,6 +30,7 @@
 
 use std::ffi::OsStr;
 use std::fmt;
+#[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
 // objc2-metal's own docs say `MTLCreateSystemDefaultDevice` lives in CoreGraphics and that
@@ -33,6 +39,7 @@ use std::sync::OnceLock;
 // crate and running the probe. If a future SDK or toolchain reinstates the requirement, the
 // fix is to depend on objc2-core-graphics (already in the workspace) rather than to
 // hand-write a `#[link]` stanza, matching how meethook-record reaches that framework.
+#[cfg(target_os = "macos")]
 use objc2_metal::MTLCreateSystemDefaultDevice;
 
 /// No usable Metal device, and the GPU is the only path compiled in.
@@ -79,16 +86,26 @@ impl fmt::Display for NoMetalDevice {
 /// order wrong -- probing first would refuse a run that `MEETHOOK_CPU=1` had already opted
 /// out of needing a device at all.
 ///
-/// Returns `Ok(true)` to run on the GPU, `Ok(false)` to run on the CPU by request, and
-/// [`NoMetalDevice`] when there is no device and the user has not asked for the CPU.
+/// Returns `Ok(true)` to run on the GPU, `Ok(false)` to run on the CPU by request -- or,
+/// off macOS, because the CPU is the only path compiled in -- and [`NoMetalDevice`] when
+/// there is no device and the user has not asked for the CPU.
 pub fn use_gpu() -> std::result::Result<bool, NoMetalDevice> {
     if cpu_requested() {
         return Ok(false);
     }
-    if metal_device_available() {
-        Ok(true)
-    } else {
-        Err(NoMetalDevice(()))
+    #[cfg(target_os = "macos")]
+    {
+        if metal_device_available() {
+            Ok(true)
+        } else {
+            Err(NoMetalDevice(()))
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No GPU backend is compiled in on this platform; the CPU is not a fallback, it is
+        // the build. Nothing to probe and nothing to refuse.
+        Ok(false)
     }
 }
 
@@ -97,6 +114,7 @@ pub fn use_gpu() -> std::result::Result<bool, NoMetalDevice> {
 /// Cached: one framework call per process, however many callers ask. The probe is far too
 /// cheap to matter next to a 1.6 GB model load, and caching keeps that true by construction
 /// if it ever gains a second caller.
+#[cfg(target_os = "macos")]
 fn metal_device_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     // Device presence, not a trial allocation. NULL from this call is the condition actually
