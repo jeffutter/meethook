@@ -427,6 +427,16 @@ impl From<&Meeting> for MeetingLabel {
 pub struct Voice<'a> {
     pub session: &'a SessionId,
 
+    /// The meeting this session was recorded during, as far as a terminal may see it -- or
+    /// `None`, which is the common case rather than the exception.
+    ///
+    /// The same value the queue announcement was handed, built from the same
+    /// `session.json` load: an interface that shows it does so across this seam rather than
+    /// reaching back for the file itself, and nothing off the roster crosses with it.
+    /// Absent costs nothing downstream -- no reserved row, no empty label -- so a run over
+    /// sessions without meetings behaves exactly as before.
+    pub meeting: Option<&'a MeetingLabel>,
+
     /// Which of this session's questions this is, and how many there are.
     ///
     /// Carried across the seam rather than counted on the far side, because an [`Interviewer`]
@@ -1177,7 +1187,9 @@ fn enroll_session(
     };
     // The meeting, projected to what a terminal may see and built here, beside the load: the
     // queue announcement below gets it from this value rather than any surface reaching back
-    // for `session.json`, and nothing off the roster ever crosses with it.
+    // for `session.json`, and nothing off the roster ever crosses with it. It is handed to the
+    // voices too -- the frame shows it across the Interviewer seam -- so the announcement takes
+    // a clone and the original outlives the asking loop.
     let meeting = metadata.meeting.as_ref().map(MeetingLabel::from);
     let mut transcript = match Transcript::read(&session.paths.transcript_json()) {
         Ok(transcript) => transcript,
@@ -1266,7 +1278,7 @@ fn enroll_session(
             &shown,
             rules.offer,
             rules.sessions,
-            meeting,
+            meeting.clone(),
             session,
             notes,
             report,
@@ -1374,6 +1386,7 @@ fn enroll_session(
                 // that replaces `speakers` once this answer is accepted.
                 interviewer.identify(&Voice {
                     session: &session.id,
+                    meeting: meeting.as_ref(),
                     position: Position { nth, of },
                     attribution,
                     number: &unknown[&cluster.id],
@@ -2268,6 +2281,10 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct Shown {
         session: String,
+        /// The meeting the prompt was told this session was recorded during -- or that it was
+        /// not labelled with one at all. The only way a test can check that the value crosses
+        /// the Interviewer seam rather than being re-read from `session.json` behind it.
+        meeting: Option<MeetingLabel>,
         /// Which of this session's questions this was, and how many there were, exactly as the
         /// prompt was handed it.
         position: Position,
@@ -2379,6 +2396,7 @@ mod tests {
         fn identify(&mut self, voice: &Voice<'_>) -> Answer {
             self.seen.push(Shown {
                 session: voice.session.to_string(),
+                meeting: voice.meeting.cloned(),
                 position: voice.position,
                 attribution: voice.attribution.clone(),
                 number: voice.number.to_string(),
@@ -3574,6 +3592,50 @@ mod tests {
         let (_, output) = run(&paths, &[], &mut interviewer);
 
         assert!(!output.contains("meeting"), "{output}");
+    }
+
+    /// TASK-051.02 acceptance criterion #6: the meeting reaches an interface across the
+    /// Interviewer seam -- every voice of a labelled session is handed the same title and fit,
+    /// and a session without one is handed `None` rather than a value an interface could only
+    /// have gotten by reading `session.json` behind the seam's back.
+    #[test]
+    fn the_seam_hands_every_voice_the_meeting_it_was_recorded_during() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        labelled_meeting(&paths, "20260809-052600", MeetingFit::JoinedLate);
+
+        let mut interviewer = Scripted::answering(vec![named("Alice"), named("Aaron")]);
+        run(&paths, &[], &mut interviewer);
+
+        let expected = Some(MeetingLabel {
+            title: "Incident review".to_owned(),
+            fit: MeetingFit::JoinedLate,
+        });
+        assert_eq!(interviewer.seen.len(), 2, "both voices were asked about");
+        for seen in &interviewer.seen {
+            assert_eq!(
+                seen.meeting, expected,
+                "the seam carries the label, per voice"
+            );
+        }
+
+        // The absent half: the common case hands `None`, which is what lets a surface reserve
+        // nothing for a title that is not there.
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::answering(vec![named("Alice"), named("Aaron")]);
+        run(&paths, &[], &mut interviewer);
+
+        assert_eq!(interviewer.seen.len(), 2, "both voices were asked about");
+        for seen in &interviewer.seen {
+            assert_eq!(
+                seen.meeting, None,
+                "no meeting means no label, not an empty one"
+            );
+        }
     }
 
     /// Acceptance criterion #2: ids scope the run, and one that is not on disk is named
@@ -5648,6 +5710,7 @@ mod tests {
         assert_eq!(aimed.seen.len(), 1, "{output}");
         let Shown {
             session,
+            meeting,
             position,
             attribution,
             number,
@@ -5662,6 +5725,7 @@ mod tests {
         } = &aimed.seen[0];
         let queued = &queued.seen[1];
         assert_eq!(session, &queued.session);
+        assert_eq!(meeting, &queued.meeting);
         assert_eq!(attribution, &queued.attribution);
         assert_eq!(number, &queued.number);
         assert_eq!(speech_seconds, &queued.speech_seconds);

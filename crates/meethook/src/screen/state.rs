@@ -35,7 +35,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use meethook_enroll::{Answer, Position, Queued, Refusal, Resolution, Scan, Snippet, resolve};
+use meethook_enroll::{
+    Answer, MeetingLabel, Position, Queued, Refusal, Resolution, Scan, Snippet, resolve,
+};
 use meethook_session::SessionId;
 use meethook_transcribe::{Attribution, Resemblance};
 
@@ -48,6 +50,11 @@ use meethook_transcribe::{Attribution, Resemblance};
 /// Borrowing throughout, so building one costs nothing per redraw.
 pub struct VoiceView<'a> {
     pub session: &'a SessionId,
+    /// The meeting this session was recorded during, as far as a terminal may see it -- or
+    /// `None`, and then the frame reserves nothing for it. Crosses from
+    /// [`Voice`](meethook_enroll::Voice) by projection rather than being re-read from
+    /// `session.json` behind the seam's back.
+    pub meeting: Option<&'a MeetingLabel>,
     pub position: Position,
     /// The "Unknown N" this voice was transcribed with -- the one handle that does not move when
     /// the voice is named, and so the only thing this module's state may be keyed on.
@@ -319,6 +326,10 @@ pub struct Candidate {
 /// Everything the frame draws, derived rather than stored.
 pub struct View<'a> {
     pub session: &'a SessionId,
+    /// Which meeting this session was recorded during, or that it carries none: the banner row
+    /// above the panes is present exactly when this is `Some`, so an absent meeting costs the
+    /// frame nothing at all.
+    pub meeting: Option<&'a MeetingLabel>,
     pub position: Position,
     pub number: &'a str,
     pub label: &'a str,
@@ -680,6 +691,7 @@ impl Screen {
 
         View {
             session: view.session,
+            meeting: view.meeting,
             position: view.position,
             number: view.number,
             label: view.attribution.label(),
@@ -944,6 +956,7 @@ pub(crate) mod tests {
     ) -> VoiceView<'a> {
         VoiceView {
             session,
+            meeting: None,
             position: Position {
                 nth,
                 of: queue.len(),

@@ -40,23 +40,48 @@ use crate::commands::Progress;
 /// having neither in it. A fourth argument says in the signature that the shell computed this and
 /// the state machine did not.
 pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String], sounding: Option<Sounding>) {
-    let whole = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(6),
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
+    // The banner row exists only when this session carries a meeting: reserving it either way
+    // would cost a session without one a row it has nothing to say, and an absent title must
+    // reserve no space at all. Present, the snippets and log bands each give up one row and
+    // the flexible top band absorbs the remainder -- at the 80x24 floor the candidate list
+    // gains an inner row (1 -> 2) instead of losing its last one.
+    let (banner, top, said, run, keys) = match view.meeting {
+        Some(_) => {
+            let whole = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min(6),
+                    Constraint::Length(4),
+                    Constraint::Length(4),
+                    Constraint::Length(1),
+                ])
+                .split(frame.area());
+            (Some(whole[0]), whole[1], whole[2], whole[3], whole[4])
+        }
+        None => {
+            let whole = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(6),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Length(1),
+                ])
+                .split(frame.area());
+            (None, whole[0], whole[1], whole[2], whole[3])
+        }
+    };
     let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(whole[0]);
+        .split(top);
     // Four bands in the right column, and the sizes are pinned by the 80x24 floor the tests hold
     // this frame to: there the top band is 13 rows and `1 + 3 + 4 + 5` fits it exactly, with the
-    // candidate list down to one visible row; at 120x40 it is 29 and the candidates get 19. The
-    // "who" pane is adjacent to the candidate it describes, which is the whole point of it -- a
+    // candidate list down to one visible row; at 120x40 it is 29 and the candidates get 19. With
+    // the meeting banner present the top band is one row taller -- 14 at the floor -- so the
+    // candidates gain their second inner row rather than the frame squeezing them. The "who"
+    // pane is adjacent to the candidate it describes, which is the whole point of it -- a
     // horizontal split of the `run` band was considered and rejected, because `log` clips rather
     // than wraps and halving its width would cut narration sentences mid-word.
     let right = Layout::default()
@@ -69,14 +94,84 @@ pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String], sounding: 
         ])
         .split(top[1]);
 
+    if let Some(banner) = banner {
+        meeting_banner(frame, banner, view);
+    }
     voices(frame, top[0], view);
     question(frame, right[0], view);
     candidates(frame, right[1], view);
     consequence(frame, right[2], view);
     who(frame, right[3], view);
-    snippets(frame, whole[1], view, sounding.and_then(|s| s.line));
-    log(frame, whole[2], narration);
-    footer(frame, whole[3], view, sounding);
+    snippets(frame, said, view, sounding.and_then(|s| s.line));
+    log(frame, run, narration);
+    footer(frame, keys, view, sounding);
+}
+
+/// The phrase the banner row begins with: the line prompt's `    meeting   ` minus its
+/// indent, so the frame and the plain prompt say the same thing about the same meeting.
+const MEETING_PREFIX: &str = "meeting   ";
+
+/// Which meeting this session was recorded during, in its own row above the panes.
+///
+/// The voices pane's title cannot hold it: at the 80x24 floor that pane is 40 columns wide and
+/// its border leaves 38 for a title that already runs to 31, and ratatui clips a block title
+/// silently. A row of its own, present only when there is a meeting, is what keeps the frame
+/// from asserting a clipped title as the whole one.
+///
+/// A bare [`Paragraph`], styled like the question band: a one-row bordered block has no
+/// interior. The phrase is the one the line prompt prints under the count line, minus the
+/// indent, so the two surfaces say the same thing about the same meeting -- and when the row
+/// runs short, [`clause_within`] decides which half of it yields.
+fn meeting_banner(frame: &mut Frame, area: Rect, view: &View<'_>) {
+    let Some(meeting) = view.meeting else { return };
+    let width = area.width.saturating_sub(MEETING_PREFIX.len() as u16) as usize;
+    let clause = clause_within(&meeting.title, meeting.fit.caveat(), width);
+    frame.render_widget(
+        Paragraph::new(Line::from(format!("{MEETING_PREFIX}{clause}")).bold()),
+        area,
+    );
+}
+
+/// [`MeetingLabel::clause`](meethook_enroll::MeetingLabel::clause) fitted to a row: the whole
+/// clause when it fits, otherwise the title cut with an ellipsis and the caveat kept whole.
+///
+/// The caveat is the safety device -- a bare title would assert a match the tool does not have
+/// -- so it is never the half that yields while there is a title to yield instead. Only when
+/// the caveat alone outgrows the row -- the 80-column floor with the longest of them -- does it
+/// take the cut itself, from the end, keeping the word that says the match is not strong.
+fn clause_within(title: &str, caveat: Option<&str>, width: usize) -> String {
+    let Some(caveat) = caveat else {
+        return within(title, width);
+    };
+    let clause = format!("{title}  ({caveat})");
+    if clause.chars().count() <= width {
+        return clause;
+    }
+    let decorated = format!("  ({caveat})");
+    let room = width.saturating_sub(decorated.chars().count());
+    if room > 0 {
+        return format!("{}{decorated}", within(title, room));
+    }
+    within(&format!("({caveat})"), width)
+}
+
+/// The longest prefix of `text` that fits `width` characters, with an ellipsis standing in for
+/// what was cut.
+///
+/// Marking the cut is the point: a shortened title that looks complete reads as the whole one.
+/// Character counts rather than cell widths, the way the footer assumes of its key list -- a
+/// title wider than its character count clips at the buffer's edge, which is a degradation
+/// rather than a failure.
+fn within(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(width - 1).collect();
+    out.push('…');
+    out
 }
 
 /// The voice queue: every voice the session has, with the quiet ones under a separator.
@@ -503,8 +598,8 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sound
 mod tests {
     use std::time::Duration;
 
-    use meethook_enroll::{Position, Queued, Refusal};
-    use meethook_session::SessionId;
+    use meethook_enroll::{MeetingLabel, Position, Queued, Refusal};
+    use meethook_session::{MeetingFit, SessionId};
     use meethook_transcribe::{Attribution, Resemblance};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -513,7 +608,7 @@ mod tests {
 
     use super::super::state::tests::{heard, holding, names, scanned};
     use super::super::state::{Context, Cost, Costs, Event, Screen, VoiceView};
-    use super::{Progress, Sounding, draw, incomplete, listed};
+    use super::{Progress, Sounding, clause_within, draw, incomplete, listed};
 
     struct Free;
 
@@ -577,20 +672,32 @@ mod tests {
             None,
             None,
             Context::Reading,
+            None,
         )
     }
 
     /// [`painted`], with a cross-session scan already gathered. The "who" pane is the only thing
     /// the context reaches, so its tests vary that and nothing else.
     fn knowing(width: u16, height: u16, keys: &[Event], context: Context<'_>) -> Vec<String> {
-        painted_with(width, height, &Free, keys, &said(), None, None, context)
+        painted_with(
+            width,
+            height,
+            &Free,
+            keys,
+            &said(),
+            None,
+            None,
+            context,
+            None,
+        )
     }
 
-    /// [`painted`], plus the four things only the snippet, footer and "who" tests vary: what this
-    /// voice said, what is sounding, what the frame last had to say, and what has been read about
-    /// the enrolled speakers. The middle two reach the footer from different directions -- one is a
-    /// parameter to `draw`, the other a field of the view -- which is exactly what the precedence
-    /// between them has to be pinned against.
+    /// [`painted`], plus the five things only the banner, snippet, footer and "who" tests vary:
+    /// what this voice said, what is sounding, what the frame last had to say, what has been
+    /// read about the enrolled speakers, and the meeting the seam named for the session. The
+    /// middle two reach the footer from different directions -- one is a parameter to `draw`,
+    /// the other a field of the view -- which is exactly what the precedence between them has
+    /// to be pinned against.
     #[allow(clippy::too_many_arguments)]
     fn painted_with(
         width: u16,
@@ -601,6 +708,7 @@ mod tests {
         sounding: Option<Sounding>,
         status: Option<&str>,
         context: Context<'_>,
+        meeting: Option<&MeetingLabel>,
     ) -> Vec<String> {
         let session = SessionId::parse("20260819-100000").expect("a well-formed session id");
         let labels = [
@@ -650,6 +758,7 @@ mod tests {
         let enrolled = ["Milo", "Ivan"];
         let voice = VoiceView {
             session: &session,
+            meeting,
             position: Position { nth: 2, of: 3 },
             number: "Unknown 2",
             speech_seconds: 95.0,
@@ -747,6 +856,7 @@ mod tests {
             sounding,
             None,
             Context::Reading,
+            None,
         )
         .join("\n");
         assert!(whole.contains("playing 12s of 1m 47s"), "{whole}");
@@ -784,6 +894,7 @@ mod tests {
             sounding,
             None,
             Context::Reading,
+            None,
         )
         .join("\n");
         assert!(
@@ -815,13 +926,24 @@ mod tests {
             sounding,
             status,
             Context::Reading,
+            None,
         )
         .join("\n");
         assert!(over.contains("playing 3s of 30s"), "{over}");
         assert!(!over.contains("could not play the clip"), "{over}");
 
-        let stopped =
-            painted_with(110, 30, &Free, &[], &said(), None, status, Context::Reading).join("\n");
+        let stopped = painted_with(
+            110,
+            30,
+            &Free,
+            &[],
+            &said(),
+            None,
+            status,
+            Context::Reading,
+            None,
+        )
+        .join("\n");
         assert!(stopped.contains("could not play the clip"), "{stopped}");
         assert!(!stopped.contains("playing 3s"), "{stopped}");
     }
@@ -879,6 +1001,7 @@ mod tests {
             }),
             None,
             Context::Reading,
+            None,
         )
         .join("\n");
         assert!(
@@ -899,6 +1022,7 @@ mod tests {
             }),
             None,
             Context::Reading,
+            None,
         )
         .join("\n");
         assert!(!voice.contains("<- playing"), "{voice}");
@@ -921,12 +1045,22 @@ mod tests {
             heard("so where did we land on the migration", 12.0, &NONE),
             heard("right, next week", 107.0, &NONE),
         ];
-        let no_audio =
-            painted_with(120, 30, &Free, &[], &silent, None, None, Context::Reading).join("\n");
+        let no_audio = painted_with(
+            120,
+            30,
+            &Free,
+            &[],
+            &silent,
+            None,
+            None,
+            Context::Reading,
+            None,
+        )
+        .join("\n");
         assert!(no_audio.contains("^L no audio"), "{no_audio}");
 
         let nothing_said =
-            painted_with(120, 30, &Free, &[], &[], None, None, Context::Reading).join("\n");
+            painted_with(120, 30, &Free, &[], &[], None, None, Context::Reading, None).join("\n");
         assert!(
             !nothing_said.contains("^L"),
             "a key that cannot work is not offered\n{nothing_said}"
@@ -957,6 +1091,7 @@ mod tests {
             sounding,
             None,
             Context::Reading,
+            None,
         )
         .join("\n");
         assert!(whole.contains("^L restart"), "{whole}");
@@ -1019,6 +1154,156 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// TASK-051.02 acceptance criteria #1 and #2: while the session is being asked about, the
+    /// frame names the meeting it was recorded during -- plainly when the fit states it
+    /// plainly, qualified with the same caveat `meethook record` prints otherwise.
+    #[test]
+    fn the_frame_names_the_meeting_above_the_panes() {
+        let plain = MeetingLabel {
+            title: "Incident review".to_owned(),
+            fit: MeetingFit::Started,
+        };
+        let rows = painted_with(
+            110,
+            30,
+            &Free,
+            &[],
+            &said(),
+            None,
+            None,
+            Context::Reading,
+            Some(&plain),
+        );
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some("meeting   Incident review"),
+            "a strong fit is stated plainly\n{rows:?}"
+        );
+
+        let late = MeetingLabel {
+            title: "Incident review".to_owned(),
+            fit: MeetingFit::JoinedLate,
+        };
+        let rows = painted_with(
+            110,
+            30,
+            &Free,
+            &[],
+            &said(),
+            None,
+            None,
+            Context::Reading,
+            Some(&late),
+        );
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some(
+                "meeting   Incident review  (uncertain: the recording began after this meeting had started)"
+            ),
+            "the caveat `meethook record` prints, not a second wording\n{rows:?}"
+        );
+
+        // Absent: the top row belongs to the panes, and nothing reserves space for a title
+        // that is not there.
+        let absent = painted(110, 30, &Free, &[]);
+        assert!(!absent[0].contains("meeting"), "{absent:?}");
+    }
+
+    /// Acceptance criterion #5: at the 80x24 floor with a long invite title, the caveat
+    /// survives and the title yields -- and every pane keeps its border, its title and an
+    /// inner row, the candidate list among them gaining a row rather than losing one.
+    #[test]
+    fn the_banner_yields_to_the_caveat_at_the_floor() {
+        let late = MeetingLabel {
+            title: "Quarterly infrastructure planning and migration review with the platform group"
+                .to_owned(),
+            fit: MeetingFit::JoinedLate,
+        };
+        let rows = painted_with(
+            80,
+            24,
+            &Free,
+            &[],
+            &said(),
+            None,
+            None,
+            Context::Reading,
+            Some(&late),
+        );
+        assert_eq!(rows.len(), 24);
+        let whole = rows.join("\n");
+        let banner = &rows[0];
+        assert!(
+            banner.contains("Quar…"),
+            "the title yields with a marked cut\n{banner}"
+        );
+        assert!(
+            banner.contains("uncertain: the recording began after this meeting had started"),
+            "the caveat is the safety device and never the half clipped off\n{banner}"
+        );
+        for title in [
+            " voices ",
+            " resembles ",
+            " would ",
+            " who ",
+            " said ",
+            " run ",
+        ] {
+            assert!(
+                whole.contains(title.trim()),
+                "{title} missing from\n{whole}"
+            );
+        }
+
+        // The longest caveat alone outgrows the floor's row: it keeps its beginning -- the
+        // word that says the match is not strong -- and takes the cut itself.
+        let unknown = MeetingLabel {
+            title: "Standup".to_owned(),
+            fit: MeetingFit::Unknown,
+        };
+        let rows = painted_with(
+            80,
+            24,
+            &Free,
+            &[],
+            &said(),
+            None,
+            None,
+            Context::Reading,
+            Some(&unknown),
+        );
+        let banner = &rows[0];
+        assert!(
+            banner.contains("unverified:"),
+            "the qualifier survives\n{banner}"
+        );
+        assert!(banner.ends_with('…'), "the cut is marked\n{banner}");
+    }
+
+    /// The banner's budget without a terminal: the whole clause when it fits, the title cut
+    /// with an ellipsis and the caveat kept whole when it does not, and the caveat's own
+    /// beginning when even it alone outgrows the row.
+    #[test]
+    fn the_clause_budget_protects_the_caveat() {
+        assert_eq!(clause_within("Standup", None, 20), "Standup");
+        assert_eq!(clause_within("Standup", None, 4), "Sta…");
+        assert_eq!(clause_within("Standup", None, 0), "");
+        assert_eq!(
+            clause_within("Standup", Some("late"), 40),
+            "Standup  (late)"
+        );
+        // The title yields ground until the whole clause fits; the caveat stays whole.
+        assert_eq!(
+            clause_within("A longer title", Some("late"), 14),
+            "A lon…  (late)"
+        );
+        // Even the caveat alone outgrows the row: it keeps its beginning and takes the cut.
+        assert_eq!(
+            clause_within("Standup", Some("a caveat that will not fit"), 10),
+            "(a caveat…"
+        );
     }
 
     /// AC #1 and AC #2 from the drawing side: how many recordings the highlighted candidate has,

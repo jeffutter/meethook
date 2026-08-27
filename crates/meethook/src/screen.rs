@@ -304,6 +304,7 @@ impl Interviewer for Interface {
     fn identify(&mut self, voice: &Voice<'_>) -> Answer {
         let view = VoiceView {
             session: voice.session,
+            meeting: voice.meeting,
             position: voice.position,
             number: voice.number,
             speech_seconds: voice.speech_seconds,
