@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use meethook_enroll::{
     Answer, Confirm, EnrollRules, Enrolment, Forgotten, GivenName, Interviewer, Labelled, Lines,
-    MeetingChoice, MeetingSource, Offer, Selection, Sessions, Target, Voice, VoiceSelector,
-    incomplete, run_enroll, run_forget, run_meeting, run_speakers, speech, write_clip,
+    MeetingChoice, MeetingLabel, MeetingSource, Offer, Selection, Sessions, Target, Voice,
+    VoiceSelector, incomplete, run_enroll, run_forget, run_meeting, run_speakers, speech,
+    write_clip,
 };
 use meethook_models::{ModelSpec, ensure_model};
 // The capture backend exists only where its Apple frameworks compile; the platform-neutral
@@ -1489,13 +1490,14 @@ fn parse_session_ids(raw: &[String]) -> Result<Vec<SessionId>> {
 /// wording is `MeetingFit`'s own -- this crate owns the stream, the library owns the sentence
 /// -- and it names only the timing, so the rule above survives it.
 ///
+/// The clause after the prefix is [`MeetingLabel::clause`]'s -- the same composer the enroll
+/// queue announcement derives its line from -- so `record` and `enroll` cannot print two
+/// shapes of the same meeting.
+///
 /// A function rather than the `println!` it replaced so that the whole rule is decidable in
 /// `cargo test` with no terminal, which is the split this module's own documentation describes.
 fn meeting_line(meeting: &meethook_session::Meeting) -> String {
-    match meeting.fit.caveat() {
-        Some(caveat) => format!("  meeting   {}  ({caveat})", meeting.title),
-        None => format!("  meeting   {}", meeting.title),
-    }
+    format!("  meeting   {}", MeetingLabel::from(meeting).clause())
 }
 
 /// The record loop's sequencing, exercised without a microphone.
@@ -2246,6 +2248,7 @@ mod tests {
 
     /// A directory that presents exactly the players named, so the choice is decided by
     /// presence rather than by whatever happens to be on the machine running the test.
+    #[cfg(not(target_os = "macos"))]
     fn fake_path(dir: &std::path::Path, present: &[&str]) {
         for program in present {
             std::fs::write(dir.join(*program), b"fake").unwrap();

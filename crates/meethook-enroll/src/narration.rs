@@ -41,7 +41,8 @@ use std::path::Path;
 use meethook_session::{SessionId, Stored, TranscriptTime};
 
 use crate::{
-    Consequence, REFERENCE_FLOOR_SECONDS, Refusal, Result, Selection, VoiceSelector, speech,
+    Consequence, MeetingLabel, REFERENCE_FLOOR_SECONDS, Refusal, Result, Selection, VoiceSelector,
+    speech,
 };
 
 /// Where a run's narration goes.
@@ -130,6 +131,11 @@ pub enum SessionNote<'a> {
 
         /// Unresolved voices under the prompt floor, which this run will not ask about.
         held_back: usize,
+
+        /// The meeting the session was recorded during, as far as a terminal may see it -- or
+        /// `None` for the common case of a session that carries none, which prints nothing:
+        /// absent is not worth a reserved row or an empty label.
+        meeting: Option<MeetingLabel>,
     },
 
     /// The user left the session before its queue ran out, and the run moved on to the next one.
@@ -421,6 +427,7 @@ impl Lines<'_> {
                 offered,
                 already_named,
                 held_back,
+                meeting,
             } => {
                 // "Unresolved" is false under `--correct`, where most of the queue is resolved
                 // and the point is to review it. The default wording is left exactly as it was.
@@ -440,6 +447,12 @@ impl Lines<'_> {
                         "{session}  {counted}, {held_back} quieter voice(s) not offered -- \
                          meethook enroll --all"
                     )?;
+                }
+                // Named once with the session rather than once per voice, and only when there
+                // is one: runs over sessions without meetings stay byte-identical. Indented
+                // like the voice lists, qualified the way `meethook record` qualifies it.
+                if let Some(meeting) = meeting {
+                    writeln!(out, "    meeting   {}", meeting.clause())?;
                 }
             }
             // "Left as they were" rather than "unanswered", because under `--correct` some of

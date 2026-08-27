@@ -107,10 +107,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use meethook_session::{
-    AssignedName, Classification, DiscoveredSession, EnrolledSpeakers, Paths, SessionId,
-    SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Transcript, TranscriptContext,
-    TranscriptTemplate, TranscriptTime, VoiceAt, discover_sessions, unknown_labels,
-    unknown_speaker,
+    AssignedName, Classification, DiscoveredSession, EnrolledSpeakers, Meeting, MeetingFit, Paths,
+    SessionId, SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Transcript,
+    TranscriptContext, TranscriptTemplate, TranscriptTime, VoiceAt, discover_sessions,
+    unknown_labels, unknown_speaker,
 };
 use meethook_transcribe::{
     Attribution, Naming, Resemblance, TARGET_RATE, attributions, identify_clusters, rank_enrolled,
@@ -368,6 +368,51 @@ pub struct Snippet<'a> {
     /// The samples for exactly that stretch: 16 kHz mono, the rate everything else in meethook
     /// works in. A borrow of the resampled track, not a copy.
     pub audio: &'a [f32],
+}
+
+/// The meeting a session was recorded during, as far as a terminal may see it.
+///
+/// Only the title and how strongly the session's start supports the match. [`Meeting`] holds
+/// more -- organizer, attendees, location, URL, invite body -- and none of that may reach a
+/// terminal or a log line: attendee names and addresses exist in `session.json` for speaker
+/// identification and are deliberately never printed, and an invite body routinely carries a
+/// dial-in PIN. Projecting to these two fields makes "nothing sensitive crosses" a property
+/// of the type rather than a rule every consumer must remember.
+///
+/// It also owns the one display shape every surface derives: [`clause`](Self::clause) is what
+/// `meethook record`'s meeting line and the enroll queue announcement both print, so they
+/// cannot drift into two wordings of the same meeting. The caveat wording itself stays on
+/// [`MeetingFit::caveat`], where it is defined and tested; this crate owns the placement, the
+/// library owns the sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetingLabel {
+    /// The invite's title: the handle for "which call was this".
+    pub title: String,
+    /// How strongly the session's start supports this being the meeting.
+    pub fit: MeetingFit,
+}
+
+impl MeetingLabel {
+    /// The title alone when the fit states it plainly, the title followed by `  ({caveat})`
+    /// otherwise -- exactly the clause `meethook record` prints after its `  meeting   `
+    /// prefix. Half the meetings on disk are not a strong match, so a bare title would assert
+    /// a match the tool does not have; the caveat is what keeps a guess from reading as a
+    /// fact.
+    pub fn clause(&self) -> String {
+        match self.fit.caveat() {
+            Some(caveat) => format!("{}  ({caveat})", self.title),
+            None => self.title.clone(),
+        }
+    }
+}
+
+impl From<&Meeting> for MeetingLabel {
+    fn from(meeting: &Meeting) -> Self {
+        Self {
+            title: meeting.title.clone(),
+            fit: meeting.fit,
+        }
+    }
 }
 
 /// One voice being asked about, and everything needed to ask.
@@ -1130,6 +1175,10 @@ fn enroll_session(
             return Ok(Outcome::Finished);
         }
     };
+    // The meeting, projected to what a terminal may see and built here, beside the load: the
+    // queue announcement below gets it from this value rather than any surface reaching back
+    // for `session.json`, and nothing off the roster ever crosses with it.
+    let meeting = metadata.meeting.as_ref().map(MeetingLabel::from);
     let mut transcript = match Transcript::read(&session.paths.transcript_json()) {
         Ok(transcript) => transcript,
         // As above, and with the same remedy: the expected instance is a `transcript.json`
@@ -1217,6 +1266,7 @@ fn enroll_session(
             &shown,
             rules.offer,
             rules.sessions,
+            meeting,
             session,
             notes,
             report,
@@ -1605,11 +1655,13 @@ fn left_unanswered<'c>(
 ///
 /// Separated from the asking so that the one decision a [`VoiceSelector`] changes is made in
 /// one place: [`targeted`] is the sibling of this, and everything downstream of both is shared.
+#[allow(clippy::too_many_arguments)]
 fn queue<'c>(
     order: &[&'c SpeakerCluster],
     shown: &BTreeMap<u32, Attribution>,
     offer: Offer,
     sessions: Sessions,
+    meeting: Option<MeetingLabel>,
     session: &DiscoveredSession,
     notes: &mut dyn Narrator,
     report: &mut EnrollReport,
@@ -1696,6 +1748,7 @@ fn queue<'c>(
                 .named
                 .then(|| offered.iter().filter(|c| shown[&c.id].is_named()).count()),
             held_back,
+            meeting,
         },
     )?;
 
@@ -2187,8 +2240,9 @@ mod tests {
     use std::collections::VecDeque;
 
     use meethook_session::{
-        EnrolledSpeaker, MAX_REFERENCES_PER_SPEAKER, RepresentativeSegment, SPEAKER_YOU,
-        SessionMetadata, SessionPaths, Stored, TRANSCRIPT_SCHEMA_VERSION, TrackSync, Turn,
+        Attendee, AttendeeStatus, EnrolledSpeaker, MAX_REFERENCES_PER_SPEAKER, Meeting, MeetingFit,
+        RepresentativeSegment, SPEAKER_YOU, SessionMetadata, SessionPaths, Stored,
+        TRANSCRIPT_SCHEMA_VERSION, TrackSync, Turn,
     };
     // The cut the ranking is deliberately *not* made at, named rather than spelled 0.40, so
     // the fixtures below still mean "outside identification's reach" if it moves.
@@ -3322,6 +3376,204 @@ mod tests {
             ["Alice", "You", "Bob", "Alice"]
         );
         assert!(output.contains("brought up to date"), "{output}");
+    }
+
+    /// Gives a fixture session the meeting label the recorder's lookup would have written,
+    /// with the fit given: `make_session` writes sessions without meetings, so the label is
+    /// attached by rewriting `session.json`, the way the `meeting.rs` fixtures do.
+    fn labelled_meeting(paths: &Paths, id: &str, fit: MeetingFit) {
+        let session = paths.session(&SessionId::parse(id).unwrap());
+        let metadata = session_metadata(&SessionId::parse(id).unwrap()).with_meeting(Some(
+            Meeting::new(
+                "EVENT-1".to_owned(),
+                "Incident review".to_owned(),
+                "Work".to_owned(),
+                "2026-08-09T05:20:00Z".parse().unwrap(),
+                "2026-08-09T06:20:00Z".parse().unwrap(),
+            )
+            .with_fit(fit),
+        ));
+        metadata.write(&session.session_json()).unwrap();
+    }
+
+    /// The one display shape, pinned byte for byte over every fit: the title alone when the
+    /// fit states it plainly, the title plus the fit's own caveat otherwise.
+    #[test]
+    fn a_meeting_label_states_a_strong_fit_plainly_and_qualifies_the_rest() {
+        for fit in [
+            MeetingFit::Started,
+            MeetingFit::StartedEarly,
+            MeetingFit::Confirmed,
+        ] {
+            let label = MeetingLabel {
+                title: "Standup".to_owned(),
+                fit,
+            };
+            assert_eq!(label.clause(), "Standup", "{fit:?}");
+        }
+        assert_eq!(
+            MeetingLabel {
+                title: "Standup".to_owned(),
+                fit: MeetingFit::JoinedLate,
+            }
+            .clause(),
+            "Standup  (uncertain: the recording began after this meeting had started)"
+        );
+        assert_eq!(
+            MeetingLabel {
+                title: "Standup".to_owned(),
+                fit: MeetingFit::AfterEnd,
+            }
+            .clause(),
+            "Standup  (uncertain: the recording began after this meeting had ended)"
+        );
+        assert_eq!(
+            MeetingLabel {
+                title: "Standup".to_owned(),
+                fit: MeetingFit::Unknown,
+            }
+            .clause(),
+            "Standup  (unverified: this session was recorded before meethook scored the match)"
+        );
+    }
+
+    /// Acceptance criteria #1, #2 and #5, over every fit: the queue announcement names the
+    /// meeting once, under the count line, unqualified when the fit is strong and with the
+    /// same caveat `meethook record` prints when it is not -- and the two voices then
+    /// prompted about do not repeat it.
+    #[test]
+    fn the_queue_line_names_the_meeting_once_and_qualifies_it_as_record_does() {
+        for fit in MeetingFit::ALL {
+            let root = tempfile::tempdir().unwrap();
+            let paths = Paths::new(root.path());
+            make_session(&paths, "20260809-052600");
+            labelled_meeting(&paths, "20260809-052600", fit);
+
+            let mut interviewer = Scripted::answering(vec![named("Alice"), named("Aaron")]);
+            let (_, output) = run(&paths, &[], &mut interviewer);
+
+            let head = "20260809-052600  2 unresolved voice(s)\n    meeting   Incident review";
+            if let Some(caveat) = fit.caveat() {
+                assert!(
+                    output.contains(&format!("{head}  ({caveat})\n")),
+                    "the weak fit must carry its caveat: {fit:?}: {output}"
+                );
+            } else {
+                assert!(
+                    output.contains(&format!("{head}\n")),
+                    "the strong fit must be stated plainly: {fit:?}: {output}"
+                );
+            }
+            // Once, with the session, not once per voice: both answers land afterwards and
+            // neither may name the meeting again.
+            assert_eq!(
+                output.matches("Incident review").count(),
+                1,
+                "the meeting is named once, where the session is announced: {fit:?}: {output}"
+            );
+        }
+    }
+
+    /// The sub-line sits under the held-back clause too, which is the other shape the count
+    /// line takes: a meeting is not only named on the plain path.
+    #[test]
+    fn the_queue_line_sits_under_the_held_back_clause_as_well() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_fragmented_session(&paths, "20260809-052600");
+        labelled_meeting(&paths, "20260809-052600", MeetingFit::Started);
+
+        let mut interviewer = Scripted::answering(vec![named("Alice")]);
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        assert!(
+            output.contains(
+                "20260809-052600  1 unresolved voice(s), 3 quieter voice(s) not offered -- \
+                 meethook enroll --all\n    meeting   Incident review\n"
+            ),
+            "{output}"
+        );
+    }
+
+    /// Acceptance criterion #3: a meeting carrying everything that must not reach a terminal
+    /// leaks none of it -- the queue line is the title and the fit, and nothing off the
+    /// roster.
+    #[test]
+    fn the_queue_line_leaks_nothing_off_the_roster() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        let session = paths.session(&SessionId::parse("20260809-052600").unwrap());
+        let metadata = session_metadata(&SessionId::parse("20260809-052600").unwrap())
+            .with_meeting(Some(
+                Meeting::new(
+                    "EVENT-1".to_owned(),
+                    "Incident review".to_owned(),
+                    "Work".to_owned(),
+                    "2026-08-09T05:20:00Z".parse().unwrap(),
+                    "2026-08-09T06:20:00Z".parse().unwrap(),
+                )
+                .with_people(
+                    Some(Attendee {
+                        name: Some("Alan Turing".to_owned()),
+                        email: Some("alan@example.com".to_owned()),
+                        status: AttendeeStatus::Accepted,
+                        is_you: false,
+                    }),
+                    vec![Attendee {
+                        name: Some("Grace Hopper".to_owned()),
+                        email: Some("grace@example.com".to_owned()),
+                        status: AttendeeStatus::Accepted,
+                        is_you: true,
+                    }],
+                )
+                .with_invite(
+                    Some("https://example.com/j/12345".to_owned()),
+                    Some("Babbage Room, 12 Ada Street".to_owned()),
+                    Some("Dial-in 555-0100, passcode 481516".to_owned()),
+                )
+                .with_fit(MeetingFit::JoinedLate),
+            ));
+        metadata.write(&session.session_json()).unwrap();
+
+        let mut interviewer = Scripted::answering(vec![named("Alice"), named("Aaron")]);
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        assert!(output.contains("Incident review"), "{output}");
+        for secret in [
+            "Turing",
+            "Hopper",
+            "@",
+            "Babbage",
+            "Ada Street",
+            "example.com",
+            "Dial-in",
+            "555-0100",
+            "passcode",
+            "481516",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "the queue line leaks {secret:?}: {output}"
+            );
+        }
+    }
+
+    /// Acceptance criterion #4, the absence half: a session with no meeting says nothing
+    /// about meetings -- no reserved row, no empty label. The word does not appear anywhere
+    /// else in enroll's output, so its absence is the whole claim; the byte-identity itself
+    /// is pinned by `one_runs_narration_reads_as_these_lines_in_this_order`, whose fixtures
+    /// carry no meetings.
+    #[test]
+    fn a_session_without_a_meeting_says_nothing_about_meetings() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::answering(vec![named("Alice"), named("Aaron")]);
+        let (_, output) = run(&paths, &[], &mut interviewer);
+
+        assert!(!output.contains("meeting"), "{output}");
     }
 
     /// Acceptance criterion #2: ids scope the run, and one that is not on disk is named
