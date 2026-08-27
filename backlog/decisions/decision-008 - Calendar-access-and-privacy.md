@@ -1,0 +1,17 @@
+---
+id: decision-008
+title: Calendar access and privacy
+date: '2026-08-27 04:40'
+status: accepted
+---
+Recording is optionally labelled with the calendar meeting it happened during, but calendar access is never requested from the path that finalizes a recording — only ever read there. The reason is specific to how macOS handles the request: without an embedded usage-description key the process doesn't have, requesting calendar access can terminate the process outright, and having that risk sit between the last audio buffer and the `session.json` write would turn a complete recording into an orphaned one on the one feature this tool must never let fail that way. Access is instead requested once, in-process, at record start — before anything is being captured, so there's nothing to lose while a person takes their time answering the permission prompt — using the deprecated (not the modern) request selector, a choice made only after a hardware probe showed the deprecated selector grants full access safely, while Apple's documented modern replacement carries exactly the termination risk being avoided. Any calendar failure at all — no permission, no matching event, an underlying framework exception, even a Rust panic in the bindings — collapses to simply no meeting label and a normally finished recording; calendar access is deliberately excluded from the tool's startup preflight check, since unlike the microphone or screen-recording grants, losing calendar access is never worth failing a recording over.
+
+Which meeting a session gets labelled with follows a fixed, unconfigurable rule — the event that most tightly contains the session's start time, or failing that the nearest event within fifteen minutes before or after — with all-day and declined events excluded. Meeting notes are never stored on this automatic path, and attendee names or addresses never reach a log line or stdout, a privacy decision later validated directly: a real hardware run turned up an actual meeting invite whose notes contained a dial-in PIN and tenant keys. Calendar-driven auto-start of recording was considered and rejected outright, on the strength of prior-art research into a similar tool that found calendar-polling triggers markedly more brittle than the microphone-activity trigger this tool already uses.
+
+## Considered options
+
+- Requesting calendar access from the session-finalize path — risks the process being killed mid-finalize, turning a complete recording into an orphan.
+- The modern (non-deprecated) calendar access request API — Apple's documented behavior for it carries a real process-termination risk this tool can't accept.
+- Treating a calendar failure as a hard error — would invert this feature's priority relative to the recording itself.
+- Auto-starting recording from calendar events instead of microphone activity — rejected on prior-art evidence of brittleness.
+
