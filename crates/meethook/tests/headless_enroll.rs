@@ -341,6 +341,45 @@ Unknown 2 in 20260809-052600, answering \"Milo\":
 }
 
 #[test]
+fn dry_run_json_is_the_versioned_document_a_script_may_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let before = snapshot(dir.path());
+
+    let output = meethook(dir.path())
+        .args([
+            "20260809-052600",
+            "--voice",
+            "2",
+            "--name",
+            "Milo",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["schema"], "meethook.enroll.dry-run.v1");
+    assert_eq!(doc["voice"]["session"], "20260809-052600");
+    assert_eq!(doc["voice"]["number"], "Unknown 2");
+    assert_eq!(doc["name"], "Milo");
+    assert!(doc["consequence"]["refused"].is_null());
+    assert_eq!(doc["consequence"]["stored"]["Added"]["held"], 2);
+    assert_eq!(doc["consequence"]["session_only"], false);
+    assert_eq!(
+        snapshot(dir.path()),
+        before,
+        "--dry-run --json wrote something"
+    );
+}
+
+#[test]
 fn a_selector_matching_nothing_fails_loudly_and_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
