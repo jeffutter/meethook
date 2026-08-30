@@ -1614,7 +1614,7 @@ mod tests {
 
     /// Opens the embedding weights, or `None` if they are not installed. Same bargain as
     /// the graph-contract tests: `cargo test` never reaches for a 26 MB download.
-    fn model(spec: &crate::ModelSpec) -> Option<Session> {
+    fn model(spec: &meethook_models::ModelSpec) -> Option<Session> {
         let root = match std::env::var_os("MEETHOOK_ROOT") {
             Some(root) => std::path::PathBuf::from(root),
             None => std::env::home_dir()?.join("meethook"),
