@@ -170,6 +170,10 @@ pub(crate) struct Labelled {
     /// labellings, so a change can always be named by the voice it happened to.
     pub(crate) unknown: BTreeMap<u32, String>,
     pub(crate) assigned: Vec<AssignedName>,
+    /// The session's one-remote-speaker assertion, if there is one. Both labellings honour it,
+    /// which is what keeps a removal from being reported as moving a label the assertion --
+    /// not the removed row -- still holds in place.
+    pub(crate) one_remote_speaker: Option<String>,
     /// What every voice reads with the database exactly as it stands on disk.
     pub(crate) baseline: BTreeMap<u32, Attribution>,
 }
@@ -187,6 +191,7 @@ impl Labelled {
             &self.unknown,
             speakers,
             &self.assigned,
+            self.one_remote_speaker.as_deref(),
         )
     }
 
@@ -284,18 +289,39 @@ pub(crate) fn label_sessions(paths: &Paths, speakers: &EnrolledSpeakers) -> Resu
             }
         };
 
+        // Read beside the other two files the labelling turns on: a session that asserts one
+        // remote speaker would otherwise be diffed through a rule the transcript does not use,
+        // and every reference in it would report naming voices the assertion, not the row, holds.
+        let one_remote_speaker = match session.load_metadata() {
+            Ok(metadata) => metadata.one_remote_speaker,
+            Err(e) => {
+                labelling.unreadable.push(Unreadable {
+                    session: session.id.clone(),
+                    why: format!("{e} -- fix that file"),
+                });
+                continue;
+            }
+        };
+
         let unknown = unknown_labels(
             clusters
                 .clusters
                 .iter()
                 .map(|c| (c.id, c.first_spoke_seconds)),
         );
-        let baseline = effective_labels(&clusters.clusters, &unknown, speakers, &assigned);
+        let baseline = effective_labels(
+            &clusters.clusters,
+            &unknown,
+            speakers,
+            &assigned,
+            one_remote_speaker.as_deref(),
+        );
         labelling.sessions.push(Labelled {
             session: session.id.clone(),
             clusters,
             unknown,
             assigned,
+            one_remote_speaker,
             baseline,
         });
     }

@@ -113,8 +113,8 @@ use meethook_session::{
     unknown_labels, unknown_speaker,
 };
 use meethook_transcribe::{
-    Attribution, Naming, Resemblance, TARGET_RATE, attributions, identify_clusters, rank_enrolled,
-    read_track_16k_mono, speaker_offset_seconds,
+    Attribution, Naming, Resemblance, TARGET_RATE, attributions, heard_at_once, identify_clusters,
+    rank_enrolled, read_track_16k_mono, speaker_offset_seconds,
 };
 
 /// How much of one line to show. Long enough for a sentence, short enough to stay on a line.
@@ -646,6 +646,29 @@ pub enum Answer {
     /// End the run here. A variant rather than an error because stopping early is an
     /// ordinary outcome -- everything accepted so far is already on disk.
     Quit,
+    /// This session's speaker track is one person, called `name`: name every voice in it with
+    /// that name, including the one this answer was given about.
+    ///
+    /// The frame-side half of the one-remote-speaker assertion; the headless half is
+    /// [`EnrollRules::one_speaker`], and both reach the same mode inside
+    /// [`enroll_session`], which is what keeps the writes and the report identical however the
+    /// assertion arrived. Answering it switches the session to assertion mode for the rest of
+    /// the run over it: the remaining voices are committed through the fixed-order write path
+    /// without being asked, each veto the heard-at-once rule would have raised is reported as
+    /// overridden rather than refused, and the fact itself is recorded in `session.json`
+    /// before the first of those commits, so an interrupt leaves a state that explains every
+    /// label on disk and a re-run converges onto it.
+    ///
+    /// Only an interface that can show the whole session at once has any use for it -- the
+    /// assertion is about every voice, and committing it from one question on screen is how a
+    /// user who sees ten "Unknown N"s that are all their colleague says so without answering
+    /// ten questions. A line prompt has no surface for the cost, and neither does a scripted
+    /// answerer, which is why the flag rather than this answer is the way a script reaches the
+    /// same mode.
+    ///
+    /// Trimmed the same way every other name in this file is; a name of nothing but spaces is
+    /// treated as the question going unanswered rather than as an entry called "".
+    OneSpeaker(String),
 }
 
 /// Asks a user who one voice is.
@@ -963,6 +986,20 @@ pub struct EnrollRules<'a> {
     /// so this belongs to the run rather than to a session: it is resolved once, from the same
     /// root `transcribe` resolved it from, and every session rewritten here goes through it.
     pub template: &'a TranscriptTemplate,
+
+    /// The user's assertion that a session's speaker track is one person, by name -- or `None`
+    /// for a run that asks about voices the ordinary way.
+    ///
+    /// Where present, it stands in for the queue and its gates alike, the way a [`Selection`]
+    /// does: every voice in the session is named with it, below the prompt floor included, and
+    /// nothing is asked about any of them. A selector passed beside it is ignored for the same
+    /// reason: pointing at one voice and asserting the whole track are two different requests,
+    /// and the CLI refuses to take both at once.
+    ///
+    /// Trimmed and non-empty by the time it gets here -- [`run_enroll`] trims it and reports an
+    /// empty one as a request it could not serve, which is what keeps "what an empty name
+    /// means" in one place rather than two.
+    pub one_speaker: Option<&'a str>,
 }
 
 /// What a run did, so the caller can pick an exit status without re-deriving it.
@@ -997,6 +1034,17 @@ pub struct EnrollRules<'a> {
 /// declined rather than absent. Not a `failed` either, since nothing went wrong and the run
 /// carries on; it is counted so the summary can say a question was answered and came to
 /// nothing, which is the one outcome a silent revert used to hide.
+///
+/// `asserted` is a **sub-count of `named`**, like `session_only`: those voices were named, and
+/// the naming came from the one-remote-speaker assertion rather than from an answer given per
+/// voice. Counted apart because the summary says what the assertion did in its own sentence,
+/// and folding it into `named` alone would leave a run that named forty-one voices reporting
+/// only that it asked and answered zero questions.
+///
+/// `vetoes_overridden` counts voices the heard-at-once veto would have refused to put under the
+/// asserted name, and that the assertion named anyway. Every one of them has printed its own
+/// line saying which voices it overlapped, which is what makes overriding reported rather than
+/// swallowed; the count is what the summary needs to say how many there were.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EnrollReport {
     pub named: usize,
@@ -1007,6 +1055,8 @@ pub struct EnrollReport {
     pub refused: usize,
     pub passed_over: usize,
     pub failed: usize,
+    pub asserted: usize,
+    pub vetoes_overridden: usize,
 }
 
 /// Whether the queue should carry on to the next session.
@@ -1061,11 +1111,41 @@ pub fn run_enroll(
         return Ok(report);
     }
 
+    // The assertion is a fact about *one* session's speaker track, so it needs the same
+    // guarantee, enforced beside the selector's for the same reason. It stands in for the queue
+    // and its gates alike, so a selector passed beside it is ignored rather than composed with:
+    // pointing at one voice and asserting the whole track are two different requests, and the
+    // CLI refuses to take both at once.
+    if rules.one_speaker.is_some() && requested.len() != 1 {
+        notes.note(Note::Run(RunNote::OneSpeakerNeedsOneSession))?;
+        report.failed += 1;
+        return Ok(report);
+    }
+
+    // Trimmed and checked here rather than in the CLI, so a library caller wiring up the rules
+    // by hand gets the same protection: an empty assertion would name every voice "", and there
+    // is no such thing. Reported as a request not served rather than dropped silently, for the
+    // reason `OneSpeakerIsEmpty` gives.
+    let mut rules = rules;
+    if let Some(name) = rules.one_speaker {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            notes.note(Note::Run(RunNote::OneSpeakerIsEmpty))?;
+            report.failed += 1;
+            return Ok(report);
+        }
+        rules.one_speaker = Some(trimmed);
+    }
+
     // An answer supplied up front is never shown the voice it lands on, so a queue would put one
     // name on everybody in it. Refused here, beside the guard above, for the same reason: this is
     // the one place that can see both the answerer and the selection, and a library caller
     // wiring up a [`GivenName`] gets the same protection the CLI does.
-    if rules.selector.is_none() && interviewer.needs_one_voice() {
+    //
+    // Not refused under an assertion: the assertion selects every voice in the session itself,
+    // so a name waiting for a voice has all of them at once, and the answerer is never
+    // consulted at all -- nothing is asked about any voice, which is the mode's whole point.
+    if rules.selector.is_none() && rules.one_speaker.is_none() && interviewer.needs_one_voice() {
         notes.note(Note::Run(RunNote::NameNeedsAVoice))?;
         report.failed += 1;
         return Ok(report);
@@ -1174,7 +1254,9 @@ fn enroll_session(
     // `session.json` has gone bad is reported and skipped like every other unreadable one
     // rather than ending the queue -- and so nothing is read inside the naming loop below,
     // where a failure would arrive after names had already been written.
-    let metadata = match session.load_metadata() {
+    // Mutable for the one-remote-speaker assertion, which may land on disk here before any
+    // voice is named.
+    let mut metadata = match session.load_metadata() {
         Ok(metadata) => metadata,
         // No re-transcribe recovers this: `session.json` is the recorder's own output and the
         // marker that this directory is a session at all, so the only honest instruction is to
@@ -1191,6 +1273,26 @@ fn enroll_session(
     // voices too -- the frame shows it across the Interviewer seam -- so the announcement takes
     // a clone and the original outlives the asking loop.
     let meeting = metadata.meeting.as_ref().map(MeetingLabel::from);
+    // The assertion, when the run carries one, is on disk before anything derived from it is
+    // written: an interrupt between the two would leave a label the next run could not explain,
+    // and the note below goes out before the first commit so every line that follows is already
+    // readable against it. Writing only where the file differs keeps a re-run byte-identical.
+    let mut assertion: Option<String> = None;
+    if let Some(name) = rules.one_speaker {
+        if metadata.one_remote_speaker.as_deref() != Some(name) {
+            metadata.assert_one_remote_speaker(name.to_string());
+            metadata.write(&session.paths.session_json())?;
+        }
+        assertion = Some(name.to_string());
+        about(
+            notes,
+            &session.id,
+            SessionNote::AssertingOneSpeaker {
+                name,
+                voices: clusters.clusters.len(),
+            },
+        )?;
+    }
     let mut transcript = match Transcript::read(&session.paths.transcript_json()) {
         Ok(transcript) => transcript,
         // As above, and with the same remedy: the expected instance is a `transcript.json`
@@ -1227,8 +1329,15 @@ fn enroll_session(
             .iter()
             .map(|c| (c.id, c.first_spoke_seconds)),
     );
-    // What each voice should be called given the database as it stands.
-    let mut shown = effective_labels(&clusters.clusters, &unknown, speakers, &assigned.names);
+    // What each voice should be called given the database as it stands -- and, under an
+    // assertion, the asserted person rather than whatever the rule would otherwise decide.
+    let mut shown = effective_labels(
+        &clusters.clusters,
+        &unknown,
+        speakers,
+        &assigned.names,
+        assertion.as_deref(),
+    );
 
     // The transcript may predate an answer given in an earlier session -- name somebody in
     // January's meeting and February's transcript still calls them Unknown 2 -- so it is
@@ -1236,7 +1345,15 @@ fn enroll_session(
     // is what stops a session with nothing left to ask about from keeping a stale label
     // forever, since it would be passed over on every later run too. Nothing is written when
     // nothing differs.
-    if relabel(&mut transcript, &shown) {
+    //
+    // Skipped under an assertion, because there it would write the transcript from the
+    // assertion before the first commit had happened -- and nothing derived from the fact may
+    // land before the first of its commits, so an interrupt between the two leaves a state
+    // that explains itself. The skip is safe rather than lossy: assertion mode commits every
+    // voice in the session, and each commit relabels the transcript through the assertion,
+    // so a stale label cannot outlive the run the way it can in a session that gets passed
+    // over.
+    if assertion.is_none() && relabel(&mut transcript, &shown) {
         transcript.write(
             &session.paths,
             rules.template,
@@ -1259,30 +1376,40 @@ fn enroll_session(
     // selector changes -- everything from here down runs on whichever list comes back, so a
     // targeted prompt is not a second implementation of a prompt, it is the same one asked
     // about a shorter list. `None` is a session that is finished and has said why.
-    let offered = match rules.selector {
-        Some(Selection::Voice(selector)) => {
-            targeted(selector, &order, &unknown, &shown, session, notes, report)?
+    // The assertion stands in for the queue and its gates alike -- every cluster, in the order
+    // the user reads the transcript in, below the prompt floor included -- so it takes the
+    // first branch rather than flowing through `queue`: none of the floor, the unresolved gate,
+    // or the pass-over applies to a session the user has just said is one person.
+    let offered = if assertion.is_some() {
+        // Every cluster, quiet ones included: the assertion is about the whole track, so the
+        // queue is the session itself rather than a filtered view of it.
+        Some(order.to_vec())
+    } else {
+        match rules.selector {
+            Some(Selection::Voice(selector)) => {
+                targeted(selector, &order, &unknown, &shown, session, notes, report)?
+            }
+            Some(Selection::At(at)) => at_timestamp(
+                at,
+                &transcript,
+                &order,
+                &unknown,
+                &shown,
+                session,
+                notes,
+                report,
+            )?,
+            None => queue(
+                &order,
+                &shown,
+                rules.offer,
+                rules.sessions,
+                meeting.clone(),
+                session,
+                notes,
+                report,
+            )?,
         }
-        Some(Selection::At(at)) => at_timestamp(
-            at,
-            &transcript,
-            &order,
-            &unknown,
-            &shown,
-            session,
-            notes,
-            report,
-        )?,
-        None => queue(
-            &order,
-            &shown,
-            rules.offer,
-            rules.sessions,
-            meeting.clone(),
-            session,
-            notes,
-            report,
-        )?,
     };
     let Some(offered) = offered else {
         return Ok(Outcome::Finished);
@@ -1320,6 +1447,16 @@ fn enroll_session(
         .map(|(index, cluster)| (index + 1, cluster))
         .collect();
 
+    // Assertion-mode bookkeeping. `committed` is every voice this run has put a name on so far,
+    // in commit order: the override report below is O(1) per voice off this list and each
+    // cluster's own overlap data -- the veto predicate is exactly "heard at once with a holder
+    // of the name", and under the assertion every committed voice holds the same name. The two
+    // counters are session-local because the summary line says what the assertion did *here*;
+    // the run-wide halves live in `report`.
+    let mut committed: Vec<&SpeakerCluster> = Vec::new();
+    let mut asserted_voices = 0;
+    let mut vetoes_overridden = 0;
+
     // Passes over a shrinking list rather than one walk, so that [`Answer::Later`] can put a
     // voice back. Each pass asks about whatever is still pending; anything deferred is asked
     // again on the next one.
@@ -1344,76 +1481,155 @@ fn enroll_session(
             // This `continue` is the one place a [`Position`] skips a number, and it is skipped
             // rather than compressed on purpose: the voice really was in the queue and really is
             // now answered, so the gap says work disappeared and the end came closer.
-            if shown[&cluster.id].is_named() && shown[&cluster.id] != baseline[&cluster.id] {
+            //
+            // Never under an assertion: there, the first commit lands the asserted name on
+            // every voice at once, and reading that as "already answered" would skip the rest
+            // of the track -- the opposite of what the assertion asks. Each voice still needs
+            // its own row and its own reference offer, so the walk commits all of them.
+            if assertion.is_none()
+                && shown[&cluster.id].is_named()
+                && shown[&cluster.id] != baseline[&cluster.id]
+            {
                 continue;
             }
 
-            // Scoped so the borrows of `transcript` and `shown` inside the voice end before the
-            // answer is acted on.
-            let answer = {
-                let attribution = &shown[&cluster.id];
-                // Keyed on the cluster, not on the label text: under `--correct` two voices can
-                // sit under one enrolled name -- which is the false accept being corrected -- and
-                // a prompt showing the other person's lines cannot be answered.
-                let snippets = snippets_for(&transcript, cluster.id, snippet_track, offset);
+            // Under the assertion there is no question at all: the assertion is the answer for
+            // every voice, which is what makes the run prompt-free -- so the seam is not reached
+            // and nothing below depends on the answerer from here on.
+            let answer = if let Some(asserted) = assertion.as_deref() {
+                Answer::Named {
+                    name: asserted.to_string(),
+                    anyway: false,
+                }
+            } else {
+                // Scoped so the borrows of `transcript` and `shown` inside the voice end before
+                // the answer is acted on.
+                let answer = {
+                    let attribution = &shown[&cluster.id];
+                    // Keyed on the cluster, not on the label text: under `--correct` two voices can
+                    // sit under one enrolled name -- which is the false accept being corrected -- and
+                    // a prompt showing the other person's lines cannot be answered.
+                    let snippets = snippets_for(&transcript, cluster.id, snippet_track, offset);
 
-                // Every voice in the session, built here and now rather than once above the
-                // loop, for the reason `Voice::queue` gives and because the borrow checker
-                // insists: `shown` is *reassigned* at the end of an accepted answer, so rows
-                // borrowing it cannot outlive one question. That is the same thing as the rows
-                // being current, which is why no separate refresh exists.
-                //
-                // `order` and not `pending`: a queue pane is the session, so the quiet voices
-                // and the already-named ones are in it whether or not this run asks about them.
-                let rows: Vec<Queued<'_>> = order
-                    .iter()
-                    .map(|c| Queued {
-                        number: &unknown[&c.id],
-                        attribution: &shown[&c.id],
-                        speech_seconds: c.speech_seconds,
-                        // Strictly less than the floor: a cluster sitting exactly on it is
-                        // offered, which is the convention every floor in this codebase states.
-                        below_floor: c.speech_seconds < PROMPT_FLOOR_SECONDS,
+                    // Every voice in the session, built here and now rather than once above the
+                    // loop, for the reason `Voice::queue` gives and because the borrow checker
+                    // insists: `shown` is *reassigned* at the end of an accepted answer, so rows
+                    // borrowing it cannot outlive one question. That is the same thing as the rows
+                    // being current, which is why no separate refresh exists.
+                    //
+                    // `order` and not `pending`: a queue pane is the session, so the quiet voices
+                    // and the already-named ones are in it whether or not this run asks about them.
+                    let rows: Vec<Queued<'_>> = order
+                        .iter()
+                        .map(|c| Queued {
+                            number: &unknown[&c.id],
+                            attribution: &shown[&c.id],
+                            speech_seconds: c.speech_seconds,
+                            // Strictly less than the floor: a cluster sitting exactly on it is
+                            // offered, which is the convention every floor in this codebase states.
+                            below_floor: c.speech_seconds < PROMPT_FLOOR_SECONDS,
+                        })
+                        .collect();
+
+                    // Computed eagerly for every voice, including on the `--name` path where nothing
+                    // reads it, and deliberately not deferred behind a closure: two dozen people at
+                    // 256 dimensions is a few thousand multiply-adds, against a run that has already
+                    // read and resampled the whole speaker track a few lines above. An owned `Vec`
+                    // rather than a borrow of the database, so the reborrow ends here and nothing
+                    // downstream -- least of all an `Interviewer` -- has to reason about the write
+                    // that replaces `speakers` once this answer is accepted.
+                    interviewer.identify(&Voice {
+                        session: &session.id,
+                        meeting: meeting.as_ref(),
+                        position: Position { nth, of },
+                        attribution,
+                        number: &unknown[&cluster.id],
+                        speech_seconds: cluster.speech_seconds,
+                        queue: &rows,
+                        snippets,
+                        clip: clip_for(&track, cluster),
+                        resembles: rank_enrolled(&cluster.embedding, speakers),
+                        // The universe `resolve()` requires, and not the ranking above -- see
+                        // `Voice::enrolled`. Owned borrows, like `resembles`, so the reborrow of
+                        // the database ends with this block.
+                        enrolled: speakers.enrolled_names(),
+                        // Six borrows and no work: what an answer would do is computed only if the
+                        // answerer asks. Nothing is written by asking, so this is safe to hand out
+                        // even though it holds the database -- see `Voice::preview`.
+                        preview: Preview::new(
+                            &clusters.clusters,
+                            &unknown,
+                            speakers,
+                            &assigned,
+                            cluster,
+                            rules.enrolment,
+                            None,
+                        ),
                     })
-                    .collect();
-
-                // Computed eagerly for every voice, including on the `--name` path where nothing
-                // reads it, and deliberately not deferred behind a closure: two dozen people at
-                // 256 dimensions is a few thousand multiply-adds, against a run that has already
-                // read and resampled the whole speaker track a few lines above. An owned `Vec`
-                // rather than a borrow of the database, so the reborrow ends here and nothing
-                // downstream -- least of all an `Interviewer` -- has to reason about the write
-                // that replaces `speakers` once this answer is accepted.
-                interviewer.identify(&Voice {
-                    session: &session.id,
-                    meeting: meeting.as_ref(),
-                    position: Position { nth, of },
-                    attribution,
-                    number: &unknown[&cluster.id],
-                    speech_seconds: cluster.speech_seconds,
-                    queue: &rows,
-                    snippets,
-                    clip: clip_for(&track, cluster),
-                    resembles: rank_enrolled(&cluster.embedding, speakers),
-                    // The universe `resolve()` requires, and not the ranking above -- see
-                    // `Voice::enrolled`. Owned borrows, like `resembles`, so the reborrow of
-                    // the database ends with this block.
-                    enrolled: speakers.enrolled_names(),
-                    // Six borrows and no work: what an answer would do is computed only if the
-                    // answerer asks. Nothing is written by asking, so this is safe to hand out
-                    // even though it holds the database -- see `Voice::preview`.
-                    preview: Preview::new(
-                        &clusters.clusters,
-                        &unknown,
-                        speakers,
-                        &assigned,
-                        cluster,
-                        rules.enrolment,
-                    ),
-                })
+                };
+                match answer {
+                    // The frame's half of the assertion. The fact goes to disk before the first
+                    // commit below -- the interrupt rule the headless path states -- and from
+                    // here on this voice and every voice left in the queue are answered with the
+                    // asserted name rather than asked about.
+                    Answer::OneSpeaker(raw) => {
+                        let raw = raw.trim();
+                        if raw.is_empty() {
+                            // A name of nothing but spaces is the question going unanswered, the
+                            // same way a blank typed answer is: counted, and nothing written.
+                            left_unanswered(std::iter::once(cluster), &shown, &baseline, report);
+                            continue;
+                        }
+                        if metadata.one_remote_speaker.as_deref() != Some(raw) {
+                            metadata.assert_one_remote_speaker(raw.to_string());
+                            metadata.write(&session.paths.session_json())?;
+                        }
+                        assertion = Some(raw.to_string());
+                        about(
+                            notes,
+                            &session.id,
+                            SessionNote::AssertingOneSpeaker {
+                                name: raw,
+                                voices: order.len(),
+                            },
+                        )?;
+                        // The assertion is about the whole track, not the queue this run was
+                        // offering: a default run only offers the voices above the floor, and
+                        // the headless flag reaches the quiet ones alike. Widen the walk to
+                        // every voice not already committed and not already queued, through
+                        // the deferral set -- the one place the loop already knows how to pick
+                        // up again on the next pass -- so both doors into this mode land the
+                        // same state.
+                        for c in order.iter() {
+                            if c.id != cluster.id
+                                && !committed.iter().any(|done| done.id == c.id)
+                                && !pending.iter().any(|&(_, queued)| queued.id == c.id)
+                                && !deferred.iter().any(|&(_, held)| held.id == c.id)
+                            {
+                                deferred.push((0, c));
+                            }
+                        }
+                        Answer::Named {
+                            name: raw.to_string(),
+                            anyway: false,
+                        }
+                    }
+                    other => other,
+                }
             };
 
+            // Decided after the switch above, so the voice the key was pressed on counts too:
+            // the assertion names it as well as the ones after it.
+            let under_assertion = assertion.is_some();
+
             let (name, anyway) = match answer {
+                // Consumed by the assertion switch above: it is either gone or already turned
+                // into a [`Answer::Named`]. Present because Rust checks exhaustiveness against
+                // the variant set rather than against what that switch left.
+                Answer::OneSpeaker(_) => {
+                    debug_assert!(false, "OneSpeaker survives past the assertion switch");
+                    unreachable!()
+                }
                 Answer::Quit => return Ok(Outcome::Quit),
                 // The rest of this session, in the three groups it comes in and no fourth: the
                 // voice that was on the screen when the key was pressed -- asked about, and
@@ -1470,6 +1686,7 @@ fn enroll_session(
                 &assigned,
                 cluster,
                 rules.enrolment,
+                assertion.as_deref(),
             )
             .of(&name) else {
                 left_unanswered(std::iter::once(cluster), &shown, &baseline, report);
@@ -1522,6 +1739,35 @@ fn enroll_session(
                 None => {}
             }
 
+            // The override report, and the only line a veto produces in assertion mode: this
+            // voice was heard at once with a voice the run has already put a name on, which is
+            // exactly the pair the heard-at-once rule refuses to put under one name. It is named
+            // anyway, and said so here rather than silently overridden -- naming the voices it
+            // overlapped, which is the evidence the veto would have acted on. No refusal ever
+            // arises on this path, because the labelling the dry run uses honours the assertion:
+            // the guard above finds the name where it belongs and declines nothing.
+            if under_assertion {
+                let overlapped: Vec<String> = committed
+                    .iter()
+                    .filter(|c| heard_at_once(cluster, c))
+                    .map(|c| handle(c.id, &unknown))
+                    .collect();
+                if !overlapped.is_empty() {
+                    let answered = handle(cluster.id, &unknown);
+                    after(
+                        notes,
+                        &session.id,
+                        AnswerNote::VetoOverridden {
+                            name,
+                            answered: &answered,
+                            speech_seconds: cluster.speech_seconds,
+                            overlapped: &overlapped,
+                        },
+                    )?;
+                    vetoes_overridden += 1;
+                }
+            }
+
             // Everything this answer wrote, as one note rather than as the four to six lines it
             // used to print, because that is the block an interface lays out together.
             //
@@ -1544,6 +1790,13 @@ fn enroll_session(
                 report.session_only += 1;
             }
             report.named += 1;
+            // A sub-count of `named`, like `session_only`: the naming came from the assertion
+            // rather than from an answer given per voice -- see `EnrollReport::asserted` for why
+            // the summary needs the split.
+            if under_assertion {
+                report.asserted += 1;
+                asserted_voices += 1;
+            }
 
             // Committed by taking the copies the dry run produced, so what lands on disk is the
             // state that was checked rather than a second construction of it.
@@ -1561,11 +1814,20 @@ fn enroll_session(
             if assignments_changed {
                 assigned.write(&session.paths)?;
             }
+            // Recorded after the writes, so the override report measures against voices whose
+            // names are actually on disk, never against answers that were refused or skipped.
+            committed.push(cluster);
 
             // Re-identified against the updated database rather than assumed: naming one voice
             // can also name a second cluster in this session, if clustering split that person in
             // two, and a `--force` re-transcribe would name both.
-            let now = effective_labels(&clusters.clusters, &unknown, speakers, &assigned.names);
+            let now = effective_labels(
+                &clusters.clusters,
+                &unknown,
+                speakers,
+                &assigned.names,
+                assertion.as_deref(),
+            );
             if relabel(&mut transcript, &now) {
                 transcript.write(
                     &session.paths,
@@ -1577,7 +1839,10 @@ fn enroll_session(
             // so how far the rename reached is the one thing they cannot infer -- whereas the queue
             // and `--voice` both showed them the voice first, and several tests pin their output
             // exactly as it is.
-            if matches!(rules.selector, Some(Selection::At(_))) {
+            // `assertion.is_none()` because the assertion stands in for the selector: a library
+            // caller that passed both gets the assertion's walk, and the timestamp's rename line
+            // is for the one voice a moment pointed at, which this is not.
+            if assertion.is_none() && matches!(rules.selector, Some(Selection::At(_))) {
                 report_rename(&transcript, &shown, &now, name, session, notes)?;
             }
             shown = now;
@@ -1615,6 +1880,27 @@ fn enroll_session(
             break;
         }
         pending = deferred;
+    }
+
+    // What the assertion came to, said once for the session: the per-voice lines carry the
+    // detail, this carries the shape of it, and the reference count is read off the database
+    // the run left rather than re-derived from the commits -- the stated rule, D4 of the
+    // plan, is that the existing cap does the bounding, so the count it holds is the answer.
+    if let Some(name) = assertion.as_deref() {
+        // The run-wide half of the session-local count: the summary line reads off the local
+        // because it says what the assertion did *here*, and the report carries it for the
+        // caller, which has no other view of the run.
+        report.vetoes_overridden += vetoes_overridden;
+        about(
+            notes,
+            &session.id,
+            SessionNote::OneSpeakerSummary {
+                name,
+                voices: asserted_voices,
+                vetoes_overridden,
+                references_stored: speakers.references(name),
+            },
+        )?;
     }
 
     Ok(Outcome::Finished)
@@ -2071,7 +2357,9 @@ pub fn speech(seconds: f64) -> String {
 /// This is the labelling `merge` performs when it writes a transcript, reached through the
 /// same [`attributions`], which is what makes a rewrite here and a `--force` re-transcribe
 /// agree on the answer rather than merely be written to. The precedence between the three is
-/// stated there and nowhere else.
+/// stated there and nowhere else; above all of it sits the one-remote-speaker assertion,
+/// passed in as `one_remote_speaker`, which when present names every voice and makes the rest
+/// of the rule moot -- see [`Naming::with_one_remote_speaker`] for why.
 ///
 /// `clusters` is what identification runs over and what `assigned` is resolved against;
 /// `unknown` is what the transcript was written with, and is the key set of the result. Those
@@ -2085,10 +2373,12 @@ pub(crate) fn effective_labels(
     unknown: &BTreeMap<u32, String>,
     speakers: &EnrolledSpeakers,
     assigned: &[AssignedName],
+    one_remote_speaker: Option<&str>,
 ) -> BTreeMap<u32, Attribution> {
     attributions(
         unknown,
-        Naming::new(clusters, &identify_clusters(clusters, speakers), assigned),
+        Naming::new(clusters, &identify_clusters(clusters, speakers), assigned)
+            .with_one_remote_speaker(one_remote_speaker),
     )
 }
 
@@ -2251,6 +2541,7 @@ pub fn write_clip(path: &Path, clip: &[f32]) -> Result<()> {
 mod tests {
     use std::cell::Cell;
     use std::collections::VecDeque;
+    use std::os::unix::fs::PermissionsExt;
 
     use meethook_session::{
         Attendee, AttendeeStatus, EnrolledSpeaker, MAX_REFERENCES_PER_SPEAKER, Meeting, MeetingFit,
@@ -2747,6 +3038,7 @@ mod tests {
                 offer,
                 sessions,
                 enrolment,
+                one_speaker: None,
                 // Resolved from the root, exactly as the CLI does, so a test that puts a
                 // template there is testing the path a user takes.
                 template: &TranscriptTemplate::resolve(paths, None).unwrap(),
@@ -5179,6 +5471,7 @@ mod tests {
                 offer: Offer::default(),
                 sessions: Sessions::default(),
                 enrolment: Enrolment::default(),
+                one_speaker: None,
                 template: &TranscriptTemplate::builtin(),
             },
             &mut interviewer,
@@ -6643,6 +6936,8 @@ mod tests {
                 refused: 1,
                 passed_over: 1,
                 failed: 0,
+                asserted: 0,
+                vetoes_overridden: 0,
             }
         );
     }
@@ -7238,5 +7533,484 @@ mod tests {
             ["Alice", "Stale"],
             "but both people are enrolled, and resolving a name is about who is there: {output}"
         );
+    }
+
+    // --- The one-remote-speaker assertion ----------------------------------------------------
+
+    /// A session with `n` voices, each on its own orthogonal axis and first speaking in id
+    /// order, so "Unknown N" is the cluster with id N - 1. All but the last eleven clear the
+    /// reference floor at distinct lengths; those sit below it. The shape real clustering leaves
+    /// when one person is split into many fragments.
+    fn make_many_cluster_session(paths: &Paths, id: &str, n: usize) -> SessionPaths {
+        let parsed = SessionId::parse(id).unwrap();
+        let session = paths.session(&parsed);
+        std::fs::create_dir_all(session.dir()).unwrap();
+        let metadata = session_metadata(&parsed);
+        metadata.write(&session.session_json()).unwrap();
+        write_speaker_wav(&session.speaker_wav());
+
+        let clusters: Vec<SpeakerCluster> = (0..n as u32)
+            .map(|i| {
+                let mut cluster = cluster(i, i as f64 * 0.1, (0.5, 2.5));
+                cluster.embedding = axis(i as usize, n);
+                cluster.speech_seconds = if (i as usize) < n - 11 {
+                    5.0 + i as f64 * 0.5
+                } else {
+                    0.5 + (n - i as usize) as f64 * 0.1
+                };
+                cluster
+            })
+            .collect();
+        SpeakerClusters::new(parsed.clone(), clusters)
+            .write(&session)
+            .unwrap();
+
+        let turns: Vec<Turn> = (0..n as u32)
+            .map(|i| speaker_turn(i as f64, i, &format!("Unknown {}", i + 1), "one word"))
+            .collect();
+        write_transcript(
+            &Transcript::new(parsed.clone(), turns),
+            paths,
+            &session,
+            &metadata,
+        );
+        session
+    }
+
+    /// `run_enroll` with the assertion half of the rules filled in, returning the result rather
+    /// than unwrapping it -- the interrupt test needs to see the failure.
+    fn run_asserting_raw(
+        paths: &Paths,
+        ids: &[&str],
+        name: Option<&str>,
+        interviewer: &mut dyn Interviewer,
+    ) -> Result<(EnrollReport, String)> {
+        let requested: Vec<SessionId> =
+            ids.iter().map(|id| SessionId::parse(id).unwrap()).collect();
+        let mut out = Vec::new();
+        let report = run_enroll(
+            paths,
+            &requested,
+            EnrollRules {
+                selector: None,
+                offer: Offer::default(),
+                sessions: Sessions::Unresolved,
+                enrolment: Enrolment::default(),
+                one_speaker: name,
+                template: &TranscriptTemplate::resolve(paths, None).unwrap(),
+            },
+            interviewer,
+            &mut Lines::new(&mut out),
+        )?;
+        Ok((report, String::from_utf8(out).unwrap()))
+    }
+
+    /// `run_asserting_raw`, for the tests where the run is expected to come back whole.
+    fn run_asserting(
+        paths: &Paths,
+        ids: &[&str],
+        name: Option<&str>,
+        interviewer: &mut Scripted,
+    ) -> (EnrollReport, String) {
+        run_asserting_raw(paths, ids, name, interviewer).unwrap()
+    }
+
+    /// Acceptance criterion #1 and #2: the user asserts one remote speaker and gives that
+    /// person a name, and every voice on the track reads it afterwards -- the quiet ones
+    /// included, which no queue offers by default -- without anything being asked about any of
+    /// them.
+    #[test]
+    fn an_asserted_name_reaches_every_voice_including_the_quiet_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_fragmented_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::answering(Vec::new());
+        let (report, output) = run_asserting(
+            &paths,
+            &["20260809-052600"],
+            Some("Grace"),
+            &mut interviewer,
+        );
+
+        assert!(
+            interviewer.seen.is_empty(),
+            "nothing may be asked under an assertion: {output}"
+        );
+        assert_eq!(report.asserted, 4, "{output}");
+        assert_eq!(report.named, 4, "{output}");
+        assert_eq!(report.session_only, 3, "{output}");
+
+        // Every voice reads the asserted name, and the mic track is untouched.
+        let transcript = transcript_of(&session);
+        let said = said(&transcript);
+        assert_eq!(
+            said.iter().filter(|(who, _, _)| *who == "Grace").count(),
+            4,
+            "every speaker-track turn should read as the asserted person: {said:?}"
+        );
+        assert!(
+            said.iter().any(|(who, _, _)| *who == SPEAKER_YOU),
+            "the local speaker keeps their own label: {said:?}"
+        );
+
+        // The three quiet voices are named against the session alone; the loud one holds the
+        // only reference.
+        let assigned = assigned_in(&session, "20260809-052600");
+        assert_eq!(assigned.names.len(), 3, "{:?}", assigned.names);
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(speakers.references("Grace"), 1, "{output}");
+        assert!(output.contains("one remote speaker settled"), "{output}");
+    }
+
+    /// Acceptance criterion #3: the voices the heard-at-once veto would have refused are named
+    /// anyway, and each one is reported -- naming the voice it was heard at once with, which is
+    /// the evidence the veto acted on -- rather than silently overridden.
+    #[test]
+    fn the_heard_at_once_veto_is_overridden_and_reported_for_each_voice_it_reached() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        heard_at_once(&session, 0, 1);
+
+        let mut interviewer = Scripted::answering(Vec::new());
+        let (report, output) = run_asserting(
+            &paths,
+            &["20260809-052600"],
+            Some("Grace"),
+            &mut interviewer,
+        );
+
+        // The second voice was heard at once with the first, and that pair is what the veto
+        // would have refused; the first was committed before the second, so exactly one veto
+        // is overridden and it is the second voice that reports it.
+        assert_eq!(report.vetoes_overridden, 1, "{output}");
+        assert!(output.contains("named Grace for Unknown 2"), "{output}");
+        assert!(output.contains("heard at once with Unknown 1"), "{output}");
+        assert!(
+            output.contains("the one-remote-speaker assertion says this track is one person"),
+            "{output}"
+        );
+        // Both keep the name regardless.
+        let transcript = transcript_of(&session);
+        let said = said(&transcript);
+        assert!(
+            said.iter().filter(|(who, _, _)| *who == "Grace").count() == 3,
+            "both voices keep the asserted name: {said:?}"
+        );
+        assert!(output.contains("1 veto(s) overridden"), "{output}");
+    }
+
+    /// Acceptance criterion #4, the plan's D4 rule made mechanical: a hundred and one above-
+    /// and-below-floor clusters do not become a hundred and one references. The existing cap
+    /// does the bounding, and the ten held are the ten longest above-floor clips -- the
+    /// selection is a stated rule, not a property of how many clusters the session happens to
+    /// hold.
+    #[test]
+    fn a_hundred_and_one_voice_session_stores_ten_references_the_ten_longest_above_the_floor() {
+        const VOICES: usize = 101;
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_many_cluster_session(&paths, "20260820-140414", VOICES);
+
+        let mut interviewer = Scripted::answering(Vec::new());
+        let (report, output) = run_asserting(
+            &paths,
+            &["20260820-140414"],
+            Some("Grace"),
+            &mut interviewer,
+        );
+
+        assert_eq!(report.asserted, VOICES, "{output}");
+        assert_eq!(report.session_only, 11, "{output}");
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(
+            speakers.references("Grace"),
+            MAX_REFERENCES_PER_SPEAKER,
+            "{output}"
+        );
+
+        // The ten longest above-floor clips are ids 80..=89, at 45.0 s up to 49.5 s: everything
+        // else held is shorter, so nothing else survives the cap.
+        let held: Vec<Vec<f32>> = speakers
+            .speakers
+            .iter()
+            .map(|s| s.embedding.clone())
+            .collect();
+        for i in 0..VOICES {
+            let expected = (80..=89).contains(&(i as u32));
+            assert_eq!(
+                held.contains(&axis(i, VOICES)),
+                expected,
+                "voice {i} should be held iff it is among the ten longest: {output}"
+            );
+        }
+
+        // And every voice, quiet included, reads the name in the transcript.
+        let transcript = transcript_of(&session);
+        let said = said(&transcript);
+        assert_eq!(said.len(), VOICES);
+        assert!(said.iter().all(|(who, _, _)| *who == "Grace"), "{output}");
+        assert!(
+            output.contains(&format!("{VOICES} voice(s) read as Grace")),
+            "{output}"
+        );
+    }
+
+    /// Acceptance criterion #7, first half: the fact lands on disk before the first per-voice
+    /// commit, so an interrupt between the two leaves a state that explains itself -- the
+    /// assertion present, nothing derived from it yet -- and a re-run converges onto the whole.
+    #[test]
+    fn an_interrupt_before_the_first_commit_leaves_the_assertion_on_disk_and_a_rerun_converges() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+
+        // Make the database unwritable: the assertion itself lives in the session directory,
+        // which stays writable, so it survives while the first commit cannot reach
+        // `speakers.json`.
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let interrupted = run_asserting_raw(
+            &paths,
+            &["20260809-052600"],
+            Some("Grace"),
+            &mut Scripted::default(),
+        );
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            interrupted.is_err(),
+            "the first commit must fail while the database is unwritable"
+        );
+
+        // What survived is self-consistent: the fact is on disk, and nothing derived from it
+        // is.
+        let metadata = SessionMetadata::read(&session.session_json()).unwrap();
+        assert_eq!(metadata.one_remote_speaker.as_deref(), Some("Grace"));
+        assert!(!session.speaker_names_json().exists());
+        assert!(!paths.speakers_json().exists());
+        let transcript = transcript_of(&session);
+        let before = said(&transcript);
+        assert!(
+            before.iter().any(|(who, _, _)| *who == "Unknown 1"),
+            "no label may have moved before the first commit: {before:?}"
+        );
+
+        // And a re-run converges onto the complete state.
+        let (_, output) = run_asserting(
+            &paths,
+            &["20260809-052600"],
+            Some("Grace"),
+            &mut Scripted::default(),
+        );
+        let transcript = transcript_of(&session);
+        let after = said(&transcript);
+        assert!(
+            after
+                .iter()
+                .all(|(who, _, _)| *who == "Grace" || *who == SPEAKER_YOU),
+            "the re-run must complete what the interrupt left behind: {after:?}\n{output}"
+        );
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(speakers.references("Grace"), 2, "{output}");
+    }
+
+    /// Acceptance criteria #6 and #7, second half: a re-run over the state a killed run would
+    /// have left -- the fact on disk, some voices already named, the transcript still carrying
+    /// the old labels -- converges onto the same state a fresh run produces, and a further
+    /// pass writes nothing at all.
+    #[test]
+    fn a_rerun_converges_from_a_partial_state_and_then_writes_nothing_new() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_fragmented_session(&paths, "20260809-052600");
+        let id = SessionId::parse("20260809-052600").unwrap();
+
+        // Two of four voices named, one reference stored, the transcript still unlabelled: a
+        // run interrupted after its second commit.
+        let mut metadata = SessionMetadata::read(&session.session_json()).unwrap();
+        metadata.assert_one_remote_speaker("Grace".to_string());
+        metadata.write(&session.session_json()).unwrap();
+        let clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
+        let mut names = SpeakerNames::read_or_empty(&session, &id).unwrap();
+        names.assign(0, "Grace", clusters.clusters[0].embedding.clone());
+        names.assign(1, "Grace", clusters.clusters[1].embedding.clone());
+        names.write(&session).unwrap();
+        enrolled(&[("Grace", clusters.clusters[0].embedding.clone())], &paths);
+
+        let (report, output) = run_asserting(
+            &paths,
+            &["20260809-052600"],
+            Some("Grace"),
+            &mut Scripted::default(),
+        );
+        assert_eq!(report.asserted, 4, "{output}");
+        let transcript = transcript_of(&session);
+        let said = said(&transcript);
+        assert!(
+            said.iter()
+                .all(|(who, _, _)| *who == "Grace" || *who == SPEAKER_YOU),
+            "the re-run must complete the transcript: {said:?}\n{output}"
+        );
+
+        // A further pass is a no-op on disk: converged means byte-identical, not merely
+        // equivalent.
+        let before = files_under(root.path());
+        let (_, output) = run_asserting(
+            &paths,
+            &["20260809-052600"],
+            Some("Grace"),
+            &mut Scripted::default(),
+        );
+        assert_eq!(
+            files_under(root.path()),
+            before,
+            "a converged assertion rewrote a file: {output}"
+        );
+    }
+
+    /// The displacement D4 states: references another name built from this very track are
+    /// withdrawn when the assertion names the track's one person, because the user has just
+    /// said the evidence belongs to somebody else.
+    #[test]
+    fn an_assertion_displaces_references_that_another_name_built_from_this_track() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        let clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
+        // Both voices were previously enrolled as Bob from this track.
+        enrolled(
+            &[
+                ("Bob", clusters.clusters[0].embedding.clone()),
+                ("Bob", clusters.clusters[1].embedding.clone()),
+            ],
+            &paths,
+        );
+
+        let (report, output) = run_asserting(
+            &paths,
+            &["20260809-052600"],
+            Some("Grace"),
+            &mut Scripted::default(),
+        );
+        assert_eq!(report.asserted, 2, "{output}");
+
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(speakers.references("Grace"), 2, "{output}");
+        assert!(
+            speakers.speakers.iter().all(|s| s.name == "Grace"),
+            "Bob's evidence from this track is withdrawn: {:?}",
+            speakers.speakers
+        );
+    }
+
+    /// Acceptance criterion #9, across sessions: asserting one session's track leaves every
+    /// other session's files byte-identical.
+    #[test]
+    fn asserting_one_session_leaves_the_other_sessions_byte_identical() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let asserted = make_session(&paths, "20260809-052600");
+        let bystander = make_session(&paths, "20260810-052600");
+
+        let before = files_under(bystander.dir());
+        let (_report, output) = run_asserting(
+            &paths,
+            &["20260809-052600"],
+            Some("Grace"),
+            &mut Scripted::default(),
+        );
+        assert_eq!(
+            files_under(bystander.dir()),
+            before,
+            "an assertion about one session must not touch another: {output}"
+        );
+        let _ = asserted;
+    }
+
+    /// The frame's half of acceptance criterion #5, at the seam: answering one voice with the
+    /// assertion switches the rest of the session to it -- the quiet voices included, which the
+    /// queue never offered -- and the headless flag and this answer land the same state.
+    #[test]
+    fn answering_a_voice_with_the_assertion_switches_the_rest_of_the_run_to_it() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_fragmented_session(&paths, "20260809-052600");
+
+        let mut interviewer = Scripted::answering(vec![Answer::OneSpeaker("Grace".to_string())]);
+        let (report, output) = run(&paths, &["20260809-052600"], &mut interviewer);
+
+        assert_eq!(
+            interviewer.seen.len(),
+            1,
+            "only the voice the key was pressed on may be asked: {output}"
+        );
+        assert_eq!(
+            report.asserted, 4,
+            "the assertion reaches the quiet voices too: {output}"
+        );
+
+        let metadata = SessionMetadata::read(&session.session_json()).unwrap();
+        assert_eq!(metadata.one_remote_speaker.as_deref(), Some("Grace"));
+        let transcript = transcript_of(&session);
+        let said = said(&transcript);
+        assert!(
+            said.iter()
+                .all(|(who, _, _)| *who == "Grace" || *who == SPEAKER_YOU),
+            "every voice reads the asserted name: {said:?}\n{output}"
+        );
+        assert!(output.contains("one remote speaker asserted"), "{output}");
+        assert!(output.contains("one remote speaker settled"), "{output}");
+    }
+
+    /// The guards at the edge of the mode: a name of nothing but spaces is a request not
+    /// served rather than a silent no-op, and the assertion needs exactly one session id.
+    #[test]
+    fn the_assertion_guards_refuse_without_writing_anything() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+        make_session(&paths, "20260810-052600");
+        let before = files_under(root.path());
+
+        let (_, output) = run_asserting(
+            &paths,
+            &["20260809-052600"],
+            Some("   "),
+            &mut Scripted::default(),
+        );
+        assert!(output.contains("nothing but spaces"), "{output}");
+
+        let (_, output) = run_asserting(
+            &paths,
+            &["20260809-052600", "20260810-052600"],
+            Some("Grace"),
+            &mut Scripted::default(),
+        );
+        assert!(output.contains("exactly one session id"), "{output}");
+
+        assert_eq!(
+            files_under(root.path()),
+            before,
+            "a refused guard writes nothing"
+        );
+    }
+
+    /// An up-front name beside the assertion is not refused: the assertion selects every voice
+    /// in the session itself, so a name waiting for a voice has all of them at once, and the
+    /// answerer is never consulted at all.
+    #[test]
+    fn an_upfront_name_is_not_refused_beside_an_assertion() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600");
+
+        let mut given = GivenName::new("Unused");
+        let (report, output) =
+            run_asserting_raw(&paths, &["20260809-052600"], Some("Grace"), &mut given).unwrap();
+        assert_eq!(
+            report.asserted, 2,
+            "the assertion outranks the up-front name: {output}"
+        );
+        assert!(!output.contains("needs a voice"), "{output}");
     }
 }

@@ -58,14 +58,23 @@ pub struct Preview<'a> {
     assigned: &'a SpeakerNames,
     cluster: &'a SpeakerCluster,
     enrolment: Enrolment,
+    /// The session's one-remote-speaker assertion, if there is one -- or `None`, which labels
+    /// exactly as before. Carried rather than looked up because the dry run and the write must
+    /// honour the same labelling: a preview that did not see the assertion could show a veto
+    /// the commit would override, and disagree with the transcript it predicts.
+    one_remote_speaker: Option<&'a str>,
 }
 
 impl<'a> Preview<'a> {
-    /// The six things a dry run of one answer needs, and nothing else.
+    /// The seven things a dry run of one answer needs, and nothing else.
     ///
     /// `speakers` and `assigned` are the two files a name can land in, borrowed rather than
     /// cloned here: the clone happens per [`Preview::of`] call, since a preview that held its
     /// own copy would go stale the moment an answer was committed.
+    ///
+    /// `one_remote_speaker` is the session-level fact [`effective_labels`] applies above all
+    /// the rest of the rule; passing it is what keeps a preview built during an assertion run
+    /// from predicting a refusal the assertion overrides.
     pub(crate) fn new(
         clusters: &'a [SpeakerCluster],
         unknown: &'a BTreeMap<u32, String>,
@@ -73,6 +82,7 @@ impl<'a> Preview<'a> {
         assigned: &'a SpeakerNames,
         cluster: &'a SpeakerCluster,
         enrolment: Enrolment,
+        one_remote_speaker: Option<&'a str>,
     ) -> Preview<'a> {
         Preview {
             clusters,
@@ -81,6 +91,7 @@ impl<'a> Preview<'a> {
             assigned,
             cluster,
             enrolment,
+            one_remote_speaker,
         }
     }
 
@@ -136,6 +147,7 @@ impl<'a> Preview<'a> {
             self.unknown,
             &candidate,
             &candidate_assigned.names,
+            self.one_remote_speaker,
         );
 
         // The addition. `None` on the below-floor path, where no reference is stored at all.
@@ -169,6 +181,7 @@ impl<'a> Preview<'a> {
             self.unknown,
             &candidate,
             &candidate_assigned.names,
+            self.one_remote_speaker,
         );
 
         // A legacy reference that *is* this exact fragment, still standing under somebody
@@ -425,6 +438,19 @@ mod tests {
         assigned: &'a SpeakerNames,
         enrolment: Enrolment,
     ) -> Preview<'a> {
+        preview_with_assertion(clusters, unknown, speakers, assigned, enrolment, None)
+    }
+
+    /// The whole fixture aimed at `cluster` under a one-remote-speaker assertion, for the tests
+    /// that pin what the dry run says when the assertion outranks the veto.
+    fn preview_with_assertion<'a>(
+        clusters: &'a [SpeakerCluster],
+        unknown: &'a BTreeMap<u32, String>,
+        speakers: &'a EnrolledSpeakers,
+        assigned: &'a SpeakerNames,
+        enrolment: Enrolment,
+        one_remote_speaker: Option<&'a str>,
+    ) -> Preview<'a> {
         Preview::new(
             clusters,
             unknown,
@@ -432,6 +458,7 @@ mod tests {
             assigned,
             &clusters[0],
             enrolment,
+            one_remote_speaker,
         )
     }
 
@@ -682,6 +709,7 @@ mod tests {
             &assigned,
             &clusters[1],
             Enrolment::default(),
+            None,
         )
         .of("Alice")
         .unwrap();
@@ -692,6 +720,47 @@ mod tests {
                 holder: Some("Unknown 1".to_string())
             })
         );
+    }
+
+    /// The same pair under the one-remote-speaker assertion: the dry run honours the assertion
+    /// the write will honour, so it predicts no veto at all -- a preview that still refused
+    /// would show a cost the commit overrides, which is the drift the assertion parameter
+    /// exists to keep out.
+    #[test]
+    fn a_preview_built_under_an_assertion_predicts_no_veto_for_the_asserted_name() {
+        let mut clusters = vec![
+            cluster(0, nearly(0.0), 40.0),
+            cluster(1, nearly(20.0), 40.0),
+        ];
+        clusters[0].heard_at_once_with = vec![1];
+        clusters[1].heard_at_once_with = vec![0];
+        let unknown = numbering(&clusters);
+        let speakers = enrolled(&[("Alice", nearly(0.0), Some(30.0))]);
+        let assigned = no_names();
+
+        let preview = Preview::new(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            &clusters[1],
+            Enrolment::default(),
+            Some("Alice"),
+        );
+
+        let consequence = preview.of("Alice").unwrap();
+
+        assert_eq!(consequence.refused, None);
+        // Both voices read the asserted name in the labelling the write commits.
+        let after = crate::effective_labels(
+            &clusters,
+            &unknown,
+            &consequence.speakers,
+            &consequence.assigned.names,
+            Some("Alice"),
+        );
+        assert_eq!(after[&0].label(), "Alice");
+        assert_eq!(after[&1].label(), "Alice");
     }
 
     /// The other refusal: the answer would take a name off a voice the user was not asked

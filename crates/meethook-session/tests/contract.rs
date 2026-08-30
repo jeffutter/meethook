@@ -376,6 +376,60 @@ fn session_json_written_before_corrections_still_reads() {
     );
 }
 
+// --- the one-remote-speaker assertion ----------------------------------------------------
+
+/// A session nobody has asserted about must write exactly the bytes it wrote before this
+/// field existed -- absent, not null, which is why `SESSION_SCHEMA_VERSION` did not move.
+#[test]
+fn a_session_with_no_assertion_writes_no_one_remote_speaker_key() {
+    let json = serde_json::to_string(&sample_metadata("20260809-052607")).unwrap();
+    assert!(
+        !json.contains("one_remote_speaker"),
+        "an unasserted session must be byte-identical to a pre-assertion file: {json}"
+    );
+}
+
+/// The assertion survives the round trip through `session.json`, and re-asserting a
+/// different name overwrites rather than accumulating.
+#[test]
+fn an_assertion_round_trips_through_session_json_and_reassert_overwrites() {
+    let mut metadata = sample_metadata("20260809-052607");
+    metadata.assert_one_remote_speaker("Grace Hopper".into());
+    let json = serde_json::to_string(&metadata).unwrap();
+
+    assert!(
+        json.contains(r##""one_remote_speaker":"Grace Hopper""##),
+        "{json}"
+    );
+    assert_eq!(
+        serde_json::from_str::<SessionMetadata>(&json).unwrap(),
+        metadata
+    );
+
+    metadata.assert_one_remote_speaker("Ada Lovelace".into());
+    assert_eq!(metadata.one_remote_speaker.as_deref(), Some("Ada Lovelace"));
+}
+
+/// A `session.json` written before assertions existed reads as unasserted, rather than
+/// failing to parse -- the same rule every other addition to this file has had to meet.
+#[test]
+fn session_json_written_before_assertions_still_reads_as_unasserted() {
+    let (_tmp, paths) = temp_root();
+    let session = make_session(&paths, "20260809-052607", &[]);
+    let before = r#"{
+      "session_id": "20260809-052607",
+      "schema_version": 1,
+      "start_time": "2026-08-09T05:26:00Z",
+      "mic": { "host_ticks": 9007199254740993, "timebase_numer": 125, "timebase_denom": 3 },
+      "speaker": { "host_ticks": 9007199254740995, "timebase_numer": 125, "timebase_denom": 3 }
+    }"#;
+    fs::write(session.session_json(), before).unwrap();
+
+    let metadata = SessionMetadata::read(&session.session_json()).unwrap();
+
+    assert!(metadata.one_remote_speaker.is_none());
+}
+
 // --- the fit ---------------------------------------------------------------------------
 
 /// A `session.json` whose meeting predates fits must not read as a *good* match.

@@ -56,7 +56,7 @@ pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
 pub use gpu::NoMetalDevice;
 pub use identify::{
-    IDENTIFY_DISTANCE, Identification, Resemblance, identify_clusters, rank_enrolled,
+    IDENTIFY_DISTANCE, Identification, Resemblance, heard_at_once, identify_clusters, rank_enrolled,
 };
 pub use import::{BuiltSession, ImportedSource, MIC_SILENCE_S, SPLICE_GAP_S, build_session};
 pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
@@ -397,7 +397,8 @@ pub fn transcribe_session(
         speaker_segments,
         speaker_offset_seconds(&metadata)?,
         &diarization.turns,
-        Naming::new(&clusters.clusters, &identified, &assigned.names),
+        Naming::new(&clusters.clusters, &identified, &assigned.names)
+            .with_one_remote_speaker(metadata.one_remote_speaker.as_deref()),
     );
 
     Ok(Transcript::new(session.id.clone(), turns))

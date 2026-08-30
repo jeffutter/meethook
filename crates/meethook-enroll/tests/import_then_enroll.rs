@@ -225,6 +225,7 @@ fn a_session_built_from_a_wav_file_transcribes_enrolls_and_stores_that_audio() {
             offer: Offer::default(),
             sessions: Sessions::default(),
             enrolment: Enrolment::default(),
+            one_speaker: None,
             template: &TranscriptTemplate::resolve(&paths, None).unwrap(),
         },
         &mut interviewer,
@@ -330,6 +331,7 @@ fn building_and_transcribing_touches_only_the_root_it_was_given() {
             offer: Offer::default(),
             sessions: Sessions::default(),
             enrolment: Enrolment::default(),
+            one_speaker: None,
             template: &TranscriptTemplate::resolve(&paths, None).unwrap(),
         },
         &mut AsksOnce {

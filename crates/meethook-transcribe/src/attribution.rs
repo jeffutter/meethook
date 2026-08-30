@@ -16,11 +16,16 @@
 //!
 //! # Precedence
 //!
-//! A hand-given name beats identification, which beats the number. The order is not a
-//! preference between two guesses: a row in `speaker_names.json` is a person saying *that
-//! voice, in this recording, is this human*, and identification is a cosine distance between
-//! two vectors. Where they disagree, the one that saw the meeting wins. The number is what
-//! is left when nobody has made a claim at all.
+//! Above all three sits the one-remote-speaker assertion: when the user has said this
+//! session's speaker track is one person, every voice on it reads as that person and the
+//! rest of the rule is moot -- see [`Naming::with_one_remote_speaker`] for why the
+//! heard-at-once exclusion does not apply to the asserted name.
+//!
+//! Below it, a hand-given name beats identification, which beats the number. The order is
+//! not a preference between two guesses: a row in `speaker_names.json` is a person saying
+//! *that voice, in this recording, is this human*, and identification is a cosine distance
+//! between two vectors. Where they disagree, the one that saw the meeting wins. The number
+//! is what is left when nobody has made a claim at all.
 //!
 //! # "Attribution" here means what a cluster is *called*
 //!
@@ -122,6 +127,12 @@ pub struct Naming<'a> {
     clusters: &'a [SpeakerCluster],
     identified: &'a BTreeMap<u32, Identification>,
     assigned: &'a [AssignedName],
+    /// The user's assertion that this session's speaker track is one person, by name.
+    ///
+    /// `None` applies no such claim and the rule runs exactly as it always has; `Some` names
+    /// every voice on the track and settles the question the exclusions below exist to keep
+    /// open.
+    one_remote_speaker: Option<&'a str>,
 }
 
 /// Somewhere for [`Naming::nothing`] to point its identification map at.
@@ -137,6 +148,7 @@ impl<'a> Naming<'a> {
             clusters,
             identified,
             assigned,
+            one_remote_speaker: None,
         }
     }
 
@@ -146,6 +158,26 @@ impl<'a> Naming<'a> {
             clusters: &[],
             identified: &NOBODY,
             assigned: &[],
+            one_remote_speaker: None,
+        }
+    }
+
+    /// The same naming under the user's assertion that this session's speaker track is one
+    /// person, `name` -- or unchanged when `name` is `None`, which is how every caller that
+    /// has nothing to assert stays exactly as it was.
+    ///
+    /// The assertion outranks everything the rule otherwise decides: every voice on the track
+    /// reads as that person, whatever an assignment, an identification, or the heard-at-once
+    /// exclusion would have said. On a track the user has called one person, an overlap is
+    /// echo, diarisation error, or somebody who was never on the invite -- not evidence of two
+    /// people -- so the exclusion is not applied to the asserted name rather than applied and
+    /// then undone. That is also why the bypass lives here, in the one place both `transcribe`
+    /// and `enroll` label through, rather than in either of them: the module invariant above
+    /// is that two implementations of one rule cannot agree by accident.
+    pub fn with_one_remote_speaker(self, name: Option<&'a str>) -> Self {
+        Naming {
+            one_remote_speaker: name,
+            ..self
         }
     }
 
@@ -255,6 +287,23 @@ pub fn attributions(
     unknown: &BTreeMap<u32, String>,
     naming: Naming<'_>,
 ) -> BTreeMap<u32, Attribution> {
+    // The assertion, when there is one, settles the whole question before any of it runs:
+    // every voice on the track is the person it names, so the exclusions below -- which exist
+    // to keep two people apart -- have no work to do. See `with_one_remote_speaker` for why
+    // overriding them is the point rather than the exception.
+    if let Some(name) = naming.one_remote_speaker {
+        return unknown
+            .iter()
+            .map(|(&id, _)| {
+                (
+                    id,
+                    Attribution::Assigned {
+                        name: name.to_string(),
+                    },
+                )
+            })
+            .collect();
+    }
     let assigned = naming.awarded();
     unknown
         .iter()
@@ -585,6 +634,93 @@ mod tests {
             Attribution::Identified {
                 name: "Alex".to_string(),
                 similarity: 0.83,
+            }
+        );
+    }
+
+    // --- the one-remote-speaker assertion -----------------------------------------------
+
+    /// The assertion outranks everything the rule otherwise decides: a hand-given name and an
+    /// identification both stand without it, and with it every voice reads as the asserted
+    /// person instead -- carrying no confidence, the way every session-assigned name does.
+    #[test]
+    fn an_asserted_name_beats_an_assignment_and_an_identification_on_every_voice() {
+        let clusters = clusters(&[0, 1]);
+        let identified = identified(&[(1, "Alice", 0.83)]);
+        let assigned = vec![assignment(0, "Alex")];
+
+        let naming =
+            Naming::new(&clusters, &identified, &assigned).with_one_remote_speaker(Some("Grace"));
+
+        let map = attributions(&unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]), naming);
+
+        for label in map.values() {
+            assert_eq!(
+                label,
+                &Attribution::Assigned {
+                    name: "Grace".to_string()
+                }
+            );
+            assert_eq!(label.confidence(), None);
+        }
+    }
+
+    /// The hard part: voices the segmenter heard talking over each other are exactly what the
+    /// heard-at-once exclusion refuses to put under one name, and the assertion overrides it
+    /// rather than losing to it. Without the assertion the lower id keeps the name and the
+    /// other falls back to its number; with it, both keep it.
+    #[test]
+    fn the_heard_at_once_exclusion_does_not_apply_to_an_asserted_name() {
+        let clusters = vec![cluster(0, vec![1]), cluster(1, vec![0])];
+
+        let map = attributions(
+            &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
+            Naming::new(&clusters, &NOBODY, &[]).with_one_remote_speaker(Some("Grace")),
+        );
+
+        assert_eq!(
+            map[&0],
+            Attribution::Assigned {
+                name: "Grace".to_string()
+            }
+        );
+        assert_eq!(
+            map[&1],
+            Attribution::Assigned {
+                name: "Grace".to_string()
+            }
+        );
+    }
+
+    /// A re-diarised session still honours the assertion: the bit-exact rows die when the
+    /// clustering changes, but the assertion is a session-level fact, so a fresh labelling
+    /// names every new voice with it. This is what makes it more durable than assignments.
+    #[test]
+    fn an_assertion_survives_reclustering_that_a_stale_assignment_cannot() {
+        // The assignment was recorded against a clustering that no longer exists, so it drops
+        // out of the rule entirely -- while the assertion, which resolves through nothing,
+        // still names the voice.
+        let stale = AssignedName {
+            embedding: vec![1.000_001, 0.5],
+            ..assignment(1, "Alex")
+        };
+        let clusters = clusters(&[0, 1]);
+
+        let map = attributions(
+            &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
+            Naming::new(&clusters, &NOBODY, &[stale]).with_one_remote_speaker(Some("Grace")),
+        );
+
+        assert_eq!(
+            map[&0],
+            Attribution::Assigned {
+                name: "Grace".to_string()
+            }
+        );
+        assert_eq!(
+            map[&1],
+            Attribution::Assigned {
+                name: "Grace".to_string()
             }
         );
     }

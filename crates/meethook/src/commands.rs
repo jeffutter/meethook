@@ -764,6 +764,15 @@ pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Resu
             report.refused
         );
     }
+    // The run-wide half of the veto override, beside the per-session lines the narration
+    // already printed: an assertion that never hit a pair it overrode says nothing here, which
+    // is the same as saying nothing happened.
+    if report.vetoes_overridden > 0 {
+        println!(
+            "overrode the heard-at-once veto on {} voice(s)",
+            report.vetoes_overridden
+        );
+    }
     // Skips and pass-overs are ordinary; a request that could not be served -- a session that
     // could not be read, an id that is not on disk, a `--voice` matching no voice or several --
     // is what makes the run unsuccessful, exactly as in `transcribe`. Each has already printed
@@ -824,8 +833,28 @@ fn ask(
         } else {
             Enrolment::AboveTheFloor
         },
+        // The CLI refuses this flag alongside any selector or up-front name (see the flag), so
+        // none of them can be set beside it: the assertion stands in for the queue and its
+        // gates alike, and composing it with a selector would give every voice two answers.
+        one_speaker: args.one_speaker.as_deref(),
         template,
     };
+
+    // Prompt-free by construction: the assertion names every voice without asking about any,
+    // so the full-screen interface has nothing to show -- and a scripted driver must reach the
+    // same writes from either terminal. This is the seam the key handler reaches mid-run;
+    // one body of work, two doors into it. The answerer below is a `Terminal` rather than a
+    // silent one on purpose: the run never consults it, and if a future change ever did, a
+    // question appearing on screen beats a fabricated answer.
+    if args.one_speaker.is_some() {
+        return Ok(run_enroll(
+            paths,
+            requested,
+            rules,
+            &mut Terminal::default(),
+            &mut Lines::new(&mut io::stdout()),
+        )?);
+    }
 
     // `--name` is refused without a selector by `run_enroll`, which is where both halves of that
     // rule are in hand. A match rather than `expect(..)`: `answerer` returns `Given` only when

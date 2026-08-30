@@ -322,6 +322,20 @@ pub struct EnrollArgs {
     /// report. --name outranks it: a name given up front is not asked about at all.
     #[arg(long)]
     plain: bool,
+
+    /// Assert that this session's speaker track is one person, and give that person a name
+    ///
+    /// Names every voice on the track with that name -- the quiet ones included -- without
+    /// asking about any of them, and reports each one the heard-at-once veto would have
+    /// refused instead of silently overriding it. Needs exactly one session id, since the
+    /// assertion is about one session's track. Prompt-free however the terminal looks: a
+    /// scripted driver reaches the same writes the full-screen key will.
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with_all = ["voice", "at", "name"]
+    )]
+    one_speaker: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -666,5 +680,40 @@ mod tests {
         ]);
         assert!(message.contains("--voice"), "{message}");
         assert!(message.contains("--at"), "{message}");
+    }
+
+    /// The assertion is about every voice in the session, so a selector or an up-front name
+    /// beside it would give the run two different answers: each pairing is refused at the
+    /// edge, and the flag alone parses with its name.
+    #[test]
+    fn the_one_speaker_flag_conflicts_with_every_selector_and_the_upfront_name() {
+        let args = enroll_args(&[
+            "meethook",
+            "enroll",
+            "20260809-052600",
+            "--one-speaker",
+            "Grace",
+        ]);
+        assert_eq!(args.one_speaker.as_deref(), Some("Grace"));
+
+        for other in [
+            &["--voice", "Unknown 2"],
+            &["--at", "12:34"],
+            &["--name", "Alice"],
+        ] {
+            let mut command = vec![
+                "meethook",
+                "enroll",
+                "20260809-052600",
+                "--one-speaker",
+                "Grace",
+            ];
+            command.extend_from_slice(other);
+            let message = refused(&command);
+            assert!(
+                message.contains("--one-speaker") && message.contains(other[0]),
+                "--one-speaker beside {other:?} was not refused: {message}"
+            );
+        }
     }
 }

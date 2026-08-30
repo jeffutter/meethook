@@ -328,6 +328,17 @@ pub struct SessionMetadata {
     /// cleared gains the key, and an old file with neither key reads as not settled by hand.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub meeting_cleared: bool,
+
+    /// The user's assertion that this session's speaker track is one person: their name.
+    ///
+    /// Absent, not null, when nobody has asserted it: a pre-assertion file reads as
+    /// unasserted, and a session nobody has asserted about writes byte-identical JSON to what
+    /// this build's predecessors wrote -- the same equivalence that keeps
+    /// [`SESSION_SCHEMA_VERSION`] where it is. Written only by
+    /// [`SessionMetadata::assert_one_remote_speaker`]; re-asserting a different name
+    /// overwrites, and the run converges on the new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_remote_speaker: Option<String>,
 }
 
 impl SessionMetadata {
@@ -345,6 +356,7 @@ impl SessionMetadata {
             speaker,
             meeting: None,
             meeting_cleared: false,
+            one_remote_speaker: None,
         }
     }
 
@@ -391,6 +403,16 @@ impl SessionMetadata {
                 self.meeting_cleared = true;
             }
         }
+    }
+
+    /// Records the user's assertion that this session's speaker track is one person, `name`.
+    ///
+    /// Like a hand-settled meeting label, only the user's word settles this: enrollment runs
+    /// apply it on the user's say-so, and nothing else may invent or clear it -- absence means
+    /// unasserted, which is how every pre-assertion file reads. Re-asserting a different name
+    /// simply overwrites; the next run re-offers every voice against the new one and converges.
+    pub fn assert_one_remote_speaker(&mut self, name: String) {
+        self.one_remote_speaker = Some(name);
     }
 
     /// Whether a human has decided this session's meeting label, either way.

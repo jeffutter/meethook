@@ -99,6 +99,20 @@ pub enum RunNote<'a> {
         /// The directory that was looked in.
         dir: &'a Path,
     },
+
+    /// `--one-speaker` was passed with anything other than exactly one session id.
+    ///
+    /// The sibling of [`SelectionNeedsOneSession`](Self::SelectionNeedsOneSession): an assertion
+    /// is a fact about *one* session's speaker track, so a run that cannot say which session it
+    /// is about has nothing to assert it against.
+    OneSpeakerNeedsOneSession,
+
+    /// `--one-speaker` was given a name of nothing but spaces.
+    ///
+    /// Counted as a request not served rather than dropped silently: naming every voice "" is
+    /// not an outcome this tool will write, and a run that quietly did nothing would look like
+    /// one that had nothing to do.
+    OneSpeakerIsEmpty,
 }
 
 /// Something about one session: a reason it was passed over, a file that would not read, or the
@@ -159,6 +173,22 @@ pub enum SessionNote<'a> {
 
     /// A selector or a timestamp arrived at no one voice. Counted as a request not served.
     NotSelected(NotSelected<'a>),
+
+    /// The one-remote-speaker assertion is being applied to this session: every voice on its
+    /// track will read as the asserted person, whatever the rule would have said. Printed
+    /// before any of the work, so the lines that follow are already explainable by it.
+    AssertingOneSpeaker { name: &'a str, voices: usize },
+
+    /// What applying the assertion came to: how many voices it named, how many of them it
+    /// overrode a heard-at-once veto to reach, and how many references the database now holds
+    /// for the person. The per-voice lines carry the detail; this carries the shape of what
+    /// happened, which is what the run summary needs to echo in one sentence.
+    OneSpeakerSummary {
+        name: &'a str,
+        voices: usize,
+        vetoes_overridden: usize,
+        references_stored: usize,
+    },
 }
 
 /// Why a session was never asked about.
@@ -345,6 +375,26 @@ pub enum AnswerNote<'a> {
         /// How much speech those turns cover.
         seconds: f64,
     },
+
+    /// The heard-at-once veto would have refused this name for this voice, and the
+    /// one-remote-speaker assertion overrode it rather than losing to it.
+    ///
+    /// The reported half of overriding: the assertion names the voice anyway, and this line is
+    /// what keeps that from being silent -- every overridden voice gets its own, naming the
+    /// voices it was heard at once with, which is the evidence the veto acted on. Printed
+    /// before the [`Committed`](Self::Committed) block, the way
+    /// [`Overrode`](Self::Overrode) prints before it: what the answer did against the rule
+    /// first, then where the name landed.
+    VetoOverridden {
+        /// The asserted name.
+        name: &'a str,
+        /// The voice it was named for, by its "Unknown N".
+        answered: &'a str,
+        /// How much the voice spoke, which is what the report is measured in.
+        speech_seconds: f64,
+        /// The earlier-committed voices it was heard at once with, by their "Unknown N"s.
+        overlapped: &'a [String],
+    },
 }
 
 /// The narration as the command-line tool prints it: one line per note, to a writer.
@@ -392,6 +442,18 @@ impl Lines<'_> {
             RunNote::NoSessionsFound { dir } => {
                 writeln!(out, "No sessions found in {}", dir.display())?
             }
+            // The same shape as the selector's refusal, for the reason it gives: an assertion
+            // about several sessions at once is not a thing, so the run says which one it needs.
+            RunNote::OneSpeakerNeedsOneSession => writeln!(
+                out,
+                "--one-speaker asserts that one session's speaker track is a single person, so \
+                 it needs exactly one session id"
+            )?,
+            RunNote::OneSpeakerIsEmpty => writeln!(
+                out,
+                "--one-speaker was given a name of nothing but spaces: type the person's name, \
+                 or drop the flag"
+            )?,
         }
         Ok(())
     }
@@ -473,6 +535,22 @@ impl Lines<'_> {
                 voice,
             } => writeln!(out, "{session}  1 voice selected at {at}: {voice}")?,
             SessionNote::NotSelected(note) => self.not_selected(session, note)?,
+            // Printed before any of the work, so the lines that follow are already explainable
+            // by it -- and before the first commit, since the assertion is on disk by then.
+            SessionNote::AssertingOneSpeaker { name, voices } => writeln!(
+                out,
+                "{session}  one remote speaker asserted: {voices} voice(s) will read as {name}"
+            )?,
+            SessionNote::OneSpeakerSummary {
+                name,
+                voices,
+                vetoes_overridden,
+                references_stored,
+            } => writeln!(
+                out,
+                "{session}  one remote speaker settled: {voices} voice(s) read as {name}, \
+                 {vetoes_overridden} veto(s) overridden, {references_stored} reference(s) stored"
+            )?,
         }
         Ok(())
     }
@@ -576,6 +654,21 @@ impl Lines<'_> {
                 turns,
                 seconds,
             } => self.renamed(session, name, turns, seconds),
+            AnswerNote::VetoOverridden {
+                name,
+                answered,
+                speech_seconds,
+                overlapped,
+            } => {
+                writeln!(
+                    self.out,
+                    "{session}  named {name} for {answered} ({speech_seconds:.1} s) despite \
+                     the heard-at-once veto: it was heard at once with {} -- the \
+                     one-remote-speaker assertion says this track is one person",
+                    overlapped.join(", ")
+                )?;
+                Ok(())
+            }
         }
     }
 
