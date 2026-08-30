@@ -90,7 +90,7 @@ mod references;
 mod resolve;
 
 use consequence::handle;
-pub use consequence::{Consequence, Preview, Refusal};
+pub use consequence::{Assertion, Consequence, Preview, Refusal};
 pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
 pub use meeting::{Labelled, MeetingChoice, MeetingSource, Relabelling, run_meeting};
 pub use narration::{
@@ -1564,6 +1564,7 @@ fn enroll_session(
                             cluster,
                             rules.enrolment,
                             None,
+                            &committed[..],
                         ),
                     })
                 };
@@ -1687,6 +1688,7 @@ fn enroll_session(
                 cluster,
                 rules.enrolment,
                 assertion.as_deref(),
+                &committed[..],
             )
             .of(&name) else {
                 left_unanswered(std::iter::once(cluster), &shown, &baseline, report);
@@ -8012,5 +8014,210 @@ mod tests {
             "the assertion outranks the up-front name: {output}"
         );
         assert!(!output.contains("needs a voice"), "{output}");
+    }
+
+    /// TASK-050.01 acceptance criterion #4: the same assertion triggered from the full-screen
+    /// frame (`Answer::OneSpeaker`) and from the headless flag leaves byte-identical on-disk
+    /// state. One commit loop, two doors into it -- the frame contributes exactly one value,
+    /// the answer, and everything else is shared.
+    #[test]
+    fn the_frame_door_and_the_headless_door_leave_byte_identical_state() {
+        // Two identically seeded fresh roots: the same fixture builder, the same session id,
+        // and a heard-at-once pair so the veto evidence is present for both doors.
+        let headless_root = tempfile::tempdir().unwrap();
+        let headless = Paths::new(headless_root.path());
+        let headless_session = make_fragmented_session(&headless, "20260809-052600");
+        heard_at_once(&headless_session, 0, 1);
+
+        let frame_root = tempfile::tempdir().unwrap();
+        let frame = Paths::new(frame_root.path());
+        let frame_session = make_fragmented_session(&frame, "20260809-052600");
+        heard_at_once(&frame_session, 0, 1);
+
+        // The headless door: the flag. The frame door: the answer the key produces.
+        let mut headless_interviewer = Scripted::answering(Vec::new());
+        let (headless_report, _) = run_asserting(
+            &headless,
+            &["20260809-052600"],
+            Some("Grace"),
+            &mut headless_interviewer,
+        );
+        let mut frame_interviewer =
+            Scripted::answering(vec![Answer::OneSpeaker("Grace".to_string())]);
+        let (frame_report, _) = run(&frame, &["20260809-052600"], &mut frame_interviewer);
+
+        // The write-relevant counts agree. The full reports are not compared field by field:
+        // the frame door builds the queue before the assertion arrives mid-run, so it counts
+        // the below-floor voices as held back, while the headless door never reaches the queue
+        // at all. Prompting bookkeeping differs; what the runs leave behind must not.
+        assert_eq!(headless_report.named, frame_report.named);
+        assert_eq!(headless_report.session_only, frame_report.session_only);
+        assert_eq!(headless_report.asserted, frame_report.asserted);
+        assert_eq!(
+            headless_report.vetoes_overridden,
+            frame_report.vetoes_overridden
+        );
+        // The trees each run left are identical file by file. `files_under` returns absolute
+        // paths, so strip the root first -- the claim is about the tree, not about where the
+        // tempdir happened to live. And the transcript header carries the wall clock of the
+        // run that rewrote it (`updated:`), which sits outside either door's control: two runs
+        // straddling a second boundary would differ there and nowhere else, so that one line
+        // is normalised and every other byte compared as written.
+        let normalise = |path: &Path, bytes: &[u8]| -> Vec<u8> {
+            // The transcript alone carries the clock; every other file compares byte for byte
+            // as written.
+            if path.file_name().is_some_and(|name| name == "transcript.md")
+                && let Ok(text) = std::str::from_utf8(bytes)
+            {
+                text.lines()
+                    .map(|line| {
+                        if line.starts_with("updated:") {
+                            "updated: <the clock>".to_string()
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into_bytes()
+            } else {
+                bytes.to_vec()
+            }
+        };
+        let tree = |root: &Path| {
+            files_under(root)
+                .into_iter()
+                .map(|(path, bytes)| {
+                    (
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        normalise(&path, &bytes),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tree(headless_root.path()), tree(frame_root.path()));
+    }
+
+    /// TASK-050.01: the preview's counts are the run's own numbers, not a re-derivation of them
+    /// -- on the fragmented fixture with its heard-at-once pair, what `Preview::one_speaker`
+    /// promises is what the run reports once it has run.
+    #[test]
+    fn the_assertion_preview_counts_match_the_run_s_override_report() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_fragmented_session(&paths, "20260809-052600");
+        heard_at_once(&session, 0, 1);
+
+        let clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
+        let unknown = unknown_labels(
+            clusters
+                .clusters
+                .iter()
+                .map(|c| (c.id, c.first_spoke_seconds)),
+        );
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        let assigned =
+            SpeakerNames::read_or_empty(&session, &SessionId::parse("20260809-052600").unwrap())
+                .unwrap();
+        let preview = Preview::new(
+            &clusters.clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            &clusters.clusters[0],
+            Enrolment::default(),
+            None,
+            &[],
+        );
+        let assertion = preview.one_speaker("Grace").unwrap();
+
+        let mut interviewer = Scripted::answering(Vec::new());
+        let (report, output) = run_asserting(
+            &paths,
+            &["20260809-052600"],
+            Some("Grace"),
+            &mut interviewer,
+        );
+
+        assert_eq!(assertion.voices, report.asserted);
+        assert_eq!(assertion.vetoes_overridden, report.vetoes_overridden);
+        assert!(output.contains("4 voice(s) will read as Grace"));
+        assert!(output.contains("1 veto(s) overridden"));
+    }
+
+    /// The frame door's interrupt rule, TASK-050.01 acceptance criterion #4: the fact lands in
+    /// `session.json` before the first commit on this door too, so a failure between the two
+    /// leaves a state that explains itself -- the assertion present, no partial labels -- and
+    /// a re-run converges.
+    #[test]
+    fn an_interrupt_after_the_frame_door_fact_leaves_the_assertion_and_a_rerun_converges() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+
+        // The frame door writes the fact after the answer comes back, so the database goes
+        // unwritable at the moment the answer is given: the fact (an existing file rewritten in
+        // place) still lands, and the first commit, which creates `speakers.json`, cannot.
+        let mut interviewer = UnwritableAfterFact(root.path().to_path_buf());
+        let mut out = Vec::new();
+        let interrupted = run_enroll(
+            &paths,
+            &[SessionId::parse("20260809-052600").unwrap()],
+            EnrollRules {
+                selector: None,
+                offer: Offer::default(),
+                sessions: Sessions::Unresolved,
+                enrolment: Enrolment::default(),
+                one_speaker: None,
+                template: &TranscriptTemplate::resolve(&paths, None).unwrap(),
+            },
+            &mut interviewer,
+            &mut Lines::new(&mut out),
+        );
+        assert!(
+            interrupted.is_err(),
+            "the failed commit must surface as an error"
+        );
+
+        // Survivors: the fact is on disk; nothing was written into the label stores; the
+        // transcript still shows the unknowns.
+        let metadata = SessionMetadata::read(&session.session_json()).unwrap();
+        assert_eq!(metadata.one_remote_speaker.as_deref(), Some("Grace"));
+        assert!(!session.speaker_names_json().exists());
+        assert!(!paths.speakers_json().exists());
+        let first_transcript = transcript_of(&session);
+        let before = said(&first_transcript);
+        assert!(
+            before.iter().any(|(who, _, _)| *who == "Unknown 1"),
+            "no label may have moved before the first commit: {before:?}"
+        );
+
+        // A re-run through the same door converges: the fact is already there, so the switch
+        // skips the write and commits every voice against it.
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut rerun = Scripted::answering(vec![Answer::OneSpeaker("Grace".to_string())]);
+        let (report, output) = run(&paths, &["20260809-052600"], &mut rerun);
+        assert_eq!(report.asserted, 2, "{output}");
+        let second_transcript = transcript_of(&session);
+        let after = said(&second_transcript);
+        assert!(
+            after
+                .iter()
+                .all(|(who, _, _)| *who == "Grace" || *who == SPEAKER_YOU),
+            "the re-run must complete what the interrupt left behind: {after:?}\n{output}"
+        );
+    }
+
+    /// The frame door's answer, with the database made unwritable the moment it is given: the
+    /// fact lands and the first commit fails, exactly as the headless flag's interrupt test
+    /// arranges it for its own door.
+    struct UnwritableAfterFact(PathBuf);
+
+    impl Interviewer for UnwritableAfterFact {
+        fn identify(&mut self, _voice: &Voice<'_>) -> Answer {
+            std::fs::set_permissions(self.0.as_path(), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            Answer::OneSpeaker("Grace".to_string())
+        }
     }
 }

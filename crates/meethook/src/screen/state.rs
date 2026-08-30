@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use meethook_enroll::{
-    Answer, MeetingLabel, Position, Queued, Refusal, Resolution, Scan, Snippet, resolve,
+    Answer, Assertion, MeetingLabel, Position, Queued, Refusal, Resolution, Scan, Snippet, resolve,
 };
 use meethook_session::SessionId;
 use meethook_transcribe::{Attribution, Resemblance};
@@ -116,6 +116,17 @@ pub enum Event {
     /// the same reflex as the harmless one. It is what makes the cost pane load-bearing: the
     /// frame prints which voice pays and what it loses before this key exists to be pressed.
     Anyway,
+    /// Assert that the session's speaker track is one person, named with the highlighted
+    /// candidate, and answer every voice in it with that name.
+    ///
+    /// Its own key because it is a different *scope* from every other answer here: `Choose` and
+    /// `Anyway` decide one voice, `Skip` passes one over, and this one decides the whole session
+    /// at once, outranking the queue and its gates alike -- a heard-at-once veto included, which
+    /// is the refusal no answer overrides. The frame previews both numbers that decision carries
+    /// -- how many voices it names, how many vetoes it overrides -- in the consequence pane
+    /// before the key exists to be pressed, and the run it reaches is the same loop the headless
+    /// flag reaches: one commit loop, two doors into it.
+    Assert,
     /// Answer with the typed text as somebody new. Its own key, never the fallback for
     /// unrecognised text.
     NewPerson,
@@ -150,14 +161,19 @@ pub struct Cost {
     pub refusal: Option<Refusal>,
     /// What choosing it would write, as the lines to show under the candidate list.
     pub summary: Vec<String>,
+    /// What asserting one remote speaker with this name would do to the session -- the two
+    /// numbers the commit reports -- or `None` where there is nothing to preview. The frame's
+    /// door into the same run the headless flag has: [`Event::Assert`] answers with
+    /// [`Answer::OneSpeaker`], and this is what the pane shows before the key is pressed.
+    pub assertion: Option<Assertion>,
 }
 
 /// What answering with a name would do -- asked, never written.
 ///
 /// A trait rather than a `Preview` because `Consequence`'s two state fields are crate-visible to
 /// `meethook-enroll`: a `Consequence` cannot be constructed from this crate at all, so anything
-/// taking one would be untestable here. `Refusal` is fully public, which is what makes [`Cost`]
-/// constructible in a test.
+/// taking one would be untestable here. `Refusal` and `Assertion` are fully public, which is
+/// what makes [`Cost`] constructible in a test.
 pub trait Costs {
     fn of(&self, name: &str) -> Cost;
 }
@@ -346,6 +362,10 @@ pub struct View<'a> {
     pub candidate: Option<usize>,
     /// What choosing the highlighted candidate would do.
     pub consequence: Vec<String>,
+    /// What asserting one remote speaker with the highlighted name would do to the session, or
+    /// `None` when there is no highlighted candidate: the pane's assertion line reads these two
+    /// numbers off the same [`Assertion`](meethook_enroll::Assertion) the commit reports from.
+    pub assertion: Option<Assertion>,
     /// Who the highlighted candidate already is, across the sessions the scan could read. Owned
     /// like [`View::rows`] and [`View::candidates`] are, so the pane borrows nothing from the
     /// snapshot the shell is free to replace between frames.
@@ -571,6 +591,21 @@ impl Screen {
                 self.decided.insert(view.number.to_string(), Mark::Answered);
                 return Step::Answered(Answer::Named { name, anyway: true });
             }
+            Event::Assert => {
+                let Some((name, _)) = self.chosen(view, costs) else {
+                    // No highlighted candidate is nothing to assert with: the run would
+                    // normalise the same text away, so there is no answer to give it.
+                    return Step::Waiting;
+                };
+                // Refusal-blind on purpose, and the one key that says so in its own right:
+                // the assertion outranks the queue and its gates alike, a heard-at-once veto
+                // included, which is exactly what the cost pane's assertion line previews --
+                // how many voices it names and how many vetoes it overrides. Choosing the
+                // voice *this question* is about is refused beside this; naming the whole
+                // track is not, because it never asks about any of them.
+                self.decided.insert(view.number.to_string(), Mark::Answered);
+                return Step::Answered(Answer::OneSpeaker(name));
+            }
             Event::NewPerson => {
                 let typed = self.filter.trim();
                 if typed.is_empty() {
@@ -675,9 +710,12 @@ impl Screen {
         let highlighted = names.get(self.candidate).cloned();
         // One `Costs::of`, and only for the row under the highlight -- which is what AC #9 is
         // about and why the refusals below are read out of the memo rather than asked for per row.
-        let consequence = match &highlighted {
-            Some(name) => self.cost(name, costs).summary.clone(),
-            None => Vec::new(),
+        let (consequence, assertion) = match &highlighted {
+            Some(name) => {
+                let cost = self.cost(name, costs);
+                (cost.summary.clone(), cost.assertion)
+            }
+            None => (Vec::new(), None),
         };
         let candidates = names
             .iter()
@@ -703,6 +741,7 @@ impl Screen {
             candidate: (!candidates.is_empty()).then_some(self.candidate),
             candidates,
             consequence,
+            assertion,
             who: who(context, highlighted.as_deref()),
             snippets: view.snippets,
             snippet: self.selected_index(view),
@@ -763,7 +802,8 @@ pub(crate) mod tests {
     use std::cell::Cell;
 
     use meethook_enroll::{
-        Answer, Enrolled, Position, Queued, Reference, Scan, Snippet, Unreadable, VoiceChange,
+        Answer, Assertion, Enrolled, Position, Queued, Reference, Scan, Snippet, Unreadable,
+        VoiceChange,
     };
     use meethook_session::SessionId;
     use meethook_transcribe::{Attribution, Resemblance};
@@ -778,6 +818,7 @@ pub(crate) mod tests {
             Cost {
                 refusal: None,
                 summary: Vec::new(),
+                assertion: None,
             }
         }
     }
@@ -792,6 +833,27 @@ pub(crate) mod tests {
                     holder: Some("Unknown 2".to_string()),
                 }),
                 summary: vec![format!("would name this voice {name}")],
+                assertion: None,
+            }
+        }
+    }
+
+    /// [`Vetoes`]'s counterpart where the same row also previews an assertion: the refusal is
+    /// about naming *this* voice, and the assertion is about the whole track, so both facts must
+    /// be able to sit in one view at once.
+    struct VetoesAsserting(&'static str);
+
+    impl Costs for VetoesAsserting {
+        fn of(&self, name: &str) -> Cost {
+            Cost {
+                refusal: (name == self.0).then(|| meethook_enroll::Refusal::Vetoed {
+                    holder: Some("Unknown 2".to_string()),
+                }),
+                summary: vec![format!("would name this voice {name}")],
+                assertion: Some(Assertion {
+                    voices: 3,
+                    vetoes_overridden: 1,
+                }),
             }
         }
     }
@@ -809,6 +871,7 @@ pub(crate) mod tests {
                     losing: "Bob".to_string(),
                 }),
                 summary: vec![format!("would name this voice {name}")],
+                assertion: None,
             }
         }
     }
@@ -823,6 +886,7 @@ pub(crate) mod tests {
             Cost {
                 refusal: None,
                 summary: vec![format!("would name this voice {name}")],
+                assertion: None,
             }
         }
     }
@@ -1285,6 +1349,131 @@ pub(crate) mod tests {
                 holder: Some("Unknown 2".to_string())
             })
         );
+    }
+
+    /// TASK-050.01 acceptance criterion #3: the key answers with the highlighted candidate and
+    /// marks the voice answered -- which is what keeps the pass loop from asking it again once
+    /// the run has moved on to committing the rest of the track.
+    #[test]
+    fn asserting_answers_with_the_highlighted_candidate_and_marks_the_voice_answered() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false)]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.91, 1)]);
+        let enrolled = ["Grace"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        assert_eq!(
+            screen.answer(&voice, Event::Assert, &Free),
+            Step::Answered(Answer::OneSpeaker("Grace".to_string()))
+        );
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert_eq!(derived.rows[0].mark, Some(Mark::Answered));
+    }
+
+    /// A filter that resolves to nobody is not an assertion either: there is no highlighted
+    /// candidate left to assert with, so the key gives nothing back -- the same rule Enter lives
+    /// under, and the one that keeps a stray-keystroke press from answering with text the run
+    /// would refuse.
+    #[test]
+    fn an_assertion_with_no_candidate_left_is_not_an_answer() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false)]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.91, 1)]);
+        let enrolled = ["Grace"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        for c in "zzz".chars() {
+            screen.answer(&voice, Event::Filter(c), &Free);
+        }
+
+        assert_eq!(screen.answer(&voice, Event::Assert, &Free), Step::Waiting);
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert_eq!(derived.assertion, None);
+    }
+
+    /// TASK-050.01 acceptance criterion #5, the frame half: on a row the veto refuses, Enter
+    /// still does nothing -- but the assertion goes through, because it never asks about this
+    /// voice at all. Both facts sit in the same view: the refusal beside the row, and the
+    /// preview of what the assertion will do.
+    #[test]
+    fn a_vetoed_candidate_still_answers_the_whole_track_by_its_own_key() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false)]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Milo", 0.71, 3)]);
+        let enrolled = ["Milo"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let vetoes = VetoesAsserting("Milo");
+
+        assert_eq!(screen.answer(&voice, Event::Choose, &vetoes), Step::Waiting);
+        assert_eq!(
+            screen.answer(&voice, Event::Assert, &vetoes),
+            Step::Answered(Answer::OneSpeaker("Milo".to_string()))
+        );
+        let derived = screen.view(&voice, &vetoes, Context::Reading);
+        assert_eq!(
+            derived.candidates[0].refusal,
+            Some(meethook_enroll::Refusal::Vetoed {
+                holder: Some("Unknown 2".to_string())
+            })
+        );
+        assert_eq!(
+            derived.assertion,
+            Some(Assertion {
+                voices: 3,
+                vetoes_overridden: 1
+            })
+        );
+    }
+
+    /// With no candidates at all there is nothing to assert with: the key leaves the frame
+    /// waiting, and the view carries no assertion line for a pane to print.
+    #[test]
+    fn an_unhighlighted_frame_leaves_nothing_to_assert() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false)]);
+        let queue = queue(&owned);
+        let voice = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        assert_eq!(screen.answer(&voice, Event::Assert, &Free), Step::Waiting);
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert_eq!(derived.assertion, None);
     }
 
     /// A candidate refused for taking a name off another voice can still be answered with -- by

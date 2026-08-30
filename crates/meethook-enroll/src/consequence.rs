@@ -41,7 +41,7 @@
 use std::collections::BTreeMap;
 
 use meethook_session::{Displaced, EnrolledSpeakers, SpeakerCluster, SpeakerNames, Stored};
-use meethook_transcribe::Attribution;
+use meethook_transcribe::{Attribution, heard_at_once};
 
 use crate::{Enrolment, REFERENCE_FLOOR_SECONDS, effective_labels};
 
@@ -63,10 +63,15 @@ pub struct Preview<'a> {
     /// honour the same labelling: a preview that did not see the assertion could show a veto
     /// the commit would override, and disagree with the transcript it predicts.
     one_remote_speaker: Option<&'a str>,
+    /// The clusters this run has already committed, in commit order -- which is the walk
+    /// order, since a cluster is committed as the walk reaches it. Consumed only by
+    /// [`Preview::one_speaker`], which must promise the commits the run will still make rather
+    /// than the ones it has made; [`Preview::of`] ignores it.
+    committed: &'a [&'a SpeakerCluster],
 }
 
 impl<'a> Preview<'a> {
-    /// The seven things a dry run of one answer needs, and nothing else.
+    /// The eight things a dry run of one answer needs, and nothing else.
     ///
     /// `speakers` and `assigned` are the two files a name can land in, borrowed rather than
     /// cloned here: the clone happens per [`Preview::of`] call, since a preview that held its
@@ -75,6 +80,7 @@ impl<'a> Preview<'a> {
     /// `one_remote_speaker` is the session-level fact [`effective_labels`] applies above all
     /// the rest of the rule; passing it is what keeps a preview built during an assertion run
     /// from predicting a refusal the assertion overrides.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         clusters: &'a [SpeakerCluster],
         unknown: &'a BTreeMap<u32, String>,
@@ -83,6 +89,7 @@ impl<'a> Preview<'a> {
         cluster: &'a SpeakerCluster,
         enrolment: Enrolment,
         one_remote_speaker: Option<&'a str>,
+        committed: &'a [&'a SpeakerCluster],
     ) -> Preview<'a> {
         Preview {
             clusters,
@@ -92,6 +99,7 @@ impl<'a> Preview<'a> {
             cluster,
             enrolment,
             one_remote_speaker,
+            committed,
         }
     }
 
@@ -204,6 +212,83 @@ impl<'a> Preview<'a> {
             assigned: candidate_assigned,
         })
     }
+
+    /// What asserting that the session's speaker track is one person called `name` would do to
+    /// the voices this run has not named yet, without writing anything.
+    ///
+    /// Session-level rather than voice-level on purpose: the assertion outranks the queue and
+    /// its gates alike, so it is about every cluster in the session at once, and this ignores
+    /// the voice the question happens to be about entirely.
+    ///
+    /// `None` for a name that is not one -- empty, or whitespace only -- the same
+    /// normalisation [`Preview::of`] applies, so a stray-keystroke press previews nothing and
+    /// answers nothing.
+    ///
+    /// Cheap enough to ask per highlighted candidate: no clone, no labelling -- one sort and
+    /// an overlap check per uncommitted pair. Deliberately no reference prediction: predicting
+    /// what the database would hold means simulating the store-and-cap trajectory across the
+    /// walk, which is the store's logic reached a second time, and the existing summary note
+    /// reports the references post-hoc in the same log pane seconds later.
+    pub fn one_speaker(&self, name: &str) -> Option<Assertion> {
+        if name.trim().is_empty() {
+            return None;
+        }
+
+        // The summary line reports how many voices the assertion names, which is exactly the
+        // commits the run makes under it: every cluster not already committed, below the
+        // prompt floor included, each through its own commit. A mid-run assertion must not
+        // promise to re-name the voices whose rows already stand.
+        let voices = self.clusters.len() - self.committed.len();
+
+        // The override report, simulated rather than counted statically: the run walks the
+        // clusters in first-appearance order starting from whatever it has already committed,
+        // and reports a veto for a cluster iff it was heard at once with one already holding
+        // the name. Walking the same order from the same starting set, with the same
+        // predicate, is the counter itself -- a static "has an overlap partner" count would
+        // drift from it in asymmetric orders and after mid-run naming.
+        let mut order: Vec<&SpeakerCluster> = self.clusters.iter().collect();
+        order.sort_by(|a, b| {
+            a.first_spoke_seconds
+                .total_cmp(&b.first_spoke_seconds)
+                .then(a.id.cmp(&b.id))
+        });
+        let mut seen: Vec<&SpeakerCluster> = self.committed.to_vec();
+        let mut vetoes_overridden = 0;
+        for cluster in order {
+            if self.committed.iter().any(|done| done.id == cluster.id) {
+                continue;
+            }
+            if seen.iter().any(|seen| heard_at_once(cluster, seen)) {
+                vetoes_overridden += 1;
+            }
+            seen.push(cluster);
+        }
+
+        Some(Assertion {
+            voices,
+            vetoes_overridden,
+        })
+    }
+}
+
+/// What asserting one remote speaker would do to the session, as the two numbers the commit
+/// reports.
+///
+/// Fully public and owned rather than borrowed, for the reason [`Refusal`] made the frame's
+/// cost type testable across the seam: the state machine carries this into its view, and a
+/// test there must be able to construct it.
+///
+/// Both fields are what the run's own report says once the assertion has run -- the voices it
+/// named and the vetoes it overrode -- computed the way the run computes them rather than
+/// re-derived, which is what keeps a preview and a write from drifting apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Assertion {
+    /// How many voices the assertion would name: every cluster this run has not committed,
+    /// below the prompt floor included.
+    pub voices: usize,
+    /// How many heard-at-once vetoes the assertion would override on the way, each of which
+    /// the run reports as overridden rather than refused.
+    pub vetoes_overridden: usize,
 }
 
 /// Everything answering one voice with one name would do.
@@ -459,6 +544,7 @@ mod tests {
             &clusters[0],
             enrolment,
             one_remote_speaker,
+            &[],
         )
     }
 
@@ -710,6 +796,7 @@ mod tests {
             &clusters[1],
             Enrolment::default(),
             None,
+            &[],
         )
         .of("Alice")
         .unwrap();
@@ -746,6 +833,7 @@ mod tests {
             &clusters[1],
             Enrolment::default(),
             Some("Alice"),
+            &[],
         );
 
         let consequence = preview.of("Alice").unwrap();
@@ -761,6 +849,146 @@ mod tests {
         );
         assert_eq!(after[&0].label(), "Alice");
         assert_eq!(after[&1].label(), "Alice");
+    }
+
+    /// A name of nothing but spaces previews nothing, the same normalisation `of` applies --
+    /// which is what keeps a stray-keystroke press from previewing an assertion it will not
+    /// answer.
+    #[test]
+    fn an_assertion_of_nothing_but_whitespace_previews_nothing() {
+        let clusters = vec![cluster(0, voice(0), 40.0)];
+        let unknown = numbering(&clusters);
+        let speakers = enrolled(&[]);
+        let assigned = no_names();
+        let preview = preview_of(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            Enrolment::default(),
+        );
+
+        for blank in ["", "   ", "\t\n"] {
+            assert!(preview.one_speaker(blank).is_none(), "{blank:?}");
+        }
+        assert_eq!(
+            preview.one_speaker("Grace"),
+            Some(Assertion {
+                voices: 1,
+                vetoes_overridden: 0
+            })
+        );
+    }
+
+    /// The counts on a fragmented fixture with a heard-at-once pair: every voice, below the
+    /// prompt floor included, is counted in `voices`, and the pair contributes exactly the one
+    /// override the run's own counter reports -- the earlier partner holds the name, the later
+    /// one is the one overridden.
+    #[test]
+    fn an_assertion_counts_every_uncommitted_voice_and_the_pair_contributes_one_override() {
+        let mut clusters = vec![
+            cluster(0, nearly(0.0), 40.0),
+            cluster(1, nearly(20.0), 1.5),
+            cluster(2, nearly(40.0), 0.9),
+            cluster(3, nearly(60.0), 2.0),
+        ];
+        clusters[0].heard_at_once_with = vec![1];
+        clusters[1].heard_at_once_with = vec![0];
+        let unknown = numbering(&clusters);
+        let speakers = enrolled(&[]);
+        let assigned = no_names();
+        let preview = preview_of(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            Enrolment::default(),
+        );
+
+        // All four voices, the two below-floor fragments among them: the assertion reaches the
+        // quiet ones alike, and each of them gets its own commit.
+        assert_eq!(
+            preview.one_speaker("Grace"),
+            Some(Assertion {
+                voices: 4,
+                vetoes_overridden: 1
+            })
+        );
+    }
+
+    /// A mid-run assertion: the voice this run has already committed is out of both counts, and
+    /// the committed set seeds the override walk -- the pair's uncommitted partner is still
+    /// reported as overridden against a holder whose row already stands.
+    #[test]
+    fn an_assertion_mid_run_excludes_committed_voices_from_both_counts() {
+        let mut clusters = vec![
+            cluster(0, nearly(0.0), 40.0),
+            cluster(1, nearly(20.0), 40.0),
+            cluster(2, nearly(40.0), 40.0),
+        ];
+        clusters[0].heard_at_once_with = vec![1];
+        clusters[1].heard_at_once_with = vec![0];
+        let unknown = numbering(&clusters);
+        let speakers = enrolled(&[]);
+        let assigned = no_names();
+        let done = &clusters[0];
+        let preview = Preview::new(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            &clusters[1],
+            Enrolment::default(),
+            None,
+            std::slice::from_ref(&done),
+        );
+
+        assert_eq!(
+            preview.one_speaker("Grace"),
+            Some(Assertion {
+                voices: 2,
+                vetoes_overridden: 1
+            })
+        );
+    }
+
+    /// The committed set is not walk-order-dependent: a voice committed out of first-appearance
+    /// order -- a targeted answer landed on a later voice first -- still overrides the veto of
+    /// an earlier partner, because the run checks every committed holder rather than only the
+    /// ones walked so far.
+    #[test]
+    fn an_assertion_checks_every_committed_holder_not_only_the_earlier_walked_ones() {
+        let mut clusters = vec![
+            cluster(0, nearly(0.0), 40.0),
+            cluster(1, nearly(20.0), 40.0),
+            cluster(2, nearly(40.0), 40.0),
+        ];
+        clusters[0].heard_at_once_with = vec![2];
+        clusters[2].heard_at_once_with = vec![0];
+        let unknown = numbering(&clusters);
+        let speakers = enrolled(&[]);
+        let assigned = no_names();
+        // Cluster 2 speaks last but was committed first: the walk reaches cluster 0 before it,
+        // and the override must still be counted.
+        let done = &clusters[2];
+        let preview = Preview::new(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            &clusters[0],
+            Enrolment::default(),
+            None,
+            std::slice::from_ref(&done),
+        );
+
+        assert_eq!(
+            preview.one_speaker("Grace"),
+            Some(Assertion {
+                voices: 2,
+                vetoes_overridden: 1
+            })
+        );
     }
 
     /// The other refusal: the answer would take a name off a voice the user was not asked

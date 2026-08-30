@@ -498,12 +498,13 @@ impl Interface {
 /// A function beside [`wait`] and [`event`], for the same reason: a rule about which of the
 /// answers costs a re-scan is then decidable in `cargo test` with no terminal in front of it.
 ///
-/// A name is the only answer that writes to `speakers.json`; the others write nothing at all.
-/// A `Named` can still be refused by the veto and write nothing either, so this over-triggers --
-/// deliberately, because an extra background scan nobody waits for is cheaper than a wrong number
-/// on the screen.
+/// Names are the only answers that write to `speakers.json`; the others write nothing at all. An
+/// assertion writes every voice in the session at once, so it rewrites too. A `Named` can still
+/// be refused by the veto and write nothing either, so this over-triggers -- deliberately,
+/// because an extra background scan nobody waits for is cheaper than a wrong number on the
+/// screen.
 fn rewrites(answer: &Answer) -> bool {
-    matches!(answer, Answer::Named { .. })
+    matches!(answer, Answer::Named { .. } | Answer::OneSpeaker(_))
 }
 
 /// What a candidate costs, off the run's own dry run.
@@ -517,12 +518,17 @@ impl Costs for Preview<'_> {
             Some(consequence) => Cost {
                 refusal: consequence.refused.clone(),
                 summary: would(&consequence),
+                // The other door into the run, previewed beside the first: the same text, held
+                // up to the whole session rather than to this voice. `None` for a whitespace
+                // name falls through to the arm below, as it should.
+                assertion: Preview::one_speaker(self, name),
             },
             // A name of nothing but spaces, which is a skip rather than an answer. Nothing is
-            // refused and nothing would be written.
+            // refused, nothing would be written, and there is nothing to assert with either.
             None => Cost {
                 refusal: None,
                 summary: vec!["a name of nothing but spaces writes nothing".to_string()],
+                assertion: None,
             },
         }
     }
@@ -618,6 +624,14 @@ fn line_to_play(selected: Option<(usize, Snippet<'_>)>) -> Result<(usize, &[f32]
 /// pairs them by accident too; and not Ctrl-E or Ctrl-K, since `e` is beside `s` and `k` beside
 /// both `l` and `o`.
 ///
+/// Ctrl-A ("a for assert") names the whole session's speaker track as one person at once, with
+/// the highlighted candidate. Its own key because its *scope* outranks every other answer here:
+/// Enter and Ctrl-O decide one voice, and this decides the session, overriding the heard-at-once
+/// veto -- the refusal no answer overrides -- which is exactly what the consequence pane previews
+/// before the key exists to be pressed. The slot was held open for it: the filter guard below
+/// excludes control characters precisely so a terminal reporting Ctrl-A as `Char('\u{1}')` cannot
+/// type into the filter, and this is what that exclusion was reserved for.
+///
 /// A free function taking a `KeyEvent` because a `KeyEvent` is constructible without a terminal,
 /// which is what makes this whole rule testable -- and it is where a stray Ctrl or a paste-shaped
 /// burst of characters would otherwise go wrong.
@@ -636,6 +650,7 @@ fn event(key: KeyEvent) -> Option<Event> {
         (KeyCode::Char('s'), true) => Some(Event::Skip),
         (KeyCode::Char('g'), true) => Some(Event::Leave),
         (KeyCode::Char('o'), true) => Some(Event::Anyway),
+        (KeyCode::Char('a'), true) => Some(Event::Assert),
         (KeyCode::Up, false) => Some(Event::Up),
         (KeyCode::Down, false) => Some(Event::Down),
         (KeyCode::Right, false) => Some(Event::Select),
@@ -754,6 +769,7 @@ mod tests {
             (KeyCode::Char('s'), KeyModifiers::CONTROL, Event::Skip),
             (KeyCode::Char('g'), KeyModifiers::CONTROL, Event::Leave),
             (KeyCode::Char('o'), KeyModifiers::CONTROL, Event::Anyway),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL, Event::Assert),
             (KeyCode::Char('a'), KeyModifiers::NONE, Event::Filter('a')),
             (KeyCode::Char(' '), KeyModifiers::NONE, Event::Filter(' ')),
             // The non-regression that matters for a new letter key: without the modifier it is
@@ -930,7 +946,7 @@ mod tests {
         assert_eq!(event(key(KeyCode::F(5), KeyModifiers::NONE)), None);
         assert_eq!(event(key(KeyCode::Left, KeyModifiers::NONE)), None);
         assert_eq!(
-            event(key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            event(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
             None,
             "an unbound control key must not type into the filter"
         );

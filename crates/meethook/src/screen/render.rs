@@ -22,7 +22,7 @@
 //! [`incomplete`] or `run_speakers`' own wording, so the frame and
 //! `meethook speakers` cannot come to describe one scan differently.
 
-use meethook_enroll::{Refusal, Resolution, incomplete, speech};
+use meethook_enroll::{Assertion, Refusal, Resolution, incomplete, speech};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
@@ -343,7 +343,7 @@ fn consequence(frame: &mut Frame, area: Rect, view: &View<'_>) {
     let highlighted = view
         .highlighted()
         .and_then(|candidate| candidate.refusal.as_ref());
-    let (title, lines): (&str, Vec<Line>) = match (highlighted, view.consequence.is_empty()) {
+    let (title, mut lines): (&str, Vec<Line>) = match (highlighted, view.consequence.is_empty()) {
         (Some(refusal), _) => (" cannot ", vec![Line::from(refused(refusal))]),
         (None, true) => (
             " would ",
@@ -357,12 +357,30 @@ fn consequence(frame: &mut Frame, area: Rect, view: &View<'_>) {
                 .collect(),
         ),
     };
+    // What asserting one remote speaker would do to the *session*, previewed beside what
+    // choosing would do to the *voice*: the two numbers the commit reports, off the same
+    // [`Assertion`]. Present on a refused row too -- Enter cannot work there, but the
+    // assertion can, and both facts sit in the pane.
+    if let (Some(assertion), Some(candidate)) = (view.assertion, view.highlighted()) {
+        lines.push(Line::from(assert_line(&candidate.name, &assertion)));
+    }
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
+}
+
+/// The pane's assertion line, in the run's own labelling: the same "voice(s)" and "veto(s)
+/// overridden" the summary note prints once the assertion has run, so a preview and its write
+/// cannot disagree about what they counted.
+fn assert_line(name: &str, assertion: &Assertion) -> String {
+    format!(
+        "^A asserts one remote speaker: {voices} voice(s) will read as {name}, {vetoes} veto(s) overridden",
+        voices = assertion.voices,
+        vetoes = assertion.vetoes_overridden,
+    )
 }
 
 /// Who the highlighted candidate already is: how many recordings of them the database holds, and
@@ -587,7 +605,7 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sound
             };
             format!(
                 "up/down voice  right work on it  tab candidate  {choose}  \
-                 ^N new  {clip}{line}  ^S skip  ^G leave  ^C quit"
+                 ^A assert  ^N new  {clip}{line}  ^S skip  ^G leave  ^C quit"
             )
         }
     };
@@ -598,7 +616,7 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sound
 mod tests {
     use std::time::Duration;
 
-    use meethook_enroll::{MeetingLabel, Position, Queued, Refusal};
+    use meethook_enroll::{Assertion, MeetingLabel, Position, Queued, Refusal};
     use meethook_session::{MeetingFit, SessionId};
     use meethook_transcribe::{Attribution, Resemblance};
     use ratatui::Terminal;
@@ -617,6 +635,24 @@ mod tests {
             Cost {
                 refusal: None,
                 summary: vec![format!("would enrol {name} from this voice")],
+                assertion: None,
+            }
+        }
+    }
+
+    /// [`Free`]'s counterpart where the highlighted candidate also previews an assertion: the
+    /// pane must show what asserting would do beside what choosing would do.
+    struct Asserts;
+
+    impl Costs for Asserts {
+        fn of(&self, name: &str) -> Cost {
+            Cost {
+                refusal: None,
+                summary: vec![format!("would enrol {name} from this voice")],
+                assertion: Some(Assertion {
+                    voices: 4,
+                    vetoes_overridden: 1,
+                }),
             }
         }
     }
@@ -630,6 +666,7 @@ mod tests {
                     holder: Some("Unknown 2".to_string()),
                 }),
                 summary: Vec::new(),
+                assertion: None,
             }
         }
     }
@@ -646,6 +683,7 @@ mod tests {
                     losing: "Bob".to_string(),
                 }),
                 summary: Vec::new(),
+                assertion: None,
             }
         }
     }
@@ -871,11 +909,12 @@ mod tests {
     /// mid-clip, and it reads as its own scope beside the two it sits between -- skip one voice,
     /// leave this session, quit the run.
     ///
-    /// Painted at 120 columns, as the candidate-and-cost tests are: the key list is past 100 and
-    /// a narrower frame is measuring truncation rather than the footer's wording.
+    /// Painted at 130 columns, as the candidate-and-cost tests are: the key list is past 120 now
+    /// that it advertises the assertion key too, and a narrower frame is measuring truncation
+    /// rather than the footer's wording.
     #[test]
     fn the_footer_names_the_key_that_leaves_the_session() {
-        let idle = painted(120, 30, &Free, &[]).join("\n");
+        let idle = painted(130, 30, &Free, &[]).join("\n");
         assert!(idle.contains("^S skip  ^G leave  ^C quit"), "{idle}");
 
         let sounding = Some(Sounding {
@@ -886,7 +925,7 @@ mod tests {
             line: None,
         });
         let playing = painted_with(
-            120,
+            130,
             30,
             &Free,
             &[],
@@ -901,6 +940,50 @@ mod tests {
             playing.contains("^S skip  ^G leave  ^C quit"),
             "leaving is as meaningful with a clip sounding as skipping is\n{playing}"
         );
+    }
+
+    /// TASK-050.01 acceptance criterion #2, the footer half: the assertion key is advertised,
+    /// beside the two answer keys it sits between -- choose one voice, or name the whole track.
+    #[test]
+    fn the_footer_advertises_the_assertion_key() {
+        let idle = painted(130, 30, &Free, &[]).join("\n");
+        assert!(idle.contains("enter choose  ^A assert  ^N new"), "{idle}");
+    }
+
+    /// TASK-050.01 acceptance criterion #2, the pane half: what asserting would do is previewed
+    /// in the consequence pane, reading its numbers off the same [`Assertion`] the commit
+    /// reports from -- how many voices it names and how many vetoes it overrides, in the run's
+    /// own labelling for both.
+    ///
+    /// Painted at 200 columns so the line does not wrap: the claim is about the wording, and a
+    /// wrap would split the sentence the assertion is pinned by.
+    #[test]
+    fn the_consequence_pane_previews_what_an_assertion_would_do() {
+        let painted = painted(200, 30, &Asserts, &[]);
+        let whole = painted.join("\n");
+        assert!(
+            whole.contains("would enrol Milo from this voice"),
+            "{whole}"
+        );
+        assert!(
+            whole.contains(
+                "^A asserts one remote speaker: 4 voice(s) will read as Milo, 1 veto(s) overridden"
+            ),
+            "{whole}"
+        );
+    }
+
+    /// The byte-identical half of the preview: with nothing to assert, the pane shows exactly
+    /// what it showed before the key existed -- no assertion line, no trace of one.
+    #[test]
+    fn an_absent_assertion_changes_nothing_in_the_pane() {
+        let painted = painted(200, 30, &Free, &[]);
+        let whole = painted.join("\n");
+        assert!(
+            whole.contains("would enrol Milo from this voice"),
+            "{whole}"
+        );
+        assert!(!whole.contains("asserts one remote speaker"), "{whole}");
     }
 
     /// The footer's precedence, both ways round: a live clip is the only one of the three that
