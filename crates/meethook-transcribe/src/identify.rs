@@ -302,8 +302,8 @@ pub fn identify_clusters(
 ///
 /// Public because `meethook-enroll` reports the same relation when the one-remote-speaker
 /// assertion overrides it: one reading of the on-disk contract rather than two, since two
-/// readings could disagree about which pairs count as an overlap. [`crate::attribution`]
-/// applies the exclusion to hand-given names and shares this rather than restating it, since
+/// readings could disagree about which pairs count as an overlap.
+/// [`attributions`](crate::attributions) applies the exclusion to hand-given names and shares this rather than restating it, since
 /// two readings of one relation could disagree.
 pub fn heard_at_once(a: &SpeakerCluster, b: &SpeakerCluster) -> bool {
     a.heard_at_once_with.contains(&b.id) || b.heard_at_once_with.contains(&a.id)
