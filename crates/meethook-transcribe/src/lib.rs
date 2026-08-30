@@ -38,6 +38,7 @@ pub mod mixdown;
 mod onnx;
 mod progress;
 mod reference;
+mod reference_policies;
 mod segmentation;
 mod speakers;
 mod timeline;
@@ -75,15 +76,17 @@ pub use reference::{
     Decline, DeclinedPoint, FragmentProbe, ORIGIN_DISTANCE, Sampling, StoredReference, Sweep,
     SweepPoint, Verdict, fragment_probe, reference_duration_sweep, stored_reference_distances,
 };
+pub use reference_policies::{
+    ArmReport, ClosedSet, Misattribution, PolicyItem, PolicyReport, PolicySweep, PolicyVerdict,
+    ReferencePolicy, policy_references, policy_sweep,
+};
 pub use segmentation::{LocalTurn, segment_speaker_track};
 pub use speakers::{
     ADOPTION_DISTANCE, Clustering, MERGE_DISTANCE, SPEAKER_FLOOR_SECONDS, cluster_speaker_turns,
 };
 pub use timeline::{mic_offset_seconds, speaker_offset_seconds};
 pub use trials::{
-    ArmReport, ClosedSet, EqualError, Misattribution, PolicyItem, PolicyReport, PolicySweep,
-    PolicyVerdict, ReferencePolicy, Spread, Trial, TrialReport, ZeroFalseAccept, policy_references,
-    policy_sweep, score_trials, wilson_interval,
+    EqualError, Spread, Trial, TrialReport, ZeroFalseAccept, score_trials, wilson_interval,
 };
 pub use vad::{SileroVad, SpeechRegion, VadTuning};
 pub use voice_vectors::{GroupDistance, group_distance};
