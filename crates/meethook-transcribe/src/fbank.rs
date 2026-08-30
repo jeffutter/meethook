@@ -165,15 +165,15 @@ impl Default for Fbank {
 /// Subtracts each of the 80 dimensions' mean over the `frames` rows of `features`.
 fn subtract_mean_over_time(features: &mut [f32], frames: usize) {
     let mut means = [0.0f32; MEL_BINS];
-    for row in features.chunks_exact(MEL_BINS) {
-        for (m, v) in means.iter_mut().zip(row) {
+    for row in features.as_chunks::<MEL_BINS>().0 {
+        for (m, v) in means.iter_mut().zip(*row) {
             *m += v;
         }
     }
     for m in &mut means {
         *m /= frames as f32;
     }
-    for row in features.chunks_exact_mut(MEL_BINS) {
+    for row in features.as_chunks_mut::<MEL_BINS>().0 {
         for (v, m) in row.iter_mut().zip(&means) {
             *v -= m;
         }
@@ -268,10 +268,8 @@ mod tests {
         let (samples, frames, bins) = (word(0), word(1), word(2));
         assert_eq!(bins, MEL_BINS);
 
-        let floats: Vec<f32> = REFERENCE[20..]
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-            .collect();
+        let (chunks, _remainder) = REFERENCE[20..].as_chunks::<4>();
+        let floats: Vec<f32> = chunks.iter().map(|b| f32::from_le_bytes(*b)).collect();
         assert_eq!(floats.len(), samples + frames * bins);
         let (audio, features) = floats.split_at(samples);
         (audio.to_vec(), frames, features.to_vec())

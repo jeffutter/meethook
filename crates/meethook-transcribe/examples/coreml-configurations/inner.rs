@@ -1,5 +1,5 @@
 //! The macOS body of the `coreml-configurations` example; see the sibling
-//! `coreml-configurations.rs` for what the tool does and why it exists here at all.
+//! `main.rs` for what the tool does and why it exists here at all.
 //!
 //! A module rather than an inline `#[cfg]` on the example itself because an example crate
 //! must still define `main` off macOS, and `#![cfg(...)]` would leave none behind.
