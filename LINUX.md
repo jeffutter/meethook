@@ -22,7 +22,8 @@ come along:
 
 The flake defines an `x86_64-linux` devShell alongside the macOS one. It carries
 the whole toolchain -- Rust (with clippy/rustfmt/rust-analyzer), cmake, pkg-config,
-onnxruntime, meson, ninja, clang, plus lefthook, cargo-audit and cargo-outdated --
+onnxruntime, meson, ninja, clang, plus lefthook, cargo-nextest, cargo-audit and
+cargo-outdated --
 and sets the two environment variables the build needs (`LIBCLANG_PATH` for
 bindgen, `LD_LIBRARY_PATH` for the onnxruntime and libstdc++ shared libraries,
 which `nix develop` would otherwise leave unset). Entering the shell also runs
@@ -30,7 +31,7 @@ which `nix develop` would otherwise leave unset). Entering the shell also runs
 
 ```sh
 nix develop
-cargo test --all-features --workspace
+cargo nextest run --all-features --workspace
 cargo run -p meethook -- transcribe --help
 ```
 
@@ -44,6 +45,7 @@ The same requirements, by hand:
 | Need | Why |
 | --- | --- |
 | A recent Rust toolchain + `clippy`, `rustfmt` | the repo gates are `-D warnings` |
+| `cargo-nextest` (e.g. `cargo binstall cargo-nextest`) | the pre-push test gate runs the suite through it |
 | `cmake` and a C/C++ toolchain | whisper.cpp compiles from source |
 | `meson`, `ninja`, `clang` | off macOS the `webrtc-audio-processing` crate builds AEC3 from source, and its `meson.build` hard-codes `clang` as the compiler |
 | `libclang` on `LIBCLANG_PATH` | bindgen invokes libclang directly, outside any cc wrapper |
@@ -57,7 +59,7 @@ Then the usual:
 
 ```sh
 cargo build --workspace
-cargo test --all-features --workspace
+cargo nextest run --all-features --workspace
 cargo run -p meethook -- transcribe [SESSION_ID]...
 ```
 

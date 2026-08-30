@@ -60,6 +60,10 @@
               pkgs.lefthook
               pkgs.cargo-audit
               pkgs.cargo-outdated
+              # The pre-push test gate runs the suite through nextest, which
+              # isolates each test binary and reports failures without the
+              # panic-aborts the rest of the suite that cargo test does.
+              pkgs.cargo-nextest
             ];
 
             # whisper.cpp pins an old CMake policy minimum; without this every

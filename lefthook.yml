@@ -1,7 +1,8 @@
 # Git hooks for meethook. Entering the devShell runs `lefthook install`, so a fresh
 # clone is gated without a manual setup step.
 #
-# Every command here resolves `cargo`/`rustfmt`/`lefthook` from the devShell PATH. A
+# Every command here resolves `cargo`/`nextest`/`rustfmt`/`lefthook` from the devShell
+# PATH. A
 # commit made from a shell where direnv is not active fails with command-not-found
 # rather than a lint error; that is accepted for this repo, which ships a committed
 # .envrc.
@@ -59,7 +60,10 @@ pre-push:
       run: cargo clippy --all-targets --all-features --workspace -- -D warnings
     test:
       priority: 3
-      run: cargo test --all-features --workspace
+      # nextest, not cargo test: it runs each test binary in isolation, so one
+      # panicking test cannot abort the rest of the suite, and the failure report
+      # lists every failed test instead of stopping at the first.
+      run: cargo nextest run --all-features --workspace
     doc:
       priority: 4
       env:
@@ -76,7 +80,7 @@ pre-push:
         cd crates/meethook-record &&
         cargo fmt --all --check &&
         cargo clippy --all-targets --workspace -- -D warnings &&
-        cargo test --workspace
+        cargo nextest run --workspace
     audit:
       priority: 6
       # Default DB location ($CARGO_HOME/advisory-db, fetched on each run) is deliberate.
