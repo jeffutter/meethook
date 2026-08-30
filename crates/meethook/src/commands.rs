@@ -720,6 +720,11 @@ impl DownloadProgress {
 pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Result<()> {
     let requested = parse_session_ids(&args.session_ids)?;
     let template = TranscriptTemplate::resolve(paths, template)?;
+    // The read-only faces take over before any answerer is chosen: neither prompts nor opens
+    // a frame, and neither prints the run summary below -- stdout carries only their document.
+    if args.list || args.dry_run {
+        return crate::headless::run(paths, &requested, args, &template);
+    }
     // Which answerer this run has, by the rule in `answerer`. Decided here and passed in so that
     // this function's only remaining job is the summary below -- which has to print with nothing
     // of `ask`'s still holding the screen.
@@ -783,30 +788,25 @@ pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Resu
     Ok(())
 }
 
-/// Runs the questions and returns what they came to, with nothing on the screen afterwards.
+/// How a run is configured, off the flags alone: the one place that reads each flag into the
+/// rules bundle, so the ordinary run and the read-only ones cannot configure the same flags
+/// differently.
 ///
-/// Split out of [`enroll`] rather than inlined for one reason: the full-screen answerer holds the
-/// terminal for as long as it is alive, and the run summary has to land on the restored screen
-/// below the narration. A function boundary is what makes that ordering structural -- the frame
-/// cannot outlive this call -- instead of a `drop` somebody has to remember not to move.
-fn ask(
-    paths: &Paths,
-    requested: &[SessionId],
-    args: &EnrollArgs,
-    template: &TranscriptTemplate,
-    chosen: Answerer,
-) -> Result<meethook_enroll::EnrollReport> {
+/// `screen` is the frame's self-widening: it asks about every voice and every named one for its
+/// queue pane, so `Offer` is widened for it rather than for `--all`/`--correct`. The read-only
+/// paths pass `false` -- the frame is not among their answerers.
+pub(crate) fn enroll_rules<'a>(
+    args: &'a EnrollArgs,
+    screen: bool,
+    template: &'a TranscriptTemplate,
+) -> EnrollRules<'a> {
     // Unlike a session id there is nothing to validate about a `--voice`: a selector that matches
     // nothing is answered against the session's actual voices, which is a better message than
     // anything this edge could produce without having read them. `--at` is the other way round --
     // a malformed timestamp has nothing to be compared against -- so clap has already parsed it.
     let selector = args.voice.as_deref().map(VoiceSelector::from);
-    // The frame navigates rather than being fed a queue, so it takes every voice the session has
-    // and decides for itself which to show; `--all` and `--correct` are how the *line* prompt
-    // widens what it is offered, and AC #2 is that the frame needs neither.
-    let screen = chosen == Answerer::Screen;
-    let rules = EnrollRules {
-        selector: match (&selector, args.at) {
+    EnrollRules {
+        selector: match (selector, args.at) {
             (Some(selector), _) => Some(Selection::Voice(selector)),
             (None, Some(at)) => Some(Selection::At(at)),
             (None, None) => None,
@@ -833,12 +833,34 @@ fn ask(
         } else {
             Enrolment::AboveTheFloor
         },
+        // Every run this function serves may write answers, so every one of them brings a stale
+        // transcript in line first; the read-only faces decline it where they take over.
+        relabel_transcript: true,
         // The CLI refuses this flag alongside any selector or up-front name (see the flag), so
         // none of them can be set beside it: the assertion stands in for the queue and its
         // gates alike, and composing it with a selector would give every voice two answers.
         one_speaker: args.one_speaker.as_deref(),
         template,
-    };
+    }
+}
+
+/// Runs the questions and returns what they came to, with nothing on the screen afterwards.
+///
+/// Split out of [`enroll`] rather than inlined for one reason: the full-screen answerer holds the
+/// terminal for as long as it is alive, and the run summary has to land on the restored screen
+/// below the narration. A function boundary is what makes that ordering structural -- the frame
+/// cannot outlive this call -- instead of a `drop` somebody has to remember not to move.
+fn ask(
+    paths: &Paths,
+    requested: &[SessionId],
+    args: &EnrollArgs,
+    template: &TranscriptTemplate,
+    chosen: Answerer,
+) -> Result<meethook_enroll::EnrollReport> {
+    // The frame navigates rather than being fed a queue, so it takes every voice the session has
+    // and decides for itself which to show; `--all` and `--correct` are how the *line* prompt
+    // widens what it is offered, and AC #2 is that the frame needs neither.
+    let rules = enroll_rules(args, chosen == Answerer::Screen, template);
 
     // Prompt-free by construction: the assertion names every voice without asking about any,
     // so the full-screen interface has nothing to show -- and a scripted driver must reach the

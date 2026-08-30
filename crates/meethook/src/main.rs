@@ -7,6 +7,7 @@
 //! talks to [`meethook_session`] and to nothing else.
 
 mod commands;
+mod headless;
 mod screen;
 
 use std::path::PathBuf;
@@ -336,6 +337,35 @@ pub struct EnrollArgs {
         conflicts_with_all = ["voice", "at", "name"]
     )]
     one_speaker: Option<String>,
+
+    /// Report every voice this run would offer, each with the enrolled speakers it resembles
+    /// ranked nearest first -- and write nothing
+    ///
+    /// The read-only half of enrolment, for deciding before answering: which voices are
+    /// unresolved, how much each said, and who each sounds like. Honours the session ids,
+    /// --voice/--at, --all and --correct exactly as a real run does; writes no file on any
+    /// path, and needs no terminal. A scripted driver reads this to decide what --dry-run
+    /// should then ask about.
+    #[arg(long, conflicts_with_all = ["name", "one_speaker"])]
+    list: bool,
+
+    /// Work out what answering the selected voice with --name would do, without doing it
+    ///
+    /// Runs the answer through the same dry run the full-screen interface shows before a
+    /// choice is made -- the refusal the heard-at-once veto or another voice would make, what
+    /// speakers.json would record, who would lose a reference -- and prints it instead of
+    /// writing anything. Needs --name, and a voice to put it on: --voice or --at beside
+    /// exactly one session id, like a plain named run.
+    #[arg(long, requires = "name", conflicts_with = "one_speaker")]
+    dry_run: bool,
+
+    /// Print the result of --list or --dry-run as a versioned JSON document instead of lines
+    ///
+    /// One pretty-printed object on stdout, tagged with its schema (meethook.enroll.list.v1,
+    /// meethook.enroll.dry-run.v1): fields may be added without a tag bump, meaning changes
+    /// take the next .vN. Run commentary still goes to stderr, so stdout stays pipeable.
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() -> Result<()> {
@@ -715,5 +745,82 @@ mod tests {
                 "--one-speaker beside {other:?} was not refused: {message}"
             );
         }
+    }
+
+    /// The read-only faces refuse to share a run with an answer: `--list` beside a name would
+    /// report and act in one invocation, and either beside `--one-speaker` would give the
+    /// assertion two doors into it. Each pairing is refused at the edge.
+    #[test]
+    fn the_read_only_flags_refuse_to_share_a_run_with_an_answer() {
+        for other in [
+            &[
+                "meethook",
+                "enroll",
+                "20260809-052600",
+                "--list",
+                "--name",
+                "Alice",
+            ],
+            &[
+                "meethook",
+                "enroll",
+                "20260809-052600",
+                "--list",
+                "--one-speaker",
+                "Grace",
+            ],
+            &[
+                "meethook",
+                "enroll",
+                "20260809-052600",
+                "--dry-run",
+                "--one-speaker",
+                "Grace",
+            ],
+        ] {
+            let message = refused(other);
+            assert!(
+                message.contains("--list") || message.contains("--dry-run"),
+                "{message}"
+            );
+        }
+
+        // `--dry-run` previews an answer, so it needs the answer itself; without `--name`
+        // there is nothing to preview.
+        let message = refused(&[
+            "meethook",
+            "enroll",
+            "20260809-052600",
+            "--voice",
+            "2",
+            "--dry-run",
+        ]);
+        assert!(
+            message.contains("--dry-run") && message.contains("--name"),
+            "{message}"
+        );
+
+        // And each flag alone parses with what it does need: `--list` stands on its own, and
+        // `--dry-run` with a selector and a name.
+        let args = enroll_args(&["meethook", "enroll", "20260809-052600", "--list"]);
+        assert!(args.list);
+        let args = enroll_args(&[
+            "meethook",
+            "enroll",
+            "20260809-052600",
+            "--voice",
+            "2",
+            "--dry-run",
+            "--name",
+            "Alice",
+        ]);
+        assert!(args.dry_run);
+        assert_eq!(args.name.as_deref(), Some("Alice"));
+
+        // `--json` alone is refused later, where the pairing can be checked against both of
+        // its companions at once; at the edge it parses, like any output-shape flag.
+        let args = enroll_args(&["meethook", "enroll", "20260809-052600", "--json"]);
+        assert!(args.json);
+        assert!(!args.list && !args.dry_run);
     }
 }

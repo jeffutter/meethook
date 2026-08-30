@@ -92,6 +92,7 @@ mod resolve;
 use consequence::handle;
 pub use consequence::{Assertion, Consequence, Preview, Refusal};
 pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
+pub use meethook_session::Stored;
 pub use meeting::{Labelled, MeetingChoice, MeetingSource, Relabelling, run_meeting};
 pub use narration::{
     AnswerNote, Lines, Narrator, Nearest, NotSelected, Note, PassedOver, RunNote, SessionFile,
@@ -841,10 +842,10 @@ impl std::fmt::Display for VoiceSelector {
 /// arm resolves *through* is different -- a label is compared against the session's voices, a
 /// timestamp is looked up in its transcript -- but everything downstream of the resolution is
 /// the same one voice, which is why this changes nothing about what an answer writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Selection<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
     /// `--voice`: the label the voice reads as. See [`VoiceSelector`].
-    Voice(&'a VoiceSelector),
+    Voice(VoiceSelector),
 
     /// `--at`: the moment the voice was speaking at, in the `MM:SS` spelling `transcript.md`
     /// prints. Resolved through [`meethook_session::Transcript::voice_at`], which owns the rule
@@ -852,7 +853,7 @@ pub enum Selection<'a> {
     At(TranscriptTime),
 }
 
-impl Selection<'_> {
+impl Selection {
     /// The flag this arrived on, so a message about the request names what the user typed.
     fn flag(&self) -> &'static str {
         match self {
@@ -962,12 +963,12 @@ pub enum Enrolment {
 /// There is no `Default`: [`template`](Self::template) has no sensible one. What a caller with
 /// no opinion wants is [`TranscriptTemplate::resolve`] with no explicit path, which is a
 /// fallible read of the root rather than a constant.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EnrollRules<'a> {
     /// `Some` replaces the queue with one voice, however the user pointed at it; `None` is the
     /// queue. Not a fourth flag on [`Offer`], because it does not widen the queue -- it stands
     /// in for it.
-    pub selector: Option<Selection<'a>>,
+    pub selector: Option<Selection>,
 
     /// Which voices get asked about. Changes the questions and nothing else: the same answers
     /// write the same files however a voice came to be offered.
@@ -976,6 +977,15 @@ pub struct EnrollRules<'a> {
     /// Which sessions get visited -- the separate question [`Sessions`] describes. Ignored when
     /// `selector` is `Some`, which stands in for the queue and its gates alike.
     pub sessions: Sessions,
+
+    /// Whether a stale `transcript.md` is brought in line before the first question.
+    ///
+    /// Every run that may write answers does it: a label left stale by an earlier session's
+    /// answer would otherwise survive every later pass-over, since such a session is opened
+    /// only to be passed over. The read-only faces (`--list`, `--dry-run`) set it off: they
+    /// promise the root exactly as found, and a query must not be a writer however small the
+    /// write.
+    pub relabel_transcript: bool,
 
     /// What an accepted name writes -- the other axis, and the only one that changes that.
     pub enrolment: Enrolment,
@@ -1103,8 +1113,8 @@ pub fn run_enroll(
     // rule already lives -- a requested id that is not on disk is printed and counted below --
     // and because one enforcement point cannot disagree with itself. Refused before anything is
     // discovered: a run that cannot say which session it is about has nothing to read.
-    if let Some(selection) = rules.selector
-        && requested.len() != 1
+    if requested.len() != 1
+        && let Some(selection) = rules.selector.clone()
     {
         notes.note(Note::Run(RunNote::SelectionNeedsOneSession { selection }))?;
         report.failed += 1;
@@ -1182,7 +1192,7 @@ pub fn run_enroll(
         match enroll_session(
             paths,
             session,
-            rules,
+            rules.clone(),
             &mut speakers,
             interviewer,
             notes,
@@ -1353,7 +1363,7 @@ fn enroll_session(
     // voice in the session, and each commit relabels the transcript through the assertion,
     // so a stale label cannot outlive the run the way it can in a session that gets passed
     // over.
-    if assertion.is_none() && relabel(&mut transcript, &shown) {
+    if assertion.is_none() && rules.relabel_transcript && relabel(&mut transcript, &shown) {
         transcript.write(
             &session.paths,
             rules.template,
@@ -1385,12 +1395,12 @@ fn enroll_session(
         // queue is the session itself rather than a filtered view of it.
         Some(order.to_vec())
     } else {
-        match rules.selector {
+        match &rules.selector {
             Some(Selection::Voice(selector)) => {
                 targeted(selector, &order, &unknown, &shown, session, notes, report)?
             }
             Some(Selection::At(at)) => at_timestamp(
-                at,
+                *at,
                 &transcript,
                 &order,
                 &unknown,
@@ -2985,7 +2995,7 @@ mod tests {
         run_over(
             paths,
             ids,
-            Some(Selection::Voice(&selector)),
+            Some(Selection::Voice(selector)),
             Offer::default(),
             // Irrelevant beside a selector, which stands in for the queue and its gates alike.
             Sessions::default(),
@@ -3023,7 +3033,7 @@ mod tests {
     fn run_over(
         paths: &Paths,
         ids: &[&str],
-        selection: Option<Selection<'_>>,
+        selection: Option<Selection>,
         offer: Offer,
         sessions: Sessions,
         enrolment: Enrolment,
@@ -3040,6 +3050,7 @@ mod tests {
                 offer,
                 sessions,
                 enrolment,
+                relabel_transcript: true,
                 one_speaker: None,
                 // Resolved from the root, exactly as the CLI does, so a test that puts a
                 // template there is testing the path a user takes.
@@ -5341,7 +5352,7 @@ mod tests {
             &paths,
             // `--voice` needs the one session it is about, exactly as the CLI insists.
             &["20260809-052600"],
-            Some(Selection::Voice(&selector)),
+            Some(Selection::Voice(selector)),
             Offer::default(),
             Sessions::default(),
             Enrolment::default(),
@@ -5473,6 +5484,7 @@ mod tests {
                 offer: Offer::default(),
                 sessions: Sessions::default(),
                 enrolment: Enrolment::default(),
+                relabel_transcript: true,
                 one_speaker: None,
                 template: &TranscriptTemplate::builtin(),
             },
@@ -6089,7 +6101,7 @@ mod tests {
         let (report, output) = run_over(
             &forced_paths,
             &["20260809-052600"],
-            Some(Selection::Voice(&second)),
+            Some(Selection::Voice(second)),
             Offer::default(),
             Sessions::default(),
             Enrolment::Always,
@@ -7599,6 +7611,7 @@ mod tests {
                 sessions: Sessions::Unresolved,
                 enrolment: Enrolment::default(),
                 one_speaker: name,
+                relabel_transcript: true,
                 template: &TranscriptTemplate::resolve(paths, None).unwrap(),
             },
             interviewer,
@@ -8169,6 +8182,7 @@ mod tests {
                 sessions: Sessions::Unresolved,
                 enrolment: Enrolment::default(),
                 one_speaker: None,
+                relabel_transcript: true,
                 template: &TranscriptTemplate::resolve(&paths, None).unwrap(),
             },
             &mut interviewer,

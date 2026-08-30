@@ -82,7 +82,7 @@ pub enum RunNote<'a> {
     /// `--voice` or `--at` was passed with anything other than exactly one session id.
     SelectionNeedsOneSession {
         /// Which of the two flags it arrived on, which is also why one id and not several.
-        selection: Selection<'a>,
+        selection: Selection,
     },
 
     /// `--name` was passed with no `--at` and no `--voice`, so the name has no voice to land on.

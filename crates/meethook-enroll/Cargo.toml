@@ -17,6 +17,7 @@ meethook-session = { workspace = true }
 meethook-transcribe = { workspace = true }
 
 hound = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 # `meeting` prints when a calendar event ran, in the machine's own zone, and takes the instant

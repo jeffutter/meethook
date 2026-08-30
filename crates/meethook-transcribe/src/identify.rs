@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 
 use meethook_session::{EnrolledSpeakers, SpeakerCluster};
+use serde::Serialize;
 
 /// How far apart a meeting's voice and an enrolled reference may be and still be one person.
 ///
@@ -161,7 +162,7 @@ pub struct Identification {
 /// existence is the claim that this cluster is this person. This is an observation with no
 /// decision in it: one row of a ranked list a person is being shown so that *they* can decide.
 /// See [`rank_enrolled`] for why the list is not cut anywhere.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Resemblance {
     /// The enrolled name, exactly as `speakers.json` spells it, so answering with it stores
     /// another reference against the person already there rather than creating a near-duplicate.

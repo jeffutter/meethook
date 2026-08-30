@@ -8,12 +8,13 @@
 //!
 //! `narration.rs` in `meethook-enroll` tells an interface not to invent sentences, and it is
 //! right: moving a sentence into the thing that displays it moves it out of `cargo test`. The
-//! refusal line below is the exception, and it is worth naming why. `Lines` renders what a run
-//! *did* -- past tense, prefixed with a session id -- and there is no `Note` for a dry run.
-//! Inventing one would put "what would happen" into a type documented as "one thing a run has to
-//! say". So the consequence lines come off [`Consequence`](meethook_enroll::Consequence) in
-//! `super` (the only place able to read it) and the refusal sentence comes off the fully public
-//! [`Refusal`] here.
+//! consequence and refusal lines are the exception, and it is worth naming why. `Lines`
+//! renders what a run *did* -- past tense, prefixed with a session id -- and there is no `Note`
+//! for a dry run. Inventing one would put "what would happen" into a type documented as "one
+//! thing a run has to say". So the consequence lines come off
+//! [`Consequence::would_do`](meethook_enroll::Consequence) in `super` (the only place able to
+//! read a `Consequence`) and the refusal sentence comes off the fully public
+//! [`Refusal::sentence`] here.
 //!
 //! The other exception is the "and N more session(s)" line in [`who`], which is layout rather than
 //! domain prose -- how much of a list fits in a pane is not a fact about enrolment -- but it is
@@ -299,24 +300,6 @@ fn candidate_line(candidate: &Candidate) -> Line<'static> {
     }
 }
 
-/// Why a candidate cannot be chosen. Off the public [`Refusal`], for the reason the module doc
-/// gives.
-fn refused(refusal: &Refusal) -> String {
-    match refusal {
-        Refusal::Vetoed {
-            holder: Some(voice),
-        } => format!(
-            "unavailable: {voice} was heard at the same time as this voice and would keep the name"
-        ),
-        Refusal::Vetoed { holder: None } => {
-            "unavailable: the name would not end up on this voice".to_string()
-        }
-        Refusal::Taken { voice, losing } => {
-            format!("unavailable: {voice} would stop reading {losing}")
-        }
-    }
-}
-
 /// The create-somebody entry, which reads differently when nobody enrolled is plausible but is
 /// the same entry either way.
 fn new_person(view: &View<'_>) -> Vec<Span<'static>> {
@@ -344,7 +327,7 @@ fn consequence(frame: &mut Frame, area: Rect, view: &View<'_>) {
         .highlighted()
         .and_then(|candidate| candidate.refusal.as_ref());
     let (title, mut lines): (&str, Vec<Line>) = match (highlighted, view.consequence.is_empty()) {
-        (Some(refusal), _) => (" cannot ", vec![Line::from(refused(refusal))]),
+        (Some(refusal), _) => (" cannot ", vec![Line::from(refusal.sentence())]),
         (None, true) => (
             " would ",
             vec![Line::from(Span::raw("(nothing highlighted)").dim())],

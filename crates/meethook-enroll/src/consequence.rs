@@ -42,6 +42,7 @@ use std::collections::BTreeMap;
 
 use meethook_session::{Displaced, EnrolledSpeakers, SpeakerCluster, SpeakerNames, Stored};
 use meethook_transcribe::{Attribution, heard_at_once};
+use serde::Serialize;
 
 use crate::{Enrolment, REFERENCE_FLOOR_SECONDS, effective_labels};
 
@@ -362,6 +363,66 @@ impl Consequence {
     pub fn session_only(&self) -> bool {
         self.stored.is_none() || matches!(self.stored, Some(Stored::AtCapacity { .. }))
     }
+
+    /// What answering would do, as the sentences an interface shows before the answer is
+    /// given -- or after it, for the ones that print outcomes rather than preview them.
+    ///
+    /// The mapping from [`Consequence::stored`] plus [`session_only`](Self::session_only)
+    /// to a sentence, stated here once so no caller restates it: the frame's "would" pane
+    /// and the headless dry-run print are two readers of the same fact, and a second copy of
+    /// this mapping is exactly what this module's doc forbids.
+    pub fn would_do(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        match &self.stored {
+            Some(Stored::Enrolled) => lines.push("enrols them, from this voice".to_string()),
+            Some(Stored::Added { held }) => {
+                lines.push(format!("stores another recording of them, {held} in all"));
+            }
+            Some(Stored::AlreadyHeld) => {
+                lines.push("stores nothing new: they already hold this recording".to_string());
+            }
+            Some(Stored::Replaced {
+                held,
+                evicted_seconds,
+            }) => lines.push(format!(
+                "stores this recording in place of their shortest, {}, {held} in all",
+                crate::speech(*evicted_seconds)
+            )),
+            Some(Stored::AtCapacity { held, .. }) => lines.push(format!(
+                "stores nothing: they hold {held} recordings and none is shorter than this voice"
+            )),
+            None => {}
+        }
+        if self.session_only() {
+            lines.push("names this voice in this session only, storing no reference".to_string());
+        }
+        for Displaced { name, remaining } in &self.displaced {
+            lines.push(format!(
+                "takes a recording off {name}, leaving them {remaining}"
+            ));
+        }
+        for name in &self.stale {
+            lines.push(format!(
+                "leaves a recording of this voice standing under {name}"
+            ));
+        }
+        lines
+    }
+
+    /// What an interface tells somebody who proposed this answer: the one sentence saying why
+    /// it will not be honoured, or -- when it will be -- the [`would_do`](Self::would_do)
+    /// lines.
+    ///
+    /// The refusal wins over the would-do lines because a refused answer writes nothing, so
+    /// those lines would describe a world that does not come to pass: the frame shows the
+    /// refusal alone for the same reason, and the headless dry-run print must not disagree
+    /// with it. Stated here rather than at each caller, beside the mapping it guards.
+    pub fn outcome_lines(&self) -> Vec<String> {
+        if let Some(refusal) = &self.refused {
+            return vec![refusal.sentence()];
+        }
+        self.would_do()
+    }
 }
 
 /// What honouring an answer would have taken away from a voice the user was not asked about.
@@ -370,7 +431,7 @@ impl Consequence {
 /// because that is the one handle which reaches a voice whatever it is called and is exactly
 /// what [`crate::VoiceSelector`] accepts -- so a refusal is a line the user can act on rather
 /// than only read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Refusal {
     /// The answered voice would not have ended up with the name at all: the heard-at-once veto
     /// refuses to put one name on two voices segmentation proved are different people, and
@@ -385,6 +446,30 @@ pub enum Refusal {
     /// The answer would have moved a name off another voice: `voice` is the voice, `losing` is
     /// the name it reads now and would not read afterwards.
     Taken { voice: String, losing: String },
+}
+
+impl Refusal {
+    /// Why this candidate cannot be chosen, as the one sentence an interface shows instead of
+    /// a consequence.
+    ///
+    /// Stated here beside [`Consequence::would_do`] for the same reason: the frame's "cannot"
+    /// pane and the headless dry-run print read the same fact through the same words.
+    pub fn sentence(&self) -> String {
+        match self {
+            Refusal::Vetoed {
+                holder: Some(voice),
+            } => format!(
+                "unavailable: {voice} was heard at the same time as this voice and would keep \
+                 the name"
+            ),
+            Refusal::Vetoed { holder: None } => {
+                "unavailable: the name would not end up on this voice".to_string()
+            }
+            Refusal::Taken { voice, losing } => {
+                format!("unavailable: {voice} would stop reading {losing}")
+            }
+        }
+    }
 }
 
 /// How a voice is named in a refusal line: the "Unknown N" its first appearance earned it.

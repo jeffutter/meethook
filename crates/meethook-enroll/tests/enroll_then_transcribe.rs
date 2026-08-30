@@ -217,6 +217,7 @@ fn enroll_offering(paths: &Paths, offer: Offer, interviewer: &mut dyn Interviewe
                 Sessions::Unresolved
             },
             enrolment: Enrolment::default(),
+            relabel_transcript: true,
             one_speaker: None,
             template: &TranscriptTemplate::resolve(paths, None).unwrap(),
         },

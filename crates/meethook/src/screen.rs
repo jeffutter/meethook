@@ -33,8 +33,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
-use meethook_enroll::{Answer, Consequence, Interviewer, Preview, Scan, Snippet, Voice, speech};
-use meethook_session::{Displaced, Paths, Stored};
+use meethook_enroll::{Answer, Interviewer, Preview, Scan, Snippet, Voice};
+use meethook_session::Paths;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
@@ -509,7 +509,8 @@ fn rewrites(answer: &Answer) -> bool {
 
 /// What a candidate costs, off the run's own dry run.
 ///
-/// The only place in this crate that reads a [`Consequence`], and it has to be here rather than in
+/// The only place in this crate that reads a [`meethook_enroll::Consequence`], and it has to be
+/// here rather than in
 /// [`state`]: `Consequence`'s two state fields are crate-visible to `meethook-enroll`, so one
 /// cannot be constructed from this crate at all and anything taking one would be untestable.
 impl Costs for Preview<'_> {
@@ -517,7 +518,7 @@ impl Costs for Preview<'_> {
         match Preview::of(self, name) {
             Some(consequence) => Cost {
                 refusal: consequence.refused.clone(),
-                summary: would(&consequence),
+                summary: consequence.would_do(),
                 // The other door into the run, previewed beside the first: the same text, held
                 // up to the whole session rather than to this voice. `None` for a whitespace
                 // name falls through to the arm below, as it should.
@@ -532,49 +533,6 @@ impl Costs for Preview<'_> {
             },
         }
     }
-}
-
-/// What answering with one name would do, as the lines the frame shows before it is chosen.
-///
-/// Read off [`Consequence`]'s public fields rather than restating its five outcomes: the mapping
-/// from `stored` plus `session_only()` to a sentence is documented there, and a second copy of it
-/// here is exactly what that module's doc forbids.
-fn would(consequence: &Consequence) -> Vec<String> {
-    let mut lines = Vec::new();
-    match &consequence.stored {
-        Some(Stored::Enrolled) => lines.push("enrols them, from this voice".to_string()),
-        Some(Stored::Added { held }) => {
-            lines.push(format!("stores another recording of them, {held} in all"));
-        }
-        Some(Stored::AlreadyHeld) => {
-            lines.push("stores nothing new: they already hold this recording".to_string());
-        }
-        Some(Stored::Replaced {
-            held,
-            evicted_seconds,
-        }) => lines.push(format!(
-            "stores this recording in place of their shortest, {}, {held} in all",
-            speech(*evicted_seconds)
-        )),
-        Some(Stored::AtCapacity { held, .. }) => lines.push(format!(
-            "stores nothing: they hold {held} recordings and none is shorter than this voice"
-        )),
-        None => {}
-    }
-    if consequence.session_only() {
-        lines.push("names this voice in this session only, storing no reference".to_string());
-    }
-    for Displaced { name, remaining } in &consequence.displaced {
-        lines.push(format!(
-            "takes a recording off {name}, leaving them {remaining}"
-        ));
-    }
-    for name in &consequence.stale {
-        lines.push(format!(
-            "leaves a recording of this voice standing under {name}"
-        ));
-    }
-    lines
 }
 
 /// What the play-the-line key should do about the selection it found: hand these samples over, or

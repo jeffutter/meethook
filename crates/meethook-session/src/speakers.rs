@@ -106,7 +106,7 @@ pub const MAX_REFERENCES_PER_SPEAKER: usize = 10;
 /// Not `Copy`, unlike its first four variants alone: [`Stored::AtCapacity`] carries the
 /// shortest length held so the caller can say *why* the recording was refused, and a future
 /// field that is not a number should not be blocked by a derive nothing needs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Stored {
     /// The first reference for this name: a person who was not in the database is now.
     Enrolled,
@@ -144,7 +144,7 @@ pub enum Stored {
 ///
 /// `remaining` exists because "Nate no longer has a reference" is a lie when Nate has three
 /// and lost one -- and under a reference set that is the usual case rather than the rare one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Displaced {
     pub name: String,
     pub remaining: usize,

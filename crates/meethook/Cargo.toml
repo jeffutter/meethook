@@ -21,6 +21,9 @@ clap = { workspace = true }
 ctrlc = { workspace = true }
 jiff = { workspace = true }
 ratatui = { workspace = true }
+# The headless `--list` / `--dry-run` documents: versioned JSON on stdout for a scripted driver.
+serde = { workspace = true }
+serde_json = { workspace = true }
 # For the scratch directory `enroll` extracts clips into: the player cannot seek, so playing
 # part of a recording means writing that part out first.
 tempfile = { workspace = true }

@@ -845,6 +845,8 @@ dependencies = [
  "meethook-session",
  "meethook-transcribe",
  "ratatui",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -856,6 +858,7 @@ dependencies = [
  "jiff",
  "meethook-session",
  "meethook-transcribe",
+ "serde",
  "tempfile",
  "thiserror",
 ]
