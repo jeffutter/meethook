@@ -85,7 +85,8 @@ use meethook_session::{EnrolledSpeaker, EnrolledSpeakers, SpeakerCluster};
 
 use crate::identify::{IDENTIFY_DISTANCE, identify_clusters};
 use crate::segmentation::LocalTurn;
-use crate::speakers::{Clustering, group_mean};
+use crate::speakers::Clustering;
+use crate::voice_vectors::group_mean;
 
 /// How close a stored reference has to sit to a single turn's embedding before
 /// [`stored_reference_distances`] calls that turn the one it was built from.

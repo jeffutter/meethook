@@ -43,6 +43,7 @@ mod speakers;
 mod timeline;
 mod trials;
 mod vad;
+mod voice_vectors;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -76,8 +77,7 @@ pub use reference::{
 };
 pub use segmentation::{LocalTurn, segment_speaker_track};
 pub use speakers::{
-    ADOPTION_DISTANCE, Clustering, GroupDistance, MERGE_DISTANCE, SPEAKER_FLOOR_SECONDS,
-    cluster_speaker_turns, group_distance,
+    ADOPTION_DISTANCE, Clustering, MERGE_DISTANCE, SPEAKER_FLOOR_SECONDS, cluster_speaker_turns,
 };
 pub use timeline::{mic_offset_seconds, speaker_offset_seconds};
 pub use trials::{
@@ -86,6 +86,7 @@ pub use trials::{
     policy_sweep, score_trials, wilson_interval,
 };
 pub use vad::{SileroVad, SpeechRegion, VadTuning};
+pub use voice_vectors::{GroupDistance, group_distance};
 
 use meethook_session::{
     Classification, CleaningRecord, DiscoveredSession, EnrolledSpeakers, Paths, SessionId,

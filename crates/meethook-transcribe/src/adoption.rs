@@ -96,8 +96,9 @@
 use std::collections::BTreeMap;
 
 use crate::segmentation::LocalTurn;
-use crate::speakers::{Clustering, GroupDistance, group_distance, heard_at_once};
+use crate::speakers::{Clustering, heard_at_once};
 use crate::trials::Trial;
+use crate::voice_vectors::{GroupDistance, group_distance};
 
 /// One side of a measured pair: which cluster it came from, and what it holds.
 #[derive(Debug, Clone, PartialEq)]

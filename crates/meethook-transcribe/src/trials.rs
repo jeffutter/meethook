@@ -50,7 +50,7 @@ use std::collections::BTreeMap;
 use meethook_session::{EnrolledSpeaker, EnrolledSpeakers, SpeakerCluster};
 
 use crate::identify::identify_clusters;
-use crate::speakers::group_mean;
+use crate::voice_vectors::group_mean;
 
 /// One scored pair: two items, and whether they are in fact the same person.
 ///
@@ -395,7 +395,7 @@ pub enum ReferencePolicy {
     /// name. **The number every other arm is reported against.**
     Replace,
 
-    /// `[normalize((a + b) / 2)]`, via `speakers::group_mean` rather than a second
+    /// `[normalize((a + b) / 2)]`, via `voice_vectors::group_mean` rather than a second
     /// implementation of it. One vector, so identification stays a single argmax and
     /// `speakers.json` keeps its shape.
     Average,
@@ -451,7 +451,7 @@ impl ReferencePolicy {
 /// one session is identical across arms" true by construction rather than by a special case.
 ///
 /// Empty when there is nothing to build a reference from: no recordings at all, or a group
-/// whose members exactly cancel, which `speakers::group_mean` declines rather than
+/// whose members exactly cancel, which `voice_vectors::group_mean` declines rather than
 /// normalizing a zero vector into a confident distance of 1.0 to everything. Unreachable for
 /// real voices, trivially reachable in a test, and counted rather than panicked on.
 pub fn policy_references(policy: ReferencePolicy, confirmed: &[&[f32]]) -> Vec<Vec<f32>> {
