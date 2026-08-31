@@ -35,6 +35,7 @@ mod speaker_clusters;
 mod speaker_names;
 mod speakers;
 mod transcript;
+mod transcript_render;
 
 // The header spelling of the tracks named above. A module rather than a flat re-export
 // because its surface is constructors: `wav::create` reads better than `create_wav`.
