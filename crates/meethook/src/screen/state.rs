@@ -364,7 +364,7 @@ pub struct View<'a> {
     pub consequence: Vec<String>,
     /// What asserting one remote speaker with the highlighted name would do to the session, or
     /// `None` when there is no highlighted candidate: the pane's assertion line reads these two
-    /// numbers off the same [`Assertion`](meethook_enroll::Assertion) the commit reports from.
+    /// numbers off the same [`Assertion`] the commit reports from.
     pub assertion: Option<Assertion>,
     /// Who the highlighted candidate already is, across the sessions the scan could read. Owned
     /// like [`View::rows`] and [`View::candidates`] are, so the pane borrows nothing from the

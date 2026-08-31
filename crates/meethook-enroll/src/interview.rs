@@ -12,8 +12,6 @@ use crate::prompt::Voice;
 #[cfg(doc)]
 use crate::queue::{Position, Selection};
 #[cfg(doc)]
-use crate::session::enroll_session;
-#[cfg(doc)]
 use crate::{EnrollRules, Refusal, run_enroll};
 
 /// The meeting a session was recorded during, as far as a terminal may see it.
@@ -142,7 +140,7 @@ pub enum Answer {
     ///
     /// The frame-side half of the one-remote-speaker assertion; the headless half is
     /// [`EnrollRules::one_speaker`], and both reach the same mode inside
-    /// [`enroll_session`], which is what keeps the writes and the report identical however the
+    /// `enroll_session`, which is what keeps the writes and the report identical however the
     /// assertion arrived. Answering it switches the session to assertion mode for the rest of
     /// the run over it: the remaining voices are committed through the fixed-order write path
     /// without being asked, each veto the heard-at-once rule would have raised is reported as

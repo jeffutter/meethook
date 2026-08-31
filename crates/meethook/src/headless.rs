@@ -12,14 +12,14 @@
 //! - `run` with `--dry-run` computes the full consequence of the proposed answer through the
 //!   real preview and reports it.
 //!
-//! Both go through [`run_enroll`](meethook_enroll::run_enroll) with a recording interviewer
+//! Both go through [`run_enroll`] with a recording interviewer
 //! rather than reaching for the session files themselves: the facts then cross the public
-//! [`Interviewer`](meethook_enroll::Interviewer) seam exactly as the interactive frame reads
+//! [`Interviewer`] seam exactly as the interactive frame reads
 //! them, so the headless report cannot drift from what the frame shows.
 //!
 //! # stdout is the document
 //!
-//! Run commentary goes to stderr (the narrator is a [`Lines`](meethook_enroll::Lines) pointed
+//! Run commentary goes to stderr (the narrator is a [`Lines`] pointed
 //! at it); stdout carries only the result, line-oriented by default and a single versioned
 //! JSON document under `--json`. That purity is what makes `meethook enroll --list --json |
 //! jq` work, and it is why the summary the ordinary run prints after `ask` never runs here.
@@ -46,7 +46,7 @@ use crate::EnrollArgs;
 ///
 /// Called from [`crate::commands::enroll`] in place of the answerer choice when `--list` or
 /// `--dry-run` is set, which is also where the two are kept away from every writing path:
-/// this function never reaches [`answerer`](crate::commands::answerer), so neither a terminal
+/// this function never reaches `answerer`, so neither a terminal
 /// nor a pipe changes what happens here.
 pub(crate) fn run(
     paths: &Paths,

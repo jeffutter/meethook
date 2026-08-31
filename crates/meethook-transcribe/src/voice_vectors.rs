@@ -132,7 +132,7 @@ pub(crate) fn group_mean(members: &[&[f32]]) -> Option<(Vec<f32>, f32)> {
 /// The raw arithmetic only -- no length checks, no renormalization, and no
 /// blocked-pair policy. For unit-length inputs the dot product *is* the cosine,
 /// so nothing here re-derives it; callers that substitute infinity for a pair
-/// segmentation heard at once ([`crate::speakers`] does) keep that policy at
+/// segmentation heard at once (`crate::speakers` does) keep that policy at
 /// their own call site rather than folding it into this helper.
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot(a, b)
