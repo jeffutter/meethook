@@ -32,7 +32,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 
 use super::Sounding;
 use super::state::{Candidate, Mark, Row, View, Who};
-use crate::commands::Progress;
+use crate::clips::Progress;
 
 /// Places every pane for one frame.
 ///

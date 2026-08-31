@@ -41,7 +41,7 @@ use ratatui::crossterm::event::{
     Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
 };
 
-use crate::commands::{Clips, Progress};
+use crate::clips::{Clips, Progress};
 use state::{Context, Cost, Costs, Event, Screen, Step, VoiceView};
 
 /// How often a frame with a clip playing redraws itself, and so how fast the position moves and

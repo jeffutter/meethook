@@ -6,6 +6,7 @@
 //! state -- only the on-disk session contract. Subcommands preserve that: everything below
 //! talks to [`meethook_session`] and to nothing else.
 
+mod clips;
 mod commands;
 mod headless;
 mod record;
