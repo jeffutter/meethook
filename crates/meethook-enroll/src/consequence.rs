@@ -207,6 +207,7 @@ impl<'a> Preview<'a> {
             &candidate_assigned.names,
             self.one_remote_speaker,
             forced,
+            None,
         );
 
         // The addition. `None` on the below-floor path, where no reference is stored at all.
@@ -222,6 +223,17 @@ impl<'a> Preview<'a> {
                 // lost: the transcript still reads the right person, and nothing already stored
                 // is dropped for a recording that is no better than it.
                 candidate_assigned.assign(cluster.id, name, cluster.embedding.clone());
+            } else if forced.is_some() {
+                // The group's half of one voice, one record: the declaration stands in *both*
+                // stores, and both say the same thing -- the reference says the name because
+                // the user declared it, and the row says the name for exactly the same reason,
+                // so there is nothing for them to disagree about. Keeping the row is what makes
+                // the decision durable against the heard-at-once exclusion on every later run:
+                // two standing rows of one name on overlapping voices are co-declaration, and
+                // both stand -- demoting one afterwards would undo the declaration and re-prompt
+                // forever. A plain naming still forgets its row below; only a declaration made
+                // with the overlap reported keeps it.
+                candidate_assigned.assign(cluster.id, name, cluster.embedding.clone());
             } else {
                 // One voice, one record. A voice named for this session only and then enrolled
                 // properly -- the same fragment reached again with `--force-reference`, or a
@@ -232,6 +244,10 @@ impl<'a> Preview<'a> {
             Some(stored)
         };
 
+        // The answer is about `self.cluster`, whose own row is what this answer would create
+        // rather than a standing declaration: pending keeps it out of the assignment award's
+        // co-declaration pass, which is what leaves the vetoed demotion for the refusal below
+        // to fire off.
         let after = effective_labels(
             self.clusters,
             self.unknown,
@@ -239,6 +255,7 @@ impl<'a> Preview<'a> {
             &candidate_assigned.names,
             self.one_remote_speaker,
             forced,
+            Some(self.cluster.id),
         );
 
         // A legacy reference that *is* this exact fragment, still standing under somebody
@@ -415,6 +432,7 @@ impl<'a> Preview<'a> {
                     &running_assigned.names,
                     self.one_remote_speaker,
                     Some(&previous_forced),
+                    None,
                 );
                 let overlapped = pre.iter().any(|(&id, label)| {
                     id != member.id
@@ -1189,6 +1207,7 @@ mod tests {
             &consequence.speakers,
             &consequence.assigned.names,
             Some("Alice"),
+            None,
             None,
         );
         assert_eq!(after[&0].label(), "Alice");

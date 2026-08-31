@@ -6113,8 +6113,11 @@ mod tests {
         // Only the loud member stores a reference; the two quiet ones leave the database alone.
         let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
         assert_eq!(speakers.references("Grace"), 1, "{:?}", speakers.speakers);
+        // All three members keep a names-file row -- the declaration stands in both stores for
+        // the above-floor member and in the session alone for the two below it -- so every
+        // later run reads all three as Grace without re-asking.
         let assigned = assigned_in(&session, "20260809-052600");
-        assert_eq!(assigned.names.len(), 2, "{:?}", assigned.names);
+        assert_eq!(assigned.names.len(), 3, "{:?}", assigned.names);
     }
 
     /// Acceptance criterion #2, first half: an interrupt between the group answer and the first

@@ -174,6 +174,7 @@ pub(crate) fn enroll_session(
         &assigned.names,
         assertion.as_deref(),
         None,
+        None,
     );
 
     // The transcript may predate an answer given in an earlier session -- name somebody in
@@ -868,6 +869,7 @@ fn commit_named<'d, 'm>(
             &assigned.names,
             assertion,
             Some(&previous_forced),
+            None,
         );
         let mut overlapped: Vec<String> = Vec::new();
         for (id, label) in pre.iter() {
@@ -960,6 +962,7 @@ fn commit_named<'d, 'm>(
         &assigned.names,
         assertion,
         forced,
+        None,
     );
     if relabel(transcript, &now) {
         transcript.write(
@@ -1156,12 +1159,21 @@ pub(crate) fn effective_labels(
     assigned: &[AssignedName],
     one_remote_speaker: Option<&str>,
     forced: Option<&BTreeMap<u32, String>>,
+    pending: Option<u32>,
 ) -> BTreeMap<u32, Attribution> {
+    // `pending` is the voice an in-progress answer is about: its hand-given row is what the
+    // answer would create rather than a standing declaration, so it earns no co-declaration
+    // pass in the assignment award below -- which is what leaves the vetoed demotion for the
+    // dry run's refusal to fire off. Every other reading passes `None`, where every standing
+    // row stands.
     let identified = identify_clusters(clusters, speakers);
     let mut naming =
         Naming::new(clusters, &identified, assigned).with_one_remote_speaker(one_remote_speaker);
     if let Some(forced) = forced {
         naming = naming.with_forced(forced);
+    }
+    if let Some(pending) = pending {
+        naming = naming.with_pending(pending);
     }
     attributions(unknown, naming)
 }

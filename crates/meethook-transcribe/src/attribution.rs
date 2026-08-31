@@ -152,6 +152,11 @@ pub struct Naming<'a> {
     /// name. An empty map applies no such claim and the rule runs exactly as it always has;
     /// see the module doc for the tier's rank and why its exemption is the point.
     forced: &'a BTreeMap<u32, String>,
+    /// The voice an in-progress answer is about, if any: its hand-given row is what the answer
+    /// would create rather than a standing declaration, so it earns no pass in the assignment
+    /// award below -- which is what leaves the vetoed demotion for the dry run's refusal to fire
+    /// off. `None` on every reading that is not previewing an answer.
+    pending: Option<u32>,
 }
 
 /// Somewhere for [`Naming::nothing`] to point its identification map at.
@@ -172,6 +177,7 @@ impl<'a> Naming<'a> {
             assigned,
             one_remote_speaker: None,
             forced: &NO_FORCED,
+            pending: None,
         }
     }
 
@@ -183,6 +189,7 @@ impl<'a> Naming<'a> {
             assigned: &[],
             one_remote_speaker: None,
             forced: &NO_FORCED,
+            pending: None,
         }
     }
 
@@ -217,6 +224,17 @@ impl<'a> Naming<'a> {
         Naming { forced, ..self }
     }
 
+    /// The same naming while an answer about `pending` is being previewed: that voice's own
+    /// row earns no co-declaration pass in the assignment award, because the row is what the
+    /// answer would write, not a decision already made -- awarding it would hide the cost the
+    /// dry run exists to show. Every other row stands as usual.
+    pub fn with_pending(self, pending: u32) -> Self {
+        Naming {
+            pending: Some(pending),
+            ..self
+        }
+    }
+
     /// The same naming with identification's answers filled in.
     pub fn with_identified(self, identified: &'a BTreeMap<u32, Identification>) -> Self {
         Naming { identified, ..self }
@@ -242,6 +260,16 @@ impl<'a> Naming<'a> {
     /// already holding the name rather than just the first -- and for the reasons argued there.
     /// Ascending id rather than by similarity because an assignment has no similarity to order
     /// by; it is arbitrary, and being arbitrary in a fixed way is what matters.
+    ///
+    /// Two exceptions to the exclusion, and both exist because one name on two overlapping
+    /// voices is otherwise impossible to record at all. **Co-declaration:** two *standing*
+    /// rows of one name on overlapping voices are the user's own group declaration -- made
+    /// together, with the heard-at-once override reported at the moment it was made -- and
+    /// both stand; demoting one of them afterwards would undo a decision the database holds
+    /// and re-prompt forever. **Pending:** the row an in-progress answer would create ([`Naming`
+    /// 's `pending`) earns no such pass -- it is not a decision already made, and awarding it
+    /// here would hide the very cost the dry run exists to show. A forced holder outranks
+    /// both: the tier replaces whatever a row says for its voice.
     fn awarded(&self) -> BTreeMap<u32, String> {
         let mut resolved: BTreeMap<u32, &str> = BTreeMap::new();
         for row in self.assigned {
@@ -266,11 +294,26 @@ impl<'a> Naming<'a> {
         for (id, name) in self.forced {
             awarded.insert(*id, name.clone());
         }
+        // Standing assignment holders only: the pending test below asks whether the row under
+        // preview is contesting a decision already made, and a forced label is not one.
+        let mut standing: BTreeMap<u32, String> = BTreeMap::new();
         for (id, name) in resolved {
-            if self.forced.contains_key(&id) || self.overlaps_a_holder_of(id, name, &awarded) {
+            if self.forced.contains_key(&id) {
+                continue;
+            }
+            let conflicts_forced = self
+                .forced
+                .iter()
+                .any(|(held, held_name)| held_name == name && self.heard_at_once(id, *held));
+            let contests_standing = self.pending == Some(id)
+                && standing
+                    .iter()
+                    .any(|(held, held_name)| held_name == name && self.heard_at_once(id, *held));
+            if conflicts_forced || contests_standing {
                 continue;
             }
             awarded.insert(id, name.to_string());
+            standing.insert(id, name.to_string());
         }
         awarded
     }
@@ -596,13 +639,16 @@ mod tests {
         assert!(map.values().all(|a| !a.is_named()), "{map:?}");
     }
 
-    /// Segmentation heard these two voices overlapping, so they are two people whatever the
-    /// user typed. The lower cluster id keeps the name; the other falls back to its number
-    /// rather than to some other name.
+    /// Two *standing* rows of one name on overlapping voices are the user's group declaration
+    /// -- the only path that writes such a pair reports the heard-at-once override at the moment
+    /// it is made -- so both stand rather than one being demoted afterwards. What the
+    /// exclusion still refuses is the *fresh* answer about one of those voices, which previews
+    /// with itself pending and so earns no pass here.
     #[test]
     fn one_name_cannot_land_on_two_voices_heard_talking_over_each_other() {
         let clusters = vec![cluster(0, vec![1]), cluster(1, vec![0])];
 
+        // Standing: the declaration is already made, and both halves of it stand.
         let map = attributions(
             &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
             Naming::new(
@@ -611,11 +657,34 @@ mod tests {
                 &[assignment(1, "Alex"), assignment(0, "Alex")],
             ),
         );
-
         assert_eq!(
             map[&0],
             Attribution::Assigned {
-                name: "Alex".to_string(),
+                name: "Alex".to_string()
+            }
+        );
+        assert_eq!(
+            map[&1],
+            Attribution::Assigned {
+                name: "Alex".to_string()
+            }
+        );
+
+        // Fresh: an answer about cluster 1 would create its row, not stand on it, so the award
+        // is withheld and the voice falls back to its number -- the cost a refusal shows off.
+        let map = attributions(
+            &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
+            Naming::new(
+                &clusters,
+                &NOBODY,
+                &[assignment(1, "Alex"), assignment(0, "Alex")],
+            )
+            .with_pending(1),
+        );
+        assert_eq!(
+            map[&0],
+            Attribution::Assigned {
+                name: "Alex".to_string()
             }
         );
         assert_eq!(map[&1], Attribution::Unknown("Unknown 2".to_string()));
