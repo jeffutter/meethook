@@ -160,6 +160,35 @@ pub enum Answer {
     /// Trimmed the same way every other name in this file is; a name of nothing but spaces is
     /// treated as the question going unanswered rather than as an entry called "".
     OneSpeaker(String),
+    /// These voices are all one person, named together with `name`: the generalisation of
+    /// [`OneSpeaker`](Self::OneSpeaker) from the whole track to a user-chosen group of it.
+    ///
+    /// `members` are the stable "Unknown N" handles the interface shows in its queue pane --
+    /// the same keys [`Voice::number`] carries across the seam -- so the answer names voices by
+    /// the handle a person reads rather than by a cluster id nobody sees. The commit walks them
+    /// in queue order, the order the transcript reads in, and each member goes through exactly
+    /// the dry run a single naming would: a member whose naming would take a name off a voice
+    /// the user was not answering about is refused for that member only, and the rest still
+    /// apply, which is the difference between a group and a single answer where a refusal writes
+    /// nothing at all.
+    ///
+    /// The group carries veto authority at two or more resolved members: a member heard at once
+    /// with one already holding the name is named anyway and reported as overridden, the way
+    /// the assertion reports its overrides. A one-member group has none -- no forcing at all,
+    /// exactly today's plain naming of that member -- which is the threshold the commit enforces
+    /// too, so a preview and a write cannot see the group differently.
+    ///
+    /// An unresolvable handle goes unanswered rather than partially answered: a group that
+    /// cannot say who its members are is not an answer, and the caller decides that before
+    /// consulting the answerer at all, on the same blank-name precedent a name of nothing but
+    /// spaces reaches.
+    Group {
+        /// Who the group is, trimmed the same way every other name in this file is.
+        name: String,
+
+        /// The "Unknown N" handles the user chose, in whatever order the interface listed them.
+        members: Vec<String>,
+    },
 }
 
 /// Asks a user who one voice is.

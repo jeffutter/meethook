@@ -93,7 +93,7 @@ mod references;
 mod resolve;
 mod session;
 
-pub use consequence::{Assertion, Consequence, Preview, Refusal};
+pub use consequence::{Assertion, Consequence, GroupConsequence, Preview, Refusal};
 pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
 pub use interview::{Answer, GivenName, Interviewer, MeetingLabel};
 pub use meethook_session::Stored;
@@ -5959,5 +5959,528 @@ mod tests {
                 .unwrap();
             Answer::OneSpeaker("Grace".to_string())
         }
+    }
+
+    // --- TASK-046.09.01: a user-chosen group of voices named under one name --------------
+
+    /// A group answer from a script: the name plus the "Unknown N" handles the user marked.
+    fn group(name: &str, members: &[&str]) -> Answer {
+        Answer::Group {
+            name: name.to_string(),
+            members: members.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    /// Every file under `root` keyed by its path relative to `root`, with the transcript's
+    /// wall-clock line normalised away -- the one byte a run controls that sits outside the
+    /// behaviour under test, so two runs straddling a second boundary still compare equal.
+    fn tree_normalised(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        files_under(root)
+            .into_iter()
+            .map(|(path, bytes)| {
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                let bytes = if path.file_name().is_some_and(|name| name == "transcript.md")
+                    && let Ok(text) = std::str::from_utf8(&bytes)
+                {
+                    text.lines()
+                        .map(|line| {
+                            if line.starts_with("updated:") {
+                                "updated: <the clock>".to_string()
+                            } else {
+                                line.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .into_bytes()
+                } else {
+                    bytes
+                };
+                (rel, bytes)
+            })
+            .collect()
+    }
+
+    /// The group's half of the frame door's interrupt rule: the database goes unwritable the
+    /// moment the group answer is given, so the first member's commit -- the first write the
+    /// group path ever makes -- cannot land, and nothing the group would write has.
+    struct UnwritableBeforeGroup(PathBuf);
+
+    impl Interviewer for UnwritableBeforeGroup {
+        fn identify(&mut self, _voice: &Voice<'_>) -> Answer {
+            std::fs::set_permissions(self.0.as_path(), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            Answer::Group {
+                name: "Grace".to_string(),
+                members: vec!["Unknown 1".to_string(), "Unknown 2".to_string()],
+            }
+        }
+    }
+
+    /// TASK-046.09.01 acceptance criterion #1: a user-chosen group of voices commits under one
+    /// name past the heard-at-once veto that would refuse them singly, and the override is
+    /// counted and narrated -- naming the voice the member was heard at once with, the evidence
+    /// the veto acted on, and saying it was the user's grouping rather than an assertion.
+    #[test]
+    fn a_group_commits_past_the_heard_at_once_veto_and_narrates_the_override() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        heard_at_once(&session, 0, 1);
+
+        let mut interviewer =
+            Scripted::answering(vec![group("Grace", &["Unknown 1", "Unknown 2"])]);
+        let (report, output) = run(&paths, &["20260809-052600"], &mut interviewer);
+
+        assert_eq!(
+            interviewer.seen.len(),
+            1,
+            "only the anchor voice may be asked: {output}"
+        );
+        assert_eq!(report.named, 2, "{output}");
+        assert_eq!(report.refused, 0, "{output}");
+        assert_eq!(report.vetoes_overridden, 1, "{output}");
+
+        // Both voices read the group's name; the mic track keeps its own label.
+        let transcript = transcript_of(&session);
+        let said = said(&transcript);
+        assert_eq!(
+            said.iter().filter(|(who, _, _)| *who == "Grace").count(),
+            3,
+            "every speaker-track turn reads the group's name: {said:?}"
+        );
+        assert!(
+            said.iter().any(|(who, _, _)| *who == SPEAKER_YOU),
+            "{said:?}"
+        );
+
+        // The override line names the overlapping voice and says it was the user's grouping.
+        assert!(output.contains("named Grace for Unknown 2"), "{output}");
+        assert!(output.contains("heard at once with Unknown 1"), "{output}");
+        assert!(
+            output.contains("you chose these voices as one person"),
+            "the group's authority must be told apart from the assertion's: {output}"
+        );
+
+        // References stored per the floor rule: both above the floor, so both are held.
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(speakers.references("Grace"), 2, "{:?}", speakers.speakers);
+    }
+
+    /// Acceptance criterion #1, the quiet half (D5): a group reaches members below the offer
+    /// floor -- the queue never offers them -- and names them against the session alone, the
+    /// way the assertion reaches the quiet voices alike. Only the loud member touches the
+    /// database; the rest are recorded against this session's names file.
+    #[test]
+    fn a_group_reaches_the_below_floor_members_and_names_them_against_the_session() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_fragmented_session(&paths, "20260809-052600");
+        heard_at_once(&session, 0, 1);
+
+        // Three-way group: the loud voice (id 0) plus two below-floor members (id 1, id 2). The
+        // heard-at-once pair is 0-1, so committing id 1 overrides one veto.
+        let mut interviewer = Scripted::answering(vec![group(
+            "Grace",
+            &["Unknown 1", "Unknown 2", "Unknown 3"],
+        )]);
+        let (report, output) = run(&paths, &["20260809-052600"], &mut interviewer);
+
+        assert_eq!(
+            interviewer.seen.len(),
+            1,
+            "the quiet members are not asked: {output}"
+        );
+        assert_eq!(report.named, 3, "{output}");
+        assert_eq!(report.refused, 0, "{output}");
+        assert_eq!(report.vetoes_overridden, 1, "{output}");
+        // Two of the three sit below the reference floor: named against the session alone.
+        assert_eq!(report.session_only, 2, "{output}");
+
+        // All three members read the group's name; the fourth voice (not a member) keeps its own.
+        let transcript = transcript_of(&session);
+        let said = said(&transcript);
+        assert_eq!(
+            said.iter().filter(|(who, _, _)| *who == "Grace").count(),
+            3,
+            "the three members read the group's name: {said:?}"
+        );
+        assert!(
+            said.iter().any(|(who, _, _)| *who == "Unknown 4"),
+            "{said:?}"
+        );
+
+        // Only the loud member stores a reference; the two quiet ones leave the database alone.
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(speakers.references("Grace"), 1, "{:?}", speakers.speakers);
+        let assigned = assigned_in(&session, "20260809-052600");
+        assert_eq!(assigned.names.len(), 2, "{:?}", assigned.names);
+    }
+
+    /// Acceptance criterion #2, first half: an interrupt between the group answer and the first
+    /// member's commit leaves the on-disk state exactly as it stood -- no reference, no names-
+    /// file delta, transcript and session.json untouched -- and a re-run with the same answer
+    /// converges onto the whole.
+    #[test]
+    fn an_interrupt_before_the_first_group_commit_writes_nothing_and_a_rerun_converges() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        heard_at_once(&session, 0, 1);
+        let before = files_under(root.path());
+
+        let mut interviewer = UnwritableBeforeGroup(root.path().to_path_buf());
+        let interrupted = run_asserting_raw(&paths, &["20260809-052600"], None, &mut interviewer);
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            interrupted.is_err(),
+            "the failed commit must surface as an error"
+        );
+
+        // Nothing the group would write has landed: byte-for-byte the same tree as before.
+        assert_eq!(
+            files_under(root.path()),
+            before,
+            "an interrupted group wrote something"
+        );
+
+        // A re-run with the same answer converges onto the complete state.
+        let mut rerun = Scripted::answering(vec![group("Grace", &["Unknown 1", "Unknown 2"])]);
+        let (report, output) = run(&paths, &["20260809-052600"], &mut rerun);
+        assert_eq!(report.named, 2, "{output}");
+        assert_eq!(report.vetoes_overridden, 1, "{output}");
+        let transcript = transcript_of(&session);
+        let said = said(&transcript);
+        assert_eq!(
+            said.iter().filter(|(who, _, _)| *who == "Grace").count(),
+            3,
+            "the re-run must complete what the interrupt left behind: {said:?}\n{output}"
+        );
+    }
+
+    /// Acceptance criterion #2, second half: a re-run over the state a killed run would have
+    /// left -- the first member fully committed, the second untouched -- converges onto the same
+    /// state a fresh run produces, and a further pass writes nothing at all.
+    #[test]
+    fn a_rerun_over_a_partial_group_converges_and_then_writes_nothing_new() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        heard_at_once(&session, 0, 1);
+
+        // A run interrupted after its first member's commit: Unknown 1 named Grace (reference,
+        // names file, transcript), Unknown 2 left where it stood.
+        let _ = run(
+            &paths,
+            &["20260809-052600"],
+            &mut Scripted::answering(vec![named("Grace")]),
+        );
+        let mid = transcript_of(&session);
+        assert_eq!(mid.turns[0].speaker.as_str(), "Grace");
+        assert_eq!(mid.turns[2].speaker.as_str(), "Unknown 2");
+
+        // Re-running the whole group completes the second member against the first's evidence,
+        // overriding the veto the first member's name now holds.
+        let mut rerun = Scripted::answering(vec![group("Grace", &["Unknown 1", "Unknown 2"])]);
+        let (report, out) = run(&paths, &["20260809-052600"], &mut rerun);
+        assert_eq!(report.vetoes_overridden, 1, "{out}");
+        let transcript = transcript_of(&session);
+        let after = said(&transcript);
+        assert_eq!(
+            after.iter().filter(|(who, _, _)| *who == "Grace").count(),
+            3,
+            "the re-run must complete the transcript: {after:?}\n{out}"
+        );
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(speakers.references("Grace"), 2, "{:?}", speakers.speakers);
+
+        // A further pass is a no-op on disk: converged means byte-identical, not merely
+        // equivalent.
+        let before = files_under(root.path());
+        let (_, out) = run(
+            &paths,
+            &["20260809-052600"],
+            &mut Scripted::answering(vec![group("Grace", &["Unknown 1", "Unknown 2"])]),
+        );
+        assert_eq!(
+            files_under(root.path()),
+            before,
+            "a converged group rewrote a file: {out}"
+        );
+    }
+
+    /// Acceptance criterion #3: the aggregate preview equals the sequential application of the
+    /// members' individual previews. On a fixture with a colliding pre-enrolment on each member
+    /// -- one displaced by the correction, one left stale below the floor -- every field of the
+    /// group's consequence is what the run's own report and the on-disk state say once it has run.
+    #[test]
+    fn the_group_preview_equals_the_sequential_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_fragmented_session(&paths, "20260809-052600");
+        heard_at_once(&session, 0, 1);
+
+        // Bob holds a reference built from the loud member's exact voice (a correction will
+        // displace it); Alice one built from the quiet member's exact voice (a session-only
+        // naming leaves it behind as stale).
+        let clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
+        enrolled(
+            &[
+                ("Bob", clusters.clusters[0].embedding.clone()),
+                ("Alice", clusters.clusters[1].embedding.clone()),
+            ],
+            &paths,
+        );
+
+        // The aggregate dry run, off the database as it stands before the run.
+        let unknown = unknown_labels(
+            clusters
+                .clusters
+                .iter()
+                .map(|c| (c.id, c.first_spoke_seconds)),
+        );
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        let assigned =
+            SpeakerNames::read_or_empty(&session, &SessionId::parse("20260809-052600").unwrap())
+                .unwrap();
+        let preview = Preview::new(
+            &clusters.clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            &clusters.clusters[0],
+            Enrolment::default(),
+            None,
+            &[],
+        );
+        let consequence = preview.group("Grace", &["Unknown 1", "Unknown 2"]).unwrap();
+
+        let mut interviewer =
+            Scripted::answering(vec![group("Grace", &["Unknown 1", "Unknown 2"])]);
+        let (report, output) = run(&paths, &["20260809-052600"], &mut interviewer);
+
+        // Applied and refused agree with the run, in queue order.
+        assert_eq!(
+            consequence.applied,
+            vec!["Unknown 1".to_string(), "Unknown 2".to_string()],
+            "{output}"
+        );
+        assert!(consequence.refused.is_empty(), "{output}");
+        assert_eq!(report.refused, 0, "{output}");
+
+        // The vetoes the preview counts are the run's own number.
+        assert_eq!(
+            consequence.vetoes_overridden, report.vetoes_overridden,
+            "{output}"
+        );
+        assert_eq!(consequence.vetoes_overridden, 1, "{output}");
+
+        // The total reference count the preview promises is what the database ends up holding --
+        // one, since only the loud member is above the floor.
+        let final_speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(
+            consequence.references_after,
+            final_speakers.references("Grace"),
+            "{output}"
+        );
+        assert_eq!(
+            final_speakers.references("Grace"),
+            1,
+            "{:?}",
+            final_speakers.speakers
+        );
+
+        // Displaced: Bob's reference, built from the loud member's exact voice, is withdrawn.
+        assert!(
+            consequence
+                .displaced
+                .iter()
+                .any(|d| d.name == "Bob" && d.remaining == 0),
+            "{:?}",
+            consequence.displaced
+        );
+        assert_eq!(
+            final_speakers.references("Bob"),
+            0,
+            "{:?}",
+            final_speakers.speakers
+        );
+
+        // Stale: Alice's reference, built from the quiet member's exact voice, survives --
+        // nothing below the floor touches the database -- and the preview flags it.
+        assert!(
+            consequence.stale.contains(&"Alice".to_string()),
+            "{:?}",
+            consequence.stale
+        );
+        assert_eq!(
+            final_speakers.references("Alice"),
+            1,
+            "{:?}",
+            final_speakers.speakers
+        );
+
+        // Both members read the name; the two non-members keep their own labels.
+        let transcript = transcript_of(&session);
+        let said = said(&transcript);
+        assert_eq!(
+            said.iter().filter(|(who, _, _)| *who == "Grace").count(),
+            2,
+            "{said:?}"
+        );
+    }
+
+    /// Acceptance criterion #3, the refusal half: a member whose naming would take a name off a
+    /// non-member is refused by the standard check while the walk carries on, and the preview
+    /// reports exactly which member was refused and what the applied members leave behind.
+    #[test]
+    fn the_group_preview_reports_the_member_the_run_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        with_embeddings(&session, &[nearly(0.0), nearly(20.0)]);
+        enrolled(&[("Bob", nearly(60.0))], &paths);
+
+        let clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
+        let unknown = unknown_labels(
+            clusters
+                .clusters
+                .iter()
+                .map(|c| (c.id, c.first_spoke_seconds)),
+        );
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        let assigned =
+            SpeakerNames::read_or_empty(&session, &SessionId::parse("20260809-052600").unwrap())
+                .unwrap();
+        let preview = Preview::new(
+            &clusters.clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            &clusters.clusters[0],
+            Enrolment::default(),
+            None,
+            &[],
+        );
+        let consequence = preview.group("Grace", &["Unknown 1", "Unknown 2"]).unwrap();
+
+        let mut interviewer =
+            Scripted::answering(vec![group("Grace", &["Unknown 1", "Unknown 2"])]);
+        let (report, output) = run(&paths, &["20260809-052600"], &mut interviewer);
+
+        // The first member's naming would take Bob off the second voice, so the group refuses it
+        // and carries on: the preview says exactly that, and the run agrees.
+        assert_eq!(consequence.refused.len(), 1, "{output}");
+        assert_eq!(consequence.refused[0].0, "Unknown 1");
+        assert!(matches!(consequence.refused[0].1, Refusal::Taken { .. }));
+        assert_eq!(
+            consequence.applied,
+            vec!["Unknown 2".to_string()],
+            "{output}"
+        );
+        assert_eq!(report.refused, 1, "{output}");
+        assert_eq!(report.named, 1, "{output}");
+
+        // The total reference count is over the applied members only.
+        let final_speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(
+            consequence.references_after,
+            final_speakers.references("Grace"),
+            "{output}"
+        );
+        assert_eq!(
+            final_speakers.references("Grace"),
+            1,
+            "{:?}",
+            final_speakers.speakers
+        );
+    }
+
+    /// Acceptance criterion #4: a group commit writes nothing to session.json. A subset names
+    /// voices; it does not claim the track, so the one-remote-speaker fact never lands and the
+    /// file's bytes do not move.
+    #[test]
+    fn a_group_commit_writes_nothing_to_session_json() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        heard_at_once(&session, 0, 1);
+
+        let before_meta = SessionMetadata::read(&session.session_json()).unwrap();
+        assert!(before_meta.one_remote_speaker.is_none());
+        let before_bytes = std::fs::read(session.session_json()).unwrap();
+
+        let mut interviewer =
+            Scripted::answering(vec![group("Grace", &["Unknown 1", "Unknown 2"])]);
+        let (report, output) = run(&paths, &["20260809-052600"], &mut interviewer);
+        assert_eq!(report.named, 2, "{output}");
+
+        // No one-remote-speaker fact, and the file is byte-for-byte unchanged.
+        let after_meta = SessionMetadata::read(&session.session_json()).unwrap();
+        assert!(
+            after_meta.one_remote_speaker.is_none(),
+            "a group must not write the assertion fact: {output}"
+        );
+        assert_eq!(
+            std::fs::read(session.session_json()).unwrap(),
+            before_bytes,
+            "session.json changed: {output}"
+        );
+    }
+
+    /// D2, made mechanical: a one-member group carries no veto authority, so it behaves exactly
+    /// like today's plain naming of that member -- including the heard-at-once veto refusing the
+    /// second voice. Two identically seeded roots, one answered with plain names and one with
+    /// one-member groups, leave identical counts and byte-identical trees.
+    #[test]
+    fn a_one_member_group_behaves_like_plain_naming_and_the_veto_still_refuses() {
+        let plain_root = tempfile::tempdir().unwrap();
+        let plain = Paths::new(plain_root.path());
+        let plain_session = make_session(&plain, "20260809-052600");
+        heard_at_once(&plain_session, 0, 1);
+
+        let group_root = tempfile::tempdir().unwrap();
+        let grp = Paths::new(group_root.path());
+        let group_session = make_session(&grp, "20260809-052600");
+        heard_at_once(&group_session, 0, 1);
+
+        // Plain: name both voices Alice; the veto refuses the second.
+        let mut plain_iv = Scripted::answering(vec![named("Alice"), named("Alice")]);
+        let (plain_report, plain_out) = run(&plain, &["20260809-052600"], &mut plain_iv);
+
+        // Group: the same two namings as one-member groups; the veto must refuse the second alike.
+        let mut group_iv = Scripted::answering(vec![
+            group("Alice", &["Unknown 1"]),
+            group("Alice", &["Unknown 2"]),
+        ]);
+        let (group_report, group_out) = run(&grp, &["20260809-052600"], &mut group_iv);
+
+        // Same counts: one named, one refused by the veto, no overrides either way.
+        assert_eq!(
+            plain_report.named, group_report.named,
+            "{plain_out}\n{group_out}"
+        );
+        assert_eq!(
+            plain_report.refused, group_report.refused,
+            "{plain_out}\n{group_out}"
+        );
+        assert_eq!(
+            plain_report.vetoes_overridden, group_report.vetoes_overridden,
+            "{plain_out}\n{group_out}"
+        );
+        assert_eq!(
+            plain_report.session_only, group_report.session_only,
+            "{plain_out}\n{group_out}"
+        );
+        assert_eq!(
+            group_report.refused, 1,
+            "the veto still refuses a one-member group: {group_out}"
+        );
+
+        // And identical trees, byte for byte.
+        assert_eq!(
+            tree_normalised(plain_root.path()),
+            tree_normalised(group_root.path())
+        );
     }
 }

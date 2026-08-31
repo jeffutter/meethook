@@ -9,8 +9,9 @@
 use std::collections::BTreeMap;
 
 use meethook_session::{
-    AssignedName, Classification, DiscoveredSession, EnrolledSpeakers, Paths, SourceTrack,
-    SpeakerCluster, SpeakerClusters, SpeakerNames, Transcript, TranscriptContext, unknown_labels,
+    AssignedName, Classification, DiscoveredSession, EnrolledSpeakers, Paths, SessionMetadata,
+    SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Transcript, TranscriptContext,
+    unknown_labels,
 };
 use meethook_transcribe::{
     Attribution, Naming, attributions, heard_at_once, identify_clusters, rank_enrolled,
@@ -172,6 +173,7 @@ pub(crate) fn enroll_session(
         speakers,
         &assigned.names,
         assertion.as_deref(),
+        None,
     );
 
     // The transcript may predate an answer given in an earlier session -- name somebody in
@@ -321,9 +323,13 @@ pub(crate) fn enroll_session(
             // every voice at once, and reading that as "already answered" would skip the rest
             // of the track -- the opposite of what the assertion asks. Each voice still needs
             // its own row and its own reference offer, so the walk commits all of them.
+            //
+            // Or a voice this run has committed through any door: a group member re-named
+            // identically to what it read when the queue was built (shown == baseline) is
+            // answered too, and only `committed` says so.
             if assertion.is_none()
-                && shown[&cluster.id].is_named()
-                && shown[&cluster.id] != baseline[&cluster.id]
+                && (shown[&cluster.id].is_named() && shown[&cluster.id] != baseline[&cluster.id]
+                    || committed.iter().any(|done| done.id == cluster.id))
             {
                 continue;
             }
@@ -458,7 +464,7 @@ pub(crate) fn enroll_session(
             // the assertion names it as well as the ones after it.
             let under_assertion = assertion.is_some();
 
-            let (name, anyway) = match answer {
+            match answer {
                 // Consumed by the assertion switch above: it is either gone or already turned
                 // into a [`Answer::Named`]. Present because Rust checks exhaustiveness against
                 // the variant set rather than against what that switch left.
@@ -496,193 +502,132 @@ pub(crate) fn enroll_session(
                     deferred.push((nth, cluster));
                     continue;
                 }
-                Answer::Named { name, anyway } => (name, anyway),
-            };
-            // Everything this answer would write, worked out on copies first -- the dry run the
-            // `consequence` module holds, and the same one an [`Interviewer`] may have already run
-            // through `Voice::preview`. Two files can carry a name and both feed the same
-            // labelling, so the only way to know what an answer *does* is to build the state it
-            // would leave and label the session through it; and the answer is not simply written
-            // and inspected afterwards because undoing a write that turned out to cost somebody
-            // their name means writing three files back, with a run interrupted mid-undo leaving
-            // exactly the mess this prevents.
-            //
-            // Built here rather than held from the prompt above because the commit below needs
-            // `speakers` mutably and a live `Preview` would keep it borrowed. It is the same six
-            // references and the same `of`, so the preview an answerer saw and the write cannot
-            // disagree.
-            //
-            // `None` is a name of nothing but spaces: somebody pressing Enter with a stray
-            // keystroke in the buffer, not a request for an entry called "". Where that is decided
-            // is `of`, so this path and a preview agree about it too.
-            let Some(consequence) = Preview::new(
-                &clusters.clusters,
-                &unknown,
-                speakers,
-                &assigned,
-                cluster,
-                rules.enrolment,
-                assertion.as_deref(),
-                &committed[..],
-            )
-            .of(&name) else {
-                left_unanswered(std::iter::once(cluster), &shown, &baseline, report);
-                continue;
-            };
-            let name = name.trim();
-
-            // The refusal. An answer that would take a name off a voice the user is not answering
-            // about is not honoured -- see `Refusal` for the three ways that can happen and why
-            // one check covers them -- unless the answer itself says otherwise. Written as one
-            // total match rather than as a guard plus an exception, because the rule is which of
-            // the three cases an answer falls into and reading it should not require holding a
-            // negation.
-            match &consequence.refused {
-                // Shown what it costs and asked for it anyway. `Answer::anyway` is only ever set
-                // by an interface that displayed the paying voice and what it loses before a key
-                // was pressed, which makes this `forget --yes`'s argument reached from the other
-                // side: see `forget.rs`'s "Nothing is ever refused". Everything below runs
-                // exactly as it does for an answer nothing refused -- honouring an override is
-                // skipping this guard, not a second write path.
-                Some(Refusal::Taken { voice, losing }) if anyway => {
-                    after(
+                // One voice through the dry run and the fixed-order writes, exactly as before:
+                // no forcing, so a preview and a write see it identically. `continue` rather
+                // than falling through because every arm of this match now acts and moves on,
+                // and the body of the pass ends right here.
+                Answer::Named { name, anyway } => {
+                    commit_named(
+                        &clusters.clusters,
+                        &unknown,
+                        speakers,
+                        &mut assigned,
+                        &mut transcript,
+                        &mut shown,
+                        &baseline,
+                        &mut committed,
+                        report,
+                        &mut vetoes_overridden,
+                        &mut asserted_voices,
                         notes,
-                        &session.id,
-                        AnswerNote::Overrode {
-                            name,
-                            answered: &handle(cluster.id, &unknown),
-                            voice,
-                            losing,
-                        },
+                        session,
+                        paths,
+                        &rules,
+                        &metadata,
+                        assertion.as_deref(),
+                        cluster,
+                        name,
+                        anyway,
+                        under_assertion,
+                        None,
                     )?;
-                }
-                // Every other refusal: a `Taken` nobody insisted on, and a `Vetoed` however
-                // insistent the answer was. Nothing is written, the voice keeps whatever it
-                // read, and the note names the voice that would have paid.
-                Some(refusal) => {
-                    let answered = handle(cluster.id, &unknown);
-                    after(
-                        notes,
-                        &session.id,
-                        AnswerNote::Refused {
-                            name,
-                            voice: &answered,
-                            refusal,
-                        },
-                    )?;
-                    report.refused += 1;
                     continue;
                 }
-                None => {}
-            }
-
-            // The override report, and the only line a veto produces in assertion mode: this
-            // voice was heard at once with a voice the run has already put a name on, which is
-            // exactly the pair the heard-at-once rule refuses to put under one name. It is named
-            // anyway, and said so here rather than silently overridden -- naming the voices it
-            // overlapped, which is the evidence the veto would have acted on. No refusal ever
-            // arises on this path, because the labelling the dry run uses honours the assertion:
-            // the guard above finds the name where it belongs and declines nothing.
-            if under_assertion {
-                let overlapped: Vec<String> = committed
-                    .iter()
-                    .filter(|c| heard_at_once(cluster, c))
-                    .map(|c| handle(c.id, &unknown))
-                    .collect();
-                if !overlapped.is_empty() {
-                    let answered = handle(cluster.id, &unknown);
-                    after(
-                        notes,
-                        &session.id,
-                        AnswerNote::VetoOverridden {
-                            name,
-                            answered: &answered,
-                            speech_seconds: cluster.speech_seconds,
-                            overlapped: &overlapped,
-                        },
-                    )?;
-                    vetoes_overridden += 1;
+                // A user-chosen group of voices named together with one name: the generalisation
+                // of the one-remote-speaker assertion from the whole track to a subset the user
+                // marked. Resolved and walked in queue order through the same commit a single
+                // naming uses, with the growing forced set the aggregate preview folds over, so
+                // a preview and a write cannot disagree about sequence or cost. Only reached when
+                // there is no assertion -- under one the seam is never consulted -- so `anyway`
+                // and `under_assertion` are both `false` here: a group names its members anyway
+                // at the veto (that is its authority) but never overrides a `Taken` refusal.
+                Answer::Group { name, members } => {
+                    // Trimmed once here rather than in each member's dry run, so the forced
+                    // map's key and the names committed agree on the same normalisation.
+                    let group_name = name.trim().to_string();
+                    let members =
+                        resolve_group_members(&clusters.clusters, &unknown, &group_name, &members);
+                    match members {
+                        // The group is real: walk it in queue order, committing each member
+                        // through the same path a single naming uses. One context for the whole
+                        // walk rather than one per member, since nothing between members touches
+                        // the files the context borrows.
+                        Some(resolved) => {
+                            // Veto authority iff the group names two or more voices: one member
+                            // is a plain naming, and the veto refuses it exactly as today.
+                            let authority = resolved.len() >= 2;
+                            // The declared members committed so far, keyed to the group's name:
+                            // the forced tier each member's dry run honours, grown as members
+                            // land and shrunken back when one is refused -- the fold
+                            // `Preview::group` applies, mirrored here so the two agree.
+                            let mut forced: BTreeMap<u32, String> = BTreeMap::new();
+                            for member in &resolved {
+                                // Answered earlier in this run, by any door: counted then, not
+                                // committed again -- and not inserted into the forced set,
+                                // because the tier claims the voice reads the group's name, and
+                                // a voice committed under another name does not.
+                                if committed.iter().any(|done| done.id == member.id) {
+                                    continue;
+                                }
+                                if authority {
+                                    forced.insert(member.id, group_name.clone());
+                                }
+                                let fref: Option<&BTreeMap<u32, String>> =
+                                    if authority { Some(&forced) } else { None };
+                                let outcome = commit_named(
+                                    &clusters.clusters,
+                                    &unknown,
+                                    speakers,
+                                    &mut assigned,
+                                    &mut transcript,
+                                    &mut shown,
+                                    &baseline,
+                                    &mut committed,
+                                    report,
+                                    &mut vetoes_overridden,
+                                    &mut asserted_voices,
+                                    notes,
+                                    session,
+                                    paths,
+                                    &rules,
+                                    &metadata,
+                                    assertion.as_deref(),
+                                    member,
+                                    group_name.clone(),
+                                    false,
+                                    false,
+                                    fref,
+                                )?;
+                                // A refused member is not committed, so it stops being a
+                                // declared holder for the members after it -- the state the run
+                                // actually reaches, and the one the next member previews against.
+                                if authority && !matches!(outcome, CommitOutcome::Committed) {
+                                    forced.remove(&member.id);
+                                }
+                            }
+                            // The voice the answer was given on, if the group did not name it:
+                            // asked, went unanswered, counted the way every other unanswered
+                            // voice is -- the group walked its members, not the anchor.
+                            if !resolved.iter().any(|m| m.id == cluster.id) {
+                                left_unanswered(
+                                    std::iter::once(cluster),
+                                    &shown,
+                                    &baseline,
+                                    report,
+                                );
+                            }
+                        }
+                        // A group that cannot say who its members are -- a blank name, an empty
+                        // mark, or a handle nothing resolves -- goes unanswered rather than
+                        // partially answered: the blank-name precedent reached with a different
+                        // input, counted the way every other unanswered voice is.
+                        None => {
+                            left_unanswered(std::iter::once(cluster), &shown, &baseline, report);
+                        }
+                    }
+                    continue;
                 }
             }
-
-            // Everything this answer wrote, as one note rather than as the four to six lines it
-            // used to print, because that is the block an interface lays out together.
-            //
-            // Narrated *before* the copies are taken out of the consequence below: nothing between
-            // here and there writes a byte, so the order the user sees is unchanged, and a
-            // partially moved `Consequence` can no longer be borrowed.
-            after(
-                notes,
-                &session.id,
-                AnswerNote::Committed {
-                    name,
-                    speech_seconds: cluster.speech_seconds,
-                    consequence: &consequence,
-                },
-            )?;
-            // A sub-count of `named`, and now read off the type rather than off the two arms of
-            // the match that used to print those two sentences -- which is what
-            // `Consequence::session_only` is documented to be.
-            if consequence.session_only() {
-                report.session_only += 1;
-            }
-            report.named += 1;
-            // A sub-count of `named`, like `session_only`: the naming came from the assertion
-            // rather than from an answer given per voice -- see `EnrollReport::asserted` for why
-            // the summary needs the split.
-            if under_assertion {
-                report.asserted += 1;
-                asserted_voices += 1;
-            }
-
-            // Committed by taking the copies the dry run produced, so what lands on disk is the
-            // state that was checked rather than a second construction of it.
-            let speakers_changed = *speakers != consequence.speakers;
-            let assignments_changed = assigned.names != consequence.assigned.names;
-            *speakers = consequence.speakers;
-            assigned = consequence.assigned;
-
-            // Written in a fixed order -- the database, then this session's names, then the
-            // transcript -- and only where something changed, so a skipped write leaves a file
-            // byte-identical rather than merely equivalent.
-            if speakers_changed {
-                speakers.write(paths)?;
-            }
-            if assignments_changed {
-                assigned.write(&session.paths)?;
-            }
-            // Recorded after the writes, so the override report measures against voices whose
-            // names are actually on disk, never against answers that were refused or skipped.
-            committed.push(cluster);
-
-            // Re-identified against the updated database rather than assumed: naming one voice
-            // can also name a second cluster in this session, if clustering split that person in
-            // two, and a `--force` re-transcribe would name both.
-            let now = effective_labels(
-                &clusters.clusters,
-                &unknown,
-                speakers,
-                &assigned.names,
-                assertion.as_deref(),
-            );
-            if relabel(&mut transcript, &now) {
-                transcript.write(
-                    &session.paths,
-                    rules.template,
-                    &TranscriptContext::now(&metadata),
-                )?;
-            }
-            // Only on the timestamp path. A user who pointed at a moment did not choose the voice,
-            // so how far the rename reached is the one thing they cannot infer -- whereas the queue
-            // and `--voice` both showed them the voice first, and several tests pin their output
-            // exactly as it is.
-            // `assertion.is_none()` because the assertion stands in for the selector: a library
-            // caller that passed both gets the assertion's walk, and the timestamp's rename line
-            // is for the one voice a moment pointed at, which this is not.
-            if assertion.is_none() && matches!(rules.selector, Some(Selection::At(_))) {
-                report_rename(&transcript, &shown, &now, name, session, notes)?;
-            }
-            shown = now;
         }
 
         // The fixed point: a pass that moved nobody out of the deferred set, *and* an answerer
@@ -723,11 +668,12 @@ pub(crate) fn enroll_session(
     // detail, this carries the shape of it, and the reference count is read off the database
     // the run left rather than re-derived from the commits -- the stated rule, D4 of the
     // plan, is that the existing cap does the bounding, so the count it holds is the answer.
+    // The run-wide half of the session-local count: the summary line reads off the local
+    // because it says what the assertion did *here*, and the report carries it for the caller,
+    // which has no other view of the run. A group's overrides feed the same counter; with
+    // neither assertion nor group the addend is zero.
+    report.vetoes_overridden += vetoes_overridden;
     if let Some(name) = assertion.as_deref() {
-        // The run-wide half of the session-local count: the summary line reads off the local
-        // because it says what the assertion did *here*, and the report carries it for the
-        // caller, which has no other view of the run.
-        report.vetoes_overridden += vetoes_overridden;
         about(
             notes,
             &session.id,
@@ -741,6 +687,346 @@ pub(crate) fn enroll_session(
     }
 
     Ok(Outcome::Finished)
+}
+
+/// What committing one voice through the dry run and the fixed-order writes left behind.
+///
+/// Three outcomes, and only three: a name landed and was written, a refusal declined it and
+/// nothing was written, or the name was not one at all and the voice is counted as unanswered.
+/// The caller -- the ordinary queue walk for a single [`Answer::Named`], or the group walk for
+/// a member of [`Answer::Group`] -- decides what each means to it, which is why the group can
+/// carry on past a refused member while a single answer simply moves to the next voice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitOutcome {
+    /// Named and written; the database, the names file, and the transcript are in line.
+    Committed,
+    /// Refused; counted, nothing written, the voice keeps whatever it read.
+    Refused,
+    /// A name of nothing but spaces; counted as an unanswered voice, nothing written.
+    Unanswered,
+}
+
+/// Names one voice and writes what it wrote, working out everything on copies first.
+///
+/// One function rather than two implementations of the same mutation sequence is the module
+/// invariant the `consequence` doc states, reached from the write side: a preview and a write
+/// that disagreed would be two producers of one rule, and the symptom of those disagreeing is a
+/// name on the wrong person's turns. The ordinary queue walk calls it once per [`Answer::Named`];
+/// the group walk calls it once per member of [`Answer::Group`]. Every file it touches is passed
+/// as a reference scoped to this call, so the borrow ends the moment a commit returns and the
+/// next commit -- or the group's next member -- sees the state this one left.
+///
+/// The dry run the `consequence` module holds, and the same one an [`Interviewer`] may have
+/// already run through `Voice::preview`: two files can carry a name and both feed the same
+/// labelling, so the only way to know what an answer *does* is to build the state it would leave
+/// and label the session through it; and the answer is not simply written and inspected
+/// afterwards because undoing a write that turned out to cost somebody their name means writing
+/// three files back, with a run interrupted mid-undo leaving exactly the mess this prevents.
+///
+/// `name` is trimmed here, the same normalisation [`crate::GivenName`] applies on the way in, so
+/// a typed answer and one supplied up front are decided identically; `None` from the dry run is
+/// a name of nothing but spaces, and that is a skip rather than an answer. `under_assertion`
+/// and `forced` are the two ways a naming outranks the heard-at-once veto, and they are mutually
+/// exclusive: the assertion names the whole track, the group a user-chosen subset of it, and a
+/// run never carries both. `anyway` overrides a `Taken` refusal only, and only the single-voice
+/// path ever sets it -- a group names its members at the veto (that is its authority) but never
+/// pays a third party's name to do it.
+#[allow(clippy::too_many_arguments)]
+fn commit_named<'d, 'm>(
+    clusters: &'d [SpeakerCluster],
+    unknown: &'d BTreeMap<u32, String>,
+    speakers: &'m mut EnrolledSpeakers,
+    assigned: &'m mut SpeakerNames,
+    transcript: &'m mut Transcript,
+    shown: &'m mut BTreeMap<u32, Attribution>,
+    baseline: &'d BTreeMap<u32, Attribution>,
+    committed: &'m mut Vec<&'d SpeakerCluster>,
+    report: &'m mut EnrollReport,
+    vetoes_overridden: &'m mut usize,
+    asserted_voices: &'m mut usize,
+    notes: &'m mut dyn Narrator,
+    session: &'d DiscoveredSession,
+    paths: &'d Paths,
+    rules: &'d EnrollRules<'d>,
+    metadata: &SessionMetadata,
+    assertion: Option<&str>,
+    cluster: &'d SpeakerCluster,
+    name: String,
+    anyway: bool,
+    under_assertion: bool,
+    forced: Option<&BTreeMap<u32, String>>,
+) -> Result<CommitOutcome> {
+    // Built here rather than held from the prompt above because the commit below needs
+    // `speakers` mutably and a live `Preview` would keep it borrowed. It is the same six
+    // references and the same `of`, so the preview an answerer saw and the write cannot
+    // disagree. `with_forced` threads the group's declared members through every labelling the
+    // dry run does, so a member previewed against the running state honours the same tier the
+    // write applies; `None` on the ordinary path labels exactly as before.
+    let Some(consequence) = Preview::new(
+        clusters,
+        unknown,
+        speakers,
+        assigned,
+        cluster,
+        rules.enrolment,
+        assertion,
+        &committed[..],
+    )
+    .with_forced(forced)
+    .of(&name) else {
+        left_unanswered(std::iter::once(cluster), shown, baseline, report);
+        return Ok(CommitOutcome::Unanswered);
+    };
+    let name = name.trim();
+
+    // The refusal. An answer that would take a name off a voice the user is not answering
+    // about is not honoured -- see `Refusal` for the three ways that can happen and why one
+    // check covers them -- unless the answer itself says otherwise. Written as one total match
+    // rather than as a guard plus an exception, because the rule is which of the three cases an
+    // answer falls into and reading it should not require holding a negation.
+    match &consequence.refused {
+        // Shown what it costs and asked for it anyway. `Answer::anyway` is only ever set by an
+        // interface that displayed the paying voice and what it loses before a key was pressed,
+        // which makes this `forget --yes`'s argument reached from the other side: see
+        // `forget.rs`'s "Nothing is ever refused". Everything below runs exactly as it does for
+        // an answer nothing refused -- honouring an override is skipping this guard, not a
+        // second write path.
+        Some(Refusal::Taken { voice, losing }) if anyway => {
+            after(
+                notes,
+                &session.id,
+                AnswerNote::Overrode {
+                    name,
+                    answered: &handle(cluster.id, unknown),
+                    voice,
+                    losing,
+                },
+            )?;
+        }
+        // Every other refusal: a `Taken` nobody insisted on, and a `Vetoed` however insistent
+        // the answer was. Nothing is written, the voice keeps whatever it read, and the note
+        // names the voice that would have paid.
+        Some(refusal) => {
+            let answered = handle(cluster.id, unknown);
+            after(
+                notes,
+                &session.id,
+                AnswerNote::Refused {
+                    name,
+                    voice: &answered,
+                    refusal,
+                },
+            )?;
+            report.refused += 1;
+            return Ok(CommitOutcome::Refused);
+        }
+        None => {}
+    }
+
+    // The override report, and the only line a veto produces in assertion mode: this voice was
+    // heard at once with a voice the run has already put a name on, which is exactly the pair
+    // the heard-at-once rule refuses to put under one name. It is named anyway, and said so here
+    // rather than silently overridden -- naming the voices it overlapped, which is the evidence
+    // the veto would have acted on. No refusal ever arises on this path, because the labelling
+    // the dry run uses honours the assertion: the guard above finds the name where it belongs
+    // and declines nothing.
+    if under_assertion {
+        let overlapped: Vec<String> = committed
+            .iter()
+            .filter(|c| heard_at_once(cluster, c))
+            .map(|c| handle(c.id, unknown))
+            .collect();
+        if !overlapped.is_empty() {
+            let answered = handle(cluster.id, unknown);
+            after(
+                notes,
+                &session.id,
+                AnswerNote::VetoOverridden {
+                    name,
+                    answered: &answered,
+                    speech_seconds: cluster.speech_seconds,
+                    overlapped: &overlapped,
+                },
+            )?;
+            *vetoes_overridden += 1;
+        }
+    } else if let Some(forced_set) = forced {
+        // The group's half of the same report: this member was heard at once with a voice that
+        // already holds the group's name, and the group's authority named it anyway. Measured
+        // against the holders of the name in the running pre-state labelling under the
+        // previous forced set -- the declared members committed so far, minus this one --
+        // which is exactly the count `Preview::group` folds, so a preview and a write report
+        // the same override. The pre-state labelling rather than `shown`: a member committed
+        // earlier in the walk can hold the name only through the tier -- the exclusion takes
+        // it off again in the unforced relabel -- and `shown` no longer shows it there.
+        let mut previous_forced: BTreeMap<u32, String> = forced_set.clone();
+        previous_forced.remove(&cluster.id);
+        let pre = effective_labels(
+            clusters,
+            unknown,
+            speakers,
+            &assigned.names,
+            assertion,
+            Some(&previous_forced),
+        );
+        let mut overlapped: Vec<String> = Vec::new();
+        for (id, label) in pre.iter() {
+            if *id != cluster.id
+                && label.label() == name
+                && clusters
+                    .iter()
+                    .any(|c| c.id == *id && heard_at_once(cluster, c))
+            {
+                overlapped.push(handle(*id, unknown));
+            }
+        }
+        if !overlapped.is_empty() {
+            let answered = handle(cluster.id, unknown);
+            after(
+                notes,
+                &session.id,
+                AnswerNote::GroupVetoOverridden {
+                    name,
+                    answered: &answered,
+                    speech_seconds: cluster.speech_seconds,
+                    overlapped: &overlapped,
+                },
+            )?;
+            *vetoes_overridden += 1;
+        }
+    }
+
+    // Everything this answer wrote, as one note rather than as the four to six lines it used to
+    // print, because that is the block an interface lays out together.
+    //
+    // Narrated *before* the copies are taken out of the consequence below: nothing between here
+    // and there writes a byte, so the order the user sees is unchanged, and a partially moved
+    // `Consequence` can no longer be borrowed.
+    after(
+        notes,
+        &session.id,
+        AnswerNote::Committed {
+            name,
+            speech_seconds: cluster.speech_seconds,
+            consequence: &consequence,
+        },
+    )?;
+    // A sub-count of `named`, and now read off the type rather than off the two arms of the
+    // match that used to print those two sentences -- which is what `Consequence::session_only`
+    // is documented to be.
+    if consequence.session_only() {
+        report.session_only += 1;
+    }
+    report.named += 1;
+    // A sub-count of `named`, like `session_only`: the naming came from the assertion rather
+    // than from an answer given per voice -- see `EnrollReport::asserted` for why the summary
+    // needs the split.
+    if under_assertion {
+        report.asserted += 1;
+        *asserted_voices += 1;
+    }
+
+    // Committed by taking the copies the dry run produced, so what lands on disk is the state
+    // that was checked rather than a second construction of it.
+    let speakers_changed = *speakers != consequence.speakers;
+    let assignments_changed = assigned.names != consequence.assigned.names;
+    *speakers = consequence.speakers;
+    *assigned = consequence.assigned;
+
+    // Written in a fixed order -- the database, then this session's names, then the transcript
+    // -- and only where something changed, so a skipped write leaves a file byte-identical
+    // rather than merely equivalent.
+    if speakers_changed {
+        speakers.write(paths)?;
+    }
+    if assignments_changed {
+        assigned.write(&session.paths)?;
+    }
+    // Recorded after the writes, so the override report measures against voices whose names are
+    // actually on disk, never against answers that were refused or skipped.
+    committed.push(cluster);
+
+    // Re-identified against the updated database rather than assumed: naming one voice can also
+    // name a second cluster in this session, if clustering split that person in two, and a
+    // `--force` re-transcribe would name both. Read with the forced tier the dry run used: a
+    // group member heard at once with another holder of the name would otherwise be dropped back
+    // to its number by the heard-at-once exclusion -- which is exactly the evidence the group's
+    // authority overrides -- and the transcript would not say what the user decided. On the
+    // ordinary path `forced` is `None`, so this reads exactly as before.
+    let now = effective_labels(
+        clusters,
+        unknown,
+        speakers,
+        &assigned.names,
+        assertion,
+        forced,
+    );
+    if relabel(transcript, &now) {
+        transcript.write(
+            &session.paths,
+            rules.template,
+            &TranscriptContext::now(metadata),
+        )?;
+    }
+    // Only on the timestamp path. A user who pointed at a moment did not choose the voice, so
+    // how far the rename reached is the one thing they cannot infer -- whereas the queue and
+    // `--voice` both showed them the voice first, and several tests pin their output exactly as
+    // it is. `assertion.is_none()` because the assertion stands in for the selector: a library
+    // caller that passed both gets the assertion's walk, and the timestamp's rename line is for
+    // the one voice a moment pointed at, which this is not. A group is its own unit, so its
+    // members get no per-member rename line either.
+    if assertion.is_none() && forced.is_none() && matches!(rules.selector, Some(Selection::At(_))) {
+        report_rename(transcript, shown, &now, name, session, notes)?;
+    }
+    *shown = now;
+    Ok(CommitOutcome::Committed)
+}
+
+/// Resolves a group's "Unknown N" handles to the clusters they name, deduplicated and sorted
+/// into queue order -- or `None` when the group cannot say who its members are.
+///
+/// `None` is the whole question going unanswered rather than a partial group: a blank name, an
+/// empty mark, or a handle nothing in this session resolves. That is the blank-name precedent
+/// reached with a different input, and deciding it here -- before the answerer is consulted --
+/// is what keeps a group from committing some of its members and silently dropping the rest.
+///
+/// Handles are the values of `unknown`, built over every cluster in the session, so a quiet
+/// member below the offer floor resolves alike. First-appearance order keeps the deduplication
+/// deterministic; the queue sort re-orders by first appearance regardless, which is the order
+/// the commit walks in and the one a preview folds over, so the two cannot disagree about
+/// sequence.
+fn resolve_group_members<'a>(
+    clusters: &'a [SpeakerCluster],
+    unknown: &BTreeMap<u32, String>,
+    name: &str,
+    members: &[String],
+) -> Option<Vec<&'a SpeakerCluster>> {
+    let name = name.trim();
+    if name.is_empty() || members.is_empty() {
+        return None;
+    }
+    let mut ids: Vec<u32> = Vec::new();
+    for handle in members {
+        match unknown
+            .iter()
+            .find(|(_, label)| label.as_str() == handle.as_str())
+            .map(|(&id, _)| id)
+        {
+            Some(id) if !ids.contains(&id) => ids.push(id),
+            Some(_) => {}
+            None => return None,
+        }
+    }
+    let mut resolved: Vec<&SpeakerCluster> = ids
+        .iter()
+        .filter_map(|id| clusters.iter().find(|c| c.id == *id))
+        .collect();
+    resolved.sort_by(|a, b| {
+        a.first_spoke_seconds
+            .total_cmp(&b.first_spoke_seconds)
+            .then(a.id.cmp(&b.id))
+    });
+    Some(resolved)
 }
 
 /// Counts voices that were offered and not answered into the buckets they have turned out to
@@ -851,7 +1137,10 @@ fn report_rename(
 /// agree on the answer rather than merely be written to. The precedence between the three is
 /// stated there and nowhere else; above all of it sits the one-remote-speaker assertion,
 /// passed in as `one_remote_speaker`, which when present names every voice and makes the rest
-/// of the rule moot -- see [`Naming::with_one_remote_speaker`] for why.
+/// of the rule moot -- see [`Naming::with_one_remote_speaker`] for why. Between the assertion
+/// and the hand-given names sits the forced-label tier, passed in as `forced`: the voices a
+/// group commit has declared one person, exempt from the exclusions for the duration of the
+/// walk -- see [`Naming::with_forced`] for the rank and the reason.
 ///
 /// `clusters` is what identification runs over and what `assigned` is resolved against;
 /// `unknown` is what the transcript was written with, and is the key set of the result. Those
@@ -866,12 +1155,15 @@ pub(crate) fn effective_labels(
     speakers: &EnrolledSpeakers,
     assigned: &[AssignedName],
     one_remote_speaker: Option<&str>,
+    forced: Option<&BTreeMap<u32, String>>,
 ) -> BTreeMap<u32, Attribution> {
-    attributions(
-        unknown,
-        Naming::new(clusters, &identify_clusters(clusters, speakers), assigned)
-            .with_one_remote_speaker(one_remote_speaker),
-    )
+    let identified = identify_clusters(clusters, speakers);
+    let mut naming =
+        Naming::new(clusters, &identified, assigned).with_one_remote_speaker(one_remote_speaker);
+    if let Some(forced) = forced {
+        naming = naming.with_forced(forced);
+    }
+    attributions(unknown, naming)
 }
 
 /// Rewrites every speaker-track turn to what `labels` says its voice should now be called,

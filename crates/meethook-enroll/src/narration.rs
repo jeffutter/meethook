@@ -395,6 +395,27 @@ pub enum AnswerNote<'a> {
         /// The earlier-committed voices it was heard at once with, by their "Unknown N"s.
         overlapped: &'a [String],
     },
+
+    /// The heard-at-once veto would have refused this name for this voice, and the group the
+    /// user chose overrode it rather than losing to it.
+    ///
+    /// The reported half of a group's veto authority: at two or more resolved members a member
+    /// heard at once with one already holding the name is named anyway, and this line is what
+    /// keeps that from being silent -- naming the voices it was heard at once with, the evidence
+    /// the veto acted on. Printed before the [`Committed`](Self::Committed) block, the way
+    /// [`VetoOverridden`](Self::VetoOverridden) prints before it. The difference from that note
+    /// is the reason: the assertion says the whole track is one person, whereas here the user
+    /// chose these particular voices as one.
+    GroupVetoOverridden {
+        /// The name the group commits.
+        name: &'a str,
+        /// The voice it was named for, by its "Unknown N".
+        answered: &'a str,
+        /// How much the voice spoke, which is what the report is measured in.
+        speech_seconds: f64,
+        /// The earlier-named voices it was heard at once with, by their "Unknown N"s.
+        overlapped: &'a [String],
+    },
 }
 
 /// The narration as the command-line tool prints it: one line per note, to a writer.
@@ -665,6 +686,21 @@ impl Lines<'_> {
                     "{session}  named {name} for {answered} ({speech_seconds:.1} s) despite \
                      the heard-at-once veto: it was heard at once with {} -- the \
                      one-remote-speaker assertion says this track is one person",
+                    overlapped.join(", ")
+                )?;
+                Ok(())
+            }
+            AnswerNote::GroupVetoOverridden {
+                name,
+                answered,
+                speech_seconds,
+                overlapped,
+            } => {
+                writeln!(
+                    self.out,
+                    "{session}  named {name} for {answered} ({speech_seconds:.1} s) despite \
+                     the heard-at-once veto: it was heard at once with {} -- you chose \
+                     these voices as one person",
                     overlapped.join(", ")
                 )?;
                 Ok(())

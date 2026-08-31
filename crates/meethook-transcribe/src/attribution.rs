@@ -21,6 +21,21 @@
 //! rest of the rule is moot -- see [`Naming::with_one_remote_speaker`] for why the
 //! heard-at-once exclusion does not apply to the asserted name.
 //!
+//! Below the assertion and above everything else sits the forced-label tier:
+//! [`Naming::with_forced`] names specific voices, exempting them from every exclusion the
+//! rule otherwise applies. A forced label is the user's declaration that *these* voices are
+//! one person, given against the session's own clustering while the run is walking it --
+//! stronger than a hand-given name, which the exclusions still test, because the user has
+//! already been shown the segmentation evidence and overridden it deliberately. The
+//! exemption is the point rather than an exception: a forced pair that the segmenter heard
+//! talking over each other keeps the shared name, exactly as an asserted pair does, only
+//! scoped to the voices named. Forced holders count as holders for every non-forced voice,
+//! so a conflicting assignment or identification on a voice they overlap falls back to its
+//! number rather than slipping past the veto; and where a forced entry conflicts with the
+//! voice's own assignment, the forced name replaces it. The assertion outranks the tier
+//! outright: on a track the user has called one person, every voice reads the asserted name
+//! whatever was forced.
+//!
 //! Below it, a hand-given name beats identification, which beats the number. The order is
 //! not a preference between two guesses: a row in `speaker_names.json` is a person saying
 //! *that voice, in this recording, is this human*, and identification is a cosine distance
@@ -133,10 +148,17 @@ pub struct Naming<'a> {
     /// every voice on the track and settles the question the exclusions below exist to keep
     /// open.
     one_remote_speaker: Option<&'a str>,
+    /// The forced-label tier: the voices the user has declared one person, by cluster id and
+    /// name. An empty map applies no such claim and the rule runs exactly as it always has;
+    /// see the module doc for the tier's rank and why its exemption is the point.
+    forced: &'a BTreeMap<u32, String>,
 }
 
 /// Somewhere for [`Naming::nothing`] to point its identification map at.
 static NOBODY: BTreeMap<u32, Identification> = BTreeMap::new();
+
+/// Somewhere for [`Naming::new`] and [`Naming::nothing`] to point their forced set at.
+static NO_FORCED: BTreeMap<u32, String> = BTreeMap::new();
 
 impl<'a> Naming<'a> {
     pub fn new(
@@ -149,6 +171,7 @@ impl<'a> Naming<'a> {
             identified,
             assigned,
             one_remote_speaker: None,
+            forced: &NO_FORCED,
         }
     }
 
@@ -159,6 +182,7 @@ impl<'a> Naming<'a> {
             identified: &NOBODY,
             assigned: &[],
             one_remote_speaker: None,
+            forced: &NO_FORCED,
         }
     }
 
@@ -179,6 +203,18 @@ impl<'a> Naming<'a> {
             one_remote_speaker: name,
             ..self
         }
+    }
+
+    /// The same naming with the forced-label tier filled in: every id in `forced` reads its
+    /// name unconditionally, exempt from the heard-at-once exclusion and from any assignment
+    /// recorded against it, while every other voice treats the forced entries as additional
+    /// holders of their names.
+    ///
+    /// The tier sits between the assertion and the hand-given names -- see the module doc for
+    /// the rank and the reason the exemption is deliberate. An empty map, and every caller
+    /// before this existed, leaves the rule byte-identical to how it ran.
+    pub fn with_forced(self, forced: &'a BTreeMap<u32, String>) -> Self {
+        Naming { forced, ..self }
     }
 
     /// The same naming with identification's answers filled in.
@@ -220,9 +256,18 @@ impl<'a> Naming<'a> {
             }
         }
 
+        // The forced labels hold first: they are the user's declaration that those voices are
+        // one person, so they stand as holders before any hand-given name is considered, and
+        // an award that would put a conflicting name on a voice heard at once with one of
+        // them loses here rather than later. A forced id's own assignment is never awarded --
+        // the forced name replaces it, which is also what keeps the seed from being shadowed
+        // by a row the tier has already overruled.
         let mut awarded: BTreeMap<u32, String> = BTreeMap::new();
+        for (id, name) in self.forced {
+            awarded.insert(*id, name.clone());
+        }
         for (id, name) in resolved {
-            if self.overlaps_a_holder_of(id, name, &awarded) {
+            if self.forced.contains_key(&id) || self.overlaps_a_holder_of(id, name, &awarded) {
                 continue;
             }
             awarded.insert(id, name.to_string());
@@ -308,7 +353,14 @@ pub fn attributions(
     unknown
         .iter()
         .map(|(&id, label)| {
-            let attribution = if let Some(name) = assigned.get(&id) {
+            // The forced tier, after the assertion and before everything else: the voice reads
+            // the name the user declared for it, whatever an assignment or an identification
+            // says, and the exclusion is not applied to it rather than applied and then undone
+            // -- the user declared these voices one person, and the segmentation evidence is
+            // overridden for them, reported elsewhere.
+            let attribution = if let Some(name) = naming.forced.get(&id) {
+                Attribution::Assigned { name: name.clone() }
+            } else if let Some(name) = assigned.get(&id) {
                 Attribution::Assigned { name: name.clone() }
             } else if let Some(who) = naming
                 .identified
@@ -709,6 +761,150 @@ mod tests {
         let map = attributions(
             &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
             Naming::new(&clusters, &NOBODY, &[stale]).with_one_remote_speaker(Some("Grace")),
+        );
+
+        assert_eq!(
+            map[&0],
+            Attribution::Assigned {
+                name: "Grace".to_string()
+            }
+        );
+        assert_eq!(
+            map[&1],
+            Attribution::Assigned {
+                name: "Grace".to_string()
+            }
+        );
+    }
+
+    // --- the forced-label tier -------------------------------------------------------------
+
+    /// A forced set built the way `enroll` builds one: the resolved members' ids mapped to the
+    /// group's name.
+    fn forced(entries: &[(u32, &str)]) -> BTreeMap<u32, String> {
+        entries
+            .iter()
+            .map(|(id, name)| (*id, name.to_string()))
+            .collect()
+    }
+
+    /// The tier's rank on the voice it names: an assignment and an identification both stand
+    /// without the forcing, and with it the voice reads the forced name -- carrying no
+    /// confidence, the way every session-assigned name does -- while the voice beside it is
+    /// untouched by a declaration made about somebody else.
+    #[test]
+    fn a_forced_label_beats_an_assignment_and_an_identification_on_that_voice_only() {
+        let clusters = clusters(&[0, 1]);
+        let id = identified(&[(0, "Alice", 0.83)]);
+        let rows = vec![assignment(0, "Alex")];
+        let f = forced(&[(0, "Grace")]);
+        let naming = Naming::new(&clusters, &id, &rows).with_forced(&f);
+
+        let map = attributions(&unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]), naming);
+
+        assert_eq!(
+            map[&0],
+            Attribution::Assigned {
+                name: "Grace".to_string()
+            }
+        );
+        assert_eq!(map[&0].confidence(), None);
+        // The neighbour keeps what the rule would have given it: nothing was said about it.
+        assert_eq!(map[&1], Attribution::Unknown("Unknown 2".to_string()));
+    }
+
+    /// The hard part, scoped: voices the segmenter heard talking over each other are exactly
+    /// what the heard-at-once exclusion refuses to put under one name, and the forcing
+    /// overrides it rather than losing to it -- for the pair it declares, only. Without the
+    /// forcing the lower id keeps the name and the other falls back to its number; with it,
+    /// both keep it.
+    #[test]
+    fn the_heard_at_once_exclusion_does_not_apply_to_a_forced_name() {
+        let pair = forced(&[(0, "Grace"), (1, "Grace")]);
+        let mut clusters = vec![cluster(0, Vec::new()), cluster(1, Vec::new())];
+        clusters[0].heard_at_once_with = vec![1];
+        clusters[1].heard_at_once_with = vec![0];
+
+        let map = attributions(
+            &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
+            Naming::new(&clusters, &NOBODY, &[]).with_forced(&pair),
+        );
+
+        assert_eq!(
+            map[&0],
+            Attribution::Assigned {
+                name: "Grace".to_string()
+            }
+        );
+        assert_eq!(
+            map[&1],
+            Attribution::Assigned {
+                name: "Grace".to_string()
+            }
+        );
+    }
+
+    /// The exemption cuts one way only: a forced holder still counts as a holder for every
+    /// non-forced voice, so a hand-given name that would land on two voices heard at once is
+    /// refused here -- falling back to the number, never to some other name.
+    #[test]
+    fn a_forced_holder_excludes_a_conflicting_assignment() {
+        let mut clusters = vec![cluster(0, Vec::new()), cluster(1, Vec::new())];
+        clusters[0].heard_at_once_with = vec![1];
+        clusters[1].heard_at_once_with = vec![0];
+        let f = forced(&[(0, "Grace")]);
+
+        let map = attributions(
+            &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
+            Naming::new(&clusters, &NOBODY, &[assignment(1, "Grace")]).with_forced(&f),
+        );
+
+        assert_eq!(
+            map[&0],
+            Attribution::Assigned {
+                name: "Grace".to_string()
+            }
+        );
+        assert_eq!(map[&1], Attribution::Unknown("Unknown 2".to_string()));
+    }
+
+    /// And the same holding power against an identification: a match to the person a forced
+    /// label already put on a voice this one was heard talking over is refused, and the voice
+    /// falls to its number rather than to the reference that already lost.
+    #[test]
+    fn a_forced_holder_excludes_a_conflicting_identification() {
+        let mut clusters = vec![cluster(0, Vec::new()), cluster(1, Vec::new())];
+        clusters[0].heard_at_once_with = vec![1];
+        clusters[1].heard_at_once_with = vec![0];
+        let f = forced(&[(0, "Grace")]);
+
+        let map = attributions(
+            &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
+            Naming::new(&clusters, &identified(&[(1, "Grace", 0.95)]), &[]).with_forced(&f),
+        );
+
+        assert_eq!(
+            map[&0],
+            Attribution::Assigned {
+                name: "Grace".to_string()
+            }
+        );
+        assert_eq!(map[&1], Attribution::Unknown("Unknown 2".to_string()));
+    }
+
+    /// The top of the stack: the assertion outranks the forced tier outright, so a track the
+    /// user has called one person reads the asserted name even where a different name was
+    /// forced onto part of it.
+    #[test]
+    fn an_assertion_outranks_a_forced_label() {
+        let clusters = clusters(&[0, 1]);
+        let f = forced(&[(0, "Milo")]);
+
+        let map = attributions(
+            &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
+            Naming::new(&clusters, &NOBODY, &[])
+                .with_forced(&f)
+                .with_one_remote_speaker(Some("Grace")),
         );
 
         assert_eq!(

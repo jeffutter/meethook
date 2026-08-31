@@ -35,6 +35,10 @@
 //! [`crate::resolve()`], which is built for that, and preview only the one candidate it has
 //! highlighted.
 //!
+//! [`Preview::group`] prices the aggregate the same way: N times one clone pair and two
+//! labellings, folded forward over clones in queue order, which is acceptable once per distinct
+//! candidate name and never per keystroke for the same reason.
+//!
 //! Nothing on the `--name` path reaches [`Preview::of`] at all, so the non-interactive command
 //! pays for the preview it never asks for exactly nothing.
 
@@ -69,6 +73,13 @@ pub struct Preview<'a> {
     /// [`Preview::one_speaker`], which must promise the commits the run will still make rather
     /// than the ones it has made; [`Preview::of`] ignores it.
     committed: &'a [&'a SpeakerCluster],
+    /// The group's declared members, keyed by cluster id to the name the group commits them
+    /// under -- or `None`, which labels exactly as before. Set by [`Preview::with_forced`]
+    /// and threaded into every labelling the dry run does, so a group member previewed against
+    /// the running state honours the same forced tier the write applies: a preview that did not
+    /// see it could show a veto the commit overrides, and disagree with the transcript it
+    /// predicts.
+    forced: Option<&'a BTreeMap<u32, String>>,
 }
 
 impl<'a> Preview<'a> {
@@ -101,7 +112,18 @@ impl<'a> Preview<'a> {
             enrolment,
             one_remote_speaker,
             committed,
+            forced: None,
         }
+    }
+
+    /// A copy of this preview whose dry run honours the group's declared members: the ids in
+    /// `forced` read their name unconditionally and are exempt from the heard-at-once and
+    /// argmax exclusions for the duration of the labelling -- see
+    /// [`meethook_transcribe::Naming::with_forced`] for the rank and the reason. `None` back
+    /// to the ordinary rule.
+    pub(crate) fn with_forced(mut self, forced: Option<&'a BTreeMap<u32, String>>) -> Preview<'a> {
+        self.forced = forced;
+        self
     }
 
     /// What answering this voice with `name` would do, without writing anything.
@@ -123,17 +145,44 @@ impl<'a> Preview<'a> {
         if name.is_empty() {
             return None;
         }
+        Some(self.commit_to(
+            name,
+            self.cluster,
+            self.speakers.clone(),
+            self.assigned.clone(),
+            self.forced,
+        ))
+    }
 
+    /// The mutation sequence one answer applies to a candidate state: the correction, the two
+    /// labellings, the addition, the stale check, and the refusal -- the whole body of
+    /// [`Preview::of`], factored out so the group fold applies the same sequence to the same
+    /// kind of state rather than re-deriving it.
+    ///
+    /// `name` must be trimmed and non-empty -- the normalisation [`Preview::of`] applies -- and
+    /// `candidate` and `candidate_assigned` are the copies the caller cloned, one per question,
+    /// since a preview that held its own copy would go stale the moment an answer was
+    /// committed. `forced` is the group's declared members, passed by the fold and `None`
+    /// everywhere else; see [`meethook_transcribe::Naming::with_forced`] for what the tier does
+    /// to the rule.
+    ///
+    /// One producer of the sequence rather than two is the module invariant above: a preview
+    /// and a write that disagreed would be two implementations of one rule, and the symptom of
+    /// those disagreeing is a name on the wrong person's turns.
+    fn commit_to(
+        &self,
+        name: &str,
+        cluster: &SpeakerCluster,
+        mut candidate: EnrolledSpeakers,
+        mut candidate_assigned: SpeakerNames,
+        forced: Option<&BTreeMap<u32, String>>,
+    ) -> Consequence {
         // Naming a voice and storing a reference built from it are two different acts, and this
         // is where they come apart. Below the floor the name is recorded against the session and
         // `speakers.json` is not touched at all -- see `REFERENCE_FLOOR_SECONDS` for what a
         // reference built from two seconds of speech does to every future meeting.
-        let session_only = self.cluster.speech_seconds < REFERENCE_FLOOR_SECONDS
-            && self.enrolment != Enrolment::Always;
-
-        // Everything this answer would write, applied to copies.
-        let mut candidate = self.speakers.clone();
-        let mut candidate_assigned = self.assigned.clone();
+        let session_only =
+            cluster.speech_seconds < REFERENCE_FLOOR_SECONDS && self.enrolment != Enrolment::Always;
 
         // The correction, on the above-floor path only: a reference identical to this cluster
         // was built from this voice, and the user has just told us this voice is somebody else,
@@ -143,7 +192,7 @@ impl<'a> Preview<'a> {
         let displaced = if session_only {
             Vec::new()
         } else {
-            candidate.forget_reference(&self.cluster.embedding, name)
+            candidate.forget_reference(&cluster.embedding, name)
         };
 
         // What every voice reads once the correction alone has been applied. The baseline the
@@ -157,30 +206,28 @@ impl<'a> Preview<'a> {
             &candidate,
             &candidate_assigned.names,
             self.one_remote_speaker,
+            forced,
         );
 
         // The addition. `None` on the below-floor path, where no reference is stored at all.
         let stored = if session_only {
-            candidate_assigned.assign(self.cluster.id, name, self.cluster.embedding.clone());
+            candidate_assigned.assign(cluster.id, name, cluster.embedding.clone());
             None
         } else {
-            let stored = candidate.store_reference(
-                name,
-                self.cluster.embedding.clone(),
-                self.cluster.speech_seconds,
-            );
+            let stored =
+                candidate.store_reference(name, cluster.embedding.clone(), cluster.speech_seconds);
             if matches!(stored, Stored::AtCapacity { .. }) {
                 // At the cap with nothing shorter than this recording to displace, so it is not
                 // stored and the answer falls back to the session-only path rather than being
                 // lost: the transcript still reads the right person, and nothing already stored
                 // is dropped for a recording that is no better than it.
-                candidate_assigned.assign(self.cluster.id, name, self.cluster.embedding.clone());
+                candidate_assigned.assign(cluster.id, name, cluster.embedding.clone());
             } else {
                 // One voice, one record. A voice named for this session only and then enrolled
                 // properly -- the same fragment reached again with `--force-reference`, or a
                 // later clustering that gave it enough speech -- must stop also being an
                 // assignment, or the two could be made to disagree about who it is.
-                candidate_assigned.forget(self.cluster.id);
+                candidate_assigned.forget(cluster.id);
             }
             Some(stored)
         };
@@ -191,6 +238,7 @@ impl<'a> Preview<'a> {
             &candidate,
             &candidate_assigned.names,
             self.one_remote_speaker,
+            forced,
         );
 
         // A legacy reference that *is* this exact fragment, still standing under somebody
@@ -200,18 +248,18 @@ impl<'a> Preview<'a> {
         let stale: Vec<String> = candidate
             .speakers
             .iter()
-            .filter(|s| s.name != name && s.embedding == self.cluster.embedding)
+            .filter(|s| s.name != name && s.embedding == cluster.embedding)
             .map(|s| s.name.clone())
             .collect();
 
-        Some(Consequence {
-            refused: refusal_of(self.cluster.id, name, self.unknown, &corrected, &after),
+        Consequence {
+            refused: refusal_of(cluster.id, name, self.unknown, &corrected, &after),
             stored,
             displaced,
             stale,
             speakers: candidate,
             assigned: candidate_assigned,
-        })
+        }
     }
 
     /// What asserting that the session's speaker track is one person called `name` would do to
@@ -270,6 +318,216 @@ impl<'a> Preview<'a> {
             vetoes_overridden,
         })
     }
+
+    /// What naming a chosen group of voices -- the stable "Unknown N" handles the interface
+    /// shows in its queue pane -- with one name would do to the session, without writing
+    /// anything.
+    ///
+    /// The aggregate dry run behind a group commit: each member is applied through the same
+    /// `commit_to` core [`Preview::of`] uses, in queue order, over clones
+    /// that grow as members land. That is what makes this the sequential application of the
+    /// members' individual previews rather than a re-derivation of them, and it is why the
+    /// cost is N times one clone pair and two labellings -- acceptable once per distinct
+    /// candidate name, never per keystroke, for the reason the module doc gives.
+    ///
+    /// `None` for a name that is not one -- empty, or whitespace only, the same normalisation
+    /// [`Preview::of`] applies -- and for any handle that does not resolve to a cluster of
+    /// this session: a group that cannot say who its members are goes unanswered rather than
+    /// partially answered, which is the blank-name precedent reached with a different input.
+    /// Duplicate handles dedupe to first appearance; the walk itself is in queue order, the
+    /// order the commit walks in, so a preview and a write cannot disagree about sequence.
+    ///
+    /// The group carries veto authority at two or more resolved members: a member heard at
+    /// once with a holder of the name is named anyway, and counted in
+    /// [`GroupConsequence::vetoes_overridden`] the way the commit counts it. A one-member
+    /// group has none -- no forcing at all, exactly today's plain naming of that member --
+    /// which is the threshold the commit enforces too, so the two cannot see the group
+    /// differently.
+    pub fn group(&self, name: &str, members: &[&str]) -> Option<GroupConsequence> {
+        let name = name.trim();
+        if name.is_empty() || members.is_empty() {
+            return None;
+        }
+
+        // Resolution and deduplication against the session's own numbering: the handles are
+        // the values of `unknown`, built over every cluster in the session, so quiet members
+        // below the offer floor resolve alike. First-appearance order keeps the deduplication
+        // deterministic; the walk below re-sorts into queue order regardless.
+        let mut ids: Vec<u32> = Vec::new();
+        for handle in members {
+            let id = self
+                .unknown
+                .iter()
+                .find(|(_, label)| label == handle)
+                .map(|(&id, _)| id)?;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let mut resolved: Vec<&SpeakerCluster> = ids
+            .iter()
+            .filter_map(|id| self.clusters.iter().find(|c| c.id == *id))
+            .collect();
+        resolved.sort_by(|a, b| {
+            a.first_spoke_seconds
+                .total_cmp(&b.first_spoke_seconds)
+                .then(a.id.cmp(&b.id))
+        });
+
+        // Veto authority iff the group names two or more voices: one member is a plain
+        // naming, and the veto refuses it exactly as today.
+        let authority = resolved.len() >= 2;
+
+        // The fold: one clone pair per member, applied forward over the running state. A
+        // refused member leaves the running state untouched, so the members after it are
+        // previewed against the state the run will actually reach.
+        let mut running_speakers = self.speakers.clone();
+        let mut running_assigned = self.assigned.clone();
+        let mut committed: Vec<&SpeakerCluster> = Vec::new();
+        let mut result = GroupConsequence {
+            name: name.to_string(),
+            applied: Vec::new(),
+            refused: Vec::new(),
+            vetoes_overridden: 0,
+            references_after: 0,
+            displaced: Vec::new(),
+            stale: Vec::new(),
+        };
+
+        for member in &resolved {
+            // The members committed so far, by id and name: the previous forced set for the
+            // veto count, and minus this member the seed of the current one.
+            let mut previous_forced: BTreeMap<u32, String> = committed
+                .iter()
+                .map(|done| (done.id, name.to_string()))
+                .collect();
+
+            // The veto count, measured before the member lands: the holders of the name in
+            // the running pre-state labelling under the previous forced set, excluding the
+            // member itself, filtered to the ones segmentation heard at once with it. One
+            // overridden veto per member however many holders it overlaps -- the run's own
+            // counter, which the summary line reports.
+            if authority {
+                let pre = effective_labels(
+                    self.clusters,
+                    self.unknown,
+                    &running_speakers,
+                    &running_assigned.names,
+                    self.one_remote_speaker,
+                    Some(&previous_forced),
+                );
+                let overlapped = pre.iter().any(|(&id, label)| {
+                    id != member.id
+                        && label.label() == name
+                        && self
+                            .clusters
+                            .iter()
+                            .any(|c| c.id == id && heard_at_once(member, c))
+                });
+                if overlapped {
+                    result.vetoes_overridden += 1;
+                }
+            }
+
+            // The member's individual consequence through the shared core, with the growing
+            // forced set -- the declared members committed so far plus this one, only while
+            // the group has authority. Under forcing a `Vetoed` refusal cannot arise, because
+            // the member always holds the name; a `Taken` refusal can, and it is honoured
+            // here the way the commit honours it: refused, state left unchanged, the walk
+            // carries on.
+            let forced_now = if authority {
+                previous_forced.insert(member.id, name.to_string());
+                Some(&previous_forced)
+            } else {
+                None
+            };
+            let consequence = self.commit_to(
+                name,
+                member,
+                running_speakers.clone(),
+                running_assigned.clone(),
+                forced_now,
+            );
+
+            match consequence.refused {
+                Some(refusal) => {
+                    result
+                        .refused
+                        .push((handle(member.id, self.unknown), refusal));
+                }
+                None => {
+                    result.applied.push(handle(member.id, self.unknown));
+                    // Merged by name rather than concatenated: one person can lose references
+                    // to two members, and concatenation would report them twice with two
+                    // different remainings. Last `remaining` wins, like the run's own writes.
+                    for displaced in consequence.displaced {
+                        if let Some(existing) = result
+                            .displaced
+                            .iter_mut()
+                            .find(|d| d.name == displaced.name)
+                        {
+                            *existing = displaced;
+                        } else {
+                            result.displaced.push(displaced);
+                        }
+                    }
+                    for stale in consequence.stale {
+                        if !result.stale.contains(&stale) {
+                            result.stale.push(stale);
+                        }
+                    }
+                    // Applied by taking the copies the dry run produced, exactly as the
+                    // commit takes them out of its own consequence.
+                    running_speakers = consequence.speakers;
+                    running_assigned = consequence.assigned;
+                    committed.push(member);
+                }
+            }
+        }
+
+        // The group's total reference count after applying, read off the final database
+        // rather than re-derived from the members: the cap does the bounding, so the count
+        // it holds is the answer.
+        result.references_after = running_speakers.references(name);
+        Some(result)
+    }
+}
+
+/// What naming a chosen group of voices with one name would do to the session, as the
+/// aggregate the commit reports.
+///
+/// Read [`GroupConsequence::refused`] first: a refused member is one the group could not
+/// name -- the rest still apply, which is the difference between a group and a single answer,
+/// where a refusal writes nothing at all.
+///
+/// Every field is what the run's own report says once the group has walked -- the members it
+/// named, the vetoes it overrode, the references the database now holds -- computed the way
+/// the run computes them rather than re-derived, which is what keeps a preview and a write
+/// from drifting apart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupConsequence {
+    /// The name, trimmed the same way [`Preview::of`] trims one.
+    pub name: String,
+
+    /// The members that would be committed, by their "Unknown N", in queue order.
+    pub applied: Vec<String>,
+
+    /// The members whose naming would be refused, with the refusal, in queue order.
+    pub refused: Vec<(String, Refusal)>,
+
+    /// How many heard-at-once vetoes the group would override on the way, counting a member
+    /// once however many holders it overlaps -- the run's own counter.
+    pub vetoes_overridden: usize,
+
+    /// The group's total reference count after applying, off the final database.
+    pub references_after: usize,
+
+    /// The people who would lose a reference to the group's corrections, merged by name.
+    pub displaced: Vec<Displaced>,
+
+    /// Names that would still hold a reference built from an applied member's exact voice
+    /// afterwards, unioned across the members.
+    pub stale: Vec<String>,
 }
 
 /// What asserting one remote speaker would do to the session, as the two numbers the commit
@@ -931,6 +1189,7 @@ mod tests {
             &consequence.speakers,
             &consequence.assigned.names,
             Some("Alice"),
+            None,
         );
         assert_eq!(after[&0].label(), "Alice");
         assert_eq!(after[&1].label(), "Alice");
@@ -1074,6 +1333,215 @@ mod tests {
                 vetoes_overridden: 1
             })
         );
+    }
+
+    // --- the group fold -------------------------------------------------------------------
+
+    /// The guards, reached through the group door: a blank name previews nothing, a handle
+    /// nothing resolves goes unanswered rather than partially answered, and an empty group is
+    /// no group at all.
+    #[test]
+    fn a_group_that_cannot_name_its_members_previews_nothing() {
+        let clusters = vec![cluster(0, voice(0), 40.0)];
+        let unknown = numbering(&clusters);
+        let speakers = enrolled(&[]);
+        let assigned = no_names();
+        let preview = preview_of(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            Enrolment::default(),
+        );
+
+        assert!(preview.group("", &["Unknown 1"]).is_none());
+        assert!(preview.group("   ", &["Unknown 1"]).is_none());
+        assert!(preview.group("Alice", &[]).is_none());
+        assert!(preview.group("Alice", &["Unknown 9"]).is_none());
+        assert!(
+            preview
+                .group("Alice", &["Unknown 1", "Unknown 9"])
+                .is_none()
+        );
+    }
+
+    /// A group of one member behaves exactly like today's plain naming of that member: the
+    /// same displaced, stale, and final reference count as [`Preview::of`] for the same voice,
+    /// which is the threshold below which the group carries no veto authority at all.
+    #[test]
+    fn a_one_member_group_is_the_plain_naming_of_that_member() {
+        let clusters = vec![cluster(0, voice(0), 40.0)];
+        let unknown = numbering(&clusters);
+        let speakers = enrolled(&[("Milo", voice(0), Some(30.0))]);
+        let assigned = no_names();
+        let preview = preview_of(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            Enrolment::default(),
+        );
+
+        let solo = preview.of("Ryan").unwrap();
+        let group = preview.group("Ryan", &["Unknown 1"]).unwrap();
+
+        assert_eq!(group.name, "Ryan");
+        assert_eq!(group.applied, ["Unknown 1".to_string()]);
+        assert!(group.refused.is_empty());
+        assert_eq!(group.vetoes_overridden, 0);
+        assert_eq!(group.displaced, solo.displaced);
+        assert_eq!(group.stale, solo.stale);
+        // The total read off the final database, and the same number `of`'s own clone holds.
+        assert_eq!(group.references_after, solo.speakers.references("Ryan"));
+    }
+
+    /// Duplicate handles dedupe to first appearance: the member is committed once, not twice,
+    /// and the second mention neither adds a reference nor reports a second application.
+    #[test]
+    fn duplicate_member_handles_dedupe_to_one_commit() {
+        let clusters = vec![cluster(0, voice(0), 40.0), cluster(1, voice(1), 40.0)];
+        let unknown = numbering(&clusters);
+        let speakers = enrolled(&[]);
+        let assigned = no_names();
+        let preview = preview_of(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            Enrolment::default(),
+        );
+
+        let group = preview
+            .group("Alice", &["Unknown 2", "Unknown 1", "Unknown 1"])
+            .unwrap();
+
+        assert_eq!(
+            group.applied,
+            ["Unknown 1".to_string(), "Unknown 2".to_string()]
+        );
+        assert!(group.refused.is_empty());
+        assert_eq!(group.references_after, 2);
+    }
+
+    /// The queue order, not the input order: the walk commits in first-appearance order, so a
+    /// preview and a write cannot disagree about sequence whatever order the interface listed
+    /// the marks in.
+    #[test]
+    fn the_group_walks_in_queue_order_not_input_order() {
+        let clusters = vec![cluster(0, voice(0), 40.0), cluster(1, voice(1), 40.0)];
+        let unknown = numbering(&clusters);
+        let speakers = enrolled(&[]);
+        let assigned = no_names();
+        let preview = preview_of(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            Enrolment::default(),
+        );
+
+        let group = preview.group("Alice", &["Unknown 2", "Unknown 1"]).unwrap();
+
+        assert_eq!(
+            group.applied,
+            ["Unknown 1".to_string(), "Unknown 2".to_string()]
+        );
+    }
+
+    /// A refused member leaves the running state untouched while the members after it still
+    /// apply: the refusal is per member, not per group, and the walk carries on against the
+    /// state the run will actually reach.
+    #[test]
+    fn a_taken_refused_member_leaves_state_unchanged_while_later_members_apply() {
+        let clusters = vec![
+            cluster(0, nearly(0.0), 40.0),
+            cluster(1, nearly(20.0), 40.0),
+            cluster(2, voice(2), 40.0),
+        ];
+        let unknown = numbering(&clusters);
+        // Bob is 40 degrees from cluster 1 and 60 from cluster 0: naming cluster 0 Alice
+        // stores a reference nearer to cluster 1 than Bob's is, which takes Bob off it -- a
+        // `Taken` the group honours rather than overrides.
+        let speakers = enrolled(&[("Bob", nearly(60.0), Some(30.0))]);
+        let assigned = no_names();
+        let preview = preview_of(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            Enrolment::default(),
+        );
+
+        let group = preview.group("Alice", &["Unknown 1", "Unknown 3"]).unwrap();
+
+        assert_eq!(
+            group.refused,
+            [(
+                "Unknown 1".to_string(),
+                Refusal::Taken {
+                    voice: "Unknown 2".to_string(),
+                    losing: "Bob".to_string()
+                }
+            )]
+        );
+        // The later member still applies, against the state the refusal left behind: Bob's
+        // reference is still there, so it is displaced by the member that did commit rather
+        // than lost to the one that did not.
+        assert_eq!(group.applied, ["Unknown 3".to_string()]);
+        assert_eq!(group.references_after, 1);
+    }
+
+    /// The aggregate the frame pane shows before any member commits: on a heard-at-once pair
+    /// plus a pre-enrolled colliding name, the fold reports the veto it will override, the
+    /// displacement it will make, and the group's total reference count off the final clone.
+    #[test]
+    fn the_group_fold_reports_the_veto_the_displacement_and_the_final_reference_count() {
+        let mut clusters = vec![
+            cluster(0, nearly(0.0), 40.0),
+            cluster(1, nearly(20.0), 40.0),
+            cluster(2, voice(2), 40.0),
+        ];
+        clusters[0].heard_at_once_with = vec![1];
+        clusters[1].heard_at_once_with = vec![0];
+        let unknown = numbering(&clusters);
+        // Milo holds a reference built from cluster 0's exact voice: naming cluster 0 Grace
+        // displaces it, and cluster 1 is the member the veto would have refused singly.
+        let speakers = enrolled(&[("Milo", nearly(0.0), Some(30.0))]);
+        let assigned = no_names();
+        let preview = preview_of(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            Enrolment::default(),
+        );
+
+        let group = preview
+            .group("Grace", &["Unknown 1", "Unknown 2", "Unknown 3"])
+            .unwrap();
+
+        assert_eq!(
+            group.applied,
+            [
+                "Unknown 1".to_string(),
+                "Unknown 2".to_string(),
+                "Unknown 3".to_string()
+            ]
+        );
+        assert!(group.refused.is_empty());
+        // Cluster 2 overlaps nobody; cluster 1 was heard at once with cluster 0, which holds
+        // the name when cluster 1 lands -- exactly one overridden veto, counted once.
+        assert_eq!(group.vetoes_overridden, 1);
+        assert_eq!(
+            group.displaced,
+            [Displaced {
+                name: "Milo".to_string(),
+                remaining: 0
+            }]
+        );
+        // Three references stored, one displaced, none held before: the total is what the
+        // final database holds, not the sum of the members' individual counts.
+        assert_eq!(group.references_after, 3);
     }
 
     /// The other refusal: the answer would take a name off a voice the user was not asked

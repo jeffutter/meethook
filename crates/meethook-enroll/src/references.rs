@@ -192,6 +192,7 @@ impl Labelled {
             speakers,
             &self.assigned,
             self.one_remote_speaker.as_deref(),
+            None,
         )
     }
 
@@ -315,6 +316,7 @@ pub(crate) fn label_sessions(paths: &Paths, speakers: &EnrolledSpeakers) -> Resu
             speakers,
             &assigned,
             one_remote_speaker.as_deref(),
+            None,
         );
         labelling.sessions.push(Labelled {
             session: session.id.clone(),
