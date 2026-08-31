@@ -1497,8 +1497,13 @@ fn print_enrolled_distances(clusters: &[SpeakerCluster]) {
             // Only the *nearest* of a person's references wins the argmax, so "accepted" is
             // marked on that one row rather than on every row bearing the winning name --
             // which would claim identification rested on evidence it never looked at.
+            //
+            // Compared as `distance == 1.0 - id.similarity`, not `id.similarity == 1.0 -
+            // distance`: both sides then do exactly one subtraction on the same bit-identical
+            // dot product, where the reverse comparison round-trips `distance` through two
+            // subtractions and loses exactness for roughly half of all f32 inputs.
             let accepted = matched
-                .is_some_and(|id| id.name == speaker.name && id.similarity == 1.0 - distance);
+                .is_some_and(|id| id.name == speaker.name && distance == 1.0 - id.similarity);
             println!(
                 "    {label:<20} {:>7.3}  {}",
                 distance,
