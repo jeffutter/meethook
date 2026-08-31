@@ -24,6 +24,7 @@
 
 pub mod render;
 pub mod state;
+pub mod who;
 
 use std::cell::RefCell;
 use std::io::{self, Write};

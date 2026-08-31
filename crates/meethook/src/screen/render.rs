@@ -607,8 +607,9 @@ mod tests {
 
     use meethook_enroll::Snippet;
 
-    use super::super::state::tests::{heard, holding, names, scanned};
+    use super::super::state::tests::heard;
     use super::super::state::{Context, Cost, Costs, Event, Screen, VoiceView};
+    use super::super::who::tests::{holding, names, scanned};
     use super::{Progress, Sounding, clause_within, draw, incomplete, listed};
 
     struct Free;
