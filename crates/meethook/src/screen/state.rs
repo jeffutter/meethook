@@ -37,7 +37,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use meethook_enroll::{
-    Answer, Assertion, MeetingLabel, Position, Queued, Refusal, Resolution, Snippet, resolve,
+    Answer, Assertion, GroupConsequence, MeetingLabel, Position, Queued, Refusal, Resolution,
+    Snippet, resolve,
 };
 use meethook_session::SessionId;
 use meethook_transcribe::{Attribution, Resemblance};
@@ -98,6 +99,14 @@ pub enum Event {
     /// Work on the voice the queue cursor is on. A no-op when that is the voice being asked
     /// about, and otherwise the only thing that returns [`Answer::Later`].
     Select,
+    /// Toggle whether the voice under the queue cursor counts as one person together with the
+    /// other marked rows.
+    ///
+    /// A grouping rather than a decision: the mark stays inert until a member is asked about,
+    /// at which point the whole group commits in one confirmation -- each member through the
+    /// fixed-order path it would have taken alone. Rows decided this run cannot join, and the
+    /// set is pruned on every arrival, so within any question every marked row is undecided.
+    Mark,
     /// A character typed into the candidate filter.
     Filter(char),
     Backspace,
@@ -180,6 +189,14 @@ pub struct Cost {
 /// what makes [`Cost`] constructible in a test.
 pub trait Costs {
     fn of(&self, name: &str) -> Cost;
+    /// What naming a chosen group of voices -- the stable "Unknown N" handles the queue pane
+    /// shows -- with one name would do, as the aggregate the commit reports.
+    ///
+    /// `None` where the name is not one or a member handle does not resolve to this session,
+    /// on the blank-name precedent the library reaches with a different input. Required rather
+    /// than defaulted so every implementation declares its stance: a fake that pretended the
+    /// frame had no group door would make the group tests vacuous without saying so.
+    fn group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence>;
 }
 
 /// What this run did to a voice, which the session's own labels cannot say.
@@ -211,6 +228,9 @@ pub struct Row {
     /// needs to see that it exists.
     pub below_floor: bool,
     pub mark: Option<Mark>,
+    /// Whether the row counts as one person together with the other marked rows: the staged
+    /// group, rendered beside the decision marks rather than instead of them.
+    pub in_group: bool,
     /// Whether this is the voice the question is about.
     pub current: bool,
 }
@@ -260,6 +280,12 @@ pub struct View<'a> {
     /// like [`View::rows`] and [`View::candidates`] are, so the pane borrows nothing from the
     /// snapshot the shell is free to replace between frames.
     pub who: Who,
+    /// What committing the staged group with the highlighted name would do -- or `None` when
+    /// nothing is marked or nothing is highlighted: the pane's group lines read these numbers
+    /// off the same [`GroupConsequence`] the commit reports from. Borrowed from the memo the
+    /// way [`View::status`] borrows from the screen, which is safe for the reason `status`
+    /// already relies on: the memo is cleared only between questions, never mid-frame.
+    pub group: Option<&'a GroupConsequence>,
     /// Every snippet, with the pane scrolled to [`View::snippet`].
     pub snippets: &'a [Snippet<'a>],
     /// Index into [`View::snippets`] of the selected line -- the row the pane marks, the row at
@@ -311,11 +337,29 @@ pub struct Screen {
     /// actually has.
     snippet: usize,
     decided: BTreeMap<String, Mark>,
+    /// The voices the user has staged as one person, keyed by the stable "Unknown N" handle --
+    /// the same keying and lifetime as `decided`: it persists across questions within the
+    /// session and is wiped by the session-change reset.
+    ///
+    /// A grouping, not a decision: each member commits individually through the existing
+    /// fixed-order path when a member is asked about, so nothing here defers a write. Pruned on
+    /// every arrival so that within any question every marked row is undecided this run, and
+    /// consumed entirely when a group answer is built -- the frame never sees commit outcomes,
+    /// so retaining the marks would re-offer an already-committed group on the next question.
+    group: BTreeSet<String>,
     /// Memo for [`Costs::of`], keyed by name and **cleared on every arrival**. One `Costs::of` is
     /// a database clone and two full labellings of the session, and the database moves after every
     /// accepted answer, so a memo outliving one question would be stale as well as expensive.
     /// That clearing is the whole reason this is keyed by name rather than by (voice, name).
     costs: BTreeMap<String, Cost>,
+    /// Memo for [`Costs::group_of`], keyed by candidate name and **cleared on every arrival**,
+    /// for the reason the cost memo gives: the database moves after every accepted answer, so a
+    /// preview taken against the old database would be stale as well as expensive -- and one
+    /// `group_of` is N clone pairs and 2N labellings, acceptable once per distinct candidate
+    /// name and never per keystroke. The name alone keys the memo only while the member set is
+    /// fixed, so a mark toggle clears it too: marks are placed while the question is open, and
+    /// a preview computed against a smaller group would understate what the commit would do.
+    groups: BTreeMap<String, Option<GroupConsequence>>,
     status: Option<String>,
 }
 
@@ -326,8 +370,8 @@ impl Screen {
     /// another voice, so this one goes back in the queue untouched. `None` means the caller
     /// should draw and take keys, with the cursor snapped to this voice's row.
     ///
-    /// Resets everything when the session changes, and clears the cost memo every time, for the
-    /// reasons those two fields give.
+    /// Resets everything when the session changes, and clears both cost memos every time, for
+    /// the reasons those fields give.
     pub fn arrive(&mut self, view: &VoiceView<'_>) -> Option<Answer> {
         if self.session.as_ref() != Some(view.session) {
             let session = view.session.clone();
@@ -337,6 +381,7 @@ impl Screen {
             };
         }
         self.costs.clear();
+        self.groups.clear();
 
         match self.target.as_deref() {
             // Reached. Whatever the user was steering toward is now the question, so the steering
@@ -370,6 +415,11 @@ impl Screen {
         self.candidate = 0;
         self.snippet = 0;
         self.decided.remove(view.number);
+        // A row answered or skipped this run can no longer join the group, and the invariant the
+        // group answer relies on -- every marked row undecided within this question -- holds only
+        // while this runs after the mark is removed above.
+        self.group
+            .retain(|handle| !self.decided.contains_key(handle));
         self.cursor = view
             .queue
             .iter()
@@ -430,6 +480,43 @@ impl Screen {
                 self.decided.insert(view.number.to_string(), Mark::Deferred);
                 return Step::Answered(Answer::Later);
             }
+            Event::Mark => {
+                let Some(row) = view.queue.get(self.cursor) else {
+                    return Step::Waiting;
+                };
+                if self.group.contains(row.number) {
+                    // Toggling off is silent: the suffix leaving the row is the feedback.
+                    // Every cached preview was computed against a bigger group.
+                    self.group.remove(row.number);
+                    self.groups.clear();
+                    return Step::Waiting;
+                }
+                match self.decided.get(row.number) {
+                    // A row already dealt with this run cannot join: the mark stays inert until
+                    // a member is asked about, and a decided row is never asked about again.
+                    Some(Mark::Answered) => {
+                        self.status = Some(format!(
+                            "{number} was answered in this run, so it cannot be marked",
+                            number = row.number
+                        ));
+                        return Step::Waiting;
+                    }
+                    Some(Mark::Skipped) => {
+                        self.status = Some(format!(
+                            "{number} was skipped in this run, so it cannot be marked",
+                            number = row.number
+                        ));
+                        return Step::Waiting;
+                    }
+                    // Deferred is documented as "not a decision", and a deferred row comes
+                    // round again, so it may join like any undecided one.
+                    Some(Mark::Deferred) | None => {}
+                }
+                // Toggle on inserts silently: the suffix appearing on the row is the feedback.
+                self.group.insert(row.number.to_string());
+                // Every cached preview was computed against a smaller group.
+                self.groups.clear();
+            }
             Event::Filter(c) => {
                 self.filter.push(c);
                 self.candidate = 0;
@@ -455,6 +542,9 @@ impl Screen {
                     // only way to create somebody is the key that says so.
                     return Step::Waiting;
                 };
+                if self.group.contains(view.number) {
+                    return self.commit_group(view, name, costs);
+                }
                 // Unchanged by the override: *every* refusal refuses this key, the overridable
                 // one included. Insisting is the other key's job.
                 if refusal.is_some() {
@@ -470,6 +560,12 @@ impl Screen {
                 let Some((name, refusal)) = self.chosen(view, costs) else {
                     return Step::Waiting;
                 };
+                // The group answer carries no insist flag and a `Taken` refusal is never
+                // overridable, so on a marked anchor insisting adds nothing: the same commit,
+                // through the same gate.
+                if self.group.contains(view.number) {
+                    return self.commit_group(view, name, costs);
+                }
                 // Nothing on a row this key cannot help with, in either direction: a candidate
                 // nothing refuses is answered by Enter and not by insisting, and the
                 // heard-at-once veto is refused however insistent the answer is -- the library
@@ -493,6 +589,9 @@ impl Screen {
                 // how many voices it names and how many vetoes it overrides. Choosing the
                 // voice *this question* is about is refused beside this; naming the whole
                 // track is not, because it never asks about any of them.
+                // The assertion claims the whole track, which supersedes any staging: whatever
+                // the user had marked goes unanswered, so the marks go with it.
+                self.group.clear();
                 self.decided.insert(view.number.to_string(), Mark::Answered);
                 return Step::Answered(Answer::OneSpeaker(name));
             }
@@ -502,6 +601,14 @@ impl Screen {
                     return Step::Waiting;
                 }
                 let name = typed.to_string();
+                if self.group.contains(view.number) {
+                    // A typed name is a person nothing holds yet, so no refusal gate stands in
+                    // the way -- none today, none added -- and the group commits as a whole.
+                    let members = self.group_handles(view);
+                    self.decided.insert(view.number.to_string(), Mark::Answered);
+                    self.group.clear();
+                    return Step::Answered(Answer::Group { name, members });
+                }
                 self.decided.insert(view.number.to_string(), Mark::Answered);
                 return Step::Answered(Answer::Named {
                     name,
@@ -587,6 +694,7 @@ impl Screen {
                 },
                 below_floor: row.below_floor,
                 mark: self.decided.get(row.number).copied(),
+                in_group: self.group.contains(row.number),
                 current: row.number == view.number,
             })
             .collect();
@@ -607,6 +715,27 @@ impl Screen {
             }
             None => (Vec::new(), None),
         };
+        // The staged group's aggregate preview, for the highlighted candidate only: one
+        // `group_of` per distinct name per question, the same memo discipline the consequence
+        // above keeps. Absent while nothing is marked, so an unmarked frame borrows nothing
+        // from the memo at all.
+        //
+        // Inlined rather than routed through [`Screen::group_cost`], because the memo insert
+        // takes `&mut self` and this borrow has to survive to the `View` below beside the
+        // shared borrows `filter` and `status` take -- a `&mut self` method cannot share its
+        // receiver with them, but the field can.
+        let mut group: Option<&GroupConsequence> = None;
+        if !self.group.is_empty()
+            && let Some(name) = highlighted.as_deref()
+        {
+            let members = self.group_handles(view);
+            if !self.groups.contains_key(name) {
+                let handles: Vec<&str> = members.iter().map(String::as_str).collect();
+                self.groups
+                    .insert(name.to_string(), costs.group_of(name, &handles));
+            }
+            group = self.groups[name].as_ref();
+        }
         let candidates = names
             .iter()
             .map(|name| Candidate {
@@ -633,6 +762,7 @@ impl Screen {
             consequence,
             assertion,
             who: who(context, highlighted.as_deref()),
+            group,
             snippets: view.snippets,
             snippet: self.selected_index(view),
             clip_is_empty: view.clip_is_empty,
@@ -685,6 +815,63 @@ impl Screen {
         }
         &self.costs[name]
     }
+
+    /// The staged group's member handles, in queue order -- the "taken from View.rows" the
+    /// group answer carries. Queue order is also the order the library walks, so the frame
+    /// cannot hand it a sequence the commit would re-sort.
+    fn group_handles(&self, view: &VoiceView<'_>) -> Vec<String> {
+        view.queue
+            .iter()
+            .filter(|row| self.group.contains(row.number))
+            .map(|row| row.number.to_string())
+            .collect()
+    }
+
+    /// What committing the staged group with one name would do, computed at most once per name
+    /// per question.
+    ///
+    /// `members` is collected owned before this call, for the reason the field doc gives: the
+    /// memo insert takes `&mut self`, and a slice borrowed out of it would not survive it.
+    fn group_cost(
+        &mut self,
+        name: &str,
+        members: &[String],
+        costs: &dyn Costs,
+    ) -> &Option<GroupConsequence> {
+        if !self.groups.contains_key(name) {
+            let handles: Vec<&str> = members.iter().map(String::as_str).collect();
+            let group = costs.group_of(name, &handles);
+            self.groups.insert(name.to_string(), group);
+        }
+        &self.groups[name]
+    }
+
+    /// What answering the staged group with one name does -- or whether it may not.
+    ///
+    /// Shared by [`Event::Choose`] and [`Event::Anyway`]: on a marked anchor the two keys mean
+    /// the same thing, because the group answer has no insist flag and a `Taken` refusal is
+    /// never overridable, so insisting would add nothing to the same commit.
+    fn commit_group(&mut self, view: &VoiceView<'_>, name: String, costs: &dyn Costs) -> Step {
+        let members = self.group_handles(view);
+        // The deciding fact is the group preview rather than the single-voice refusal: a
+        // two-or-more-member group overrides heard-at-once vetoes the lone anchor could not,
+        // so a veto-refused candidate is choosable for such a group. A `Taken` refusal keeps
+        // the anchor out of `applied`, and there is no insist channel that reaches it.
+        let proceeds = self
+            .group_cost(&name, &members, costs)
+            .as_ref()
+            .is_some_and(|group| group.applied.iter().any(|handle| handle == view.number));
+        if !proceeds {
+            return Step::Waiting;
+        }
+        self.decided.insert(view.number.to_string(), Mark::Answered);
+        // One confirmation is one group commit: consume the staging rather than leave a stale
+        // mark that would re-offer the committed group on the next question. Members the
+        // library later refuses keep no mark -- the frame cannot see outcomes -- so retrying
+        // means marking them again.
+        self.group.clear();
+        Step::Answered(Answer::Group { name, members })
+    }
 }
 
 #[cfg(test)]
@@ -696,6 +883,7 @@ pub(crate) mod tests {
     use meethook_transcribe::{Attribution, Resemblance};
 
     use super::{Context, Cost, Costs, Event, Mark, Screen, Step, VoiceView};
+    use meethook_enroll::GroupConsequence;
 
     /// Nothing costs anything, which is what every test that is not about the memo wants.
     pub(crate) struct Free;
@@ -707,6 +895,10 @@ pub(crate) mod tests {
                 summary: Vec::new(),
                 assertion: None,
             }
+        }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
         }
     }
 
@@ -722,6 +914,10 @@ pub(crate) mod tests {
                 summary: vec![format!("would name this voice {name}")],
                 assertion: None,
             }
+        }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
         }
     }
 
@@ -743,6 +939,10 @@ pub(crate) mod tests {
                 }),
             }
         }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
     }
 
     /// One named candidate is refused for taking a name off another voice, which is the only
@@ -761,11 +961,16 @@ pub(crate) mod tests {
                 assertion: None,
             }
         }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
     }
 
     /// Counts calls, which is the only way AC #9 is assertable: "once per highlighted candidate"
-    /// is a claim about how many times the expensive thing ran.
-    struct Counted(Cell<usize>);
+    /// is a claim about how many times the expensive thing ran. The second cell counts the group
+    /// door separately, so the two memos cannot hide behind one another.
+    struct Counted(Cell<usize>, Cell<usize>);
 
     impl Costs for Counted {
         fn of(&self, name: &str) -> Cost {
@@ -775,6 +980,79 @@ pub(crate) mod tests {
                 summary: vec![format!("would name this voice {name}")],
                 assertion: None,
             }
+        }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            self.1.set(self.1.get() + 1);
+            None
+        }
+    }
+
+    /// The group door reports a hand-built aggregate per candidate name: `applied` echoes back
+    /// exactly the member set the preview was computed for -- which is what the stale-memo
+    /// regression hangs on -- holding the anchor exactly for the one name this fake names
+    /// choosable. Its single-voice cost vetoes that same name, which is the point: the gate
+    /// under test is the group preview, not the refusal the lone anchor would meet.
+    struct Groups(&'static str);
+
+    impl Costs for Groups {
+        fn of(&self, name: &str) -> Cost {
+            Cost {
+                refusal: (name == self.0).then(|| meethook_enroll::Refusal::Vetoed {
+                    holder: Some("Unknown 2".to_string()),
+                }),
+                summary: vec![format!("would name this voice {name}")],
+                assertion: None,
+            }
+        }
+
+        fn group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence> {
+            let applied = if name == self.0 {
+                members.iter().map(|member| (*member).to_string()).collect()
+            } else {
+                Vec::new()
+            };
+            Some(GroupConsequence {
+                name: name.to_string(),
+                applied,
+                refused: Vec::new(),
+                vetoes_overridden: usize::from(name == self.0),
+                references_after: 2,
+                displaced: Vec::new(),
+                stale: Vec::new(),
+            })
+        }
+    }
+
+    /// [`Groups`]'s counterpart where the group's dry run refuses every member: the anchor is
+    /// out of `applied`, so the gate must hold whichever key is pressed.
+    struct RefusesGroup;
+
+    impl Costs for RefusesGroup {
+        fn of(&self, name: &str) -> Cost {
+            Cost {
+                refusal: None,
+                summary: vec![format!("would name this voice {name}")],
+                assertion: None,
+            }
+        }
+
+        fn group_of(&self, name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            Some(GroupConsequence {
+                name: name.to_string(),
+                applied: Vec::new(),
+                refused: vec![(
+                    "Unknown 1".to_string(),
+                    meethook_enroll::Refusal::Taken {
+                        voice: "Unknown 2".to_string(),
+                        losing: "Bob".to_string(),
+                    },
+                )],
+                vetoes_overridden: 0,
+                references_after: 0,
+                displaced: Vec::new(),
+                stale: Vec::new(),
+            })
         }
     }
 
@@ -1487,7 +1765,7 @@ pub(crate) mod tests {
         );
         let mut screen = Screen::default();
         screen.arrive(&voice);
-        let counted = Counted(Cell::new(0));
+        let counted = Counted(Cell::new(0), Cell::new(0));
 
         // Six keystrokes, each followed by the redraw a real loop would do, all of them
         // highlighting the one candidate the filter can mean -- the first four by prefix and the
@@ -1698,7 +1976,7 @@ pub(crate) mod tests {
         let similar = resembles(&[("Milo", 0.71, 3)]);
         let enrolled = ["Milo"];
         let mut screen = Screen::default();
-        let counted = Counted(Cell::new(0));
+        let counted = Counted(Cell::new(0), Cell::new(0));
 
         let second = view(
             &a,
@@ -1737,5 +2015,634 @@ pub(crate) mod tests {
         assert_eq!(derived.cursor, 1, "snapped to this session's own row");
         assert!(derived.rows.iter().all(|row| row.mark.is_none()));
         assert_eq!(counted.0.get(), 2, "the memo did not survive the session");
+    }
+
+    /// AC #1, the toggle half: the mark lands on the cursor row and leaves again, and neither
+    /// press answers the question.
+    #[test]
+    fn toggling_a_mark_adds_and_removes_the_cursor_row() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false), ("Unknown 2", 60.0, false)]);
+        let queue = queue(&owned);
+        let voice = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        // The cursor starts on the asked-about row; move it to the other before marking.
+        screen.answer(&voice, Event::Down, &Free);
+        assert_eq!(screen.answer(&voice, Event::Mark, &Free), Step::Waiting);
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert!(derived.rows[1].in_group, "the cursor row carries the mark");
+        assert!(!derived.rows[0].in_group);
+
+        assert_eq!(screen.answer(&voice, Event::Mark, &Free), Step::Waiting);
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert!(
+            !derived.rows[1].in_group,
+            "the second press takes it off again"
+        );
+    }
+
+    /// AC #1, the lifetime half: marks persist across questions within the session and are
+    /// wiped by a session change, the same two rules `decided` lives under.
+    #[test]
+    fn marks_survive_subsequent_questions_and_a_session_change_wipes_them() {
+        let a = session();
+        let b = other_session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let mut screen = Screen::default();
+
+        let first = view(&a, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
+        screen.arrive(&first);
+        screen.answer(&first, Event::Down, &Free);
+        screen.answer(&first, Event::Mark, &Free);
+        screen.answer(&first, Event::Down, &Free);
+        screen.answer(&first, Event::Mark, &Free);
+
+        let second = view(&a, "Unknown 2", 2, &queue, &[], &[], &[], &owned[1].1);
+        screen.arrive(&second);
+        let derived = screen.view(&second, &Free, Context::Reading);
+        assert!(
+            derived.rows[1].in_group && derived.rows[2].in_group,
+            "the staging survived the question changing"
+        );
+
+        let elsewhere = view(&b, "Unknown 2", 2, &queue, &[], &[], &[], &owned[1].1);
+        screen.arrive(&elsewhere);
+        let derived = screen.view(&elsewhere, &Free, Context::Reading);
+        assert!(
+            derived.rows.iter().all(|row| !row.in_group),
+            "a different session resets the whole screen, staging included"
+        );
+    }
+
+    /// The ticket's edge case, both variants: a row already dealt with this run cannot join the
+    /// group, and the frame says why rather than silently dropping the press.
+    #[test]
+    fn marking_a_decided_row_is_refused_with_a_status_line() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false), ("Unknown 2", 60.0, false)]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Milo", 0.71, 3)]);
+        let enrolled = ["Milo"];
+
+        // Skipped variant.
+        let mut screen = Screen::default();
+        let first = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        screen.arrive(&first);
+        screen.answer(&first, Event::Skip, &Free);
+        let second = view(
+            &session,
+            "Unknown 2",
+            2,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[1].1,
+        );
+        screen.arrive(&second);
+        screen.answer(&second, Event::Up, &Free);
+        assert_eq!(screen.answer(&second, Event::Mark, &Free), Step::Waiting);
+        assert!(screen.group.is_empty());
+        let derived = screen.view(&second, &Free, Context::Reading);
+        assert_eq!(
+            derived.status,
+            Some("Unknown 1 was skipped in this run, so it cannot be marked")
+        );
+
+        // Answered variant.
+        let mut screen = Screen::default();
+        screen.arrive(&first);
+        assert_eq!(
+            screen.answer(&first, Event::Choose, &Free),
+            Step::Answered(Answer::Named {
+                name: "Milo".to_string(),
+                anyway: false,
+            })
+        );
+        screen.arrive(&second);
+        screen.answer(&second, Event::Up, &Free);
+        assert_eq!(screen.answer(&second, Event::Mark, &Free), Step::Waiting);
+        assert!(screen.group.is_empty());
+        let derived = screen.view(&second, &Free, Context::Reading);
+        assert_eq!(
+            derived.status,
+            Some("Unknown 1 was answered in this run, so it cannot be marked")
+        );
+    }
+
+    /// AC #3: choosing a name while a marked row is being asked commits the whole group in one
+    /// answer, members in queue order, and consumes the staging.
+    #[test]
+    fn choosing_a_name_for_a_marked_anchor_returns_the_group_answer() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.9, 1)]);
+        let enrolled = ["Grace"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        // Stage all three rows together with the anchor.
+        screen.answer(&voice, Event::Mark, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+        let groups = Groups("Grace");
+
+        assert_eq!(
+            screen.answer(&voice, Event::Choose, &groups),
+            Step::Answered(Answer::Group {
+                name: "Grace".to_string(),
+                members: vec![
+                    "Unknown 1".to_string(),
+                    "Unknown 2".to_string(),
+                    "Unknown 3".to_string(),
+                ],
+            })
+        );
+        assert!(
+            screen.group.is_empty(),
+            "one confirmation is one group commit: the staging is consumed"
+        );
+        let derived = screen.view(&voice, &groups, Context::Reading);
+        assert_eq!(derived.rows[0].mark, Some(Mark::Answered));
+    }
+
+    /// Choosing an unmarked anchor behaves exactly as today even with other rows staged: marks
+    /// stay inert until a member is asked about, and the staging survives the plain answer.
+    #[test]
+    fn choosing_an_unmarked_anchor_behaves_as_today_even_with_other_rows_marked() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.9, 1)]);
+        let enrolled = ["Grace"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        // Stage only the third row; the anchor stays unmarked.
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+
+        assert_eq!(
+            screen.answer(&voice, Event::Choose, &Free),
+            Step::Answered(Answer::Named {
+                name: "Grace".to_string(),
+                anyway: false,
+            })
+        );
+        assert!(
+            screen.group.contains("Unknown 3"),
+            "the plain answer touches no staging"
+        );
+    }
+
+    /// A typed name on a marked anchor commits the group under the typed spelling: the create-
+    /// somebody key has no refusal gate, so nothing stands between the staging and the commit.
+    #[test]
+    fn a_new_person_name_on_a_marked_anchor_returns_the_group() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let voice = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        screen.answer(&voice, Event::Mark, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+        for c in "Maya".chars() {
+            screen.answer(&voice, Event::Filter(c), &Free);
+        }
+
+        assert_eq!(
+            screen.answer(&voice, Event::NewPerson, &Free),
+            Step::Answered(Answer::Group {
+                name: "Maya".to_string(),
+                members: vec!["Unknown 1".to_string(), "Unknown 3".to_string()],
+            })
+        );
+        assert!(screen.group.is_empty());
+    }
+
+    /// A lone mark commits as a one-member group: the library pins that a one-member group is
+    /// byte-identical to plain naming, so the frame needs no size-1 special case and the
+    /// preview and the commit cannot diverge.
+    #[test]
+    fn a_lone_mark_commits_as_a_one_member_group() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false), ("Unknown 2", 60.0, false)]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.9, 1)]);
+        let enrolled = ["Grace"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        screen.answer(&voice, Event::Mark, &Free);
+        let groups = Groups("Grace");
+
+        assert_eq!(
+            screen.answer(&voice, Event::Choose, &groups),
+            Step::Answered(Answer::Group {
+                name: "Grace".to_string(),
+                members: vec!["Unknown 1".to_string()],
+            })
+        );
+    }
+
+    /// The prune the group invariant rests on: a member answered or skipped this run drops out
+    /// of the staging on arrival, so the next group answer carries only what is still open.
+    #[test]
+    fn decided_rows_are_pruned_from_the_group_on_arrival() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.9, 1)]);
+        let enrolled = ["Grace"];
+        let mut screen = Screen::default();
+
+        let first = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        screen.arrive(&first);
+        screen.answer(&first, Event::Mark, &Free);
+        screen.answer(&first, Event::Down, &Free);
+        screen.answer(&first, Event::Down, &Free);
+        screen.answer(&first, Event::Mark, &Free);
+
+        // Unknown 3 arrives, gets skipped, and comes back around to Unknown 1.
+        let third = view(
+            &session,
+            "Unknown 3",
+            3,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[2].1,
+        );
+        screen.arrive(&third);
+        screen.answer(&third, Event::Skip, &Free);
+        screen.arrive(&first);
+        assert_eq!(screen.group.len(), 1, "the skipped member dropped out");
+
+        let groups = Groups("Grace");
+        assert_eq!(
+            screen.answer(&first, Event::Choose, &groups),
+            Step::Answered(Answer::Group {
+                name: "Grace".to_string(),
+                members: vec!["Unknown 1".to_string()],
+            })
+        );
+    }
+
+    /// The memo discipline pinned for the group door the way AC #9 pins it for the single voice:
+    /// one `group_of` per distinct highlighted candidate per question, and none surviving the
+    /// question.
+    #[test]
+    fn the_group_preview_costs_one_call_per_highlighted_candidate() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Marco", 0.6, 2), ("Ivan", 0.38, 1)]);
+        let enrolled = ["Marco", "Ivan"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        screen.answer(&voice, Event::Mark, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+        let counted = Counted(Cell::new(0), Cell::new(0));
+
+        // Three redraws over two distinct highlights: Marco, Ivan, back to Marco.
+        screen.view(&voice, &counted, Context::Reading);
+        screen.answer(&voice, Event::CandidateDown, &counted);
+        screen.view(&voice, &counted, Context::Reading);
+        screen.answer(&voice, Event::CandidateUp, &counted);
+        screen.view(&voice, &counted, Context::Reading);
+        assert_eq!(counted.1.get(), 2, "two distinct highlights, two calls");
+
+        // The next question starts from nothing, beside the single-voice memo.
+        screen.arrive(&voice);
+        screen.view(&voice, &counted, Context::Reading);
+        assert_eq!(
+            counted.1.get(),
+            3,
+            "the group memo did not survive the question"
+        );
+    }
+
+    /// [`Groups`] with a call counter on the group door, for the stale-memo regression.
+    struct CountingGroups(Groups, Cell<u32>);
+
+    impl Costs for CountingGroups {
+        fn of(&self, name: &str) -> Cost {
+            self.0.of(name)
+        }
+
+        fn group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence> {
+            self.1.set(self.1.get() + 1);
+            self.0.group_of(name, members)
+        }
+    }
+
+    /// Marks are placed while the question is open, so the member set is not constant within
+    /// one: a toggle must invalidate whatever preview was computed against the old set, or the
+    /// pane understates what the commit would do -- the live pass that caught this marked the
+    /// second row after the first preview had already been taken.
+    #[test]
+    fn marking_a_row_after_the_preview_was_computed_invalidates_the_memo() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.9, 1)]);
+        let enrolled = ["Grace"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        screen.answer(&voice, Event::Mark, &Free);
+        let counted = CountingGroups(Groups("Grace"), Cell::new(0));
+
+        // The first preview is computed against the one-member group and memoised.
+        let derived = screen.view(&voice, &counted, Context::Reading);
+        let applied: Vec<String> = derived
+            .group
+            .expect("a mark and a highlight")
+            .applied
+            .clone();
+        assert_eq!(applied, vec!["Unknown 1".to_string()]);
+        assert_eq!(counted.1.get(), 1);
+
+        // A second row joins: the cached preview is the wrong one now, and the pane must say
+        // so before any key applies the group.
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+        let derived = screen.view(&voice, &counted, Context::Reading);
+        let applied: Vec<String> = derived.group.expect("marks still active").applied.clone();
+        assert_eq!(
+            applied,
+            vec!["Unknown 1".to_string(), "Unknown 3".to_string()],
+            "the preview was recomputed against the new member set"
+        );
+        assert_eq!(counted.1.get(), 2, "the toggle cleared the memo");
+        // And toggling the row back off invalidates again: the three-member preview would
+        // overstate the two-member commit.
+        screen.answer(&voice, Event::Mark, &Free);
+        let derived = screen.view(&voice, &counted, Context::Reading);
+        let applied: Vec<String> = derived.group.expect("one mark remains").applied.clone();
+        assert_eq!(applied, vec!["Unknown 1".to_string()]);
+        assert_eq!(counted.1.get(), 3);
+    }
+
+    /// The view carries the aggregate preview while marks are active and a candidate is
+    /// highlighted, and nothing otherwise: the pane reads its numbers off this field alone.
+    #[test]
+    fn the_view_carries_the_group_preview_while_marks_are_active() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.9, 1)]);
+        let enrolled = ["Grace"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let groups = Groups("Grace");
+
+        // No marks: the preview is absent whatever is highlighted.
+        assert!(
+            screen
+                .view(&voice, &groups, Context::Reading)
+                .group
+                .is_none()
+        );
+
+        // A mark and a highlight: the preview rides along, off the same aggregate the commit
+        // would report.
+        screen.answer(&voice, Event::Mark, &Free);
+        let derived = screen.view(&voice, &groups, Context::Reading);
+        let group = derived
+            .group
+            .expect("marks active and a candidate highlighted");
+        assert_eq!(group.name, "Grace");
+        assert_eq!(group.references_after, 2);
+        assert_eq!(group.vetoes_overridden, 1);
+
+        // Marks but no highlighted candidate: there is nothing to preview with.
+        for c in "zzz".chars() {
+            screen.answer(&voice, Event::Filter(c), &Free);
+        }
+        assert!(
+            screen
+                .view(&voice, &groups, Context::Reading)
+                .group
+                .is_none()
+        );
+    }
+
+    /// The moved gate, both directions: a veto-refused candidate is choosable for a two-member
+    /// group whose preview applies the anchor, and a group whose preview refuses the anchor does
+    /// not commit however the key is pressed.
+    #[test]
+    fn a_vetoed_candidate_is_choosable_for_a_two_member_group_but_not_for_a_lone_mark() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.9, 1)]);
+        let enrolled = ["Grace"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+
+        // Two members, the preview applies the anchor: the lone-voice veto no longer gates.
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        screen.answer(&voice, Event::Mark, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+        let groups = Groups("Grace");
+        assert_eq!(
+            screen.answer(&voice, Event::Choose, &groups),
+            Step::Answered(Answer::Group {
+                name: "Grace".to_string(),
+                members: vec!["Unknown 1".to_string(), "Unknown 3".to_string()],
+            }),
+            "a two-member group overrides the heard-at-once veto the lone anchor could not"
+        );
+
+        // A lone mark whose preview refuses the anchor: nothing commits, on either key.
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        screen.answer(&voice, Event::Mark, &Free);
+        let refuses = RefusesGroup;
+        for key in [Event::Choose, Event::Anyway] {
+            assert_eq!(
+                screen.answer(&voice, key, &refuses),
+                Step::Waiting,
+                "{key:?} must not commit a group whose preview refuses the anchor"
+            );
+        }
+    }
+
+    /// The assertion claims the whole track, which supersedes any staging: the marks go with the
+    /// answer they were staged against.
+    #[test]
+    fn asserting_clears_the_staged_group() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.9, 1)]);
+        let enrolled = ["Grace"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        screen.answer(&voice, Event::Mark, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+
+        assert_eq!(
+            screen.answer(&voice, Event::Assert, &Free),
+            Step::Answered(Answer::OneSpeaker("Grace".to_string()))
+        );
+        assert!(
+            screen.group.is_empty(),
+            "the assertion supersedes the staging"
+        );
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert_eq!(derived.rows[0].mark, Some(Mark::Answered));
     }
 }

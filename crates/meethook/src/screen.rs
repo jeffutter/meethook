@@ -34,7 +34,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
-use meethook_enroll::{Answer, Interviewer, Preview, Scan, Snippet, Voice};
+use meethook_enroll::{Answer, GroupConsequence, Interviewer, Preview, Scan, Snippet, Voice};
 use meethook_session::Paths;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -505,7 +505,10 @@ impl Interface {
 /// because an extra background scan nobody waits for is cheaper than a wrong number on the
 /// screen.
 fn rewrites(answer: &Answer) -> bool {
-    matches!(answer, Answer::Named { .. } | Answer::OneSpeaker(_))
+    matches!(
+        answer,
+        Answer::Named { .. } | Answer::OneSpeaker(_) | Answer::Group { .. }
+    )
 }
 
 /// What a candidate costs, off the run's own dry run.
@@ -533,6 +536,12 @@ impl Costs for Preview<'_> {
                 assertion: None,
             },
         }
+    }
+
+    /// The group door, off the run's own aggregate dry run -- the same seam as `of`, so a
+    /// preview and a write cannot see the group differently.
+    fn group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence> {
+        Preview::group(self, name, members)
     }
 }
 
@@ -591,6 +600,16 @@ fn line_to_play(selected: Option<(usize, Snippet<'_>)>) -> Result<(usize, &[f32]
 /// excludes control characters precisely so a terminal reporting Ctrl-A as `Char('\u{1}')` cannot
 /// type into the filter, and this is what that exclusion was reserved for.
 ///
+/// Ctrl-K ("k for mark") stages the voice under the queue cursor as one of several who are all
+/// one person: the group's aggregate preview sits in the consequence pane before any key applies
+/// it, and choosing a name while a member is asked about commits the whole group in one
+/// confirmation. Its own key for the reason choosing and creating are -- printable characters go
+/// to the filter. The slot was meant to be Ctrl-M ("m for mark"), but every terminal sends the
+/// same byte for Ctrl-M and Enter -- carriage return, 0x0D -- so the decoder hands the press
+/// over as `Enter` and the advertised key would answer the question instead of marking; Ctrl-K
+/// is the nearest free letter with its own byte (checked against a live terminal through this
+/// very decoder), and the bare letter types into the filter as every other unbound one does.
+///
 /// A free function taking a `KeyEvent` because a `KeyEvent` is constructible without a terminal,
 /// which is what makes this whole rule testable -- and it is where a stray Ctrl or a paste-shaped
 /// burst of characters would otherwise go wrong.
@@ -610,6 +629,7 @@ fn event(key: KeyEvent) -> Option<Event> {
         (KeyCode::Char('g'), true) => Some(Event::Leave),
         (KeyCode::Char('o'), true) => Some(Event::Anyway),
         (KeyCode::Char('a'), true) => Some(Event::Assert),
+        (KeyCode::Char('k'), true) => Some(Event::Mark),
         (KeyCode::Up, false) => Some(Event::Up),
         (KeyCode::Down, false) => Some(Event::Down),
         (KeyCode::Right, false) => Some(Event::Select),
@@ -729,11 +749,13 @@ mod tests {
             (KeyCode::Char('g'), KeyModifiers::CONTROL, Event::Leave),
             (KeyCode::Char('o'), KeyModifiers::CONTROL, Event::Anyway),
             (KeyCode::Char('a'), KeyModifiers::CONTROL, Event::Assert),
+            (KeyCode::Char('k'), KeyModifiers::CONTROL, Event::Mark),
             (KeyCode::Char('a'), KeyModifiers::NONE, Event::Filter('a')),
             (KeyCode::Char(' '), KeyModifiers::NONE, Event::Filter(' ')),
             // The non-regression that matters for a new letter key: without the modifier it is
             // still text, because printable characters type into the candidate filter.
             (KeyCode::Char('g'), KeyModifiers::NONE, Event::Filter('g')),
+            (KeyCode::Char('k'), KeyModifiers::NONE, Event::Filter('k')),
         ];
         for (code, modifiers, expected) in bound {
             assert_eq!(
@@ -805,6 +827,12 @@ mod tests {
         assert!(rewrites(&Answer::Named {
             name: "Milo".to_string(),
             anyway: false,
+        }));
+        // A group commit names every member through the same path `Named` uses, so it moves
+        // `speakers.json` exactly as one of them would.
+        assert!(rewrites(&Answer::Group {
+            name: "Grace".to_string(),
+            members: vec!["Unknown 1".to_string()],
         }));
         for quiet in [Answer::Skip, Answer::Later, Answer::Leave, Answer::Quit] {
             assert!(!rewrites(&quiet), "{quiet:?} writes nothing");

@@ -548,6 +548,37 @@ pub struct GroupConsequence {
     pub stale: Vec<String>,
 }
 
+impl GroupConsequence {
+    /// What committing the group would do, as the sentences an interface shows before the
+    /// group is committed -- or after it, for the ones that print outcomes rather than
+    /// preview them.
+    ///
+    /// Stated here once beside [`Consequence::would_do`] so no caller restates it: the frame's
+    /// "would" pane and whatever prints the group's report are readers of the same fact, and a
+    /// second copy of this mapping is exactly what this module's doc forbids. The lines run
+    /// displaced first, then stale, then the refused members -- the load-bearing counts before
+    /// the exceptions, so a pane that clips still shows what the commit did to people.
+    ///
+    /// The stale line drops the single voice's "of this voice": the union carries no
+    /// per-member attribution, and naming one member would be a claim the aggregate does not
+    /// make.
+    pub fn would_do(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for Displaced { name, remaining } in &self.displaced {
+            lines.push(format!(
+                "takes a recording off {name}, leaving them {remaining}"
+            ));
+        }
+        for name in &self.stale {
+            lines.push(format!("leaves a recording standing under {name}"));
+        }
+        for (handle, refusal) in &self.refused {
+            lines.push(format!("{handle}: {}", refusal.sentence()));
+        }
+        lines
+    }
+}
+
 /// What asserting one remote speaker would do to the session, as the two numbers the commit
 /// reports.
 ///
@@ -1561,6 +1592,87 @@ mod tests {
         // Three references stored, one displaced, none held before: the total is what the
         // final database holds, not the sum of the members' individual counts.
         assert_eq!(group.references_after, 3);
+    }
+
+    /// The group's report as sentences, pinned verbatim: the same register
+    /// [`Consequence::would_do`] keeps, so the frame's pane and whatever prints the commit read
+    /// the same words off the same struct.
+    #[test]
+    fn the_groups_report_reads_as_its_own_lines() {
+        let empty = GroupConsequence {
+            name: "Grace".to_string(),
+            applied: vec!["Unknown 1".to_string()],
+            refused: Vec::new(),
+            vetoes_overridden: 0,
+            references_after: 1,
+            displaced: Vec::new(),
+            stale: Vec::new(),
+        };
+        assert_eq!(empty.would_do(), Vec::<String>::new());
+
+        let displaced_only = GroupConsequence {
+            displaced: vec![Displaced {
+                name: "Milo".to_string(),
+                remaining: 2,
+            }],
+            ..empty.clone()
+        };
+        assert_eq!(
+            displaced_only.would_do(),
+            ["takes a recording off Milo, leaving them 2"]
+        );
+
+        let stale_only = GroupConsequence {
+            stale: vec!["Bob".to_string()],
+            ..empty.clone()
+        };
+        // The single voice's "of this voice" is gone: the union carries no per-member
+        // attribution, so the line names only the person the legacy reference stands under.
+        assert_eq!(
+            stale_only.would_do(),
+            ["leaves a recording standing under Bob"]
+        );
+
+        let refused_only = GroupConsequence {
+            refused: vec![(
+                "Unknown 3".to_string(),
+                Refusal::Taken {
+                    voice: "Unknown 2".to_string(),
+                    losing: "Bob".to_string(),
+                },
+            )],
+            ..empty.clone()
+        };
+        assert_eq!(
+            refused_only.would_do(),
+            ["Unknown 3: unavailable: Unknown 2 would stop reading Bob"]
+        );
+
+        let combined = GroupConsequence {
+            displaced: vec![Displaced {
+                name: "Milo".to_string(),
+                remaining: 0,
+            }],
+            stale: vec!["Ivan".to_string()],
+            refused: vec![(
+                "Unknown 2".to_string(),
+                Refusal::Vetoed {
+                    holder: Some("Unknown 1".to_string()),
+                },
+            )],
+            ..empty
+        };
+        // Displaced first, then stale, then the exceptions: the load-bearing counts before the
+        // lines a clipping pane may lose.
+        assert_eq!(
+            combined.would_do(),
+            [
+                "takes a recording off Milo, leaving them 0",
+                "leaves a recording standing under Ivan",
+                "Unknown 2: unavailable: Unknown 1 was heard at the same time as this voice \
+                 and would keep the name",
+            ]
+        );
     }
 
     /// The other refusal: the answer would take a name off a voice the user was not asked

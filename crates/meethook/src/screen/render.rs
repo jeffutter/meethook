@@ -22,8 +22,15 @@
 //! about what a name currently names is either
 //! [`incomplete`] or `run_speakers`' own wording, so the frame and
 //! `meethook speakers` cannot come to describe one scan differently.
+//!
+//! Two further exceptions are the key-tied UI sentences: the assertion line ([`assert_line`]) and
+//! the group header line ([`group_line`]). Their wording is invented here because the keybinding
+//! is a fact about the binary -- the run never learns which key pressed its answer -- but their
+//! numbers come off the library's own data: each reads its counts off the same
+//! [`meethook_enroll::Assertion`] or [`meethook_enroll::GroupConsequence`] the commit reports from,
+//! so a preview and its write cannot disagree about what they counted.
 
-use meethook_enroll::{Assertion, Refusal, Resolution, incomplete, speech};
+use meethook_enroll::{Assertion, GroupConsequence, Refusal, Resolution, incomplete, speech};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
@@ -226,6 +233,11 @@ fn voice_line(row: &Row) -> Line<'static> {
             Mark::Deferred => "  [later]",
         }));
     }
+    // Beside the decision mark, not instead of it: a row skipped while staged renders both,
+    // which is honest -- it was skipped and it is still staged.
+    if row.in_group {
+        spans.push(Span::raw("  [group]"));
+    }
     // Which row is the question, as distinct from which row the cursor is on. They part company
     // the moment the user moves the cursor to line up the next voice, and without this the queue
     // would stop saying which one the candidates pane is about.
@@ -323,30 +335,45 @@ fn new_person(view: &View<'_>) -> Vec<Span<'static>> {
 /// One pane for both, because they are the same question asked of the same row and only one of
 /// them ever has an answer: a refused candidate would do nothing at all.
 fn consequence(frame: &mut Frame, area: Rect, view: &View<'_>) {
-    let highlighted = view
-        .highlighted()
-        .and_then(|candidate| candidate.refusal.as_ref());
-    let (title, mut lines): (&str, Vec<Line>) = match (highlighted, view.consequence.is_empty()) {
-        (Some(refusal), _) => (" cannot ", vec![Line::from(refusal.sentence())]),
-        (None, true) => (
+    // The staged group previews the operation the user is about to perform -- what committing
+    // it with the highlighted name would do -- so while it is on screen the pane shows only
+    // that: two previews in a two-inner-row pane is noise, and the group's own lines already
+    // carry the refusal of every member it refused.
+    let (title, lines) = if let Some(group) = view.group {
+        (
             " would ",
-            vec![Line::from(Span::raw("(nothing highlighted)").dim())],
-        ),
-        (None, false) => (
-            " would ",
-            view.consequence
-                .iter()
-                .map(|line| Line::from(line.as_str()))
-                .collect(),
-        ),
+            std::iter::once(Line::from(group_line(group)))
+                .chain(group.would_do().into_iter().map(Line::from))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        let highlighted = view
+            .highlighted()
+            .and_then(|candidate| candidate.refusal.as_ref());
+        let (title, mut lines): (&str, Vec<Line>) = match (highlighted, view.consequence.is_empty())
+        {
+            (Some(refusal), _) => (" cannot ", vec![Line::from(refusal.sentence())]),
+            (None, true) => (
+                " would ",
+                vec![Line::from(Span::raw("(nothing highlighted)").dim())],
+            ),
+            (None, false) => (
+                " would ",
+                view.consequence
+                    .iter()
+                    .map(|line| Line::from(line.as_str()))
+                    .collect(),
+            ),
+        };
+        // What asserting one remote speaker would do to the *session*, previewed beside what
+        // choosing would do to the *voice*: the two numbers the commit reports, off the same
+        // [`Assertion`]. Present on a refused row too -- Enter cannot work there, but the
+        // assertion can, and both facts sit in the pane.
+        if let (Some(assertion), Some(candidate)) = (view.assertion, view.highlighted()) {
+            lines.push(Line::from(assert_line(&candidate.name, &assertion)));
+        }
+        (title, lines)
     };
-    // What asserting one remote speaker would do to the *session*, previewed beside what
-    // choosing would do to the *voice*: the two numbers the commit reports, off the same
-    // [`Assertion`]. Present on a refused row too -- Enter cannot work there, but the
-    // assertion can, and both facts sit in the pane.
-    if let (Some(assertion), Some(candidate)) = (view.assertion, view.highlighted()) {
-        lines.push(Line::from(assert_line(&candidate.name, &assertion)));
-    }
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
@@ -363,6 +390,20 @@ fn assert_line(name: &str, assertion: &Assertion) -> String {
         "^A asserts one remote speaker: {voices} voice(s) will read as {name}, {vetoes} veto(s) overridden",
         voices = assertion.voices,
         vetoes = assertion.vetoes_overridden,
+    )
+}
+
+/// The pane's group header line, in the run's own labelling: the same "voice(s)" and "veto(s)
+/// overridden" the group commit reports, so a preview and its write cannot disagree about what
+/// they counted. The key prefix is the binary's fact; the numbers come off the same
+/// [`GroupConsequence`] the commit reports from.
+fn group_line(group: &GroupConsequence) -> String {
+    format!(
+        "^K marks {} voice(s) as {}: {} reference(s), {} veto(s) overridden",
+        group.applied.len(),
+        group.name,
+        group.references_after,
+        group.vetoes_overridden
     )
 }
 
@@ -588,7 +629,7 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sound
             };
             format!(
                 "up/down voice  right work on it  tab candidate  {choose}  \
-                 ^A assert  ^N new  {clip}{line}  ^S skip  ^G leave  ^C quit"
+                 ^A assert  ^K mark  ^N new  {clip}{line}  ^S skip  ^G leave  ^C quit"
             )
         }
     };
@@ -599,7 +640,7 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sound
 mod tests {
     use std::time::Duration;
 
-    use meethook_enroll::{Assertion, MeetingLabel, Position, Queued, Refusal};
+    use meethook_enroll::{Assertion, GroupConsequence, MeetingLabel, Position, Queued, Refusal};
     use meethook_session::{MeetingFit, SessionId};
     use meethook_transcribe::{Attribution, Resemblance};
     use ratatui::Terminal;
@@ -608,9 +649,11 @@ mod tests {
     use meethook_enroll::Snippet;
 
     use super::super::state::tests::heard;
-    use super::super::state::{Context, Cost, Costs, Event, Screen, VoiceView};
+    use super::super::state::{Context, Cost, Costs, Event, Mark, Row, Screen, VoiceView};
     use super::super::who::tests::{holding, names, scanned};
-    use super::{Progress, Sounding, clause_within, draw, incomplete, listed};
+    use super::{Progress, Sounding, clause_within, draw, incomplete, listed, voice_line};
+
+    use meethook_session::Displaced;
 
     struct Free;
 
@@ -621,6 +664,10 @@ mod tests {
                 summary: vec![format!("would enrol {name} from this voice")],
                 assertion: None,
             }
+        }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
         }
     }
 
@@ -639,6 +686,10 @@ mod tests {
                 }),
             }
         }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
     }
 
     struct Vetoes;
@@ -652,6 +703,10 @@ mod tests {
                 summary: Vec::new(),
                 assertion: None,
             }
+        }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
         }
     }
 
@@ -669,6 +724,10 @@ mod tests {
                 summary: Vec::new(),
                 assertion: None,
             }
+        }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
         }
     }
 
@@ -826,7 +885,7 @@ mod tests {
     /// highlighted candidate is, the snippets and the run's own narration.
     #[test]
     fn the_frame_places_all_six_panes() {
-        let painted = painted(110, 30, &Free, &[]);
+        let painted = painted(140, 30, &Free, &[]);
         let whole = painted.join("\n");
         assert!(whole.contains("voices  20260819-100000  2/3"), "{whole}");
         assert!(whole.contains("who Milo is"), "{whole}");
@@ -893,12 +952,12 @@ mod tests {
     /// mid-clip, and it reads as its own scope beside the two it sits between -- skip one voice,
     /// leave this session, quit the run.
     ///
-    /// Painted at 130 columns, as the candidate-and-cost tests are: the key list is past 120 now
-    /// that it advertises the assertion key too, and a narrower frame is measuring truncation
+    /// Painted at 140 columns, as the candidate-and-cost tests are: the key list is past 130 now
+    /// that it advertises the mark key too, and a narrower frame is measuring truncation
     /// rather than the footer's wording.
     #[test]
     fn the_footer_names_the_key_that_leaves_the_session() {
-        let idle = painted(130, 30, &Free, &[]).join("\n");
+        let idle = painted(140, 30, &Free, &[]).join("\n");
         assert!(idle.contains("^S skip  ^G leave  ^C quit"), "{idle}");
 
         let sounding = Some(Sounding {
@@ -909,7 +968,7 @@ mod tests {
             line: None,
         });
         let playing = painted_with(
-            130,
+            140,
             30,
             &Free,
             &[],
@@ -928,10 +987,14 @@ mod tests {
 
     /// TASK-050.01 acceptance criterion #2, the footer half: the assertion key is advertised,
     /// beside the two answer keys it sits between -- choose one voice, or name the whole track.
+    /// The mark key sits beside it, advertising the staging the group preview previews.
     #[test]
     fn the_footer_advertises_the_assertion_key() {
         let idle = painted(130, 30, &Free, &[]).join("\n");
-        assert!(idle.contains("enter choose  ^A assert  ^N new"), "{idle}");
+        assert!(
+            idle.contains("enter choose  ^A assert  ^K mark  ^N new"),
+            "{idle}"
+        );
     }
 
     /// TASK-050.01 acceptance criterion #2, the pane half: what asserting would do is previewed
@@ -966,6 +1029,105 @@ mod tests {
         assert!(
             whole.contains("would enrol Milo from this voice"),
             "{whole}"
+        );
+        assert!(!whole.contains("asserts one remote speaker"), "{whole}");
+    }
+
+    /// The group door's counterpart to [`Asserts`]: the single-voice cost previews nothing
+    /// special, but the aggregate dry run reports a hand-built displacement, which is what the
+    /// pane must show while marks are active.
+    struct StagesGroup;
+
+    impl Costs for StagesGroup {
+        fn of(&self, name: &str) -> Cost {
+            Cost {
+                refusal: None,
+                summary: vec![format!("would enrol {name} from this voice")],
+                assertion: None,
+            }
+        }
+
+        fn group_of(&self, name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            Some(GroupConsequence {
+                name: name.to_string(),
+                applied: vec!["Unknown 2".to_string(), "Unknown 3".to_string()],
+                refused: Vec::new(),
+                vetoes_overridden: 1,
+                references_after: 2,
+                displaced: vec![Displaced {
+                    name: "Ivan".to_string(),
+                    remaining: 0,
+                }],
+                stale: Vec::new(),
+            })
+        }
+    }
+
+    /// A row staged into the group renders the suffix beside its decision mark, not instead of
+    /// it: skipped-and-staged is honest, because both facts are true.
+    #[test]
+    fn a_marked_row_renders_the_group_suffix() {
+        let row = Row {
+            number: "Unknown 2".to_string(),
+            label: "Unknown 2".to_string(),
+            speech_seconds: 95.0,
+            similarity: None,
+            below_floor: false,
+            mark: Some(Mark::Skipped),
+            in_group: true,
+            current: false,
+        };
+        let rendered: String = voice_line(&row)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.contains("[skipped]"), "{rendered}");
+        assert!(rendered.contains("[group]"), "{rendered}");
+        assert!(
+            rendered.find("[skipped]").unwrap() < rendered.find("[group]").unwrap(),
+            "the group suffix follows the mark suffix: {rendered}"
+        );
+
+        // And a row nobody marked renders no trace of one.
+        let quiet = Row {
+            number: "Unknown 3".to_string(),
+            label: "Unknown 3".to_string(),
+            speech_seconds: 1.5,
+            similarity: None,
+            below_floor: true,
+            mark: None,
+            in_group: false,
+            current: false,
+        };
+        let rendered: String = voice_line(&quiet)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(!rendered.contains("[group]"), "{rendered}");
+    }
+
+    /// AC #2, the drawing side: while marks are active the consequence pane previews the
+    /// operation the user is about to perform -- the header line off the commit's own numbers,
+    /// then the would-do lines -- and nothing else: the single-voice preview gives way, because
+    /// two previews in a two-inner-row pane is noise.
+    ///
+    /// Painted at 200 columns so the lines do not wrap: the claim is about the wording, and a
+    /// wrap would split the sentence the header is pinned by.
+    #[test]
+    fn the_consequence_pane_previews_the_staged_group() {
+        let painted = painted(200, 30, &StagesGroup, &[Event::Mark]);
+        let whole = painted.join("\n");
+        assert!(
+            whole.contains("^K marks 2 voice(s) as Milo: 2 reference(s), 1 veto(s) overridden"),
+            "{whole}"
+        );
+        assert!(
+            whole.contains("takes a recording off Ivan, leaving them 0"),
+            "{whole}"
+        );
+        assert!(
+            !whole.contains("would enrol Milo from this voice"),
+            "the single-voice preview gives way to the group's own lines\n{whole}"
         );
         assert!(!whole.contains("asserts one remote speaker"), "{whole}");
     }
