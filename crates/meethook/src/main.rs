@@ -8,6 +8,7 @@
 
 mod commands;
 mod headless;
+mod record;
 mod screen;
 
 use std::path::PathBuf;
@@ -375,7 +376,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         #[cfg(target_os = "macos")]
-        Command::Record => commands::record(&paths),
+        Command::Record => record::record(&paths),
         Command::Transcribe {
             session_ids,
             force,
