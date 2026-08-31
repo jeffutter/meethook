@@ -79,6 +79,9 @@
 //! precisely because it was rejected. Here every pair is printed, accepted or not, so the
 //! margin either side of the cut is readable rather than inferred.
 
+#[path = "support/mod.rs"]
+mod support;
+
 use std::path::PathBuf;
 
 use meethook_session::{
@@ -87,10 +90,11 @@ use meethook_session::{
 use meethook_transcribe::{
     ADOPTION_DISTANCE, AdoptionPopulations, CentroidPair, Clustering, EMBEDDING_MODEL,
     IDENTIFY_DISTANCE, LocalTurn, MERGE_DISTANCE, PairLabel, SEGMENTATION_MODEL,
-    SPEAKER_FLOOR_SECONDS, Sampling, Sweep, TARGET_RATE, TrialReport, Verdict,
-    adoption_populations, fragment_probe, identify_clusters, open_session,
-    reference_duration_sweep, score_trials, stored_reference_distances,
+    SPEAKER_FLOOR_SECONDS, Sampling, Sweep, TARGET_RATE, Verdict, adoption_populations,
+    fragment_probe, identify_clusters, reference_duration_sweep, score_trials,
+    stored_reference_distances,
 };
+use support::{cosine_distance, cost_lines, fail, load, separation_and_rates};
 
 /// Pairs below which the adoption-population block reports a population as too thin to choose a
 /// threshold from.
@@ -190,8 +194,8 @@ fn main() {
     let audio =
         meethook_transcribe::read_track_16k_mono(&track).unwrap_or_else(|e| fail(&format!("{e}")));
 
-    let mut segmenter = load(SEGMENTATION_MODEL.file_name);
-    let mut embedder = load(EMBEDDING_MODEL.file_name);
+    let mut segmenter = load(&meethook_root(), SEGMENTATION_MODEL.file_name);
+    let mut embedder = load(&meethook_root(), EMBEDDING_MODEL.file_name);
 
     let started = std::time::Instant::now();
     let turns = meethook_transcribe::segment_speaker_track(&audio, &mut segmenter)
@@ -283,13 +287,10 @@ fn main() {
         for row in &clustering.clusters {
             print!("{:>5}", row.id);
             for column in &clustering.clusters {
-                let cosine: f32 = row
-                    .embedding
-                    .iter()
-                    .zip(&column.embedding)
-                    .map(|(a, b)| a * b)
-                    .sum();
-                print!("{:>7.3}", 1.0 - cosine);
+                print!(
+                    "{:>7.3}",
+                    cosine_distance(&row.embedding, &column.embedding)
+                );
             }
             println!();
         }
@@ -426,27 +427,22 @@ fn spread(pairs: Vec<(usize, usize, f32)>) -> Option<Spread> {
     })
 }
 
-/// Cosine distance between two unit-length turn embeddings.
-///
-/// Raw, unlike the distance clustering merges on, which substitutes infinity for a pair
-/// segmentation heard at once. Within a cluster the difference cannot arise -- an infinite
-/// pair makes its groups' average infinite, so no cluster can hold one -- but between
-/// clusters and in the known-different block it is the entire point: infinity there would
-/// erase precisely the closest approaches being measured.
-fn distance(a: &[f32], b: &[f32]) -> f32 {
-    1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
-}
-
 /// Every unordered pair of turns within one cluster, with its distance.
 ///
 /// Turns too short to embed carry no vector and take part in nothing; they are already
 /// reported as the "turns too short to embed" count on the first line.
+///
+/// The distance is [`cosine_distance`] -- raw, unlike the distance clustering merges on,
+/// which substitutes infinity for a pair segmentation heard at once. Within a cluster the
+/// difference cannot arise -- an infinite pair makes its groups' average infinite, so no
+/// cluster can hold one -- but between clusters and in the known-different block it is the
+/// entire point: infinity there would erase precisely the closest approaches being measured.
 fn pairs_within(members: &[usize], embeddings: &[Option<Vec<f32>>]) -> Vec<(usize, usize, f32)> {
     let mut pairs = Vec::new();
     for (nth, &i) in members.iter().enumerate() {
         for &j in &members[nth + 1..] {
             if let (Some(a), Some(b)) = (&embeddings[i], &embeddings[j]) {
-                pairs.push((i, j, distance(a, b)));
+                pairs.push((i, j, cosine_distance(a, b)));
             }
         }
     }
@@ -463,7 +459,7 @@ fn pairs_between(
     for &i in left {
         for &j in right {
             if let (Some(a), Some(b)) = (&embeddings[i], &embeddings[j]) {
-                pairs.push((i, j, distance(a, b)));
+                pairs.push((i, j, cosine_distance(a, b)));
             }
         }
     }
@@ -486,7 +482,7 @@ fn pairs_heard_at_once(
                 continue;
             }
             if let (Some(a), Some(b)) = (&embeddings[i], &embeddings[j]) {
-                pairs.push((i, j, distance(a, b)));
+                pairs.push((i, j, cosine_distance(a, b)));
             }
         }
     }
@@ -741,8 +737,9 @@ fn is_blocked(offer: &CentroidPair) -> bool {
 /// `meethook_transcribe::adoption_populations`, where they are unit-tested, and the scoring lives
 /// in [`score_trials`], which states and tests the boundary convention -- accept is *strictly*
 /// below the cut -- so that this report cannot state a different one than the decision it informs
-/// would use. What is local is the presentation, deliberately following
-/// `examples/speaker-trials.rs` word for word wherever the two print the same arithmetic.
+/// would use. Wherever this section prints the same arithmetic `speaker-trials` does, it calls
+/// the same shared printers (`support::cost_lines`, `support::separation_and_rates`); what stays
+/// local is the prose only this section can say.
 fn print_adoption_populations(
     clustering: &Clustering,
     turns: &[LocalTurn],
@@ -915,51 +912,17 @@ fn print_adoption_populations(
          DISTANCE-ONLY rule would have got wrong, not one this pass does:",
         report.threshold
     );
-    print_costs("      ", &report);
+    cost_lines("      ", &report);
 
     println!("\n  separation:");
-    match report.overlap {
-        Some((min_different, max_same)) => println!(
-            "    NO SINGLE THRESHOLD SEPARATES THESE TWO POPULATIONS. They overlap between \
-             {min_different:.3} (the closest different-speaker pair) and {max_same:.3} (the \
-             furthest-apart same-speaker pair); every cut inside that band trades one kind of \
-             mistake for the other."
-        ),
-        None => match (report.same, report.different) {
-            (Some(same), Some(different)) => println!(
-                "    the two populations do not overlap: every same-speaker pair is below {:.3} \
-                 and every different-speaker pair is at or above {:.3}, so any cut in between \
-                 makes no mistakes on this list",
-                same.max, different.min
-            ),
-            _ => println!("    not measurable: one side of the trial list is empty"),
-        },
-    }
-    match report.equal_error {
-        Some(equal_error) => println!(
-            "    equal error rate {:.1}% at a cut of {:.3}  (the mean of the two rates where they \
-             come closest to crossing)",
-            equal_error.rate * 100.0,
-            equal_error.threshold
-        ),
-        None => println!("    equal error rate: not measurable, one side of the list is empty"),
-    }
-    match report.zero_false_accept {
-        Some(zero) => {
-            println!(
-                "    the largest cut that misattributes nobody is {:.3}, and it rejects {:.1}% of \
-                 same-speaker pairs",
-                zero.threshold,
-                zero.false_reject_rate * 100.0
-            );
-            // Priced as well as named. The asymmetry argument the adoption constant will rest on
-            // -- a silent misattribution is expensive and a visible extra Unknown N is cheap --
-            // is only an argument until somebody says what the cheap error costs in pairs.
-            let priced = score_trials(&trials, zero.threshold);
-            println!("    what refusing to misattribute anybody costs, at that cut:");
-            print_costs("      ", &priced);
-        }
-        None => println!("    no misattribution-free cut is measurable from this list"),
+    separation_and_rates("    ", &report);
+    if let Some(zero) = &report.zero_false_accept {
+        // Priced as well as named. The asymmetry argument the adoption constant will rest on
+        // -- a silent misattribution is expensive and a visible extra Unknown N is cheap --
+        // is only an argument until somebody says what the cheap error costs in pairs.
+        let priced = score_trials(&trials, zero.threshold);
+        println!("    what refusing to misattribute anybody costs, at that cut:");
+        cost_lines("      ", &priced);
     }
 
     // The thinness statement, immediately under the cut it is about, because the cut is the
@@ -1230,27 +1193,6 @@ fn print_centroid_spread(label: &str, distances: &[f32]) {
             s.count, s.min, s.p05, s.median, s.p95, s.max, s.mean
         ),
         None => println!("    {label}: no pairs"),
-    }
-}
-
-/// The two error counts at one cut, in the wording `speaker-trials` uses for the same numbers.
-fn print_costs(indent: &str, report: &TrialReport) {
-    println!(
-        "{indent}false accepts: {} different-speaker pair(s) below the cut{}",
-        report.false_accepts,
-        percent(report.false_accept_rate)
-    );
-    println!(
-        "{indent}false rejects: {} same-speaker pair(s) at or above it{}",
-        report.false_rejects,
-        percent(report.false_reject_rate)
-    );
-}
-
-fn percent(rate: Option<f32>) -> String {
-    match rate {
-        Some(rate) => format!("  ({:.1}%)", rate * 100.0),
-        None => "  (no such pairs, so no rate)".to_string(),
     }
 }
 
@@ -1551,20 +1493,15 @@ fn print_enrolled_distances(clusters: &[SpeakerCluster]) {
 
             // Both sides are unit vectors by contract, so the dot product is the cosine --
             // the same arithmetic `best_match` does, so the two cannot disagree.
-            let cosine: f32 = speaker
-                .embedding
-                .iter()
-                .zip(&cluster.embedding)
-                .map(|(a, b)| a * b)
-                .sum();
+            let distance = cosine_distance(&speaker.embedding, &cluster.embedding);
             // Only the *nearest* of a person's references wins the argmax, so "accepted" is
             // marked on that one row rather than on every row bearing the winning name --
             // which would claim identification rested on evidence it never looked at.
-            let accepted =
-                matched.is_some_and(|id| id.name == speaker.name && id.similarity == cosine);
+            let accepted = matched
+                .is_some_and(|id| id.name == speaker.name && id.similarity == 1.0 - distance);
             println!(
                 "    {label:<20} {:>7.3}  {}",
-                1.0 - cosine,
+                distance,
                 if accepted { "accepted" } else { "rejected" }
             );
         }
@@ -1990,27 +1927,4 @@ fn meethook_root() -> PathBuf {
             .expect("could not determine the home directory; set MEETHOOK_ROOT")
             .join("meethook"),
     }
-}
-
-fn load(file_name: &str) -> ort::session::Session {
-    let model = meethook_root().join("models").join(file_name);
-
-    let loaded = open_session(&model).unwrap_or_else(|e| {
-        fail(&format!(
-            "{e}\nrun `cargo run --example fetch-onnx-models` first"
-        ))
-    });
-    // Only meaningful where a CoreML EP was compiled in: off macOS `accelerated` is always
-    // false by construction of the build, so printing this there would name a component the
-    // platform never had.
-    #[cfg(target_os = "macos")]
-    if !loaded.accelerated {
-        eprintln!("note: CoreML declined {file_name}; running on CPU");
-    }
-    loaded.session
-}
-
-fn fail(message: &str) -> ! {
-    eprintln!("{message}");
-    std::process::exit(1);
 }

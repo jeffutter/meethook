@@ -32,6 +32,12 @@
 #[cfg(target_os = "macos")]
 mod inner;
 
+// Only compiled where `inner` is: off macOS nothing in this example reads it, and an unused
+// private module would be a warning rather than dead weight.
+#[cfg(target_os = "macos")]
+#[path = "../support/mod.rs"]
+mod support;
+
 #[cfg(target_os = "macos")]
 fn main() {
     inner::run();

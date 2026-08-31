@@ -23,9 +23,13 @@
 //! boundaries land in the right place" is a judgement a person has to make once, and this
 //! is how they make it again after a change.
 
+#[path = "support/mod.rs"]
+mod support;
+
 use std::path::PathBuf;
 
 use meethook_transcribe::{LocalTurn, SEGMENTATION_MODEL, TARGET_RATE, open_session};
+use support::fail;
 
 /// One column of the strip. Fine enough to see a turn edge, coarse enough that a minute of
 /// meeting is ten lines.
@@ -146,9 +150,4 @@ fn models_dir() -> PathBuf {
             .join("meethook"),
     }
     .join("models")
-}
-
-fn fail(message: &str) -> ! {
-    eprintln!("{message}");
-    std::process::exit(1);
 }

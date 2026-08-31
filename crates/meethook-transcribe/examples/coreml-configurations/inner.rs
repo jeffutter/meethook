@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::support::fail;
 use meethook_transcribe::{
     Clustering, EMBEDDING_MODEL, LocalTurn, SEGMENTATION_MODEL, cluster_speaker_turns,
     read_track_16k_mono, segment_speaker_track,
@@ -756,9 +757,4 @@ fn meethook_root() -> PathBuf {
             .expect("could not determine the home directory; set MEETHOOK_ROOT")
             .join("meethook"),
     }
-}
-
-fn fail(message: &str) -> ! {
-    eprintln!("{message}");
-    std::process::exit(1);
 }

@@ -61,6 +61,9 @@
 //! keeping both and taking the nearest -- through [`meethook_transcribe::policy_sweep`]. The
 //! arithmetic and every verdict live in the crate and are unit-tested there; this file prints.
 
+#[path = "support/mod.rs"]
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -68,12 +71,14 @@ use meethook_session::{
     EnrolledSpeaker, EnrolledSpeakers, Paths, RepresentativeSegment, SpeakerCluster,
 };
 use meethook_transcribe::{
-    ArmReport, EMBEDDING_MODEL, IDENTIFY_DISTANCE, ImportedSource, LevelSummary, PolicyItem,
-    PolicyReport, PolicySweep, SEGMENTATION_MODEL, SPLICE_GAP_S, Spread, TARGET_RATE, Trial,
-    TrialReport, build_session, cluster_speaker_turns, identify_clusters, open_session,
-    policy_sweep, read_track_16k_mono, score_trials, segment_speaker_track, wilson_interval,
+    ArmReport, EMBEDDING_MODEL, IDENTIFY_DISTANCE, PolicyItem, PolicyReport, PolicySweep,
+    SEGMENTATION_MODEL, SPLICE_GAP_S, Spread, TARGET_RATE, Trial, TrialReport, build_session,
+    cluster_speaker_turns, identify_clusters, policy_sweep, read_track_16k_mono, score_trials,
+    segment_speaker_track, wilson_interval,
 };
 use serde::{Deserialize, Serialize};
+use support::session_prep::{converted, levels};
+use support::{cosine_distance, cost_lines, fail, load, separation_and_rates};
 
 /// How much of each item's audio is measured, in seconds, unless `--seconds` says otherwise.
 ///
@@ -330,23 +335,6 @@ impl Models {
     }
 }
 
-fn load(root: &Path, file_name: &str) -> ort::session::Session {
-    let model = root.join("models").join(file_name);
-    let loaded = open_session(&model).unwrap_or_else(|e| {
-        fail(&format!(
-            "{e}\nrun `cargo run --release --example fetch-onnx-models` first"
-        ))
-    });
-    // Only meaningful where a CoreML EP was compiled in: off macOS `accelerated` is always
-    // false by construction of the build, so printing this there would name a component the
-    // platform never had.
-    #[cfg(target_os = "macos")]
-    if !loaded.accelerated {
-        eprintln!("note: CoreML declined {file_name}; running on CPU");
-    }
-    loaded.session
-}
-
 /// Turns every item into one voice, printing what it measured and dropping -- by name -- the
 /// items that could not produce one.
 ///
@@ -425,7 +413,7 @@ fn measure(paths: &Paths, args: &Args, item: &Item, models: &mut Models) -> Resu
     if built.speaker_sources.len() > 1 {
         println!("  spliced with {SPLICE_GAP_S:.2} s of silence between sources");
     }
-    levels(&built.speaker);
+    levels("speaker.wav", &built.speaker);
 
     let measured = measure_built(args, &built.paths.speaker_wav(), item, models);
 
@@ -495,33 +483,6 @@ fn measure_built(
         speech_seconds: dominant.speech_seconds,
         embedding: dominant.embedding.clone(),
     })
-}
-
-fn converted(source: &ImportedSource) -> String {
-    format!(
-        "{}: {} Hz, {} ch -> {TARGET_RATE} Hz mono ({:.2} s)",
-        source.path.display(),
-        source.sample_rate,
-        source.channels,
-        source.samples as f64 / f64::from(TARGET_RATE)
-    )
-}
-
-/// The same line `build-session` prints, and for the same reason: reading it takes a second
-/// and turns "the measurement came back empty" into "the input was dead".
-fn levels(summary: &LevelSummary) {
-    let dbfs = summary.peak_dbfs();
-    let peak = if dbfs.is_infinite() {
-        "0.0 (digital silence)".to_string()
-    } else {
-        format!("{:.4} ({dbfs:.1} dBFS)", summary.peak)
-    };
-    println!(
-        "  speaker.wav  {:.2} s, peak {peak}, {:.1}% above floor, longest run {:.3} s",
-        summary.duration_s(),
-        summary.above_fraction() * 100.0,
-        summary.longest_run_s()
-    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -626,7 +587,7 @@ fn pair_up(voices: &[Voice]) -> TrialList {
             }
             trials.push(Trial {
                 same_speaker: a.speaker == b.speaker,
-                distance: distance(&a.embedding, &b.embedding),
+                distance: cosine_distance(&a.embedding, &b.embedding),
             });
         }
     }
@@ -634,12 +595,6 @@ fn pair_up(voices: &[Voice]) -> TrialList {
         trials,
         within_session,
     }
-}
-
-/// Cosine distance between two unit-length voices: the same dot product `best_match` does, so
-/// this cannot disagree with the decision it is measuring.
-fn distance(a: &[f32], b: &[f32]) -> f32 {
-    1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
 }
 
 /// The shape of the trial list, printed before any statistic taken over it.
@@ -699,54 +654,10 @@ fn report_scores(report: &TrialReport) {
     print_spread("different speaker", report.different.as_ref());
 
     println!("\nat threshold {:.3}", report.threshold);
-    println!(
-        "  false accepts: {} different-speaker pair(s) below the cut{}",
-        report.false_accepts,
-        percent(report.false_accept_rate)
-    );
-    println!(
-        "  false rejects: {} same-speaker pair(s) at or above it{}",
-        report.false_rejects,
-        percent(report.false_reject_rate)
-    );
+    cost_lines("  ", report);
 
     println!("\nseparation");
-    match report.overlap {
-        Some((min_different, max_same)) => println!(
-            "  NO SINGLE THRESHOLD SEPARATES THESE TWO POPULATIONS. They overlap between \
-             {min_different:.3} (the closest different-speaker pair) and {max_same:.3} (the \
-             furthest-apart same-speaker pair); every cut inside that band trades one kind of \
-             mistake for the other."
-        ),
-        None => match (report.same, report.different) {
-            (Some(same), Some(different)) => println!(
-                "  the two populations do not overlap: every same-speaker pair is below \
-                 {:.3} and every different-speaker pair is at or above {:.3}, so any cut in \
-                 between makes no mistakes on this list",
-                same.max, different.min
-            ),
-            _ => println!("  not measurable: one side of the trial list is empty"),
-        },
-    }
-
-    match report.equal_error {
-        Some(equal_error) => println!(
-            "  equal error rate {:.1}% at a cut of {:.3}  (the mean of the two rates where \
-             they come closest to crossing)",
-            equal_error.rate * 100.0,
-            equal_error.threshold
-        ),
-        None => println!("  equal error rate: not measurable, one side of the list is empty"),
-    }
-    match report.zero_false_accept {
-        Some(zero) => println!(
-            "  the largest cut that misattributes nobody is {:.3}, and it rejects {:.1}% of \
-             same-speaker pairs",
-            zero.threshold,
-            zero.false_reject_rate * 100.0
-        ),
-        None => println!("  no misattribution-free cut is measurable from this list"),
-    }
+    separation_and_rates("  ", report);
 }
 
 fn print_spread(label: &str, spread: Option<&Spread>) {
@@ -757,13 +668,6 @@ fn print_spread(label: &str, spread: Option<&Spread>) {
             s.count, s.min, s.p05, s.median, s.p95, s.max, s.mean
         ),
         None => println!("  {label}: no pairs"),
-    }
-}
-
-fn percent(rate: Option<f32>) -> String {
-    match rate {
-        Some(rate) => format!("  ({:.1}%)", rate * 100.0),
-        None => "  (no such pairs, so no rate)".to_string(),
     }
 }
 
@@ -920,7 +824,6 @@ fn identify(probe: &Voice, enrolled: &EnrolledSpeakers) -> Option<String> {
         .remove(&0)
         .map(|identification| identification.name)
 }
-
 // ---------------------------------------------------------------------------------------
 // What a person's reference should be made of (TASK-027)
 // ---------------------------------------------------------------------------------------
@@ -1166,9 +1069,4 @@ fn report_distances(report: &PolicyReport) {
         ),
         None => println!("      the two populations do not overlap"),
     }
-}
-
-fn fail(message: &str) -> ! {
-    eprintln!("{message}");
-    std::process::exit(1);
 }

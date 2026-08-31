@@ -48,12 +48,16 @@
 //! diagnostic is not that case. `fetch-onnx-models` is left alone -- it is correct by its name
 //! and its contents, and bolting a ggml file onto it would make the name a lie.
 
+#[path = "support/mod.rs"]
+mod support;
+
 use std::path::{Path, PathBuf};
 
 use meethook_models::ensure_model;
 use meethook_transcribe::{
     SILERO_VAD_MODEL, SileroVad, SpeechRegion, TARGET_RATE, VadTuning, read_track_16k_mono,
 };
+use support::fail;
 
 /// The window Whisper decodes at a time. Not configurable here: it is a property of the model,
 /// and it is what turns "seconds of audio saved" into "decoder passes saved".
@@ -346,9 +350,4 @@ fn parse() -> Result<Args, String> {
         target: target.ok_or("no session directory or wav file was given")?,
         tuning,
     })
-}
-
-fn fail(message: &str) -> ! {
-    eprintln!("{message}");
-    std::process::exit(1);
 }

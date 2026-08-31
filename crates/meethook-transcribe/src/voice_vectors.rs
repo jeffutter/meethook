@@ -127,6 +127,17 @@ pub(crate) fn group_mean(members: &[&[f32]]) -> Option<(Vec<f32>, f32)> {
     Some((mean, length))
 }
 
+/// Cosine distance between two unit-length vectors: `1 - a.b`.
+///
+/// The raw arithmetic only -- no length checks, no renormalization, and no
+/// blocked-pair policy. For unit-length inputs the dot product *is* the cosine,
+/// so nothing here re-derives it; callers that substitute infinity for a pair
+/// segmentation heard at once ([`crate::speakers`] does) keep that policy at
+/// their own call site rather than folding it into this helper.
+pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    1.0 - dot(a, b)
+}
+
 /// Cosine of two unit-length vectors, which for them is just the dot product.
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
@@ -174,6 +185,16 @@ pub(crate) fn two_clouds() -> Vec<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The raw contract [`cosine_distance`] states: identical directions are 0, orthogonal
+    /// directions are 1, and a known angle reads off the cosine rather than a fitted decimal.
+    #[test]
+    fn cosine_distance_reads_off_the_angle() {
+        assert!(cosine_distance(&at(20.0), &at(20.0)).abs() < 1e-6);
+        assert!((cosine_distance(&at(0.0), &at(90.0)) - 1.0).abs() < 1e-6);
+        let expected = 1.0 - ((45.0_f32).to_radians()).cos();
+        assert!((cosine_distance(&at(0.0), &at(45.0)) - expected).abs() < 1e-6);
+    }
 
     /// AC#2 of TASK-018.01, and the reason [`GroupDistance`] returns three numbers rather than
     /// two: average linkage is centroid distance inflated by the shrinkage of the two group

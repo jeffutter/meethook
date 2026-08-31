@@ -38,13 +38,14 @@
 //! measurement came back empty" into "the input was dead" *before* a whisper pass is paid for
 //! rather than after.
 
+#[path = "support/mod.rs"]
+mod support;
+
 use std::path::PathBuf;
 
 use meethook_session::Paths;
-use meethook_transcribe::{
-    BuiltSession, ImportedSource, LevelSummary, MIC_SILENCE_S, SPLICE_GAP_S, TARGET_RATE,
-    build_session,
-};
+use meethook_transcribe::{BuiltSession, MIC_SILENCE_S, SPLICE_GAP_S, build_session};
+use support::session_prep::{converted, levels};
 
 fn main() {
     let args = parse().unwrap_or_else(|message| {
@@ -139,32 +140,4 @@ fn report(paths: &Paths, args: &Args, built: &BuiltSession) {
              so it cannot reach clustering or enrollment"
         );
     }
-}
-
-fn converted(source: &ImportedSource) -> String {
-    format!(
-        "{}: {} Hz, {} ch -> {TARGET_RATE} Hz mono ({:.2} s)",
-        source.path.display(),
-        source.sample_rate,
-        source.channels,
-        source.samples as f64 / f64::from(TARGET_RATE)
-    )
-}
-
-/// Peak alone does not settle whether a track holds speech: two UI chimes peak around 0.57
-/// while the track is silent for 99% of its length. The fraction and the run length are what
-/// separate "somebody talked" from "something beeped".
-fn levels(name: &str, summary: &LevelSummary) {
-    let dbfs = summary.peak_dbfs();
-    let peak = if dbfs.is_infinite() {
-        "0.0 (digital silence)".to_string()
-    } else {
-        format!("{:.4} ({dbfs:.1} dBFS)", summary.peak)
-    };
-    println!(
-        "  {name:<12} {:.2} s, peak {peak}, {:.1}% above floor, longest run {:.3} s",
-        summary.duration_s(),
-        summary.above_fraction() * 100.0,
-        summary.longest_run_s()
-    );
 }

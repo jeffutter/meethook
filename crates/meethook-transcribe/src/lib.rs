@@ -89,7 +89,7 @@ pub use trials::{
     EqualError, Spread, Trial, TrialReport, ZeroFalseAccept, score_trials, wilson_interval,
 };
 pub use vad::{SileroVad, SpeechRegion, VadTuning};
-pub use voice_vectors::{GroupDistance, group_distance};
+pub use voice_vectors::{GroupDistance, cosine_distance, group_distance};
 
 use meethook_session::{
     Classification, CleaningRecord, DiscoveredSession, EnrolledSpeakers, Paths, SessionId,
