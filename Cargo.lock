@@ -839,6 +839,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "jiff",
+ "libc",
  "meethook-enroll",
  "meethook-models",
  "meethook-record",

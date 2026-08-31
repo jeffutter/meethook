@@ -28,6 +28,10 @@ serde_json = { workspace = true }
 # part of a recording means writing that part out first.
 tempfile = { workspace = true }
 
+[dev-dependencies]
+# The interrupt test drives the built binary through a real pty and kills it mid-commit.
+libc = { workspace = true }
+
 # The capture backend is pure Apple frameworks and cannot compile off macOS, so it is a
 # target-gated dependency rather than an ordinary one: on non-macOS platforms the `record`
 # subcommand and the calendar-backed halves of `meeting` simply do not exist, and nothing in

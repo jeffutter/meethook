@@ -84,8 +84,10 @@ pub enum Answer {
         ///
         /// [`Refusal::Vetoed`] is out of reach whatever this says. That refusal is a different
         /// claim -- segmentation heard the two voices at once and so proved they are different
-        /// people -- and overriding it means asserting several voices are one person, which is
-        /// TASK-046.09's question and not this field's.
+        /// people -- and overriding it means asserting several voices are one person. That
+        /// assertion has its own answer since, [`Answer::Group`]: it commits a user-chosen set
+        /// of voices under one name and reports the vetoes it overrides. The authority still
+        /// sits with the group rather than this field.
         anyway: bool,
     },
     Skip,
