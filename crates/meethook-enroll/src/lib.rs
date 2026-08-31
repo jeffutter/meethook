@@ -6212,6 +6212,79 @@ mod tests {
         );
     }
 
+    /// A commit interrupted between a member's `speakers.json` write and its
+    /// `speaker_names.json` write leaves that member holding a database reference under the
+    /// name but no names-file row. Confirming it plainly -- the natural recovery gesture, not
+    /// the group door -- must stand the declaration up in both stores so the transcript label
+    /// agrees with the database on every later pass, and the rest of the group still converges
+    /// through the door onto the same state.
+    #[test]
+    fn a_plain_confirmation_of_a_stranded_voice_repairs_its_row_and_the_group_converges() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600");
+        heard_at_once(&session, 0, 1);
+        // The post-SIGKILL state: a Grace reference built from cluster 0's exact embedding,
+        // with no `speaker_names.json` row for it.
+        enrolled(&[("Grace", voice(0))], &paths);
+
+        // Pass 1 (the natural gesture): confirm 'is Unknown 1 Grace?' with Enter. Before the
+        // fix this confirmation forgot the row and left the voice demoted on every later pass.
+        let (_, out) = run_asking(
+            &paths,
+            &[],
+            CORRECT,
+            &mut Scripted::answering(vec![named("Grace")]),
+        );
+        let transcript = transcript_of(&session);
+        assert_eq!(transcript.turns[0].speaker.as_str(), "Grace", "{out}");
+        assert_eq!(transcript.turns[3].speaker.as_str(), "Grace", "{out}");
+        // The heart of the fix: a standing row now exists for the stranded member.
+        let assigned = assigned_in(&session, "20260809-052600");
+        assert!(
+            assigned
+                .names
+                .iter()
+                .any(|row| row.cluster == 0 && row.name == "Grace"),
+            "no names-file row for the confirmed voice: {:?}\n{out}",
+            assigned.names
+        );
+
+        // Pass 2 (the rest of the group through the door): completes the second member against
+        // the first's evidence, overriding the veto the first member's name now holds.
+        let (report, out) = run(
+            &paths,
+            &["20260809-052600"],
+            &mut Scripted::answering(vec![group("Grace", &["Unknown 1", "Unknown 2"])]),
+        );
+        assert_eq!(report.vetoes_overridden, 1, "{out}");
+        let transcript = transcript_of(&session);
+        let after = said(&transcript);
+        assert_eq!(after[0].0, "Grace", "{after:?}\n{out}");
+        assert_eq!(after[1].0, "You", "{after:?}\n{out}");
+        assert_eq!(after[2].0, "Grace", "{after:?}\n{out}");
+        assert_eq!(after[3].0, "Grace", "{after:?}\n{out}");
+        let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+        assert_eq!(speakers.references("Grace"), 2, "{:?}", speakers.speakers);
+        // Both members hold a standing row: the one the plain confirmation wrote and the one
+        // the group door wrote.
+        let assigned = assigned_in(&session, "20260809-052600");
+        assert_eq!(assigned.names.len(), 2, "{:?}", assigned.names);
+
+        // Pass 3: a further pass writes nothing at all -- converged means byte-identical.
+        let before = files_under(root.path());
+        let (_, out) = run(
+            &paths,
+            &["20260809-052600"],
+            &mut Scripted::answering(vec![]),
+        );
+        assert_eq!(
+            files_under(root.path()),
+            before,
+            "a converged pass rewrote a file: {out}"
+        );
+    }
+
     /// Acceptance criterion #3: the aggregate preview equals the sequential application of the
     /// members' individual previews. On a fixture with a colliding pre-enrolment on each member
     /// -- one displaced by the correction, one left stale below the floor -- every field of the

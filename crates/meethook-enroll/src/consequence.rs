@@ -234,6 +234,21 @@ impl<'a> Preview<'a> {
                 // forever. A plain naming still forgets its row below; only a declaration made
                 // with the overlap reported keeps it.
                 candidate_assigned.assign(cluster.id, name, cluster.embedding.clone());
+            } else if stored == Stored::AlreadyHeld && !cluster.heard_at_once_with.is_empty() {
+                // The stranded declaration stands up in both stores. `AlreadyHeld` means the
+                // database already holds a bit-identical reference built from this exact
+                // fragment under this exact name -- a commit interrupted between its
+                // `speakers.json` write and its `speaker_names.json` write left exactly that:
+                // the declaration survived in the first store and never reached the second.
+                // Standing it up here records the existing declaration in the second store,
+                // which is what the heard-at-once exclusion needs to stand on: two standing
+                // rows of one name on overlapping voices are co-declaration, and both stand.
+                // Without the row the exclusion demotes the voice on every later pass, so the
+                // transcript reads `Unknown N` forever while the database says the name. The
+                // overlap condition is the boundary: on a solo voice the confirmation is pure
+                // redundancy, where the row risks the stale-pin disagreement the forget below
+                // guards against.
+                candidate_assigned.assign(cluster.id, name, cluster.embedding.clone());
             } else {
                 // One voice, one record. A voice named for this session only and then enrolled
                 // properly -- the same fragment reached again with `--force-reference`, or a
@@ -1794,6 +1809,85 @@ mod tests {
         let first = preview.of("Alice").unwrap();
         let _ = preview.of("Bob").unwrap();
         assert_eq!(preview.of("Alice").unwrap(), first);
+    }
+
+    /// A commit interrupted between its `speakers.json` write and its `speaker_names.json`
+    /// write leaves a reference with no names-file row. Confirming that stranded voice plainly,
+    /// on a voice heard at once with another, must stand the declaration up in *both* stores:
+    /// the row the heard-at-once exclusion needs to stand on is written by the very
+    /// confirmation that today forgets it.
+    #[test]
+    fn a_stranded_confirmation_on_a_heard_at_once_voice_keeps_its_row() {
+        let mut clusters = vec![cluster(0, voice(0), 40.0), cluster(1, voice(1), 40.0)];
+        clusters[0].heard_at_once_with = vec![1];
+        clusters[1].heard_at_once_with = vec![0];
+        let unknown = numbering(&clusters);
+        // The post-SIGKILL state: the database holds a bit-identical reference built from this
+        // exact fragment under the name, but no names-file row exists yet.
+        let speakers = enrolled(&[("Grace", voice(0), Some(30.0))]);
+        let assigned = no_names();
+
+        let consequence = preview_of(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            Enrolment::default(),
+        )
+        .of("Grace")
+        .unwrap();
+
+        assert_eq!(consequence.stored, Some(Stored::AlreadyHeld));
+        // The declaration stands up in the names file rather than being forgotten.
+        assert!(
+            consequence
+                .assigned
+                .names
+                .iter()
+                .any(|row| row.cluster == 0 && row.name == "Grace")
+        );
+        // A later pass -- no pending, no assertion -- reads the name, not a demotion: the row
+        // resolves the voice by embedding equality and awards it, so the veto never runs.
+        let later = crate::effective_labels(
+            &clusters,
+            &unknown,
+            &consequence.speakers,
+            &consequence.assigned.names,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(later[&0].label(), "Grace");
+    }
+
+    /// The mirror of the stranded case with no overlap: an `AlreadyHeld` confirmation on a solo
+    /// voice is pure redundancy, so the one-voice-one-record forget still applies and no row is
+    /// left behind -- byte-identical behaviour to before the fix.
+    #[test]
+    fn a_stranded_confirmation_on_a_solo_voice_still_forgets_its_row() {
+        let clusters = vec![cluster(0, voice(0), 40.0), cluster(1, voice(1), 40.0)];
+        let unknown = numbering(&clusters);
+        let speakers = enrolled(&[("Grace", voice(0), Some(30.0))]);
+        let assigned = no_names();
+
+        let consequence = preview_of(
+            &clusters,
+            &unknown,
+            &speakers,
+            &assigned,
+            Enrolment::default(),
+        )
+        .of("Grace")
+        .unwrap();
+
+        assert_eq!(consequence.stored, Some(Stored::AlreadyHeld));
+        assert!(
+            !consequence
+                .assigned
+                .names
+                .iter()
+                .any(|row| row.cluster == 0)
+        );
     }
 
     /// The refusal rule, exercised as the pure comparison it is: two labellings in, and either

@@ -492,11 +492,12 @@ fn complete_and_verify(root: &Path, db: &BTreeSet<u32>) {
     let mut driver = Driver::spawn(root);
     if driver.wait_for_frame_or_exit(Duration::from_secs(15)) {
         // The gesture is the group door again, over every row the queue offers -- including the
-        // ones the interrupt already committed. A plain confirmation of an identified voice
-        // forgets its names-file row (the "one voice, one record" rule in the dry run), and the
-        // heard-at-once exclusion would then demote the voice for good; only the group's forced
-        // tier keeps the declaration standing in both stores, which is what makes the re-run
-        // converge rather than merely finish.
+        // ones the interrupt already committed. The group's forced tier stands each member's
+        // declaration up in both stores, which is what makes the re-run converge rather than
+        // merely finish. (A plain confirmation of an identified voice now does the same for a
+        // stranded member: since TASK-055 it keeps -- rather than forgets -- the names-file row
+        // when the database already holds the reference, so the natural recovery gesture no
+        // longer leaves the voice demoted. The group door remains the canonical recovery.)
         driver.feed(&[b"\x0b", b"\x1b[B", b"\x0b", b"\x1b[B", b"\x0b"]);
         driver.write_now(NAME.as_bytes());
         driver.write_now(b"\x0e");
