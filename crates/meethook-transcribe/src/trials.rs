@@ -12,7 +12,7 @@
 //! directories -- for the same reason [`crate::identify_clusters`] is: every claim here is
 //! decidable in microseconds against hand-written numbers, and a diagnostic whose conventions
 //! nobody can test is a number to believe rather than evidence. The runner that turns audio
-//! into a `&[Trial]` is `examples/speaker-trials.rs`.
+//! into a `&[Trial]` is `examples/speaker-trials/main.rs`.
 //!
 //! # The other altitude
 //!
