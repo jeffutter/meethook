@@ -77,18 +77,27 @@
               "${pkgs.onnxruntime}/lib:${gccRuntime}/lib";
           }
           // nixpkgs.lib.optionalAttrs isMacos {
-            # `pkgs.llvmPackages.libclang` ships only the shared library, not a `clang`
-            # executable next to it -- and libclang-sys, which every bindgen build script
-            # here dlopens directly, normally derives its resource directory (the builtin
-            # `stddef.h`/`math.h` etc. that a real `clang` binary would find relative to
-            # itself) from exactly that missing binary. Without it, libc++ headers that
-            # lean on those builtins -- `<string>`'s `using_if_exists size_t;`, `<cmath>`'s
-            # `FP_NAN` family -- fail to parse, which is otherwise invisible: it only bites
-            # a bindgen invocation that actually walks the C++ standard library (i.e.
-            # webrtc-audio-processing-sys, not the plain-C headers the other bindgen
-            # consumers here parse), so it can look like "bindgen works" if that crate's
-            # build.rs output happens to already be cached from before this was noticed.
-            BINDGEN_EXTRA_CLANG_ARGS = "-isysroot ${pkgs.apple-sdk_26} -isystem ${pkgs.llvmPackages.libclang.lib}/lib/clang/${nixpkgs.lib.versions.major pkgs.llvmPackages.libclang.version}/include";
+            # bindgen invokes libclang directly, bypassing the cc-wrapper that would
+            # otherwise supply `-isysroot` itself, so it has to be pointed at the SDK
+            # by hand -- but `${pkgs.apple-sdk_26}` is only the *package* root
+            # (`.../apple-sdk-26.5`), which has no `usr/include` of its own. The SDK
+            # proper -- `usr/include`, the framework directories, all of it -- lives
+            # nested inside at `Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk`;
+            # that's the exact path apple-sdk_26's own setup-hook exports as
+            # `SDKROOT` for every C/C++ compile the wrapped `cc` runs. A previous
+            # version of this line passed the bare package root, which silently
+            # isysroot'd into a directory with no SDK content at all -- clang doesn't
+            # error on that, it just resolves `<isysroot>/usr/include` to nothing and
+            # silently falls back to whatever clang can still find without it -- which
+            # is what actually produced the "unknown type name 'size_t'" / undeclared
+            # `FP_NAN` family / "reference to unresolved using declaration" failures:
+            # without real SDK headers, libc++'s `<cstddef>`/`<cstring>`/`<cmath>`
+            # wrappers can't find the real C library declarations they're supposed to
+            # layer on top of. Confirmed by replaying bindgen's exact clang_args
+            # through `clang -fsyntax-only` against webrtc-audio-processing-sys's own
+            # `src/wrapper.hpp`: the bare package root reproduces the failure
+            # reliably, and the corrected, SDKROOT-matching path fixes it reliably.
+            BINDGEN_EXTRA_CLANG_ARGS = "-isysroot ${pkgs.apple-sdk_26}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
           };
 
           # On macOS the AEC3 library links dynamically against the flake's
