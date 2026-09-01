@@ -32,13 +32,14 @@ jobs:
       - name: Run doctests
         run: nix develop -c cargo test --doc --all-features --workspace
 
+  # Linux-only, unlike the other three matrix jobs: rustfmt formats source text without
+  # evaluating `#[cfg(...)]`, so it already checks every line of macOS-gated code even when
+  # run on Linux. Clippy and Docs stay cross-platform because they type-check per target and
+  # would otherwise miss the `cfg(target_os = "macos")` branches in meethook and
+  # meethook-transcribe.
   rustfmt:
-    name: Rustfmt (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-26, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    name: Rustfmt
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -49,7 +50,7 @@ jobs:
           use-flakehub: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rustfmt-${{ matrix.os }}
+          shared-key: rustfmt-ubuntu-latest
           workspaces: ". -> target"
       - name: Check formatting
         run: nix develop -c cargo fmt --all --check
