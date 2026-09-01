@@ -131,6 +131,10 @@ fn open_pty() -> (std::fs::File, std::fs::File) {
     // SAFETY: `master`/`slave`/`win` are valid stack locals passed by pointer to a well-formed
     // libc call; `openpty` fills `master`/`slave` with fresh, valid fds on success (checked via
     // `rc`), which `from_raw_fd` then takes ownership of.
+    //
+    // `&mut win` is required because macOS's `libc::openpty` declares `winp` as `*mut winsize`
+    // (unlike Linux's POSIX-matching `*const`), which clippy running on Linux CI can't see.
+    #[allow(clippy::unnecessary_mut_passed)]
     unsafe {
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
