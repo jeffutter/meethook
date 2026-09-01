@@ -136,10 +136,14 @@
 
           craneLib = crane.mkLib pkgs;
 
-          # Single source of truth for the package version -- read from the meethook crate's
-          # own Cargo.toml (the workspace's [workspace.package] table has no `version` key;
-          # every crate here pins its own) so the flake never drifts out of sync with `cargo`.
-          version = (builtins.fromTOML (builtins.readFile ./crates/meethook/Cargo.toml)).package.version;
+          # Single source of truth for the package version -- read from the root workspace's
+          # [workspace.package] table, which every crate here inherits via
+          # `version.workspace = true` (see Cargo.toml), so the flake never drifts out of sync
+          # with `cargo`. Reading it from a member crate's own manifest instead would hand
+          # `builtins.fromTOML` the literal `{ workspace = true }` table rather than a string:
+          # that inheritance is Cargo's own manifest resolution, which a bare TOML parse here
+          # cannot follow.
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
           # The whole repository, not just crates/meethook: the `meethook` binary pulls in
           # meethook-record (macOS only, target-gated) via a path dependency that roots its
