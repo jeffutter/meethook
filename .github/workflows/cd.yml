@@ -28,7 +28,7 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          - os: macos-14
+          - os: macos-15
             os-name: macos
             target: aarch64-apple-darwin
             architecture: arm64
@@ -87,7 +87,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-latest]
+        os: [macos-15, ubuntu-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
