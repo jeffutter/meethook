@@ -5,6 +5,7 @@ description = "Correcting what an automatic pass got wrong -- the voices it coul
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 meethook-session = { workspace = true }

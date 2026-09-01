@@ -5,6 +5,7 @@ description = "The on-disk session-directory contract shared by every meethook s
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 # A session-contract crate depends on an audio library because it owns the *spelling* of the

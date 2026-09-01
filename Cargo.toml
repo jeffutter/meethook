@@ -28,6 +28,7 @@ edition = "2024"
 # one. The devShell pins 1.97, so nothing observable changes here.
 rust-version = "1.88"
 publish = false
+license = "MIT"
 
 # cargo-release treats every crate's `version.workspace = true` as one shared version already
 # (bumping one bumps all five), but its default tag naming still tags each crate separately --

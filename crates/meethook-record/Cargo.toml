@@ -28,6 +28,7 @@ description = "Dual-track (microphone + system audio) macOS capture into a meeth
 edition = "2024"
 rust-version = "1.88"
 publish = false
+license = "MIT"
 
 # Rooting its own workspace (above) means the root's `cargo release` never reaches this
 # manifest, so its version bump is a separate `cargo release` invocation against this

@@ -5,6 +5,7 @@ description = "Whisper ASR over a recorded meethook session's microphone track"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 meethook-models = { workspace = true }
