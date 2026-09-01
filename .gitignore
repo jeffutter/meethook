@@ -6,6 +6,10 @@ result-*
 __pycache__
 .claude/settings.local.json
 
+# Backlog.md task tracking is local working state, not repository content.
+# Other backlog/ material (decisions, docs, milestones) stays tracked.
+backlog/tasks/
+
 # Recorded and generated audio under scratch/. The scripts that produce and
 # consume it are tracked; the waveforms themselves are large, regenerable
 # (`make_click_track.py`) or machine-specific captures.
