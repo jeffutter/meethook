@@ -118,6 +118,23 @@
               # pkg-config, which is how the dynamic AEC3 dependency reaches
               # the linker.
               pkgs.webrtc-audio-processing
+            ]
+            ++ nixpkgs.lib.optionals (!isMacos) [
+              # AEC3's own meson.build asks for `absl_base`/`absl_flags`/etc via
+              # dependency(), which meson resolves through pkg-config first. Without
+              # this, none of those probes find anything (the sandbox has no
+              # PKG_CONFIG_PATH pointed at abseil at all), so meson falls back to its
+              # subproject-wrap mechanism for abseil-cpp -- and that fallback path
+              # unconditionally `os.makedirs()`s a subprojects/packagecache dir to
+              # stage the fetch into, inside the copy of the read-only Nix store
+              # source that webrtc-audio-processing-sys's build.rs made with `cp -a`
+              # (which preserves the store's read-only mode bits on the copy). The
+              # mkdir dies with EACCES before the build ever gets far enough to need
+              # network -- sandboxing isn't actually why this fails. Putting
+              # abseil-cpp's pkg-config files on PKG_CONFIG_PATH lets both the crate's
+              # own build.rs probe (build.rs:167) and meson's identical probe resolve
+              # abseil directly, so the subproject/packagecache path is never taken.
+              pkgs.abseil-cpp
             ];
 
           # ort-sys probes pkg-config for libonnxruntime at build time; the pkg-config
