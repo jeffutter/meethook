@@ -1,0 +1,125 @@
+name: CI # Continuous Integration
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_call:
+
+jobs:
+  test:
+    name: Test Suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}
+          workspaces: ". -> target"
+      - name: Run tests
+        run: nix develop -c cargo nextest run --all-features --workspace
+      - name: Run doctests
+        run: nix develop -c cargo test --doc --all-features --workspace
+
+  rustfmt:
+    name: Rustfmt (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rustfmt-${{ matrix.os }}
+          workspaces: ". -> target"
+      - name: Check formatting
+        run: nix develop -c cargo fmt --all --check
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy-${{ matrix.os }}
+          workspaces: ". -> target"
+      - name: Clippy check
+        run: nix develop -c cargo clippy --all-targets --all-features --workspace -- -D warnings
+
+  docs:
+    name: Docs (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs-${{ matrix.os }}
+          workspaces: ". -> target"
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: nix develop -c cargo doc --no-deps --document-private-items --all-features --workspace
+
+  # meethook-record roots its own workspace (see crates/meethook-record/Cargo.toml) because
+  # its Apple-framework dependencies cannot compile off macOS, so `--workspace` above never
+  # touches it -- mirrored from lefthook.yml's pre-push `record-crate` gate, which runs the
+  # same three commands from inside the same directory on Darwin only.
+  record:
+    name: meethook-record (macOS-only workspace)
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: record
+          workspaces: "crates/meethook-record -> target"
+      - name: fmt, clippy, test
+        run: |
+          nix develop -c bash -c '
+            set -euo pipefail
+            cd crates/meethook-record
+            cargo fmt --all --check
+            cargo clippy --all-targets --workspace -- -D warnings
+            cargo nextest run --workspace
+          '

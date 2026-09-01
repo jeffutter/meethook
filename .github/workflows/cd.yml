@@ -1,0 +1,121 @@
+name: CD # Continuous Deployment
+
+on:
+  push:
+    tags:
+      - "v?[0-9]+.[0-9]+.[0-9]+"
+
+env:
+  # The one [[bin]] target in the workspace today (crates/meethook/Cargo.toml, package
+  # "meethook"). Every job below loops over this list rather than hard-coding the name, so a
+  # future second `[[bin]]` only needs adding here.
+  BINARIES: meethook
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  # Native `cargo build`, not `nix build`: this is the fast path to a release tarball, run
+  # directly on the runner's own toolchain via the devShell rather than through a full Nix
+  # package derivation. `nix-check` below builds the same binary the Nix way and validates it
+  # separately; this job's tarballs are what actually get published.
+  build:
+    name: Build (${{ matrix.job.os-name }}-${{ matrix.job.architecture }})
+    needs: ci
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - os: macos-14
+            os-name: macos
+            target: aarch64-apple-darwin
+            architecture: arm64
+          - os: ubuntu-latest
+            os-name: linux
+            target: x86_64-unknown-linux-gnu
+            architecture: x86_64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-${{ matrix.job.os-name }}
+          workspaces: ". -> target"
+
+      - name: Cargo build
+        run: |
+          set -euo pipefail
+          for BIN in $BINARIES; do
+            nix develop -c cargo build --release --target ${{ matrix.job.target }} --bin "$BIN"
+          done
+
+      - name: Packaging release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target/${{ matrix.job.target }}/release
+          for BIN in $BINARIES; do
+            # Reduce binary size by removing debug symbols.
+            strip "$BIN"
+
+            RELEASE_NAME="${BIN}-${GITHUB_REF_NAME}-${{ matrix.job.os-name }}-${{ matrix.job.architecture }}"
+            tar czvf "$RELEASE_NAME.tar.gz" "$BIN"
+            shasum -a 256 "$RELEASE_NAME.tar.gz" > "$RELEASE_NAME.sha256"
+          done
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.job.os-name }}-${{ matrix.job.architecture }}
+          path: |
+            target/${{ matrix.job.target }}/release/*.tar.gz
+            target/${{ matrix.job.target }}/release/*.sha256
+          retention-days: 1
+
+  nix-check:
+    name: Nix build (${{ matrix.os }})
+    needs: ci
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+      - run: nix build .#meethook --option log-lines 200
+      - run: nix flake check
+
+  release:
+    name: Publish release
+    needs: [build, nix-check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Releasing assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

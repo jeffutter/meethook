@@ -69,3 +69,22 @@ cargo run -p meethook -- transcribe [SESSION_ID]...
 `crates/meethook-record`) only on Darwin; on Linux those steps print a skip notice
 and pass, and the rest of the chain (fmt, clippy, test, doc, audit) runs as
 usual.
+
+## Downloaded release binaries
+
+The `.tar.gz` binaries the CD workflow (`.github/workflows/cd.yml`) attaches to
+each GitHub release are plain `cargo build --release` output -- not the Nix
+package below -- so they carry the same dynamic-linking requirements as
+"Without Nix" above: `libonnxruntime` findable via the loader (on both
+platforms), plus `libwebrtc_audio_processing` on macOS specifically (Linux
+compiles AEC3 from source into the binary instead, so it has no such runtime
+dependency there). Neither is bundled in the tarball. A machine without those
+libraries already installed -- via Nix, Homebrew, or a distro package -- will
+fail to start the binary with a dynamic-linker error, not a clean one.
+
+`nix build .#meethook` (or `nix profile install`/`nix run` against this flake)
+is the reliable install path: it resolves those libraries from the same Nix
+store the build already depends on, rather than assuming the target machine
+happens to have them. Prefer it over the tarball unless you already know the
+target machine has onnxruntime (and, on macOS, webrtc-audio-processing)
+available outside Nix.
