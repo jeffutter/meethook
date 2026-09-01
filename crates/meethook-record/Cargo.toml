@@ -29,6 +29,16 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 
+# Rooting its own workspace (above) means the root's `cargo release` never reaches this
+# manifest, so its version bump is a separate `cargo release` invocation against this
+# directory -- scripts/release.sh runs it first. `tag = false` / `push = false` because the
+# tag and push belong to the root's release: this crate's version-bump commit just needs to
+# exist on `main` before the root runs, so it rides along in the root's push instead of
+# racing it with a second one.
+[package.metadata.release]
+tag = false
+push = false
+
 [workspace]
 
 [dependencies]

@@ -21,12 +21,24 @@ exclude = ["crates/meethook-record"]
 # Darwin), and its manifest mirrors this file's versions instead of inheriting them.
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 # 1.88 rather than 1.85 because `ropus` declares that floor, so a 1.85 toolchain can no longer
 # build this workspace and saying otherwise would be a false claim rather than a conservative
 # one. The devShell pins 1.97, so nothing observable changes here.
 rust-version = "1.88"
 publish = false
+
+# cargo-release treats every crate's `version.workspace = true` as one shared version already
+# (bumping one bumps all five), but its default tag naming still tags each crate separately --
+# `meethook-v0.1.1`, `meethook-session-v0.1.1`, and so on. This project ships one binary from
+# one repo, and cd.yml's release trigger (`v?[0-9]+.[0-9]+.[0-9]+`) expects one tag per release,
+# so both are collapsed to a single `vX.Y.Z` here.
+[workspace.metadata.release]
+tag-name = "v{{version}}"
+consolidate-commits = true
+pre-release-commit-message = "chore: release {{version}}"
+tag-message = "meethook {{version}}"
 
 # A `cargo run` has to be usable on a real session, and at opt-level 0 it is not: the
 # transcribe pre-pass is scalar float DSP over ~141 M samples per track -- rubato's

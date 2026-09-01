@@ -1,6 +1,6 @@
 [package]
 name = "meethook"
-version = "0.1.0"
+version.workspace = true
 description = "Local meeting recorder (macOS) and transcriber"
 edition.workspace = true
 rust-version.workspace = true

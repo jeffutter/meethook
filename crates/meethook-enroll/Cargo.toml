@@ -1,6 +1,6 @@
 [package]
 name = "meethook-enroll"
-version = "0.1.0"
+version.workspace = true
 description = "Correcting what an automatic pass got wrong -- the voices it could not name, the meeting it guessed at -- and rewriting the transcripts that said so"
 edition.workspace = true
 rust-version.workspace = true

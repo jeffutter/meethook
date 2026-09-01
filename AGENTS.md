@@ -56,6 +56,28 @@ than silently falling back).
 See `LINUX.md` for what does and doesn't work off macOS (no `record`, no calendar
 correction, no accelerators, clip playback falls back through `paplay`/`aplay`/`ffplay`/`mpv`).
 
+### Releasing
+
+`scripts/release.sh <patch|minor|major|VERSION> [cargo-release flags...]` cuts a release.
+Preview it first (no `--execute`, the `cargo-release` default), then run it for real:
+
+```sh
+scripts/release.sh minor            # dry run: shows what would change
+scripts/release.sh minor --execute  # commits the version bumps, tags, and pushes
+```
+
+It runs `cargo-release` twice: once against `crates/meethook-record` (which roots its own
+workspace and so is invisible to the root's release), then against the root, both to the
+same level/version. Only the root's run tags and pushes (`v{{version}}`, matching
+`cd.yml`'s release trigger) — `meethook-record`'s `[package.metadata.release]` disables its
+own tag/push so its version-bump commit rides along in the root's push rather than racing
+it. Run them in the other order, or independently, and you either push meethook-record's
+bump under no tag or tag a commit that doesn't include it.
+
+The pushed tag is what triggers `cd.yml`: it builds and publishes release binaries for both
+platforms. `publish = false` is set workspace-wide, so nothing here ever reaches crates.io —
+this is tagging and packaging a binary release, not a library release.
+
 ## Architecture
 
 Five crates, one binary. **`record`, `transcribe`, and `enroll` run as entirely separate

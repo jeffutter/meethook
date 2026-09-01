@@ -1,6 +1,6 @@
 [package]
 name = "meethook-transcribe"
-version = "0.1.0"
+version.workspace = true
 description = "Whisper ASR over a recorded meethook session's microphone track"
 edition.workspace = true
 rust-version.workspace = true

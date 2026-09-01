@@ -1,6 +1,6 @@
 [package]
 name = "meethook-models"
-version = "0.1.0"
+version.workspace = true
 description = "Lazy, hash-verified acquisition of model weights that are deliberately outside the Nix closure"
 edition.workspace = true
 rust-version.workspace = true

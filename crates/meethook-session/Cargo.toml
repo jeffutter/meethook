@@ -1,6 +1,6 @@
 [package]
 name = "meethook-session"
-version = "0.1.0"
+version.workspace = true
 description = "The on-disk session-directory contract shared by every meethook subcommand"
 edition.workspace = true
 rust-version.workspace = true

@@ -188,6 +188,7 @@
               # isolates each test binary and reports failures without the
               # panic-aborts the rest of the suite that cargo test does.
               pkgs.cargo-nextest
+              pkgs.cargo-release
             ];
 
             env = commonEnv;
