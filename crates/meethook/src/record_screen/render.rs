@@ -17,7 +17,7 @@ use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::state::{Phase, State};
+use super::state::{EditingField, Phase, State};
 use crate::record::{NO_ROSTER, meeting_clause_line, mic_line, session_id_line, speaker_line};
 use meethook_session::AttendeeStatus;
 
@@ -116,11 +116,27 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
         } else {
             for (nth, attendee) in roster.iter().enumerate() {
                 let mut spans = vec![Span::raw(format!("{:>2}  ", nth + 1))];
-                match &attendee.name {
-                    Some(name) => spans.push(Span::raw(name.clone())),
-                    None => spans.push(Span::raw("(unnamed)").dim()),
+                // While a correction is in progress, the row under the cursor paints what has
+                // been typed so far -- not the committed value -- with a block cursor at the
+                // end, so a typo is visible before Enter writes it into the session. The block
+                // glyph keeps an empty buffer distinguishable from not-editing at all.
+                let editing_name =
+                    nth == state.roster_cursor && state.editing == Some(EditingField::Name);
+                let editing_email =
+                    nth == state.roster_cursor && state.editing == Some(EditingField::Email);
+                if editing_name {
+                    spans.push(Span::raw(format!("{}\u{2588}", state.edit_buffer)).underlined());
+                } else {
+                    match &attendee.name {
+                        Some(name) => spans.push(Span::raw(name.clone())),
+                        None => spans.push(Span::raw("(unnamed)").dim()),
+                    }
                 }
-                if let Some(email) = &attendee.email {
+                // `else if`: while the email is the field under correction, painting the
+                // committed one alongside the buffer would show two values for one column.
+                if editing_email {
+                    spans.push(Span::raw(format!("  {}\u{2588}", state.edit_buffer)).underlined());
+                } else if let Some(email) = &attendee.email {
                     spans.push(Span::raw(format!("  {email}")));
                 }
                 if attendee.is_you {
@@ -806,6 +822,108 @@ mod tests {
             .find(|(text, _)| text.contains("Hopper"))
             .expect("the second attendee is listed: {rows:?}");
         assert!(hopper.1, "the highlight follows the cursor: {rows:?}");
+    }
+
+    /// A run with the roster pane open on the fixture invite: the setup every live-editing
+    /// frame below needs, spelled once.
+    fn roster_state() -> State {
+        let meeting = secret_meeting();
+        let mut state = State::default();
+        state.apply(&started(18));
+        state.apply(&Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&meeting)],
+            guess: Some(MeetingLabel::from(&meeting)),
+        });
+        state.apply(&secret_roster());
+        state.open_roster();
+        state
+    }
+
+    /// The row under the cursor in a highlighted read-out: the attendee number pins it, since
+    /// the header and session lines are bold too. The number reads bare -- ratatui skips
+    /// leading spaces when it sets a span, so the row's `{number:>2}` pad never reaches the
+    /// buffer.
+    fn cursor_row(rows: &[(String, bool)]) -> &(String, bool) {
+        rows.iter()
+            .find(|(text, _)| text.starts_with("1  "))
+            .unwrap_or_else(|| panic!("the first attendee is listed: {rows:?}"))
+    }
+
+    /// While a name correction is being typed, the row paints what has been fed so far --
+    /// not the committed value -- before Enter commits anything.
+    #[test]
+    fn an_in_progress_correction_paints_what_has_been_typed_so_far() {
+        let mut state = roster_state();
+        state.begin_edit(EditingField::Name);
+        state.feed_edit('X');
+        state.feed_edit('y');
+
+        let rows = rows_highlighted(80, 24, &state, None);
+        let row = cursor_row(&rows);
+        assert!(row.1, "the cursor row is highlighted: {rows:?}");
+        assert!(
+            row.0.contains("Xy\u{2588}"),
+            "the typed characters appear on screen as they are fed: {rows:?}"
+        );
+        assert!(
+            !row.0.contains("Turing"),
+            "the committed name is off screen while the field is open: {rows:?}"
+        );
+    }
+
+    /// Correcting one field leaves the other column untouched: the email still shows its
+    /// committed value while the name is under the buffer.
+    #[test]
+    fn correcting_a_name_leaves_the_email_column_alone() {
+        let mut state = roster_state();
+        state.begin_edit(EditingField::Name);
+        state.feed_edit('x');
+
+        let rows = rows_highlighted(80, 24, &state, None);
+        let row = cursor_row(&rows);
+        assert!(
+            row.0.contains("alan@example.com"),
+            "the field not under correction keeps its committed value: {rows:?}"
+        );
+    }
+
+    /// An empty buffer is not invisible: the block cursor marks the field as open even
+    /// before the first character is fed.
+    #[test]
+    fn an_empty_edit_buffer_still_shows_a_cursor() {
+        let mut state = roster_state();
+        state.begin_edit(EditingField::Name);
+
+        let rows = rows_highlighted(80, 24, &state, None);
+        let row = cursor_row(&rows);
+        assert!(
+            row.0.contains('\u{2588}'),
+            "an empty buffer still paints a visible marker: {rows:?}"
+        );
+        assert!(
+            !row.0.contains("Turing"),
+            "the committed name is replaced by the open field: {rows:?}"
+        );
+    }
+
+    /// Correcting the email replaces the committed one on screen: the stale value never
+    /// paints alongside the buffer.
+    #[test]
+    fn correcting_an_email_replaces_the_committed_email() {
+        let mut state = roster_state();
+        state.begin_edit(EditingField::Email);
+        state.feed_edit('x');
+
+        let rows = rows_highlighted(80, 24, &state, None);
+        let row = cursor_row(&rows);
+        assert!(
+            row.0.contains("x\u{2588}"),
+            "the typed email appears with the cursor: {rows:?}"
+        );
+        assert!(
+            !row.0.contains("alan@example.com"),
+            "the committed email does not paint beside the buffer: {rows:?}"
+        );
     }
 
     /// The other side of the boundary: with the roster pane closed -- base context and
