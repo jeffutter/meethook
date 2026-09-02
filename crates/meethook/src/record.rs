@@ -34,7 +34,7 @@ use meethook_session::Paths;
 #[cfg(any(target_os = "macos", test))]
 use meethook_session::SessionId;
 #[cfg(any(target_os = "macos", test))]
-use meethook_session::{Meeting, MeetingFit};
+use meethook_session::{Attendee, Meeting, MeetingFit, RosterEdit};
 // The capture backend exists only where its Apple frameworks compile; the platform-neutral
 // sequencing in `record_loop` below stays ungated and keeps testing without it.
 #[cfg(target_os = "macos")]
@@ -123,6 +123,14 @@ pub(crate) enum Event {
     /// `String`, so the channel's contract (one reader, events decided at the loop) is
     /// unchanged in kind, and no `Meeting` crosses it.
     MeetingPicked(String),
+    /// The user committed a correction to the attached meeting's roster in the frame's roster
+    /// pane, riding the same addressing rule [`Event::MeetingPicked`] sets: the session
+    /// crate's own [`RosterEdit`], identified by the event id the frame was shown, resolved
+    /// against the held list at the loop. It carries the FULL edited roster rather than a
+    /// delta -- last write wins, and merging partial changes across the channel would invent
+    /// merge bugs the run does not need. No `Meeting` crosses it either: the invite content
+    /// stays out of the frame's reach by construction.
+    RosterEdited(RosterEdit),
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -162,11 +170,16 @@ trait Capture {
     fn candidates(&mut self) -> Offered;
     /// Finalizes the current session and reports what it produced.
     ///
-    /// `hand` is the pick the user settled while recording, if any. It is applied here, at
-    /// the single finalize point, rather than written mid-flight: `session.json` does not
-    /// exist until this write, and its presence is the completion marker every other process
-    /// reads.
-    fn finish(&mut self, sink: &mut dyn Reporter, hand: Option<Meeting>) -> Result<()>;
+    /// `hand` is the pick the user settled while recording, if any, and `roster_edit` the
+    /// roster correction the frame committed, if any. Both are applied here, at the single
+    /// finalize point, rather than written mid-flight: `session.json` does not exist until
+    /// this write, and its presence is the completion marker every other process reads.
+    fn finish(
+        &mut self,
+        sink: &mut dyn Reporter,
+        hand: Option<Meeting>,
+        roster_edit: Option<RosterEdit>,
+    ) -> Result<()>;
     /// Whether the microphone track has stopped receiving audio.
     ///
     /// Asked only while a session is live, once per `Timing::recheck`. The live backend
@@ -234,10 +247,10 @@ pub(crate) fn presenter(plain: bool, tty: Tty) -> Presenter {
 /// the errors are flattened at the point they happen because a `String` is what a notice pane
 /// and a scrollback line alike can hold.
 ///
-/// Two frame-only notes ride the same type with nothing to print: `MeetingOffered` and
-/// `MeetingSettled` carry data the interface renders, and composing them to the empty string
-/// is what keeps a plain run silent about the calendar -- headless output stays byte-identical
-/// to the pre-interface binary.
+/// Three frame-only notes ride the same type with nothing to print: `MeetingOffered`,
+/// `MeetingSettled` and `RosterAttached` carry data the interface renders, and composing
+/// them to the empty string is what keeps a plain run silent about the calendar -- headless
+/// output stays byte-identical to the pre-interface binary.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) enum Note {
     // ---- stdout class ----
@@ -278,6 +291,21 @@ pub(crate) enum Note {
     /// finish -- never the candidate's own fit, whose caveat would qualify a pick a human just
     /// made. Composes to nothing for the same reason [`Note::MeetingOffered`] does.
     MeetingSettled { label: MeetingLabel },
+    /// The attached meeting's roster, for the frame's roster pane: name, email, status and
+    /// `is_you` per attendee -- the [`Attendee`] fields are exactly the disclosure unit, and
+    /// nothing more crosses. The invite content (`notes`, `location`, `url`) lives on the
+    /// `Meeting`, which still never crosses this seam, so it stays out of the frame by
+    /// construction (decision-008, as amended for the roster pane).
+    ///
+    /// Sent whenever the attachment changes: once at session start when the automatic rule
+    /// chose a meeting, and again when a hand pick settles one -- the settled meeting
+    /// supersedes whatever the frame was shown, and the frame replaces its copy wholesale.
+    /// Composes to nothing for the same reason [`Note::MeetingOffered`] does: a plain run
+    /// says nothing about the calendar's people.
+    RosterAttached {
+        event_id: String,
+        attendees: Vec<Attendee>,
+    },
     /// A session finished: what it produced, and the meeting it was matched to if any.
     ///
     /// The meeting crosses as a [`MeetingLabel`] -- title and fit only -- never as the full
@@ -338,7 +366,9 @@ impl Note {
             Note::NoNewSession => format!("{NO_NEW_SESSION}\n"),
             // Frame-only: data for the interface, not words for a terminal. Composing them
             // away is what keeps the line-based run byte-identical.
-            Note::MeetingOffered { .. } | Note::MeetingSettled { .. } => String::new(),
+            Note::MeetingOffered { .. }
+            | Note::MeetingSettled { .. }
+            | Note::RosterAttached { .. } => String::new(),
             Note::Recorded {
                 id,
                 mic_secs,
@@ -392,6 +422,16 @@ pub(crate) const STOPPING: &str = "Stopping...";
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const NO_NEW_SESSION: &str =
     "That call has ended as well, so no new session was opened.";
+
+/// The roster pane's degraded view: a meeting is attached but its invite lists nobody.
+///
+/// A separate literal from the empty-selector sentence -- which itself has a separate
+/// plain-mode twin the `meeting` command owns: the two panes say different things (no
+/// meeting found, versus a meeting found with nobody on it), and pinning each in its own
+/// pane's tests keeps them from drifting into each other's words.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const NO_ROSTER: &str =
+    "This meeting lists no attendees, so there is no roster to correct";
 
 /// The line naming a session as it opens.
 #[cfg(any(target_os = "macos", test))]
@@ -567,13 +607,18 @@ impl Capture for SessionCapture<'_> {
         }
     }
 
-    fn finish(&mut self, sink: &mut dyn Reporter, hand: Option<Meeting>) -> Result<()> {
+    fn finish(
+        &mut self,
+        sink: &mut dyn Reporter,
+        hand: Option<Meeting>,
+        roster_edit: Option<RosterEdit>,
+    ) -> Result<()> {
         // Nothing running is not an error. The loop only finishes a start it saw succeed, so
         // defining the case away here is cheaper than a branch that can only ever be wrong.
         let Some(session) = self.running.take() else {
             return Ok(());
         };
-        let recording = session.finish(hand)?;
+        let recording = session.finish(hand, roster_edit)?;
         sink.note(Note::Recorded {
             id: recording.id.clone(),
             mic_secs: recording.mic.seconds(),
@@ -742,6 +787,8 @@ fn record_loop(
                 // No session is live to attach a pick to -- it cannot normally arrive here --
                 // and dropping it is the answer that keeps the idle wait idle.
                 Ok(Event::MeetingPicked(_)) => continue,
+                // No session is live to attach an edit to either; the same answer.
+                Ok(Event::RosterEdited(_)) => continue,
                 Ok(Event::Interrupt) | Err(_) => break,
             }
         }
@@ -762,12 +809,25 @@ fn record_loop(
         // inherit a predecessor's list or pick.
         let offered = capture.candidates();
         let mut hand: Option<Meeting> = None;
+        // The frame's committed roster correction, if any: stashed beside the pick so both
+        // die with the session block, and applied at the single finalize point below.
+        let mut roster_edit: Option<RosterEdit> = None;
         // Sent even when both halves are empty: a restarted session starts clean rather than
         // inheriting what the frame was last shown.
         sink.note(Note::MeetingOffered {
             guess: offered.chosen.as_ref().map(MeetingLabel::from),
             offered: offered.meetings.iter().map(MeetingOffer::from).collect(),
         });
+        // The roster note goes out only when an attachment exists: the pane opens on the
+        // attached meeting's people, and with no guess there is nothing to open on. A pick
+        // later settles a different meeting and re-sends the note for it, superseding this
+        // copy wholesale in the frame.
+        if let Some(chosen) = &offered.chosen {
+            sink.note(Note::RosterAttached {
+                event_id: chosen.event_id.clone(),
+                attendees: chosen.attendees().to_vec(),
+            });
+        }
 
         let outcome = loop {
             match rx.recv_timeout(timing.recheck) {
@@ -791,12 +851,34 @@ fn record_loop(
                         .cloned()
                     {
                         hand = Some(meeting.clone());
+                        // Lifted out before the Confirmed stamp moves the meeting into the
+                        // label: the supersedure below needs the same id and attendees.
+                        let event_id = meeting.event_id.clone();
+                        let attendees = meeting.attendees().to_vec();
                         // What crosses to the frame is what `label_by_hand` will write at
                         // finish -- the Confirmed stamp -- never the candidate's own fit,
                         // whose caveat would qualify a pick a human just made.
                         sink.note(Note::MeetingSettled {
                             label: MeetingLabel::from(&meeting.with_fit(MeetingFit::Confirmed)),
                         });
+                        // The settled meeting supersedes whatever roster the frame was shown
+                        // for the guess: the pane's copy is replaced wholesale, mirroring how
+                        // the settlement supersedes the guess itself.
+                        sink.note(Note::RosterAttached {
+                            event_id,
+                            attendees,
+                        });
+                    }
+                }
+                // The frame committed a roster correction, addressed by the event id it was
+                // shown. Validated against the held list -- an unknown id changes nothing,
+                // since the frame can only edit what it was given -- and stashed for the
+                // single finalize point; a later edit replaces an earlier one. Unlike a pick,
+                // nothing settles back: an edit changes neither the fit nor the label, so the
+                // frame's local copy stays authoritative and no note goes home.
+                Ok(Event::RosterEdited(edit)) => {
+                    if offered.meetings.iter().any(|m| m.event_id == edit.event_id) {
+                        roster_edit = Some(edit);
                     }
                 }
                 // The engine is bound to the device that was default when it started, so it
@@ -845,7 +927,7 @@ fn record_loop(
             Recording::Ended | Recording::Interrupted => sink.note(Note::Stopping),
         }
 
-        if let Err(e) = capture.finish(sink, hand.take()) {
+        if let Err(e) = capture.finish(sink, hand.take(), roster_edit.take()) {
             sink.note(Note::FinishFailed(format!(
                 "This session did not produce a usable recording: {e}"
             )));
@@ -959,6 +1041,8 @@ fn begin(
             // No session exists yet to attach a pick to -- it cannot normally arrive here --
             // so the answer is the same as a redundant start edge: keep retrying.
             Ok(Event::MeetingPicked(_)) => {}
+            // No session exists yet to attach an edit to either; the same answer.
+            Ok(Event::RosterEdited(_)) => {}
             Err(RecvTimeoutError::Timeout) => {
                 // The stop edge can be missed outright, so the level is recomputed from the
                 // world here rather than inferred from the absence of a message. It has to
@@ -1017,6 +1101,10 @@ fn await_end(rx: &Receiver<Event>, grace: Duration) -> Outcome {
             // is a recorded edge rather than a hole -- the post-hoc `meeting` command remains
             // the fallback. Waiting out the remainder keeps the grace honest.
             Ok(Event::MeetingPicked(_)) => {}
+            // An edit lost here is dropped with the same reasoning: the session finalizes
+            // within seconds and the pane closes with it, so no further edit could arrive
+            // anyway -- waiting out the remainder keeps the grace honest.
+            Ok(Event::RosterEdited(_)) => {}
             Err(RecvTimeoutError::Timeout) => return Outcome::CallEnded,
             // Every sender is gone, so nothing can resume this session. Finalizing is the
             // only outcome that does not lose the audio already captured.
@@ -1060,7 +1148,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::commands::Tty;
-    use meethook_session::{Meeting, MeetingFit, SessionId};
+    use meethook_session::{Meeting, MeetingFit, RosterEdit, SessionId};
 
     use super::{
         Capture, DEVICE_CHANGED, Event, MIC_STALLED, Note, Offered, Outcome, Presenter, Timing,
@@ -1372,6 +1460,10 @@ mod tests {
         /// so a test can assert a pick reached the single finalize point without holding a
         /// full `Meeting` of its own.
         hands: Vec<Option<String>>,
+        /// What each `finish` was handed as the roster edit -- the full values, in order --
+        /// so a test can assert both the addressing id and the edited rows reached the
+        /// single finalize point.
+        roster_edits: Vec<Option<RosterEdit>>,
     }
 
     impl Capture for FakeCapture {
@@ -1392,10 +1484,12 @@ mod tests {
             &mut self,
             _sink: &mut dyn super::Reporter,
             hand: Option<Meeting>,
+            roster_edit: Option<RosterEdit>,
         ) -> super::Result<()> {
             self.calls.push("finish");
             self.finished_at.get_or_insert_with(Instant::now);
             self.hands.push(hand.map(|m| m.event_id));
+            self.roster_edits.push(roster_edit);
             Ok(())
         }
 
@@ -1679,6 +1773,198 @@ mod tests {
         };
         assert!(offered.is_empty());
         assert!(guess.is_none());
+        // No attachment means no roster note: the pane has nothing to open on, and the
+        // frame's copy stays whatever it last had rather than being cleared by absence.
+        assert!(
+            !notes
+                .iter()
+                .any(|note| matches!(note, Note::RosterAttached { .. })),
+            "no roster crossed for a calendar with nothing attached"
+        );
+    }
+
+    /// An edit of the attached roster reaches the single finalize point addressed by the
+    /// event id the frame was shown, and the frame was told the roster right after the
+    /// offers -- composing to nothing, so a plain run says nothing about the people.
+    #[test]
+    fn an_edit_reaches_finish_addressed_by_event_id() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (
+                BLIP,
+                Event::RosterEdited(RosterEdit {
+                    event_id: "EVENT-A".to_owned(),
+                    attendees: vec![],
+                }),
+            ),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            candidates: Some(Offered {
+                meetings: vec![meeting_of("EVENT-A", "Standup")],
+                chosen: Some(meeting_of("EVENT-A", "Standup")),
+            }),
+            ..FakeCapture::default()
+        };
+        let notes = run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(capture.hands, [None]);
+        assert_eq!(capture.roster_edits.len(), 1);
+        let edit = capture.roster_edits[0]
+            .as_ref()
+            .expect("the edit did not reach finish");
+        assert_eq!(edit.event_id, "EVENT-A");
+
+        // The roster crossed into the frame after the offers, and composes to nothing.
+        let mut seen_offer = false;
+        for note in &notes {
+            match note {
+                Note::MeetingOffered { .. } => seen_offer = true,
+                Note::RosterAttached { event_id, .. } => {
+                    assert!(seen_offer, "the roster crossed before the offers");
+                    assert_eq!(event_id, "EVENT-A");
+                    assert_eq!(note.composed(), "", "a roster note must compose to nothing");
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            seen_offer,
+            "the session opened without offering its calendar"
+        );
+    }
+
+    /// A pick and an edit of the same meeting both reach finish: the mismatch question is
+    /// deliberately NOT pre-filtered in the loop -- the documented drop lives in
+    /// `apply_roster_edit` alone, so the semantics have one home. The settlement also
+    /// re-sends the roster for the picked meeting, superseding the guess's copy.
+    #[test]
+    fn an_edit_rides_alside_a_hand_pick() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::MeetingPicked("EVENT-B".to_owned())),
+            (
+                BLIP,
+                Event::RosterEdited(RosterEdit {
+                    event_id: "EVENT-B".to_owned(),
+                    attendees: vec![],
+                }),
+            ),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            candidates: Some(Offered {
+                meetings: vec![
+                    meeting_of("EVENT-A", "Standup"),
+                    meeting_of("EVENT-B", "Planning"),
+                ],
+                chosen: Some(meeting_of("EVENT-A", "Standup")),
+            }),
+            ..FakeCapture::default()
+        };
+        let notes = run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(capture.hands, [Some("EVENT-B".to_owned())]);
+        assert_eq!(capture.roster_edits.len(), 1);
+        assert_eq!(
+            capture.roster_edits[0]
+                .as_ref()
+                .map(|e| e.event_id.as_str()),
+            Some("EVENT-B"),
+            "the edit rode alongside the pick, addressed to the picked meeting"
+        );
+        // Two attachments in order: the guess at start, the settled pick after.
+        let attached: Vec<&str> = notes
+            .iter()
+            .filter_map(|note| match note {
+                Note::RosterAttached { event_id, .. } => Some(event_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attached, ["EVENT-A", "EVENT-B"]);
+    }
+
+    /// An edit addressed to a meeting the frame was never shown changes nothing: finish
+    /// receives no edit, exactly as an unresolvable pick settles nothing.
+    #[test]
+    fn an_unknown_roster_id_changes_nothing() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (
+                BLIP,
+                Event::RosterEdited(RosterEdit {
+                    event_id: "NOT-OFFERED".to_owned(),
+                    attendees: vec![],
+                }),
+            ),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            candidates: Some(Offered {
+                meetings: vec![meeting_of("EVENT-A", "Standup")],
+                chosen: Some(meeting_of("EVENT-A", "Standup")),
+            }),
+            ..FakeCapture::default()
+        };
+        run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(capture.hands, [None]);
+        assert_eq!(
+            capture.roster_edits,
+            [None],
+            "the unresolvable edit reached finish as an edit"
+        );
+    }
+
+    /// A device change right after an edit finalizes the first session with it and starts
+    /// the next clean: the second finish sees no inherited edit, mirroring the pick's
+    /// restart-clean guarantee.
+    #[test]
+    fn an_edit_does_not_leak_across_a_restart() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (
+                BLIP,
+                Event::RosterEdited(RosterEdit {
+                    event_id: "EVENT-A".to_owned(),
+                    attendees: vec![],
+                }),
+            ),
+            (BLIP, Event::InputDeviceChanged),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            candidates: Some(Offered {
+                meetings: vec![meeting_of("EVENT-A", "Standup")],
+                chosen: Some(meeting_of("EVENT-A", "Standup")),
+            }),
+            ..FakeCapture::default()
+        };
+        run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish", "start", "finish"]);
+        assert_eq!(
+            capture.roster_edits,
+            [
+                Some(RosterEdit {
+                    event_id: "EVENT-A".to_owned(),
+                    attendees: vec![]
+                }),
+                None,
+            ],
+            "the second session inherited its predecessor's edit"
+        );
     }
 
     /// A call already in progress at startup is recorded without waiting for an edge that

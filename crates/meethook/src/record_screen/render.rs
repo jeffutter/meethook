@@ -18,7 +18,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::state::{Phase, State};
-use crate::record::{meeting_clause_line, mic_line, session_id_line, speaker_line};
+use crate::record::{NO_ROSTER, meeting_clause_line, mic_line, session_id_line, speaker_line};
+use meethook_session::AttendeeStatus;
 
 /// Places the record frame for one draw.
 ///
@@ -100,7 +101,44 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
     // the body has exactly this much room to spare. Each row is the projection's own line; the
     // cursor row is highlighted, and the guess is marked the way the correction command marks
     // the attached one -- adapted, since what the rules would attach is not yet attached.
-    if state.selector_open {
+    // The roster pane takes the notice region exactly as the selector does; the two are
+    // mutually exclusive in the state machine, so the branches never compete. Each row shows
+    // what the pane is for -- who is on the attached meeting's invite, and nothing the
+    // invite carries beyond the attendees: the note that filled this pane has no field for
+    // notes, location or url, so their absence from every frame is a property of the type.
+    if state.roster_open {
+        body_lines.push(Line::from(Span::raw(" ")));
+        let roster = state.roster.clone().unwrap_or_default();
+        if roster.is_empty() {
+            // The degraded view, in the pane's own words: a meeting was found, but its
+            // invite lists nobody.
+            body_lines.push(Line::from(Span::raw(NO_ROSTER).dim()));
+        } else {
+            for (nth, attendee) in roster.iter().enumerate() {
+                let mut spans = vec![Span::raw(format!("{:>2}  ", nth + 1))];
+                match &attendee.name {
+                    Some(name) => spans.push(Span::raw(name.clone())),
+                    None => spans.push(Span::raw("(unnamed)").dim()),
+                }
+                if let Some(email) = &attendee.email {
+                    spans.push(Span::raw(format!("  {email}")));
+                }
+                if attendee.is_you {
+                    spans.push(Span::raw("  (you)"));
+                }
+                let line = Line::from(spans);
+                body_lines.push(if nth == state.roster_cursor {
+                    // The cursor row wins the style, like the selector's: bold even when the
+                    // row would otherwise be dimmed.
+                    line.bold()
+                } else if matches!(attendee.status, AttendeeStatus::Declined) {
+                    line.dim()
+                } else {
+                    line
+                });
+            }
+        }
+    } else if state.selector_open {
         body_lines.push(Line::from(Span::raw(" ")));
         if state.offered.is_empty() {
             // The degraded view, in the correction command's own words: no grant, empty
@@ -142,9 +180,20 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
         Span::raw("  stop and exit").dim(),
     ];
     if state.phase == Phase::Recording {
-        if state.selector_open {
+        if state.roster_open {
+            if state.editing.is_some() {
+                hint.push(Span::raw("  type  enter save  esc cancel").dim());
+            } else {
+                hint.push(Span::raw("  up/down move  x remove  n name  e email  esc back").dim());
+            }
+        } else if state.selector_open {
             hint.push(Span::raw("  up/down move  enter choose  esc back").dim());
         } else {
+            // The roster key is advertised only while a roster is attached: with no meeting
+            // there is nothing to open, and a key that cannot work is not offered.
+            if state.roster.is_some() {
+                hint.push(Span::raw("  r roster").dim());
+            }
             hint.push(Span::raw("  enter choose a meeting").dim());
         }
     }
@@ -301,6 +350,59 @@ mod tests {
             .collect()
     }
 
+    /// A meeting carrying every field that must never reach a terminal beyond the roster
+    /// pane's carve-out: the people, and the invite content behind them.
+    fn secret_meeting() -> Meeting {
+        Meeting::new(
+            "EVENT-ABC".to_owned(),
+            "Incident review".to_owned(),
+            "Work".to_owned(),
+            "2026-08-15T10:00:00Z".parse().unwrap(),
+            "2026-08-15T11:00:00Z".parse().unwrap(),
+        )
+        .with_people(
+            Some(Attendee {
+                name: Some("Alan Turing".to_owned()),
+                email: Some("alan@example.com".to_owned()),
+                status: AttendeeStatus::Accepted,
+                is_you: false,
+            }),
+            vec![Attendee {
+                name: Some("Grace Hopper".to_owned()),
+                email: Some("grace@example.com".to_owned()),
+                status: AttendeeStatus::Declined,
+                is_you: true,
+            }],
+        )
+        .with_invite(
+            Some("https://example.com/j/12345".to_owned()),
+            Some("Babbage Room".to_owned()),
+            Some("Dial-in 555-0100, passcode 481516".to_owned()),
+        )
+    }
+
+    /// Its roster, the way the loop sends it when the attachment settles: the disclosure
+    /// unit per attendee, addressed by the event id.
+    fn secret_roster() -> Note {
+        Note::RosterAttached {
+            event_id: "EVENT-ABC".to_owned(),
+            attendees: vec![
+                Attendee {
+                    name: Some("Alan Turing".to_owned()),
+                    email: Some("alan@example.com".to_owned()),
+                    status: AttendeeStatus::Accepted,
+                    is_you: false,
+                },
+                Attendee {
+                    name: Some("Grace Hopper".to_owned()),
+                    email: Some("grace@example.com".to_owned()),
+                    status: AttendeeStatus::Declined,
+                    is_you: true,
+                },
+            ],
+        }
+    }
+
     /// An idle frame says what it is waiting for, where sessions will land, and how to leave.
     #[test]
     fn the_idle_frame_says_what_it_is_waiting_for() {
@@ -392,12 +494,14 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(3661)), "1:01:01");
     }
 
-    /// Privacy from day one, constraint 6: a meeting carrying every field that must never reach
-    /// a terminal crosses into the frame as title and fit only. The negative list is asserted
-    /// against the *pixels* rather than the state, so a projection widened by accident fails
-    /// here instead of at a user's screen.
+    /// The scoped invariant on the finished-session surface: the roster pane is dead here
+    /// (`clear_meeting_pane` runs on `Recorded`), so attendee names are absent -- and the
+    /// invite content is absent from every frame, always, because the note crosses as a
+    /// title-and-fit label with no room for it. The negative list is asserted against the
+    /// *pixels* rather than the state, so a projection widened by accident fails here
+    /// instead of at a user's screen.
     #[test]
-    fn the_frame_never_paints_an_attendee_or_the_invite() {
+    fn after_a_finish_the_frame_paints_no_attendee_and_never_the_invite() {
         use meethook_enroll::MeetingLabel;
         use meethook_session::{Attendee, AttendeeStatus, Meeting};
 
@@ -580,12 +684,12 @@ mod tests {
         assert!(painted.contains("could not be"), "{painted}");
     }
 
-    /// Privacy at the type boundary the live selector crosses: a meeting carrying every field
-    /// that must never reach a terminal projects into offers, and the painted pixels carry the
-    /// title and count -- and nothing from the secret list. The same promise as the finish
-    /// line's negative test, asserted against the selector's rows instead of the summary.
+    /// The scoped invariant on the open selector: mutual exclusion keeps the roster pane
+    /// closed while the selector is up, so the painted pixels carry the title and count --
+    /// and nothing from the secret list, names included. The same promise as the finish
+    /// surface's negative test, asserted against the selector's rows instead of the summary.
     #[test]
-    fn the_selector_never_paints_an_attendee_or_the_invite() {
+    fn the_selector_paints_no_attendee_and_never_the_invite() {
         let meeting = Meeting::new(
             "EVENT-ABC".to_owned(),
             "Incident review".to_owned(),
@@ -639,6 +743,141 @@ mod tests {
                 "the selector leaks {secret:?}: {painted}"
             );
         }
+    }
+
+    /// The deliberate relaxation, bounded exactly like the fit gate: while the roster pane
+    /// shows the attached meeting's people, their names and emails are painted -- with the
+    /// cursor row highlighted like the selector's -- and nothing the invite carries beyond
+    /// them.
+    #[test]
+    fn an_open_roster_paints_the_people_but_never_the_invite() {
+        let meeting = secret_meeting();
+        let mut state = State::default();
+        state.apply(&started(18));
+        state.apply(&Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&meeting)],
+            guess: Some(MeetingLabel::from(&meeting)),
+        });
+        state.apply(&secret_roster());
+        state.open_roster();
+
+        let painted = painted(80, 24, &state, None).join("\n");
+        assert!(painted.contains("Incident review"), "{painted}");
+        assert!(
+            painted.contains("Turing"),
+            "the roster pane shows the names: {painted}"
+        );
+        assert!(
+            painted.contains("Hopper"),
+            "the roster pane shows the names: {painted}"
+        );
+        assert!(painted.contains("alan@example.com"), "{painted}");
+        assert!(painted.contains("grace@example.com"), "{painted}");
+        assert!(
+            painted.contains("(you)"),
+            "the calendar's is-you marker is shown: {painted}"
+        );
+        // The invite content stays out even where the names may appear: the note that filled
+        // the pane has no field for it.
+        for secret in ["Babbage", "Dial-in", "481516", "passcode", "example.com/j"] {
+            assert!(
+                !painted.contains(secret),
+                "the roster pane leaks {secret:?}: {painted}"
+            );
+        }
+
+        // The cursor row is highlighted, mirroring the selector's row grammar -- here the
+        // first row, then the second after one move down, and only the cursor row.
+        let rows = rows_highlighted(80, 24, &state, None);
+        let turing = rows
+            .iter()
+            .find(|(text, _)| text.contains("Turing"))
+            .expect("the first attendee is listed: {rows:?}");
+        let hopper = rows
+            .iter()
+            .find(|(text, _)| text.contains("Hopper"))
+            .expect("the second attendee is listed: {rows:?}");
+        assert!(turing.1, "the cursor row is highlighted: {rows:?}");
+        assert!(!hopper.1, "only the cursor row is highlighted: {rows:?}");
+        state.roster_next();
+        let rows = rows_highlighted(80, 24, &state, None);
+        let hopper = rows
+            .iter()
+            .find(|(text, _)| text.contains("Hopper"))
+            .expect("the second attendee is listed: {rows:?}");
+        assert!(hopper.1, "the highlight follows the cursor: {rows:?}");
+    }
+
+    /// The other side of the boundary: with the roster pane closed -- base context and
+    /// selector alike -- the frame paints neither the people nor the invite, whatever the
+    /// run has shown it. The day-one invariant survives everywhere outside the pane.
+    #[test]
+    fn a_closed_roster_paints_noone_and_never_the_invite() {
+        let meeting = secret_meeting();
+        let mut state = State::default();
+        state.apply(&started(19));
+        state.apply(&Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&meeting)],
+            guess: Some(MeetingLabel::from(&meeting)),
+        });
+        state.apply(&secret_roster());
+
+        // Base context: the roster was shown to the frame but the pane is closed.
+        let base = painted(80, 24, &state, None).join("\n");
+        for secret in [
+            "Turing",
+            "Hopper",
+            "@example.com",
+            "@",
+            "Babbage",
+            "Dial-in",
+            "481516",
+            "example.com",
+        ] {
+            assert!(
+                !base.contains(secret),
+                "the base frame leaks {secret:?}: {base}"
+            );
+        }
+
+        // Selector context: mutual exclusion keeps the roster's rows off screen too.
+        state.open_selector();
+        let selector = painted(80, 24, &state, None).join("\n");
+        for secret in [
+            "Turing",
+            "Hopper",
+            "@example.com",
+            "@",
+            "Babbage",
+            "Dial-in",
+            "481516",
+            "example.com",
+        ] {
+            assert!(
+                !selector.contains(secret),
+                "the selector leaks {secret:?}: {selector}"
+            );
+        }
+    }
+
+    /// The roster pane's degraded view: an attached meeting whose invite lists nobody opens
+    /// to the pane's own sentence rather than a blank area or an error.
+    #[test]
+    fn an_empty_roster_says_there_is_no_one_to_correct() {
+        let mut state = State::default();
+        state.apply(&started(20));
+        state.apply(&Note::RosterAttached {
+            event_id: "EVENT-A".to_owned(),
+            attendees: vec![],
+        });
+        state.open_roster();
+
+        let painted = painted(80, 24, &state, None).join("\n");
+        assert!(
+            painted.contains("This meeting lists no attendees"),
+            "{painted}"
+        );
+        assert!(painted.contains("no roster to correct"), "{painted}");
     }
 
     /// A terminal too small to mean anything draws nothing rather than a wall of borders: the

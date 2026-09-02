@@ -15,9 +15,10 @@
 //! the cloned sender the run's ctrlc handler uses in plain mode: the main loop finalizes the
 //! session exactly as it would have. The frame is now a second producer of events in kind,
 //! not just in that one case: a hand pick of a calendar offer rides the same cloned sender
-//! as an [`Event::MeetingPicked`], decided at the same single reader as a mic edge. What keeps
-//! the contract intact is that the payload is an identifier the run resolves against the list
-//! it handed over -- never a meeting -- and that every match site in the loop owes a deliberate
+//! as an [`Event::MeetingPicked`], and a committed roster correction as an
+//! [`Event::RosterEdited`], each decided at the same single reader as a mic edge. What keeps
+//! the contract intact is that the payloads are values the run resolves against the lists it
+//! handed over -- never a meeting -- and that every match site in the loop owes a deliberate
 //! answer per variant.
 //!
 //! # Teardown
@@ -46,7 +47,7 @@ use ratatui::crossterm::event::Event as CrosstermEvent;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read};
 
 use crate::record::{Event, Note, Reporter};
-use state::{Phase, State};
+use state::{EditingField, Phase, State};
 
 /// How often the frame wakes when nothing else is waiting on it.
 ///
@@ -248,7 +249,17 @@ fn run(
             // still runs immediately, since `poll` finds it ready right away.
             Ok(true) => {
                 if let Ok(CrosstermEvent::Key(key)) = read() {
-                    match event(key, state.selector_open) {
+                    // One context at a time, innermost first: editing beats the roster pane,
+                    // which beats the selector, which beats the base. The panes are mutually
+                    // exclusive in the state machine and editing only ever begins from the
+                    // roster pane, so the derivation is total without focus bookkeeping.
+                    let ctx = match state.editing {
+                        Some(field) => KeyContext::RosterEditing(field),
+                        None if state.roster_open => KeyContext::Roster,
+                        None if state.selector_open => KeyContext::Selector,
+                        None => KeyContext::Base,
+                    };
+                    match event(key, ctx) {
                         Some(Action::Interrupt) => {
                             // Raw mode swallows SIGINT, so the frame delivers the
                             // interrupt through the same channel the ctrlc handler uses
@@ -274,6 +285,29 @@ fn run(
                                         let _ = tx.send(Event::MeetingPicked(event_id));
                                     }
                                 }
+                                Action::OpenRoster => state.open_roster(),
+                                Action::CloseRoster => state.close_roster(),
+                                Action::RosterNext => state.roster_next(),
+                                Action::RosterPrevious => state.roster_previous(),
+                                Action::RemoveAttendee => {
+                                    // The full edited roster crosses, addressed by the
+                                    // meeting's own identifier; the run validates it
+                                    // against the meetings it handed over and stashes the
+                                    // last for the single finalize point.
+                                    if let Some(edit) = state.remove_selected() {
+                                        let _ = tx.send(Event::RosterEdited(edit));
+                                    }
+                                }
+                                Action::EditName => state.begin_edit(EditingField::Name),
+                                Action::EditEmail => state.begin_edit(EditingField::Email),
+                                Action::Type(c) => state.feed_edit(c),
+                                Action::DeleteChar => state.backspace_edit(),
+                                Action::CommitField => {
+                                    if let Some(edit) = state.commit_edit() {
+                                        let _ = tx.send(Event::RosterEdited(edit));
+                                    }
+                                }
+                                Action::CancelField => state.cancel_edit(),
                                 // The stop never reaches this arm: the interrupt arm
                                 // above decides Ctrl-C before the selector commands get
                                 // a look at the key.
@@ -348,14 +382,56 @@ enum Action {
     Confirm,
     /// Close the selector without picking.
     CloseSelector,
+    /// Open the roster pane: the attached meeting's attendees replace the notice region while
+    /// it is open. A no-op in the state machine when no meeting is attached, which is why the
+    /// hint line advertises the key only while a roster is on screen.
+    OpenRoster,
+    /// Close the roster pane without committing anything; any in-flight correction dies with
+    /// it.
+    CloseRoster,
+    /// Move the roster cursor down one row, wrapping.
+    RosterNext,
+    /// Move the roster cursor up one row, wrapping.
+    RosterPrevious,
+    /// Remove the attendee under the cursor: the full edited roster crosses into the run as
+    /// an [`Event::RosterEdited`], addressed by the meeting's own identifier.
+    RemoveAttendee,
+    /// Begin correcting the selected row's name inline.
+    EditName,
+    /// Begin correcting the selected row's email inline.
+    EditEmail,
+    /// Feed one character into the field under correction. Bound only in the editing context:
+    /// printables are consumed there and nowhere else, so roster input can never drive the
+    /// selector or a background action.
+    Type(char),
+    /// Delete the last character of the field under correction.
+    DeleteChar,
+    /// Commit the field under correction: the full edited roster crosses as an
+    /// [`Event::RosterEdited`].
+    CommitField,
+    /// Cancel the field under correction: the buffer is dropped locally and nothing crosses.
+    CancelField,
 }
 
-/// The key map, as a free function of `(key, selector_open)` because a `KeyEvent` is
-/// constructible without a terminal -- which is what makes this rule testable, the way
-/// `enroll`'s `event` is -- and because Enter genuinely means two things depending on context:
-/// opening the question when there is no list on screen, choosing from it when there is. It
-/// is also where a stray Ctrl or a release-shaped duplicate would otherwise go wrong.
-fn event(key: KeyEvent, selector_open: bool) -> Option<Action> {
+/// The context a keypress lands in, derived from the state the shell holds: editing beats
+/// the roster pane, which beats the selector, which beats the base. One context at a time is
+/// what keeps the table below total without focus bookkeeping -- the panes are mutually
+/// exclusive in the state machine, and editing only ever begins from the roster pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyContext {
+    Base,
+    Selector,
+    Roster,
+    RosterEditing(EditingField),
+}
+
+/// The key map, as a free function of `(key, context)` because a `KeyEvent` is constructible
+/// without a terminal -- which is what makes this rule testable, the way `enroll`'s `event`
+/// is -- and because Enter genuinely means three things depending on context: opening the
+/// question when there is no list on screen, choosing from it when there is, and committing
+/// a field while one is being corrected. It is also where a stray Ctrl or a release-shaped
+/// duplicate would otherwise go wrong.
+fn event(key: KeyEvent, ctx: KeyContext) -> Option<Action> {
     // A release is not a press. Terminals that report both would otherwise act on every key
     // twice.
     if key.kind == KeyEventKind::Release {
@@ -363,7 +439,7 @@ fn event(key: KeyEvent, selector_open: bool) -> Option<Action> {
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // The control-modifier check comes first, exactly as the base TUI had it: a Ctrl-prefixed
-    // key is the stop regardless of what the selector is doing.
+    // key is the stop regardless of what any pane is doing.
     if ctrl {
         // Ctrl-C and Ctrl-D are both stopping, the way `enroll`'s interface reads them: raw
         // mode means no SIGINT arrives, so the keys are the interrupt, and end-of-input is
@@ -374,18 +450,42 @@ fn event(key: KeyEvent, selector_open: bool) -> Option<Action> {
             _ => None,
         };
     }
-    match key.code {
-        // The cursor moves in both contexts: while the selector is closed it moves the row a
-        // later open will land on, and the state machine makes movement a no-op on an empty
-        // list, so a key that cannot work does nothing rather than something wrong.
-        KeyCode::Up => Some(Action::Previous),
-        KeyCode::Down => Some(Action::Next),
-        // Contextual: with a list on screen Enter chooses from it; without one it opens it.
-        KeyCode::Enter if !selector_open => Some(Action::OpenSelector),
-        KeyCode::Enter => Some(Action::Confirm),
-        // Esc closes the list; with none open it has nothing to close, and a key that cannot
-        // work is not acted on.
-        KeyCode::Esc if selector_open => Some(Action::CloseSelector),
+    match (key.code, ctx) {
+        // The cursor moves in every list context: the selector's when it is open, the
+        // roster's when the roster pane is open. In the base it moves the row a later
+        // selector open will land on; movement on an empty or closed list is the state
+        // machine's no-op, not the table's refusal.
+        (KeyCode::Up, KeyContext::Base | KeyContext::Selector) => Some(Action::Previous),
+        (KeyCode::Down, KeyContext::Base | KeyContext::Selector) => Some(Action::Next),
+        (KeyCode::Up, KeyContext::Roster) => Some(Action::RosterPrevious),
+        (KeyCode::Down, KeyContext::Roster) => Some(Action::RosterNext),
+        // Contextual: with no list on screen Enter opens the selector; with one it chooses
+        // from it; while a field is being corrected it commits. In the roster pane itself it
+        // does nothing -- the pane has no confirm action, only its row operations.
+        (KeyCode::Enter, KeyContext::Base) => Some(Action::OpenSelector),
+        (KeyCode::Enter, KeyContext::Selector) => Some(Action::Confirm),
+        (KeyCode::Enter, KeyContext::RosterEditing(_)) => Some(Action::CommitField),
+        // Esc unwinds one level: the field being corrected, else the pane it sits in. With
+        // none open it has nothing to close, and a key that cannot work is not acted on.
+        (KeyCode::Esc, KeyContext::RosterEditing(_)) => Some(Action::CancelField),
+        (KeyCode::Esc, KeyContext::Selector) => Some(Action::CloseSelector),
+        (KeyCode::Esc, KeyContext::Roster) => Some(Action::CloseRoster),
+        // The roster pane's toggle: bound wherever the pane might be opened or closed, and a
+        // no-op in the state machine when there is no attachment to open it on.
+        (KeyCode::Char('r'), KeyContext::Base) => Some(Action::OpenRoster),
+        (KeyCode::Char('r'), KeyContext::Roster) => Some(Action::CloseRoster),
+        // The roster pane's row operations, bound only while the pane is open.
+        (KeyCode::Char('x'), KeyContext::Roster) => Some(Action::RemoveAttendee),
+        (KeyCode::Char('n'), KeyContext::Roster) => Some(Action::EditName),
+        (KeyCode::Char('e'), KeyContext::Roster) => Some(Action::EditEmail),
+        // The editing context consumes printables and Backspace, and nothing else: the guard
+        // keeps control characters out of the buffer the same way enroll's search input keeps
+        // them out of its filter, and any other key falls through to unbound -- so a key that
+        // is not part of the correction can never drive the selector or a background action.
+        (KeyCode::Char(c), KeyContext::RosterEditing(_)) if !c.is_control() => {
+            Some(Action::Type(c))
+        }
+        (KeyCode::Backspace, KeyContext::RosterEditing(_)) => Some(Action::DeleteChar),
         _ => None,
     }
 }
@@ -409,85 +509,176 @@ mod tests {
         }
     }
 
-    /// The stop keeps its precedence in both contexts, and only a press of it counts: Ctrl-C
-    /// and Ctrl-D, either case, interrupt even while the selector is open -- a pick in flight
-    /// must not keep a Ctrl-C from ending the run.
+    /// The stop keeps its precedence in every context, and only a press of it counts:
+    /// Ctrl-C and Ctrl-D interrupt even while a list or a field correction is in flight --
+    /// a pick or an edit in progress must not keep a Ctrl-C from ending the run.
     #[test]
-    fn the_stop_keeps_its_precedence_in_both_contexts() {
-        for selector_open in [false, true] {
+    fn the_stop_keeps_its_precedence_in_every_context() {
+        let contexts = [
+            KeyContext::Base,
+            KeyContext::Selector,
+            KeyContext::Roster,
+            KeyContext::RosterEditing(EditingField::Name),
+            KeyContext::RosterEditing(EditingField::Email),
+        ];
+        for ctx in contexts {
             for letter in ['c', 'C', 'd', 'D'] {
                 assert_eq!(
-                    event(
-                        press(KeyCode::Char(letter), KeyEventKind::Press, true),
-                        selector_open,
-                    ),
+                    event(press(KeyCode::Char(letter), KeyEventKind::Press, true), ctx),
                     Some(Action::Interrupt),
-                    "Ctrl-{letter} on a press stops the run with the selector {selector_open:?}"
+                    "Ctrl-{letter} on a press stops the run in {ctx:?}"
                 );
                 assert_eq!(
                     event(
                         press(KeyCode::Char(letter), KeyEventKind::Release, true),
-                        selector_open,
+                        ctx,
                     ),
                     None,
-                    "a release of Ctrl-{letter} does nothing with the selector {selector_open:?}"
+                    "a release of Ctrl-{letter} does nothing in {ctx:?}"
                 );
             }
         }
     }
 
     /// Every other bound key means what the footer advertises in that context, and only a
-    /// press of it: Enter opens the list when there is none on screen and chooses from it
-    /// when there is; up and down move the cursor either way; Esc closes only an open list.
+    /// press of it: Enter opens the list when there is none on screen, chooses from it when
+    /// there is, and commits a field while one is being corrected; up and down move the
+    /// cursor of whichever pane is open; Esc unwinds one level.
     #[test]
     fn every_bound_key_means_what_the_footer_says_in_its_context() {
-        let closed = |code: KeyCode| event(press(code, KeyEventKind::Press, false), false);
-        let open = |code: KeyCode| event(press(code, KeyEventKind::Press, false), true);
+        let base = |code: KeyCode| event(press(code, KeyEventKind::Press, false), KeyContext::Base);
+        let selector = |code: KeyCode| {
+            event(
+                press(code, KeyEventKind::Press, false),
+                KeyContext::Selector,
+            )
+        };
+        let roster =
+            |code: KeyCode| event(press(code, KeyEventKind::Press, false), KeyContext::Roster);
 
-        // The contextual key: the same physical key, two meanings.
-        assert_eq!(closed(KeyCode::Enter), Some(Action::OpenSelector));
-        assert_eq!(open(KeyCode::Enter), Some(Action::Confirm));
+        // The contextual keys: the same physical key, different meanings.
+        assert_eq!(base(KeyCode::Enter), Some(Action::OpenSelector));
+        assert_eq!(selector(KeyCode::Enter), Some(Action::Confirm));
+        assert_eq!(
+            roster(KeyCode::Enter),
+            None,
+            "the roster pane has no confirm action"
+        );
 
-        // The cursor moves in both contexts; movement on an empty or closed list is the
-        // state machine's no-op, not the table's refusal.
-        assert_eq!(closed(KeyCode::Up), Some(Action::Previous));
-        assert_eq!(closed(KeyCode::Down), Some(Action::Next));
-        assert_eq!(open(KeyCode::Up), Some(Action::Previous));
-        assert_eq!(open(KeyCode::Down), Some(Action::Next));
+        // The cursor moves in every list context, toward whatever list is on screen.
+        assert_eq!(base(KeyCode::Up), Some(Action::Previous));
+        assert_eq!(base(KeyCode::Down), Some(Action::Next));
+        assert_eq!(selector(KeyCode::Up), Some(Action::Previous));
+        assert_eq!(selector(KeyCode::Down), Some(Action::Next));
+        assert_eq!(roster(KeyCode::Up), Some(Action::RosterPrevious));
+        assert_eq!(roster(KeyCode::Down), Some(Action::RosterNext));
 
-        // Esc has something to close only while the list is on screen.
-        assert_eq!(open(KeyCode::Esc), Some(Action::CloseSelector));
-        assert_eq!(closed(KeyCode::Esc), None, "nothing is open to close");
+        // Esc has something to close only where a pane is on screen.
+        assert_eq!(selector(KeyCode::Esc), Some(Action::CloseSelector));
+        assert_eq!(roster(KeyCode::Esc), Some(Action::CloseRoster));
+        assert_eq!(base(KeyCode::Esc), None, "nothing is open to close");
 
-        // Releases of the navigation keys do nothing, in either context.
+        // The roster toggle and row operations are bound wherever they can work.
+        assert_eq!(base(KeyCode::Char('r')), Some(Action::OpenRoster));
+        assert_eq!(roster(KeyCode::Char('r')), Some(Action::CloseRoster));
+        assert_eq!(roster(KeyCode::Char('x')), Some(Action::RemoveAttendee));
+        assert_eq!(roster(KeyCode::Char('n')), Some(Action::EditName));
+        assert_eq!(roster(KeyCode::Char('e')), Some(Action::EditEmail));
+
+        // Releases of the navigation and pane keys do nothing, in any context.
         for code in [KeyCode::Enter, KeyCode::Up, KeyCode::Down, KeyCode::Esc] {
-            assert_eq!(
-                event(press(code, KeyEventKind::Release, false), true),
-                None,
-                "a release of {code:?} does nothing"
-            );
-            assert_eq!(
-                event(press(code, KeyEventKind::Release, false), false),
-                None,
-                "a release of {code:?} does nothing"
-            );
+            for ctx in [KeyContext::Base, KeyContext::Selector, KeyContext::Roster] {
+                assert_eq!(
+                    event(press(code, KeyEventKind::Release, false), ctx),
+                    None,
+                    "a release of {code:?} does nothing in {ctx:?}"
+                );
+            }
         }
 
-        // Unbound keys are ignored in both contexts, and a control-modified navigation key
-        // is not a navigation key: the modifier check comes first.
-        for code in [
-            KeyCode::Char('x'),
-            KeyCode::Tab,
-            KeyCode::Left,
-            KeyCode::Right,
-        ] {
-            assert_eq!(closed(code), None, "unbound {code:?} does nothing");
-            assert_eq!(open(code), None, "unbound {code:?} does nothing");
+        // Unbound keys are ignored outside their context, and a control-modified navigation
+        // key is not a navigation key: the modifier check comes first.
+        for code in [KeyCode::Tab, KeyCode::Left, KeyCode::Right] {
+            for ctx in [KeyContext::Base, KeyContext::Selector, KeyContext::Roster] {
+                assert_eq!(
+                    event(press(code, KeyEventKind::Press, false), ctx),
+                    None,
+                    "unbound {code:?} does nothing in {ctx:?}"
+                );
+            }
         }
         assert_eq!(
-            event(press(KeyCode::Up, KeyEventKind::Press, true), true),
+            event(
+                press(KeyCode::Up, KeyEventKind::Press, true),
+                KeyContext::Roster
+            ),
             None,
             "Ctrl-Up is not the cursor"
         );
+    }
+
+    /// Printables feed ONLY the editing context: the enroll search-input partitioning, scoped
+    /// to a context instead of permanent. In every other context a printable stays unbound,
+    /// so roster input can never drive the selector or a background action; and inside the
+    /// editing context a control character is refused rather than buffered.
+    #[test]
+    fn printables_feed_only_the_editing_context() {
+        for ctx in [KeyContext::Base, KeyContext::Selector, KeyContext::Roster] {
+            assert_eq!(
+                event(press(KeyCode::Char('g'), KeyEventKind::Press, false), ctx),
+                None,
+                "a printable is unbound outside editing ({ctx:?})"
+            );
+        }
+        for field in [EditingField::Name, EditingField::Email] {
+            let ctx = KeyContext::RosterEditing(field);
+            for c in ['g', '.', '@', ' '] {
+                assert_eq!(
+                    event(press(KeyCode::Char(c), KeyEventKind::Press, false), ctx),
+                    Some(Action::Type(c)),
+                    "{c:?} feeds the {field:?} field"
+                );
+            }
+            assert_eq!(
+                event(press(KeyCode::Backspace, KeyEventKind::Press, false), ctx),
+                Some(Action::DeleteChar)
+            );
+            // Control characters are refused in the buffer, exactly as enroll refuses them
+            // in its filter.
+            for c in ['\u{1}', '\t', '\r'] {
+                assert_eq!(
+                    event(press(KeyCode::Char(c), KeyEventKind::Press, false), ctx),
+                    None,
+                    "control {c:?} does not enter the field"
+                );
+            }
+            // A release of a printable does nothing either.
+            assert_eq!(
+                event(press(KeyCode::Char('g'), KeyEventKind::Release, false), ctx),
+                None
+            );
+        }
+    }
+
+    /// The roster pane's letters are unbound outside the pane: x, n and e do nothing in the
+    /// base and selector contexts, so correcting a name cannot be triggered by typing while
+    /// choosing a meeting.
+    #[test]
+    fn roster_row_keys_are_unbound_outside_the_roster_pane() {
+        for code in [KeyCode::Char('x'), KeyCode::Char('n'), KeyCode::Char('e')] {
+            assert_eq!(
+                event(press(code, KeyEventKind::Press, false), KeyContext::Base),
+                None,
+                "{code:?} is unbound in the base"
+            );
+            assert_eq!(
+                event(
+                    press(code, KeyEventKind::Press, false),
+                    KeyContext::Selector
+                ),
+                None,
+                "{code:?} is unbound in the selector"
+            );
+        }
     }
 }

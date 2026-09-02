@@ -46,7 +46,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use jiff::{Timestamp, Zoned};
-use meethook_session::{Meeting, Paths, SessionId, SessionMetadata, SessionPaths};
+use meethook_session::{Meeting, Paths, RosterEdit, SessionId, SessionMetadata, SessionPaths};
 
 /// Everything capture can fail with.
 ///
@@ -288,18 +288,33 @@ impl RunningSession {
     /// The metadata write is last and atomic, so the presence of `session.json` keeps
     /// meaning "this recording completed and both tracks are finalized".
     ///
-    /// `hand` is the meeting a person chose while the session was live, if one was chosen.
-    /// It is applied *here* rather than written when it was made because `session.json` does
-    /// not exist until this write -- writing mid-flight would mark a still-recording session
-    /// complete to every other process -- and it is the single finalize point that keeps the
-    /// choice and the completion marker one atomic step apart. A hand pick enters through
-    /// [`SessionMetadata::label_by_hand`], the same function the `meethook meeting`
+    /// `hand` is the meeting a person chose while the session was live, if one was chosen,
+    /// and `roster_edit` the roster correction the record interface committed, if any.
+    /// Both are applied *here* rather than written when they were made because `session.json`
+    /// does not exist until this write -- writing mid-flight would mark a still-recording
+    /// session complete to every other process -- and it is the single finalize point that
+    /// keeps the choice and the completion marker one atomic step apart. A hand pick enters
+    /// through [`SessionMetadata::label_by_hand`], the same function the `meethook meeting`
     /// correction writes with, so the `Confirmed` stamp and the settle-by-hand derivation
     /// come from one place whether the pick was made live or afterwards. When a pick exists
     /// the automatic lookup is skipped entirely: a human who was in the call is stronger
     /// evidence than any rule over start and end times, and computing-then-discarding would
     /// wake the calendar daemon for nothing.
-    pub fn finish(self, hand: Option<Meeting>) -> Result<Recording> {
+    ///
+    /// The roster edit rides BOTH branches on purpose: the automatic path re-queries the
+    /// calendar here, so an edit applied only to the snapshot held while recording would be
+    /// silently lost behind the fresh fetch. The re-query returns the same `event_id` domain
+    /// -- EKEvent identity is stable across fetches -- so the match succeeds and the user's
+    /// correction overrides the refetched roster; a mismatch leaves the meeting untouched,
+    /// which [`SessionMetadata::apply_roster_edit`] documents as the safe drop. Because the
+    /// application goes through the fit-preserving mutation, `fit` is untouched throughout,
+    /// and the `is_strong()` gate on the seedable roster applies to the edited roster by
+    /// construction.
+    pub fn finish(
+        self,
+        hand: Option<Meeting>,
+        roster_edit: Option<RosterEdit>,
+    ) -> Result<Recording> {
         let RunningSession {
             id,
             paths,
@@ -352,6 +367,10 @@ impl RunningSession {
             // no-op guard on a hand-settled label keeps the two halves from ever disagreeing.
             metadata = metadata.with_meeting(calendar::meeting_at(start_time));
         }
+        // After the winner is resolved, before the write: one application point for both
+        // branches, matched by event id -- see the method doc for why the automatic path
+        // needs it just as much as the hand-pick path does.
+        metadata = metadata.apply_roster_edit(roster_edit);
         metadata.write(&paths.session_json())?;
 
         Ok(Recording {

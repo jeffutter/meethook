@@ -39,7 +39,7 @@
 //! they keep.
 
 use meethook_enroll::{MeetingLabel, MeetingOffer};
-use meethook_session::{Paths, SessionId};
+use meethook_session::{Attendee, Paths, RosterEdit, SessionId};
 
 use crate::record::{
     ALREADY_ACTIVE, DEVICE_CHANGED, MIC_STALLED, NO_NEW_SESSION, Note, STOPPING, WATCHING,
@@ -72,6 +72,16 @@ impl Phase {
             Phase::Finalizing => "finalizing",
         }
     }
+}
+
+/// Which field of the selected roster row is being corrected inline.
+///
+/// A typed command rather than a key event: the shell's key map decides which letter means
+/// which field, and this type is what the state machine holds while the correction is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditingField {
+    Name,
+    Email,
 }
 
 /// A session that is open right now: its identity and the rates both engines came up at.
@@ -129,6 +139,30 @@ pub struct State {
     /// The row under the cursor within `offered`. Meaningful while the selector is open;
     /// reset with the pane rather than trusted across sessions.
     pub cursor: usize,
+    /// The attached meeting's roster, as the run showed it: the roster pane lists these rows,
+    /// and every committed correction rides back to the run addressed by `roster_event_id`.
+    /// `None` when no meeting is attached -- there is then no roster to show, and the key
+    /// that opens the pane does nothing rather than opening an empty one. Replaced wholesale
+    /// by each [`crate::record::Note::RosterAttached`], so a restarted session cannot inherit
+    /// its predecessor's people.
+    pub roster: Option<Vec<Attendee>>,
+    /// The calendar event the roster belongs to: the address every correction rides back on.
+    /// Set together with `roster`, never apart.
+    pub roster_event_id: Option<String>,
+    /// Whether the roster pane is open: the attached meeting's attendees replace the notice
+    /// region while it is, exactly as the selector does. Mutually exclusive with the
+    /// selector -- one context at a time keeps the key map total without focus bookkeeping,
+    /// and makes the privacy scoping crisp (the selector's rows and the roster's rows are
+    /// never painted together).
+    pub roster_open: bool,
+    /// The row under the cursor within `roster`. Reset with the pane rather than trusted
+    /// across sessions.
+    pub roster_cursor: usize,
+    /// The field being corrected inline, if any: entered from the roster pane, where it is
+    /// the innermost context -- printables feed the buffer, Enter commits, Esc cancels.
+    pub editing: Option<EditingField>,
+    /// The text typed into the field under correction. Crosses nowhere until committed.
+    pub edit_buffer: String,
     /// Stderr-class notes, held back from the alternate screen until it is restored.
     pub trouble: Vec<String>,
     /// Composed stdout-class text, in the order the notes arrived. Flushed to stdout when the
@@ -151,17 +185,29 @@ impl State {
             settled: None,
             selector_open: false,
             cursor: 0,
+            roster: None,
+            roster_event_id: None,
+            roster_open: false,
+            roster_cursor: 0,
+            editing: None,
+            edit_buffer: String::new(),
         }
     }
 
     /// The meeting pane dies with the session it described: a new session starting and a
-    /// session finishing both call it, rather than spelling the six assignments twice.
+    /// session finishing both call it, rather than spelling the assignments twice.
     fn clear_meeting_pane(&mut self) {
         self.offered.clear();
         self.guess = None;
         self.settled = None;
         self.selector_open = false;
         self.cursor = 0;
+        self.roster = None;
+        self.roster_event_id = None;
+        self.roster_open = false;
+        self.roster_cursor = 0;
+        self.editing = None;
+        self.edit_buffer.clear();
     }
 
     /// Folds one note into the frame.
@@ -227,12 +273,33 @@ impl State {
                 self.settled = Some(label.clone());
                 self.selector_open = false;
             }
+            Note::RosterAttached {
+                event_id,
+                attendees,
+            } => {
+                // The pane's copy is replaced, not merged: a pick settling a different
+                // meeting supersedes the roster the guess first rode in with, and a
+                // restarted session starts clean rather than inheriting its predecessor's
+                // people. The pane itself stays closed -- the run showing a roster is not
+                // the user opening it.
+                self.roster = Some(attendees.clone());
+                self.roster_event_id = Some(event_id.clone());
+                self.roster_open = false;
+                self.roster_cursor = 0;
+                self.editing = None;
+                self.edit_buffer.clear();
+            }
             Note::DeviceChanged | Note::MicStalled | Note::Stopping => {
                 self.phase = Phase::Finalizing;
-                // The session is ending, so picks stop being accepted; the pane itself stays
-                // up -- the user should still see what the session was named while it
-                // finalizes.
+                // The session is ending, so picks and edits stop being accepted; the meeting
+                // pane itself stays up -- the user should still see what the session was
+                // named while it finalizes. The roster PANE, unlike the selector's list, IS
+                // the thing being shown, so it closes to make room for the notice, and an
+                // in-flight correction is cancelled along with it.
                 self.selector_open = false;
+                self.roster_open = false;
+                self.editing = None;
+                self.edit_buffer.clear();
                 self.notice = Some(
                     match note {
                         Note::DeviceChanged => DEVICE_CHANGED,
@@ -286,9 +353,17 @@ impl State {
     ///
     /// Does not reset the cursor: the pane's replacement resets it, and a user who scrolls,
     /// closes with Esc and reopens is mid-list, not at its top.
+    ///
+    /// Closes the roster pane: the two panes share the notice region and are mutually
+    /// exclusive -- unreachable through the key map today (Enter is unbound while the roster
+    /// is open), but the state machine keeps the invariant total rather than relying on the
+    /// table above it, and an in-flight correction dies with the pane.
     pub fn open_selector(&mut self) {
         if self.phase == Phase::Recording {
             self.selector_open = true;
+            self.roster_open = false;
+            self.editing = None;
+            self.edit_buffer.clear();
         }
     }
 
@@ -327,6 +402,147 @@ impl State {
     pub fn close_selector(&mut self) {
         self.selector_open = false;
     }
+
+    /// Opens the roster pane while a session is recording and a meeting is attached.
+    ///
+    /// Requires an attachment: unlike the selector, whose degraded view is "no meetings",
+    /// there is no roster to degrade to when no meeting is attached, so the key does nothing
+    /// rather than opening an empty pane -- which is also why the footer advertises it only
+    /// while a roster is on screen. Closes the selector: the two panes share the notice
+    /// region, and one context at a time is what keeps the key map total.
+    ///
+    /// Does not reset the cursor: the note that replaces the roster resets it, and a user
+    /// who scrolls, closes with Esc and reopens is mid-list, not at its top.
+    pub fn open_roster(&mut self) {
+        if self.phase == Phase::Recording && self.roster.is_some() {
+            self.selector_open = false;
+            self.roster_open = true;
+        }
+    }
+
+    /// Moves the roster cursor down one row, wrapping. No-op on an empty roster: there is
+    /// nothing to move through, and the frame keeps saying so.
+    pub fn roster_next(&mut self) {
+        if let Some(roster) = &self.roster
+            && !roster.is_empty()
+        {
+            self.roster_cursor = (self.roster_cursor + 1) % roster.len();
+        }
+    }
+
+    /// Moves the roster cursor up one row, wrapping. No-op on an empty roster.
+    ///
+    /// `(cursor + len - 1) % len` rather than `wrapping_sub(1) % len`: the underflow route
+    /// computes `usize::MAX % len`, which lands back on zero for lengths that divide it --
+    /// silently a no-op where a wrap was owed. Same argument as [`State::previous`].
+    pub fn roster_previous(&mut self) {
+        if let Some(roster) = &self.roster
+            && !roster.is_empty()
+        {
+            self.roster_cursor = (self.roster_cursor + roster.len() - 1) % roster.len();
+        }
+    }
+
+    /// Removes the attendee under the cursor and hands back the full edited roster,
+    /// addressed by the meeting it came from -- or none when there is no roster to remove
+    /// from.
+    ///
+    /// The whole roster crosses, never the removed row: last write wins, and the run applies
+    /// whatever it was last given at the single finalize point. Removal commits immediately --
+    /// there is no cancel for it -- so the cursor clamps to the shortened list.
+    pub fn remove_selected(&mut self) -> Option<RosterEdit> {
+        if self.roster.as_ref()?.is_empty() {
+            return None;
+        }
+        // Cloned before the roster is touched: `roster` and `roster_event_id` are always set
+        // together (§ their doc comments), so this cannot fail in practice, but failing here
+        // keeps a would-be violation from mutating local state while still reporting nothing
+        // to cross.
+        let event_id = self.roster_event_id.clone()?;
+        let roster = self.roster.as_mut()?;
+        roster.remove(self.roster_cursor.min(roster.len() - 1));
+        self.roster_cursor = self.roster_cursor.min(roster.len().saturating_sub(1));
+        Some(RosterEdit {
+            event_id,
+            attendees: roster.clone(),
+        })
+    }
+
+    /// Enters inline correction of the selected row's `field`: the buffer starts empty, and
+    /// committing replaces the field wholesale -- so a cleared buffer clears the field.
+    /// Does nothing when there is no row to correct.
+    pub fn begin_edit(&mut self, field: EditingField) {
+        if self
+            .roster
+            .as_ref()
+            .and_then(|r| r.get(self.roster_cursor))
+            .is_some()
+        {
+            self.editing = Some(field);
+            self.edit_buffer.clear();
+        }
+    }
+
+    /// Feeds one character into the field under correction.
+    ///
+    /// Only the shell's key map calls this, and it feeds non-control characters only -- the
+    /// same guard enroll's search input applies to its filter -- so a stray control byte can
+    /// never land in the text a correction will write.
+    pub fn feed_edit(&mut self, c: char) {
+        if self.editing.is_some() {
+            self.edit_buffer.push(c);
+        }
+    }
+
+    /// Deletes the last character of the field under correction.
+    pub fn backspace_edit(&mut self) {
+        if self.editing.is_some() {
+            self.edit_buffer.pop();
+        }
+    }
+
+    /// Commits the field under correction: the buffer replaces the selected row's field
+    /// (empty buffer clears it), editing exits, and the full edited roster is handed back
+    /// addressed by the meeting it came from.
+    ///
+    /// Like [`State::remove_selected`], the whole roster crosses -- the run applies the last
+    /// committed state at the single finalize point, so the frame's copy and the run's stash
+    /// stay the same value by construction.
+    pub fn commit_edit(&mut self) -> Option<RosterEdit> {
+        let field = self.editing?;
+        // Cloned before the roster is touched: see the matching comment in `remove_selected`.
+        let event_id = self.roster_event_id.clone()?;
+        let buffer = std::mem::take(&mut self.edit_buffer);
+        let text = (!buffer.is_empty()).then_some(buffer);
+        let roster = self.roster.as_mut()?;
+        let row = roster.get_mut(self.roster_cursor)?;
+        match field {
+            EditingField::Name => row.name = text,
+            EditingField::Email => row.email = text,
+        }
+        self.editing = None;
+        Some(RosterEdit {
+            event_id,
+            attendees: roster.clone(),
+        })
+    }
+
+    /// Cancels the field under correction: the buffer is dropped and the row is untouched.
+    ///
+    /// Crosses nothing -- the run's stash keeps the pre-edit roster, so a cancel cannot
+    /// desync the frame's copy from what will be written.
+    pub fn cancel_edit(&mut self) {
+        self.editing = None;
+        self.edit_buffer.clear();
+    }
+
+    /// Closes the roster pane without committing anything: the toggle, the escape, or the
+    /// session ending underneath it. Any in-flight correction is cancelled along with it.
+    pub fn close_roster(&mut self) {
+        self.roster_open = false;
+        self.editing = None;
+        self.edit_buffer.clear();
+    }
 }
 
 impl Default for State {
@@ -344,7 +560,7 @@ mod tests {
         meeting_clause_line, recorded_lines, session_id_line, session_started_lines,
     };
     use meethook_enroll::MeetingOffer;
-    use meethook_session::{Meeting, MeetingFit};
+    use meethook_session::{Attendee, AttendeeStatus, Meeting, MeetingFit};
 
     fn id(n: u8) -> SessionId {
         SessionId::parse(format!("20260809-05{n:02}00").as_str()).unwrap()
@@ -384,6 +600,28 @@ mod tests {
     /// Its projection, the way the loop projects every offer before it crosses.
     fn offer_of(event_id: &str, title: &str) -> MeetingOffer {
         MeetingOffer::from(&meeting_of(event_id, title))
+    }
+
+    /// The attached meeting's roster, the way the loop sends it: the disclosure unit per
+    /// attendee -- name, email, status, `is_you` -- addressed by the event id.
+    fn roster_of(event_id: &str) -> Note {
+        Note::RosterAttached {
+            event_id: event_id.to_owned(),
+            attendees: vec![
+                Attendee {
+                    name: Some("Alan Turing".to_owned()),
+                    email: Some("alan@example.com".to_owned()),
+                    status: AttendeeStatus::Accepted,
+                    is_you: false,
+                },
+                Attendee {
+                    name: Some("Grace Hopper".to_owned()),
+                    email: Some("grace@example.com".to_owned()),
+                    status: AttendeeStatus::Declined,
+                    is_you: true,
+                },
+            ],
+        }
     }
 
     /// An offer replaces the pane whole and arrives with the selector closed: whatever the
@@ -676,5 +914,227 @@ mod tests {
         assert_eq!(session.mic_channels, 1);
         assert_eq!(session.speaker_rate, 44_100);
         assert!(session_id_line(&session.id).starts_with("Session 20260809-050600"));
+    }
+
+    /// The roster pane opens only while recording with an attached meeting, and it and the
+    /// selector never share the notice region: opening one closes the other, both ways.
+    #[test]
+    fn the_roster_pane_requires_an_attachment_and_excludes_the_selector() {
+        // No attachment: the key does nothing rather than opening an empty pane.
+        let mut s = State::default();
+        s.apply(&started(20));
+        s.open_roster();
+        assert!(!s.roster_open, "no attachment, no pane");
+
+        // No session at all: there is nothing to correct.
+        let mut idle = State::default();
+        idle.apply(&roster_of("EVENT-A"));
+        idle.open_roster();
+        assert!(!idle.roster_open, "no session, no pane");
+
+        // With a roster: it opens, and closes the selector if one was open.
+        let mut s = State::default();
+        s.apply(&started(21));
+        s.apply(&Note::MeetingOffered {
+            offered: vec![offer_of("EVENT-A", "Standup")],
+            guess: None,
+        });
+        s.apply(&roster_of("EVENT-A"));
+        s.open_selector();
+        s.open_roster();
+        assert!(s.roster_open);
+        assert!(!s.selector_open, "opening the roster closes the selector");
+
+        // And back the other way.
+        s.open_selector();
+        assert!(s.selector_open);
+        assert!(!s.roster_open, "opening the selector closes the roster");
+    }
+
+    /// An attached meeting whose invite lists nobody still opens the pane -- the frame says
+    /// so rather than hiding the key -- and movement and removal are no-ops on the empty
+    /// list, mirroring the empty-selector rule.
+    #[test]
+    fn an_empty_roster_still_opens_but_moves_and_removes_nothing() {
+        let mut s = State::default();
+        s.apply(&started(22));
+        s.apply(&Note::RosterAttached {
+            event_id: "EVENT-A".to_owned(),
+            attendees: vec![],
+        });
+        s.open_roster();
+        assert!(s.roster_open, "an empty roster still opens");
+        s.roster_next();
+        s.roster_previous();
+        assert_eq!(s.roster_cursor, 0, "movement is a no-op on an empty roster");
+        assert_eq!(s.remove_selected(), None, "nothing to remove");
+        s.begin_edit(EditingField::Name);
+        assert!(s.editing.is_none(), "no row to correct");
+        assert_eq!(s.commit_edit(), None, "nothing to commit");
+    }
+
+    /// The roster cursor wraps at both ends, like the selector's.
+    #[test]
+    fn the_roster_cursor_wraps_at_both_ends() {
+        let mut s = State::default();
+        s.apply(&started(23));
+        s.apply(&roster_of("EVENT-A"));
+        s.open_roster();
+        s.roster_next();
+        assert_eq!(s.roster_cursor, 1);
+        s.roster_next();
+        assert_eq!(s.roster_cursor, 0, "down wraps");
+        s.roster_previous();
+        assert_eq!(s.roster_cursor, 1, "up wraps");
+    }
+
+    /// Every committed local change crosses exactly once, as the full edited roster: a
+    /// removal drops a row and clamps the cursor, a committed correction rewrites the field
+    /// wholesale (an empty buffer clears it), and a cancelled correction crosses nothing.
+    #[test]
+    fn committed_changes_cross_the_full_roster_once_each() {
+        let mut s = State::default();
+        s.apply(&started(24));
+        s.apply(&roster_of("EVENT-A"));
+        s.open_roster();
+
+        // Removal: the full roster comes back minus the row, and the cursor clamps.
+        let removed = s.remove_selected().expect("a removal crosses");
+        assert_eq!(removed.event_id, "EVENT-A");
+        assert_eq!(removed.attendees.len(), 1);
+        assert_eq!(removed.attendees[0].name.as_deref(), Some("Grace Hopper"));
+        assert_eq!(
+            s.roster_cursor, 0,
+            "the cursor clamps to the shortened list"
+        );
+
+        // Name correction: typed text replaces the field wholesale.
+        s.begin_edit(EditingField::Name);
+        for c in "Grace M. Hopper".chars() {
+            s.feed_edit(c);
+        }
+        let committed = s.commit_edit().expect("a commit crosses");
+        assert_eq!(committed.event_id, "EVENT-A");
+        assert_eq!(
+            committed.attendees[0].name.as_deref(),
+            Some("Grace M. Hopper"),
+            "the commit rewrites the field"
+        );
+        assert!(s.editing.is_none(), "editing exits on commit");
+        assert_eq!(s.edit_buffer, "");
+
+        // A cleared buffer clears the field: committing empty removes it.
+        s.begin_edit(EditingField::Email);
+        let cleared = s.commit_edit().expect("an empty commit crosses");
+        assert_eq!(
+            cleared.attendees[0].email.as_ref(),
+            None,
+            "an empty buffer clears the field"
+        );
+
+        // Cancel: the row is untouched and nothing crossed.
+        s.begin_edit(EditingField::Name);
+        s.feed_edit('x');
+        s.cancel_edit();
+        assert!(s.editing.is_none());
+        assert_eq!(s.edit_buffer, "");
+        assert_eq!(
+            s.roster.as_ref().unwrap()[0].name.as_deref(),
+            Some("Grace M. Hopper"),
+            "a cancel reverts locally"
+        );
+    }
+
+    /// `roster` and `roster_event_id` are documented to move together; this pins the fallback
+    /// if that invariant were ever violated elsewhere: neither commit path mutates the roster
+    /// before it has confirmed it has an id to address the edit with, so a violation reports
+    /// nothing to cross rather than silently dropping a local mutation on the floor.
+    #[test]
+    fn a_missing_roster_event_id_leaves_the_roster_untouched() {
+        let mut s = State::default();
+        s.apply(&started(30));
+        s.apply(&roster_of("EVENT-A"));
+        s.open_roster();
+        s.roster_event_id = None;
+
+        assert_eq!(s.remove_selected(), None, "no id to address a removal with");
+        assert_eq!(
+            s.roster.as_ref().unwrap().len(),
+            2,
+            "the roster was not touched"
+        );
+
+        s.begin_edit(EditingField::Name);
+        s.feed_edit('x');
+        assert_eq!(s.commit_edit(), None, "no id to address a commit with");
+        assert_eq!(
+            s.roster.as_ref().unwrap()[0].name.as_deref(),
+            Some("Alan Turing"),
+            "the row was not touched"
+        );
+    }
+
+    /// The roster copy is replaced wholesale by each note, and dies with the session it
+    /// described: a settled pick supersedes it, and a finished session wipes it -- so a
+    /// restarted session cannot inherit its predecessor's people.
+    #[test]
+    fn a_roster_note_replaces_the_pane_whole_and_a_restart_cannot_inherit_it() {
+        let mut s = State::default();
+        s.apply(&started(25));
+        s.apply(&roster_of("EVENT-A"));
+        s.open_roster();
+        s.begin_edit(EditingField::Name);
+        s.feed_edit('x');
+
+        // A note for a different meeting supersedes the copy wholesale...
+        s.apply(&Note::RosterAttached {
+            event_id: "EVENT-B".to_owned(),
+            attendees: vec![],
+        });
+        assert_eq!(s.roster_event_id.as_deref(), Some("EVENT-B"));
+        assert_eq!(s.roster.as_ref().unwrap().len(), 0);
+        assert!(
+            !s.roster_open,
+            "the replacement arrives with the pane closed"
+        );
+        assert!(
+            s.editing.is_none(),
+            "an in-flight correction dies with the copy"
+        );
+
+        // ...and the session ending wipes it entirely.
+        s.apply(&Note::Stopping);
+        s.apply(&recorded(25, None));
+        assert!(s.roster.is_none(), "the roster dies with the session");
+        assert!(s.roster_event_id.is_none());
+    }
+
+    /// The relaxation's boundary, asserted at the state level: a stuffed roster note drives
+    /// the buffers, and neither narration nor trouble carries any of its secrets. The note
+    /// composes to nothing, and the pane's rows live only in fields the frame renders while
+    /// the alternate screen is active -- the dial-in-PIN incident is why this must hold.
+    #[test]
+    fn a_roster_note_never_reaches_the_narration_or_trouble() {
+        let mut s = State::default();
+        s.apply(&started(26));
+        s.apply(&roster_of("EVENT-ABC"));
+        s.open_roster();
+
+        assert_eq!(
+            roster_of("EVENT-ABC").composed(),
+            "",
+            "the roster note composes to nothing"
+        );
+        let narration = s.take_narration();
+        for secret in ["Turing", "Hopper", "@example.com"] {
+            assert!(
+                !narration.contains(secret),
+                "the narration leaks {secret:?}"
+            );
+            assert!(
+                !s.trouble.iter().any(|t| t.contains(secret)),
+                "trouble leaks {secret:?}"
+            );
+        }
     }
 }
