@@ -240,46 +240,50 @@ fn run(
         }
 
         match poll(TICK) {
+            // A single `read()`, not a loop: `poll` returning `Ok(true)` is the guarantee that
+            // this one read will not block, and only that one -- `read()` itself always blocks
+            // until an event exists, so a second call here would stall the frame (no redraws,
+            // no note draining, no stop detection) until another key happened to arrive. Any
+            // further buffered event is picked up on the loop's next iteration instead, which
+            // still runs immediately, since `poll` finds it ready right away.
             Ok(true) => {
-                while let Ok(crossterm_event) = read() {
-                    if let CrosstermEvent::Key(key) = crossterm_event {
-                        match event(key, state.selector_open) {
-                            Some(Action::Interrupt) => {
-                                // Raw mode swallows SIGINT, so the frame delivers the
-                                // interrupt through the same channel the ctrlc handler uses
-                                // in plain mode: the main loop finalizes the session exactly
-                                // as it would have.
-                                let _ = tx.send(Event::Interrupt);
-                            }
-                            Some(action) => {
-                                // The selector's commands enter the state machine as typed
-                                // commands, the way `enroll` feeds answers: the shell decides
-                                // nothing about them, it only hands them over and marks the
-                                // frame dirty so the cursor move is drawn.
-                                match action {
-                                    Action::OpenSelector => state.open_selector(),
-                                    Action::Next => state.next(),
-                                    Action::Previous => state.previous(),
-                                    Action::CloseSelector => state.close_selector(),
-                                    Action::Confirm => {
-                                        // The identifier, not the meeting: the run resolves
-                                        // it against the list it handed over, and a pick it
-                                        // cannot resolve settles nothing.
-                                        if let Some(event_id) = state.confirm() {
-                                            let _ = tx.send(Event::MeetingPicked(event_id));
-                                        }
-                                    }
-                                    // The stop never reaches this arm: the interrupt arm
-                                    // above decides Ctrl-C before the selector commands get
-                                    // a look at the key.
-                                    Action::Interrupt => {
-                                        unreachable!("Ctrl-C is decided by the interrupt arm")
+                if let Ok(CrosstermEvent::Key(key)) = read() {
+                    match event(key, state.selector_open) {
+                        Some(Action::Interrupt) => {
+                            // Raw mode swallows SIGINT, so the frame delivers the
+                            // interrupt through the same channel the ctrlc handler uses
+                            // in plain mode: the main loop finalizes the session exactly
+                            // as it would have.
+                            let _ = tx.send(Event::Interrupt);
+                        }
+                        Some(action) => {
+                            // The selector's commands enter the state machine as typed
+                            // commands, the way `enroll` feeds answers: the shell decides
+                            // nothing about them, it only hands them over and marks the
+                            // frame dirty so the cursor move is drawn.
+                            match action {
+                                Action::OpenSelector => state.open_selector(),
+                                Action::Next => state.next(),
+                                Action::Previous => state.previous(),
+                                Action::CloseSelector => state.close_selector(),
+                                Action::Confirm => {
+                                    // The identifier, not the meeting: the run resolves
+                                    // it against the list it handed over, and a pick it
+                                    // cannot resolve settles nothing.
+                                    if let Some(event_id) = state.confirm() {
+                                        let _ = tx.send(Event::MeetingPicked(event_id));
                                     }
                                 }
-                                *dirty = true;
+                                // The stop never reaches this arm: the interrupt arm
+                                // above decides Ctrl-C before the selector commands get
+                                // a look at the key.
+                                Action::Interrupt => {
+                                    unreachable!("Ctrl-C is decided by the interrupt arm")
+                                }
                             }
-                            None => {}
+                            *dirty = true;
                         }
+                        None => {}
                     }
                 }
             }
