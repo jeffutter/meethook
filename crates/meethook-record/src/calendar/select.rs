@@ -335,6 +335,42 @@ pub(crate) mod tests {
         assert!(offers(Vec::new()).is_empty());
     }
 
+    /// The combined lookup hands both halves to the record interface at once, so whatever the
+    /// automatic rule would attach must be one a person may offer themselves: a frame that
+    /// marks a guess the listing does not contain would let the user confirm nothing they were
+    /// shown. Decided over plain candidates, so it holds on any machine.
+    #[test]
+    fn whatever_select_picks_the_listing_also_offers() {
+        for candidates in [
+            Vec::new(),
+            vec![candidate(
+                "containing",
+                "2026-08-15T09:55:00Z",
+                "2026-08-15T10:25:00Z",
+            )],
+            vec![
+                candidate("block", "2026-08-15T09:00:00Z", "2026-08-15T11:00:00Z"),
+                candidate("standup", "2026-08-15T09:55:00Z", "2026-08-15T10:25:00Z"),
+                candidate("upcoming", "2026-08-15T10:05:00Z", "2026-08-15T10:35:00Z"),
+            ],
+            {
+                let mut all_day =
+                    candidate("conference", "2026-08-15T00:00:00Z", "2026-08-16T00:00:00Z");
+                all_day.all_day = true;
+                vec![all_day]
+            },
+        ] {
+            let chosen = select(candidates.clone(), session_start());
+            let offered = offerable(candidates);
+            if let Some(chosen) = chosen {
+                assert!(
+                    offered.iter().any(|m| m.event_id == chosen.event_id),
+                    "the listing skipped the meeting the rules would attach"
+                );
+            }
+        }
+    }
+
     /// An offered candidate is not a match: it is one of several a person is about to choose
     /// between, and nothing here has decided anything about it. The fit it eventually carries
     /// is `Confirmed`, and only whoever picks it can put that there.

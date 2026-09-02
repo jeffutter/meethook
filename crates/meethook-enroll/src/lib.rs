@@ -97,7 +97,7 @@ pub use consequence::{Assertion, Consequence, GroupConsequence, Preview, Refusal
 pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
 pub use interview::{Answer, GivenName, Interviewer, MeetingLabel};
 pub use meethook_session::Stored;
-pub use meeting::{Labelled, MeetingChoice, MeetingSource, Relabelling, run_meeting};
+pub use meeting::{Labelled, MeetingChoice, MeetingOffer, MeetingSource, Relabelling, run_meeting};
 pub use narration::{
     AnswerNote, Lines, Narrator, Nearest, NotSelected, Note, PassedOver, RunNote, SessionFile,
     SessionNote, VoiceDescription,

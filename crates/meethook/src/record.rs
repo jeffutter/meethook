@@ -28,15 +28,19 @@ use anyhow::Context;
 #[cfg(any(target_os = "macos", test))]
 use anyhow::Result;
 #[cfg(any(target_os = "macos", test))]
-use meethook_enroll::MeetingLabel;
+use meethook_enroll::{MeetingLabel, MeetingOffer};
 #[cfg(target_os = "macos")]
 use meethook_session::Paths;
 #[cfg(any(target_os = "macos", test))]
 use meethook_session::SessionId;
+#[cfg(any(target_os = "macos", test))]
+use meethook_session::{Meeting, MeetingFit};
 // The capture backend exists only where its Apple frameworks compile; the platform-neutral
 // sequencing in `record_loop` below stays ungated and keeps testing without it.
 #[cfg(target_os = "macos")]
-use meethook_record::{Activity, MicActivityWatcher, Recorder, RunningSession, preflight};
+use meethook_record::{
+    Activity, MicActivityWatcher, Recorder, RunningSession, meetings_for, preflight,
+};
 
 #[cfg(any(target_os = "macos", test))]
 /// The four waits the record loop's behaviour depends on.
@@ -102,8 +106,9 @@ impl Timing {
 ///
 /// One enum, one channel: a Ctrl-C during a recording has to be seen at the same instant
 /// as a microphone edge, and two separate waits cannot both be blocking. `pub(crate)` because
-/// the full-screen frame delivers its Ctrl-C through a clone of this channel's sender; the
-/// event set itself stays private to this module.
+/// the full-screen frame is a second producer of these -- it delivers its Ctrl-C and its
+/// calendar picks through a clone of this channel's sender; the event set itself stays private
+/// to this module, and every match site below owes a deliberate answer per variant.
 pub(crate) enum Event {
     Started,
     Stopped,
@@ -112,6 +117,29 @@ pub(crate) enum Event {
     /// a deliberate answer for.
     InputDeviceChanged,
     Interrupt,
+    /// The user confirmed one of the calendar offers the frame was showing, addressed by the
+    /// event's own identifier rather than its title: titles repeat across calendars, and the
+    /// identifier is what `finish` writes. The first payload-carrying variant -- kept a
+    /// `String`, so the channel's contract (one reader, events decided at the loop) is
+    /// unchanged in kind, and no `Meeting` crosses it.
+    MeetingPicked(String),
+}
+
+#[cfg(any(target_os = "macos", test))]
+/// The calendar's answer for the session being recorded.
+///
+/// Every meeting worth offering as a hand correction, and the one the automatic rule would
+/// attach (with the fit that rule decided) -- or nothing, when there is no live session or no
+/// calendar. Total rather than fallible, exactly as the lookup behind it is: a missing grant
+/// or an empty calendar is an empty answer, and the selector degrades to "no meetings" rather
+/// than erroring. The full values stay on the main thread where a pick resolves; what crosses
+/// into the frame are projections of them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Offered {
+    /// Every meeting worth offering, in the listing's stable order.
+    meetings: Vec<Meeting>,
+    /// The one the automatic rule would attach, with the fit that rule decided.
+    chosen: Option<Meeting>,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -130,8 +158,15 @@ pub(crate) enum Event {
 trait Capture {
     /// Begins a session and announces it.
     fn start(&mut self, sink: &mut dyn Reporter) -> Result<()>;
+    /// The calendar's answer for the session being recorded, asked once per session start.
+    fn candidates(&mut self) -> Offered;
     /// Finalizes the current session and reports what it produced.
-    fn finish(&mut self, sink: &mut dyn Reporter) -> Result<()>;
+    ///
+    /// `hand` is the pick the user settled while recording, if any. It is applied here, at
+    /// the single finalize point, rather than written mid-flight: `session.json` does not
+    /// exist until this write, and its presence is the completion marker every other process
+    /// reads.
+    fn finish(&mut self, sink: &mut dyn Reporter, hand: Option<Meeting>) -> Result<()>;
     /// Whether the microphone track has stopped receiving audio.
     ///
     /// Asked only while a session is live, once per `Timing::recheck`. The live backend
@@ -198,6 +233,11 @@ pub(crate) fn presenter(plain: bool, tty: Tty) -> Presenter {
 /// value it came from: the calendar-problem text is static guidance that names no person, and
 /// the errors are flattened at the point they happen because a `String` is what a notice pane
 /// and a scrollback line alike can hold.
+///
+/// Two frame-only notes ride the same type with nothing to print: `MeetingOffered` and
+/// `MeetingSettled` carry data the interface renders, and composing them to the empty string
+/// is what keeps a plain run silent about the calendar -- headless output stays byte-identical
+/// to the pre-interface binary.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) enum Note {
     // ---- stdout class ----
@@ -223,6 +263,21 @@ pub(crate) enum Note {
     Stopping,
     /// A finalize-and-restart found the call was already over, so nothing new was opened.
     NoNewSession,
+    /// The calendar's view of the session just opened: the numbered offers and the guess among
+    /// them, projected so far as a frame may show them.
+    ///
+    /// Composes to nothing -- see the type doc -- and is sent once per session start, even
+    /// when both halves are empty, so a restarted session cannot inherit its predecessor's
+    /// list.
+    MeetingOffered {
+        offered: Vec<MeetingOffer>,
+        guess: Option<MeetingLabel>,
+    },
+    /// A hand pick settled: which offer the user confirmed, in the same projection the offers
+    /// crossed in. Carries `MeetingFit::Confirmed` -- what `label_by_hand` will write at
+    /// finish -- never the candidate's own fit, whose caveat would qualify a pick a human just
+    /// made. Composes to nothing for the same reason [`Note::MeetingOffered`] does.
+    MeetingSettled { label: MeetingLabel },
     /// A session finished: what it produced, and the meeting it was matched to if any.
     ///
     /// The meeting crosses as a [`MeetingLabel`] -- title and fit only -- never as the full
@@ -281,6 +336,9 @@ impl Note {
             Note::MicStalled => format!("{MIC_STALLED}\n"),
             Note::Stopping => format!("{STOPPING}\n"),
             Note::NoNewSession => format!("{NO_NEW_SESSION}\n"),
+            // Frame-only: data for the interface, not words for a terminal. Composing them
+            // away is what keeps the line-based run byte-identical.
+            Note::MeetingOffered { .. } | Note::MeetingSettled { .. } => String::new(),
             Note::Recorded {
                 id,
                 mic_secs,
@@ -493,13 +551,29 @@ impl Capture for SessionCapture<'_> {
         Ok(())
     }
 
-    fn finish(&mut self, sink: &mut dyn Reporter) -> Result<()> {
+    fn candidates(&mut self) -> Offered {
+        // Asked against the session's own start -- the moment a recording began, not now --
+        // because that is the instant decision-009 says identifies the meeting. The query is
+        // a pure read; the calendar *ask* happened once at process start, so asking mid-call
+        // costs a brief main-thread pause rather than a prompt, and the capture engines run
+        // on their own threads.
+        let Some(session) = self.running.as_ref() else {
+            return Offered::default();
+        };
+        let lookup = meetings_for(session.start_time());
+        Offered {
+            meetings: lookup.offered,
+            chosen: lookup.chosen,
+        }
+    }
+
+    fn finish(&mut self, sink: &mut dyn Reporter, hand: Option<Meeting>) -> Result<()> {
         // Nothing running is not an error. The loop only finishes a start it saw succeed, so
         // defining the case away here is cheaper than a branch that can only ever be wrong.
         let Some(session) = self.running.take() else {
             return Ok(());
         };
-        let recording = session.finish()?;
+        let recording = session.finish(hand)?;
         sink.note(Note::Recorded {
             id: recording.id.clone(),
             mic_secs: recording.mic.seconds(),
@@ -665,6 +739,9 @@ fn record_loop(
                 // not fall through to the arm below, which would end the recorder outright
                 // because somebody unplugged their headphones.
                 Ok(Event::InputDeviceChanged) => continue,
+                // No session is live to attach a pick to -- it cannot normally arrive here --
+                // and dropping it is the answer that keeps the idle wait idle.
+                Ok(Event::MeetingPicked(_)) => continue,
                 Ok(Event::Interrupt) | Err(_) => break,
             }
         }
@@ -679,6 +756,19 @@ fn record_loop(
             Begin::Interrupted => break,
         }
 
+        // The calendar's answer for this session, asked once at start and held until finish:
+        // the offers project into the frame, the full values stay here where a pick resolves.
+        // Both locals die with the session, so a device-change or stall restart cannot
+        // inherit a predecessor's list or pick.
+        let offered = capture.candidates();
+        let mut hand: Option<Meeting> = None;
+        // Sent even when both halves are empty: a restarted session starts clean rather than
+        // inheriting what the frame was last shown.
+        sink.note(Note::MeetingOffered {
+            guess: offered.chosen.as_ref().map(MeetingLabel::from),
+            offered: offered.meetings.iter().map(MeetingOffer::from).collect(),
+        });
+
         let outcome = loop {
             match rx.recv_timeout(timing.recheck) {
                 Ok(Event::Stopped) => match await_end(rx, timing.grace) {
@@ -689,6 +779,26 @@ fn record_loop(
                 // A redundant start edge cannot happen while recording, but ignoring it is
                 // the interpretation that keeps the session whole either way.
                 Ok(Event::Started) => {}
+                // The frame settled on one of the offers it was shown. Resolved against the
+                // held list -- an unknown id changes nothing, since the frame can only offer
+                // what it was given -- and stashed for the single finalize point; a later pick
+                // replaces an earlier one, and the finish applies the last.
+                Ok(Event::MeetingPicked(event_id)) => {
+                    if let Some(meeting) = offered
+                        .meetings
+                        .iter()
+                        .find(|m| m.event_id == event_id)
+                        .cloned()
+                    {
+                        hand = Some(meeting.clone());
+                        // What crosses to the frame is what `label_by_hand` will write at
+                        // finish -- the Confirmed stamp -- never the candidate's own fit,
+                        // whose caveat would qualify a pick a human just made.
+                        sink.note(Note::MeetingSettled {
+                            label: MeetingLabel::from(&meeting.with_fit(MeetingFit::Confirmed)),
+                        });
+                    }
+                }
                 // The engine is bound to the device that was default when it started, so it
                 // is now delivering nothing. Everything worth keeping is already on disk;
                 // finalize it and open a new session on the new device.
@@ -735,7 +845,7 @@ fn record_loop(
             Recording::Ended | Recording::Interrupted => sink.note(Note::Stopping),
         }
 
-        if let Err(e) = capture.finish(sink) {
+        if let Err(e) = capture.finish(sink, hand.take()) {
             sink.note(Note::FinishFailed(format!(
                 "This session did not produce a usable recording: {e}"
             )));
@@ -846,6 +956,9 @@ fn begin(
             // and the next attempt opens the input device afresh -- so the useful answer is to
             // retry immediately rather than wait out the interval against the old device.
             Ok(Event::InputDeviceChanged) => {}
+            // No session exists yet to attach a pick to -- it cannot normally arrive here --
+            // so the answer is the same as a redundant start edge: keep retrying.
+            Ok(Event::MeetingPicked(_)) => {}
             Err(RecvTimeoutError::Timeout) => {
                 // The stop edge can be missed outright, so the level is recomputed from the
                 // world here rather than inferred from the absence of a message. It has to
@@ -900,6 +1013,10 @@ fn await_end(rx: &Receiver<Event>, grace: Duration) -> Outcome {
             // already dead, so there is nothing left for a new device to capture into it --
             // returning `Continue` would rescue a session that has no audio coming.
             Ok(Event::InputDeviceChanged) => {}
+            // The session is already ending; the grace period is seconds, and a pick lost here
+            // is a recorded edge rather than a hole -- the post-hoc `meeting` command remains
+            // the fallback. Waiting out the remainder keeps the grace honest.
+            Ok(Event::MeetingPicked(_)) => {}
             Err(RecvTimeoutError::Timeout) => return Outcome::CallEnded,
             // Every sender is gone, so nothing can resume this session. Finalizing is the
             // only outcome that does not lose the audio already captured.
@@ -943,12 +1060,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::commands::Tty;
-    use meethook_session::SessionId;
+    use meethook_session::{Meeting, MeetingFit, SessionId};
 
     use super::{
-        Capture, DEVICE_CHANGED, Event, MIC_STALLED, Note, Outcome, Presenter, Timing, await_end,
-        meeting_clause_line, mic_line, presenter, record_loop, recorded_lines, session_dir_line,
-        session_id_line, speaker_line,
+        Capture, DEVICE_CHANGED, Event, MIC_STALLED, Note, Offered, Outcome, Presenter, Timing,
+        await_end, meeting_clause_line, mic_line, presenter, record_loop, recorded_lines,
+        session_dir_line, session_id_line, speaker_line,
     };
 
     /// A reporter that records nothing.
@@ -980,6 +1097,54 @@ mod tests {
             LOOP_TIMING,
             &mut silent,
         );
+    }
+
+    /// A reporter that records the notes it is handed, in order.
+    ///
+    /// The pick tests below assert on what the loop *says* as well as what it does: the
+    /// offer note and the settlement note are the frame's whole view of the calendar, so
+    /// their order and content are part of the contract the call log alone cannot see.
+    #[derive(Default)]
+    struct Noted {
+        notes: Vec<Note>,
+    }
+
+    impl super::Reporter for Noted {
+        fn note(&mut self, note: Note) {
+            self.notes.push(note);
+        }
+    }
+
+    /// Drives [`record_loop`] with a note-recording reporter at the test timing, handing back
+    /// what the loop said in the order it said it.
+    fn run_noted(
+        rx: &mpsc::Receiver<Event>,
+        capture: &mut FakeCapture,
+        recheck: &dyn Fn() -> bool,
+        already_active: bool,
+    ) -> Vec<Note> {
+        let mut noted = Noted::default();
+        record_loop(
+            rx,
+            capture,
+            recheck,
+            already_active,
+            LOOP_TIMING,
+            &mut noted,
+        );
+        noted.notes
+    }
+
+    /// A candidate meeting, the way the record crate's lookup would hand one over: the fit
+    /// left at the candidate's own, since only a person choosing it makes it Confirmed.
+    fn meeting_of(event_id: &str, title: &str) -> Meeting {
+        Meeting::new(
+            event_id.to_owned(),
+            title.to_owned(),
+            "Work".to_owned(),
+            "2026-08-15T10:00:00Z".parse().unwrap(),
+            "2026-08-15T11:00:00Z".parse().unwrap(),
+        )
     }
 
     /// Long enough that scheduling noise cannot be mistaken for a timeout, short enough
@@ -1199,6 +1364,14 @@ mod tests {
         /// nothing about *when* a session ended; this is what distinguishes a session the
         /// loop ended on its own from one an interrupt cleaned up afterwards.
         finished_at: Option<Instant>,
+        /// The calendar's answer `candidates` hands back, scripted like the rest. Not logged
+        /// into `calls`: the sequencing tests' exact call logs predate the seam, and asking
+        /// for candidates is not a sequencing decision.
+        candidates: Option<Offered>,
+        /// What each `finish` was handed as the in-memory pick -- the event ids, in order --
+        /// so a test can assert a pick reached the single finalize point without holding a
+        /// full `Meeting` of its own.
+        hands: Vec<Option<String>>,
     }
 
     impl Capture for FakeCapture {
@@ -1215,10 +1388,19 @@ mod tests {
             Ok(())
         }
 
-        fn finish(&mut self, _sink: &mut dyn super::Reporter) -> super::Result<()> {
+        fn finish(
+            &mut self,
+            _sink: &mut dyn super::Reporter,
+            hand: Option<Meeting>,
+        ) -> super::Result<()> {
             self.calls.push("finish");
             self.finished_at.get_or_insert_with(Instant::now);
+            self.hands.push(hand.map(|m| m.event_id));
             Ok(())
+        }
+
+        fn candidates(&mut self) -> Offered {
+            self.candidates.clone().unwrap_or_default()
         }
 
         fn mic_stalled(&mut self, _sink: &mut dyn super::Reporter) -> bool {
@@ -1300,6 +1482,203 @@ mod tests {
         run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "finish"]);
+    }
+
+    /// A pick of an offered id reaches the single finalize point as the hand, and the frame
+    /// is told about both halves in order: the offers when the session opens, the settlement
+    /// when the pick lands -- carrying the Confirmed stamp `label_by_hand` will write, never
+    /// the candidate's own fit.
+    #[test]
+    fn a_pick_reaches_finish_as_the_hand_and_settles_in_order() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::MeetingPicked("EVENT-A".to_owned())),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            candidates: Some(Offered {
+                meetings: vec![
+                    meeting_of("EVENT-A", "Standup"),
+                    meeting_of("EVENT-B", "Planning"),
+                ],
+                chosen: Some(meeting_of("EVENT-A", "Standup")),
+            }),
+            ..FakeCapture::default()
+        };
+        let notes = run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(capture.hands, [Some("EVENT-A".to_owned())]);
+
+        let mut seen_offer = false;
+        let mut settled = None;
+        for note in &notes {
+            match note {
+                Note::MeetingOffered { offered, guess } => {
+                    assert!(!seen_offer, "two offer notes for one session");
+                    seen_offer = true;
+                    assert_eq!(offered.len(), 2);
+                    assert_eq!(
+                        guess.as_ref().map(|label| label.title.as_str()),
+                        Some("Standup")
+                    );
+                }
+                Note::MeetingSettled { label } => {
+                    assert!(seen_offer, "the settlement crossed before the offers");
+                    settled = Some(label.clone());
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            seen_offer,
+            "the session opened without offering its calendar"
+        );
+        let settled = settled.expect("no settlement reached the frame");
+        assert_eq!(settled.title, "Standup");
+        assert_eq!(settled.fit, MeetingFit::Confirmed);
+    }
+
+    /// A later pick replaces an earlier one: the finish applies the last, and the frame sees
+    /// both settlements in the order they were made.
+    #[test]
+    fn a_later_pick_replaces_an_earlier_one() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::MeetingPicked("EVENT-A".to_owned())),
+            (BLIP, Event::MeetingPicked("EVENT-B".to_owned())),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            candidates: Some(Offered {
+                meetings: vec![
+                    meeting_of("EVENT-A", "Standup"),
+                    meeting_of("EVENT-B", "Planning"),
+                ],
+                chosen: Some(meeting_of("EVENT-A", "Standup")),
+            }),
+            ..FakeCapture::default()
+        };
+        let notes = run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(capture.hands, [Some("EVENT-B".to_owned())]);
+        let settled: Vec<String> = notes
+            .iter()
+            .filter_map(|note| match note {
+                Note::MeetingSettled { label } => Some(label.title.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            settled,
+            vec!["Standup".to_owned(), "Planning".to_owned()],
+            "both picks settled, in the order they were made"
+        );
+    }
+
+    /// An id the frame was never offered changes nothing: no settlement crosses, and the
+    /// finish settles by the automatic rule rather than a pick the run cannot resolve.
+    #[test]
+    fn an_unresolvable_pick_changes_nothing() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::MeetingPicked("NOT-OFFERED".to_owned())),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            candidates: Some(Offered {
+                meetings: vec![meeting_of("EVENT-A", "Standup")],
+                chosen: Some(meeting_of("EVENT-A", "Standup")),
+            }),
+            ..FakeCapture::default()
+        };
+        let notes = run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(
+            capture.hands,
+            [None],
+            "the unresolvable pick reached finish as a pick"
+        );
+        assert!(
+            !notes
+                .iter()
+                .any(|note| matches!(note, Note::MeetingSettled { .. })),
+            "the frame was told a pick stuck that the run could not resolve"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| matches!(note, Note::MeetingOffered { .. })),
+            "the offers still went out"
+        );
+    }
+
+    /// A device change right after a pick finalizes the first session with it and starts the
+    /// next clean: the second finish sees no inherited pick, and the frame is offered again
+    /// for the session it now describes.
+    #[test]
+    fn a_pick_does_not_leak_across_a_restart() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::MeetingPicked("EVENT-A".to_owned())),
+            (BLIP, Event::InputDeviceChanged),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            candidates: Some(Offered {
+                meetings: vec![meeting_of("EVENT-A", "Standup")],
+                chosen: Some(meeting_of("EVENT-A", "Standup")),
+            }),
+            ..FakeCapture::default()
+        };
+        let notes = run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish", "start", "finish"]);
+        assert_eq!(
+            capture.hands,
+            [Some("EVENT-A".to_owned()), None],
+            "the second session inherited its predecessor's pick"
+        );
+        let offers = notes
+            .iter()
+            .filter(|note| matches!(note, Note::MeetingOffered { .. }))
+            .count();
+        assert_eq!(offers, 2, "each session got its own offer note");
+    }
+
+    /// A calendar that answers nothing still gets offered: the note goes out even when both
+    /// halves are empty, so a restarted session cannot inherit its predecessor's list.
+    #[test]
+    fn an_empty_calendar_still_gets_offered() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        let notes = run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        let Note::MeetingOffered { offered, guess } = notes
+            .iter()
+            .find(|note| matches!(note, Note::MeetingOffered { .. }))
+            .expect("no offer note for an empty calendar")
+        else {
+            unreachable!("the match above found a MeetingOffered")
+        };
+        assert!(offered.is_empty());
+        assert!(guess.is_none());
     }
 
     /// A call already in progress at startup is recorded without waiting for an edge that

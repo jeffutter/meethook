@@ -32,6 +32,7 @@ fn a_meeting_label_states_a_strong_fit_plainly_and_qualifies_the_rest() {
         let label = MeetingLabel {
             title: "Standup".to_owned(),
             fit,
+            event_id: "EVENT-1".to_owned(),
         };
         assert_eq!(label.clause(), "Standup", "{fit:?}");
     }
@@ -39,6 +40,7 @@ fn a_meeting_label_states_a_strong_fit_plainly_and_qualifies_the_rest() {
         MeetingLabel {
             title: "Standup".to_owned(),
             fit: MeetingFit::JoinedLate,
+            event_id: "EVENT-1".to_owned(),
         }
         .clause(),
         "Standup  (uncertain: the recording began after this meeting had started)"
@@ -47,6 +49,7 @@ fn a_meeting_label_states_a_strong_fit_plainly_and_qualifies_the_rest() {
         MeetingLabel {
             title: "Standup".to_owned(),
             fit: MeetingFit::AfterEnd,
+            event_id: "EVENT-1".to_owned(),
         }
         .clause(),
         "Standup  (uncertain: the recording began after this meeting had ended)"
@@ -55,6 +58,7 @@ fn a_meeting_label_states_a_strong_fit_plainly_and_qualifies_the_rest() {
         MeetingLabel {
             title: "Standup".to_owned(),
             fit: MeetingFit::Unknown,
+            event_id: "EVENT-1".to_owned(),
         }
         .clause(),
         "Standup  (unverified: this session was recorded before meethook scored the match)"
@@ -217,6 +221,7 @@ fn the_seam_hands_every_voice_the_meeting_it_was_recorded_during() {
     let expected = Some(MeetingLabel {
         title: "Incident review".to_owned(),
         fit: MeetingFit::JoinedLate,
+        event_id: "EVENT-1".to_owned(),
     });
     assert_eq!(interviewer.seen.len(), 2, "both voices were asked about");
     for seen in &interviewer.seen {

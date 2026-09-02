@@ -4,9 +4,10 @@
 //! Nothing in this module decides anything: it takes the state the notes produced and places
 //! it. That is what lets it be exercised through [`ratatui::backend::TestBackend`] without a
 //! terminal, and what keeps the part that *is* decidable in `state`. Wording follows the same
-//! rule as there: every sentence comes off the composers in `crate::record`, verbatim. The only
-//! lines invented here are the phase word and the key hint, which are chrome about the frame
-//! itself rather than facts about the run.
+//! rule as there: every sentence comes off the composers in `crate::record` -- the meeting line
+//! and each selector row included -- verbatim. The only lines invented here are chrome about
+//! the frame itself rather than facts about the run: the phase word, the key hint, the guess
+//! marker on the offer list and the "by hand" marker on a settled pick.
 
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::state::{Phase, State};
-use crate::record::{mic_line, session_id_line, speaker_line};
+use crate::record::{meeting_clause_line, mic_line, session_id_line, speaker_line};
 
 /// Places the record frame for one draw.
 ///
@@ -73,6 +74,18 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
             session.mic_channels,
         ))));
         body_lines.push(Line::from(Span::raw(speaker_line(session.speaker_rate))));
+        // The meeting the session is stated to be, placed where the finish summary puts its
+        // clause: the settled pick first -- its fit is Confirmed by construction, so the
+        // clause reads plainly and the marker says how it got there -- else the automatic
+        // guess through the composer, so a weak fit shows its caveat verbatim.
+        if let Some(settled) = &state.settled {
+            body_lines.push(Line::from(Span::raw(format!(
+                "  meeting   {}  (by hand)",
+                settled.clause()
+            ))));
+        } else if let Some(guess) = &state.guess {
+            body_lines.push(Line::from(Span::raw(meeting_clause_line(guess))));
+        }
     }
 
     if let Some(last) = &state.last {
@@ -83,16 +96,59 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
         body_lines.push(Line::from(spans));
     }
 
-    if let Some(notice) = &state.notice {
+    // The selector takes the notice region rather than growing the frame: at the 80x24 floor
+    // the body has exactly this much room to spare. Each row is the projection's own line; the
+    // cursor row is highlighted, and the guess is marked the way the correction command marks
+    // the attached one -- adapted, since what the rules would attach is not yet attached.
+    if state.selector_open {
+        body_lines.push(Line::from(Span::raw(" ")));
+        if state.offered.is_empty() {
+            // The degraded view, in the correction command's own words: no grant, empty
+            // calendar or unreadable store all land here, and none of them is an error.
+            body_lines.push(Line::from(Span::raw(
+                "No meeting is on the calendar around this session, or the calendar could not be read",
+            )
+            .dim()));
+        } else {
+            for (nth, offer) in state.offered.iter().enumerate() {
+                let marker = if state
+                    .guess
+                    .as_ref()
+                    .is_some_and(|guess| guess.event_id == offer.event_id)
+                {
+                    "  <- the guess"
+                } else {
+                    ""
+                };
+                let line = format!("{:>2}  {}{marker}", nth + 1, offer.line());
+                body_lines.push(if nth == state.cursor {
+                    Line::from(Span::raw(line).bold())
+                } else {
+                    Line::from(Span::raw(line))
+                });
+            }
+        }
+    } else if let Some(notice) = &state.notice {
         body_lines.push(Line::from(Span::raw(" ")));
         body_lines.push(Line::from(Span::raw(notice.clone())));
     }
 
     body_lines.push(Line::from(Span::raw(" ")));
-    body_lines.push(Line::from(vec![
+    // Contextual bindings: the base stop always, and the meeting keys only while a session is
+    // recording -- a key that cannot work in the current context is not advertised, and
+    // Enter's wording follows what it would do now.
+    let mut hint = vec![
         Span::raw("Ctrl-C / Ctrl-D").bold(),
         Span::raw("  stop and exit").dim(),
-    ]));
+    ];
+    if state.phase == Phase::Recording {
+        if state.selector_open {
+            hint.push(Span::raw("  up/down move  enter choose  esc back").dim());
+        } else {
+            hint.push(Span::raw("  enter choose a meeting").dim());
+        }
+    }
+    body_lines.push(Line::from(hint));
 
     if trouble_height > 0 {
         let [main, trouble] = Layout::default()
@@ -169,9 +225,11 @@ fn format_elapsed(elapsed: Duration) -> String {
 mod tests {
     use super::*;
     use crate::record::{Note, STOPPING, WATCHING};
-    use meethook_session::SessionId;
+    use meethook_enroll::{MeetingLabel, MeetingOffer};
+    use meethook_session::{Attendee, AttendeeStatus, Meeting, MeetingFit, SessionId};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
 
     /// Draws one frame into a buffer and hands back its rows, trimmed: the same read-out the
     /// assertions below need, spelled once.
@@ -202,6 +260,47 @@ mod tests {
         }
     }
 
+    /// A candidate meeting with a chosen fit, the way the loop would hand one over.
+    fn meeting_of(event_id: &str, title: &str, fit: MeetingFit) -> Meeting {
+        Meeting::new(
+            event_id.to_owned(),
+            title.to_owned(),
+            "Work".to_owned(),
+            "2026-08-15T10:00:00Z".parse().unwrap(),
+            "2026-08-15T11:00:00Z".parse().unwrap(),
+        )
+        .with_fit(fit)
+    }
+
+    /// Draws one frame and hands back each row with whether any of its cells are bold: the
+    /// highlight assertions below need the style, which the plain read-out trims away.
+    fn rows_highlighted(
+        width: u16,
+        height: u16,
+        state: &State,
+        elapsed: Option<Duration>,
+    ) -> Vec<(String, bool)> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
+        terminal
+            .draw(|frame| draw(frame, state, elapsed))
+            .expect("drawing into a buffer cannot fail");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                let mut any_bold = false;
+                let text: String = (0..buffer.area.width)
+                    .map(|x| {
+                        if buffer[(x, y)].modifier.contains(Modifier::BOLD) {
+                            any_bold = true;
+                        }
+                        buffer[(x, y)].symbol().to_string()
+                    })
+                    .collect();
+                (text.trim_end().to_string(), any_bold)
+            })
+            .collect()
+    }
+
     /// An idle frame says what it is waiting for, where sessions will land, and how to leave.
     #[test]
     fn the_idle_frame_says_what_it_is_waiting_for() {
@@ -214,6 +313,9 @@ mod tests {
         assert!(painted.contains("Ctrl-C"), "{painted}");
         assert!(painted.contains("stop and exit"), "{painted}");
         assert!(painted.contains("sessions"), "{painted}");
+        // No session is recording, so the meeting keys are not advertised: a key that cannot
+        // work in the current context is not offered.
+        assert!(!painted.contains("choose a meeting"), "{painted}");
     }
 
     /// A recording frame shows the live session the way the plain run announced it: id,
@@ -351,6 +453,190 @@ mod tests {
             assert!(
                 !painted.contains(secret),
                 "the frame leaks {secret:?}: {painted}"
+            );
+        }
+    }
+
+    /// While a session is live, the frame states the meeting the automatic rule would attach,
+    /// through the composer -- so a weak fit carries its caveat verbatim -- and advertises the
+    /// key that opens the list.
+    #[test]
+    fn the_live_meeting_line_carries_the_guess_and_its_caveat() {
+        let guess = meeting_of("EVENT-A", "Standup", MeetingFit::JoinedLate);
+        let mut state = State::default();
+        state.apply(&started(13));
+        state.apply(&Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&guess)],
+            guess: Some(MeetingLabel::from(&guess)),
+        });
+
+        let painted = painted(80, 24, &state, Some(Duration::from_secs(60))).join("\n");
+        assert!(painted.contains("recording"), "{painted}");
+        assert!(painted.contains("Standup"), "{painted}");
+        // The caveat is longer than the 80-column floor once composed onto the line, so it
+        // wraps -- assert the halves rather than the whole sentence.
+        assert!(
+            painted.contains("uncertain:"),
+            "the weak fit's caveat is missing: {painted}"
+        );
+        assert!(
+            painted.contains("began after this meeting had"),
+            "the weak fit's caveat is missing: {painted}"
+        );
+        assert!(painted.contains("enter choose a meeting"), "{painted}");
+    }
+
+    /// A settled pick supersedes the guess wherever the frame states the meeting: the clause
+    /// reads plainly -- Confirmed carries no caveat -- with a marker saying how it got there.
+    #[test]
+    fn a_settled_pick_replaces_the_guess_on_the_frame() {
+        let guess = meeting_of("EVENT-A", "Standup", MeetingFit::JoinedLate);
+        let picked = meeting_of("EVENT-B", "Incident review", MeetingFit::Confirmed);
+        let mut state = State::default();
+        state.apply(&started(14));
+        state.apply(&Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&guess), MeetingOffer::from(&picked)],
+            guess: Some(MeetingLabel::from(&guess)),
+        });
+        state.apply(&Note::MeetingSettled {
+            label: MeetingLabel::from(&picked),
+        });
+
+        let painted = painted(80, 24, &state, None).join("\n");
+        assert!(painted.contains("Incident review"), "{painted}");
+        assert!(painted.contains("(by hand)"), "{painted}");
+        assert!(
+            !painted.contains("uncertain:"),
+            "the guess's caveat survived the pick: {painted}"
+        );
+    }
+
+    /// The open selector lists every offer through the projection's own line, marks the guess
+    /// the way the correction command marks the attached one, and highlights only the row under
+    /// the cursor -- here the second, after one move down.
+    #[test]
+    fn an_open_selector_lists_marks_and_highlights() {
+        let guess = meeting_of("EVENT-A", "Standup", MeetingFit::Started);
+        let other = meeting_of("EVENT-B", "Planning", MeetingFit::Unknown);
+        let mut state = State::default();
+        state.apply(&started(15));
+        state.apply(&Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&guess), MeetingOffer::from(&other)],
+            guess: Some(MeetingLabel::from(&guess)),
+        });
+        state.open_selector();
+        state.next();
+
+        let rows = rows_highlighted(80, 24, &state, None);
+        // The quoted titles discriminate the selector's rows from the session block's
+        // meeting line, which states the same guess unquoted.
+        let standup = rows
+            .iter()
+            .find(|(text, _)| text.contains("\"Standup\""))
+            .expect("the guess offer is listed: {rows:?}");
+        let planning = rows
+            .iter()
+            .find(|(text, _)| text.contains("\"Planning\""))
+            .expect("the second offer is listed: {rows:?}");
+        assert!(
+            standup.0.contains("<- the guess"),
+            "the guess is not marked: {rows:?}"
+        );
+        assert!(
+            !planning.0.contains("<- the guess"),
+            "the marker follows the guess, not the cursor: {rows:?}"
+        );
+        assert!(planning.1, "the cursor row is highlighted: {rows:?}");
+        assert!(!standup.1, "only the cursor row is highlighted: {rows:?}");
+        assert!(
+            rows.iter().any(|(text, _)| text.contains("up/down move")),
+            "the open selector advertises its keys: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(text, _)| text.contains("esc back")),
+            "the open selector advertises its escape: {rows:?}"
+        );
+    }
+
+    /// The degraded view: no grant, empty calendar or unreadable store all open the selector
+    /// to the correction command's own sentence rather than a blank area or an error.
+    #[test]
+    fn an_empty_offer_list_says_nothing_is_offered() {
+        let mut state = State::default();
+        state.apply(&started(16));
+        state.apply(&Note::MeetingOffered {
+            offered: vec![],
+            guess: None,
+        });
+        state.open_selector();
+
+        let painted = painted(80, 24, &state, None).join("\n");
+        // The sentence is longer than the 80-column floor, so it wraps -- assert the halves
+        // rather than the whole line.
+        assert!(
+            painted.contains("No meeting is on the calendar around this session"),
+            "{painted}"
+        );
+        assert!(painted.contains("could not be"), "{painted}");
+    }
+
+    /// Privacy at the type boundary the live selector crosses: a meeting carrying every field
+    /// that must never reach a terminal projects into offers, and the painted pixels carry the
+    /// title and count -- and nothing from the secret list. The same promise as the finish
+    /// line's negative test, asserted against the selector's rows instead of the summary.
+    #[test]
+    fn the_selector_never_paints_an_attendee_or_the_invite() {
+        let meeting = Meeting::new(
+            "EVENT-ABC".to_owned(),
+            "Incident review".to_owned(),
+            "Work".to_owned(),
+            "2026-08-15T10:00:00Z".parse().unwrap(),
+            "2026-08-15T11:00:00Z".parse().unwrap(),
+        )
+        .with_people(
+            Some(Attendee {
+                name: Some("Alan Turing".to_owned()),
+                email: Some("alan@example.com".to_owned()),
+                status: AttendeeStatus::Accepted,
+                is_you: false,
+            }),
+            vec![Attendee {
+                name: Some("Grace Hopper".to_owned()),
+                email: Some("grace@example.com".to_owned()),
+                status: AttendeeStatus::Accepted,
+                is_you: true,
+            }],
+        )
+        .with_invite(
+            Some("https://example.com/j/12345".to_owned()),
+            Some("Babbage Room".to_owned()),
+            Some("Dial-in 555-0100, passcode 481516".to_owned()),
+        );
+
+        let mut state = State::default();
+        state.apply(&started(17));
+        state.apply(&Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&meeting)],
+            guess: Some(MeetingLabel::from(&meeting)),
+        });
+        state.open_selector();
+
+        let painted = painted(80, 24, &state, None).join("\n");
+        assert!(painted.contains("Incident review"), "{painted}");
+        assert!(painted.contains("attendee(s)"), "{painted}");
+        for secret in [
+            "Turing",
+            "Hopper",
+            "@example.com",
+            "@",
+            "Babbage",
+            "Dial-in",
+            "481516",
+            "example.com",
+        ] {
+            assert!(
+                !painted.contains(secret),
+                "the selector leaks {secret:?}: {painted}"
             );
         }
     }

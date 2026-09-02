@@ -13,7 +13,12 @@
 //!
 //! Raw mode means SIGINT no longer arrives, so Ctrl-C is delivered by the frame itself, through
 //! the cloned sender the run's ctrlc handler uses in plain mode: the main loop finalizes the
-//! session exactly as it would have.
+//! session exactly as it would have. The frame is now a second producer of events in kind,
+//! not just in that one case: a hand pick of a calendar offer rides the same cloned sender
+//! as an [`Event::MeetingPicked`], decided at the same single reader as a mic edge. What keeps
+//! the contract intact is that the payload is an identifier the run resolves against the list
+//! it handed over -- never a meeting -- and that every match site in the loop owes a deliberate
+//! answer per variant.
 //!
 //! # Teardown
 //!
@@ -237,13 +242,44 @@ fn run(
         match poll(TICK) {
             Ok(true) => {
                 while let Ok(crossterm_event) = read() {
-                    if let CrosstermEvent::Key(key) = crossterm_event
-                        && event(key) == Some(Action::Interrupt)
-                    {
-                        // Raw mode swallows SIGINT, so the frame delivers the interrupt
-                        // through the same channel the ctrlc handler uses in plain mode:
-                        // the main loop finalizes the session exactly as it would have.
-                        let _ = tx.send(Event::Interrupt);
+                    if let CrosstermEvent::Key(key) = crossterm_event {
+                        match event(key, state.selector_open) {
+                            Some(Action::Interrupt) => {
+                                // Raw mode swallows SIGINT, so the frame delivers the
+                                // interrupt through the same channel the ctrlc handler uses
+                                // in plain mode: the main loop finalizes the session exactly
+                                // as it would have.
+                                let _ = tx.send(Event::Interrupt);
+                            }
+                            Some(action) => {
+                                // The selector's commands enter the state machine as typed
+                                // commands, the way `enroll` feeds answers: the shell decides
+                                // nothing about them, it only hands them over and marks the
+                                // frame dirty so the cursor move is drawn.
+                                match action {
+                                    Action::OpenSelector => state.open_selector(),
+                                    Action::Next => state.next(),
+                                    Action::Previous => state.previous(),
+                                    Action::CloseSelector => state.close_selector(),
+                                    Action::Confirm => {
+                                        // The identifier, not the meeting: the run resolves
+                                        // it against the list it handed over, and a pick it
+                                        // cannot resolve settles nothing.
+                                        if let Some(event_id) = state.confirm() {
+                                            let _ = tx.send(Event::MeetingPicked(event_id));
+                                        }
+                                    }
+                                    // The stop never reaches this arm: the interrupt arm
+                                    // above decides Ctrl-C before the selector commands get
+                                    // a look at the key.
+                                    Action::Interrupt => {
+                                        unreachable!("Ctrl-C is decided by the interrupt arm")
+                                    }
+                                }
+                                *dirty = true;
+                            }
+                            None => {}
+                        }
                     }
                 }
             }
@@ -284,33 +320,68 @@ fn run(
     Ok(())
 }
 
-/// What a keypress means to the frame. One action today; the base TUI has no navigation, and
-/// TASK-056.01 grows this table rather than the loop that reads it.
+/// What a keypress means to the frame.
+///
+/// The stop is the base TUI's only binding; the rest is TASK-056.01's meeting selector, and
+/// they grow this table rather than the loop that reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     /// Stop the run and exit: the main loop finalizes the session exactly as a plain-mode
     /// Ctrl-C would have.
     Interrupt,
+    /// Open the meeting selector: the numbered offers replace the notice region while it is
+    /// open. Allowed even with an empty list -- that is the degraded view, and the frame says
+    /// nothing is offered rather than hiding the key.
+    OpenSelector,
+    /// Move the cursor down one row, wrapping.
+    Next,
+    /// Move the cursor up one row, wrapping.
+    Previous,
+    /// Confirm the offer under the cursor: its identifier crosses into the run as an
+    /// [`Event::MeetingPicked`]. The selector stays open until the run's settlement says the
+    /// pick stuck -- a pick the run drops leaves the user looking at the list rather than a
+    /// false confirmation.
+    Confirm,
+    /// Close the selector without picking.
+    CloseSelector,
 }
 
-/// The key map, as a free function taking a [`KeyEvent`] because a `KeyEvent` is constructible
-/// without a terminal -- which is what makes this rule testable, the way `enroll`'s `event`
-/// is. It is also where a stray Ctrl or a release-shaped duplicate would otherwise go wrong.
-fn event(key: KeyEvent) -> Option<Action> {
+/// The key map, as a free function of `(key, selector_open)` because a `KeyEvent` is
+/// constructible without a terminal -- which is what makes this rule testable, the way
+/// `enroll`'s `event` is -- and because Enter genuinely means two things depending on context:
+/// opening the question when there is no list on screen, choosing from it when there is. It
+/// is also where a stray Ctrl or a release-shaped duplicate would otherwise go wrong.
+fn event(key: KeyEvent, selector_open: bool) -> Option<Action> {
     // A release is not a press. Terminals that report both would otherwise act on every key
     // twice.
     if key.kind == KeyEventKind::Release {
         return None;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match (key.code, ctrl) {
+    // The control-modifier check comes first, exactly as the base TUI had it: a Ctrl-prefixed
+    // key is the stop regardless of what the selector is doing.
+    if ctrl {
         // Ctrl-C and Ctrl-D are both stopping, the way `enroll`'s interface reads them: raw
         // mode means no SIGINT arrives, so the keys are the interrupt, and end-of-input is
         // stopping rather than failing. A real terminal delivers the control byte (lowercase),
         // but the pre-interface handler read either case, so both are kept.
-        (KeyCode::Char('c' | 'C' | 'd' | 'D'), true) => Some(Action::Interrupt),
-        // Everything else is ignored: the base TUI binds nothing but the stop, and a key that
-        // cannot work is not acted on.
+        return match key.code {
+            KeyCode::Char('c' | 'C' | 'd' | 'D') => Some(Action::Interrupt),
+            _ => None,
+        };
+    }
+    match key.code {
+        // The cursor moves in both contexts: while the selector is closed it moves the row a
+        // later open will land on, and the state machine makes movement a no-op on an empty
+        // list, so a key that cannot work does nothing rather than something wrong.
+        KeyCode::Up => Some(Action::Previous),
+        KeyCode::Down => Some(Action::Next),
+        // Contextual: with a list on screen Enter chooses from it; without one it opens it.
+        KeyCode::Enter if !selector_open => Some(Action::OpenSelector),
+        KeyCode::Enter => Some(Action::Confirm),
+        // Esc closes the list; with none open it has nothing to close, and a key that cannot
+        // work is not acted on.
+        KeyCode::Esc if selector_open => Some(Action::CloseSelector),
         _ => None,
     }
 }
@@ -334,37 +405,85 @@ mod tests {
         }
     }
 
-    /// Every bound key means what the footer says, and only a press of it: Ctrl-C and Ctrl-D,
-    /// either case, stop the run; their releases and every unbound key do nothing.
+    /// The stop keeps its precedence in both contexts, and only a press of it counts: Ctrl-C
+    /// and Ctrl-D, either case, interrupt even while the selector is open -- a pick in flight
+    /// must not keep a Ctrl-C from ending the run.
     #[test]
-    fn every_bound_key_means_what_the_footer_says() {
-        for letter in ['c', 'C', 'd', 'D'] {
+    fn the_stop_keeps_its_precedence_in_both_contexts() {
+        for selector_open in [false, true] {
+            for letter in ['c', 'C', 'd', 'D'] {
+                assert_eq!(
+                    event(
+                        press(KeyCode::Char(letter), KeyEventKind::Press, true),
+                        selector_open,
+                    ),
+                    Some(Action::Interrupt),
+                    "Ctrl-{letter} on a press stops the run with the selector {selector_open:?}"
+                );
+                assert_eq!(
+                    event(
+                        press(KeyCode::Char(letter), KeyEventKind::Release, true),
+                        selector_open,
+                    ),
+                    None,
+                    "a release of Ctrl-{letter} does nothing with the selector {selector_open:?}"
+                );
+            }
+        }
+    }
+
+    /// Every other bound key means what the footer advertises in that context, and only a
+    /// press of it: Enter opens the list when there is none on screen and chooses from it
+    /// when there is; up and down move the cursor either way; Esc closes only an open list.
+    #[test]
+    fn every_bound_key_means_what_the_footer_says_in_its_context() {
+        let closed = |code: KeyCode| event(press(code, KeyEventKind::Press, false), false);
+        let open = |code: KeyCode| event(press(code, KeyEventKind::Press, false), true);
+
+        // The contextual key: the same physical key, two meanings.
+        assert_eq!(closed(KeyCode::Enter), Some(Action::OpenSelector));
+        assert_eq!(open(KeyCode::Enter), Some(Action::Confirm));
+
+        // The cursor moves in both contexts; movement on an empty or closed list is the
+        // state machine's no-op, not the table's refusal.
+        assert_eq!(closed(KeyCode::Up), Some(Action::Previous));
+        assert_eq!(closed(KeyCode::Down), Some(Action::Next));
+        assert_eq!(open(KeyCode::Up), Some(Action::Previous));
+        assert_eq!(open(KeyCode::Down), Some(Action::Next));
+
+        // Esc has something to close only while the list is on screen.
+        assert_eq!(open(KeyCode::Esc), Some(Action::CloseSelector));
+        assert_eq!(closed(KeyCode::Esc), None, "nothing is open to close");
+
+        // Releases of the navigation keys do nothing, in either context.
+        for code in [KeyCode::Enter, KeyCode::Up, KeyCode::Down, KeyCode::Esc] {
             assert_eq!(
-                event(press(KeyCode::Char(letter), KeyEventKind::Press, true)),
-                Some(Action::Interrupt),
-                "Ctrl-{letter} on a press stops the run"
+                event(press(code, KeyEventKind::Release, false), true),
+                None,
+                "a release of {code:?} does nothing"
             );
             assert_eq!(
-                event(press(KeyCode::Char(letter), KeyEventKind::Release, true)),
+                event(press(code, KeyEventKind::Release, false), false),
                 None,
-                "a release of Ctrl-{letter} does nothing"
+                "a release of {code:?} does nothing"
             );
         }
 
-        // Unbound keys are ignored, including the ones a future navigation layer will want:
-        // acting on them now would make the base TUI do something it does not advertise.
+        // Unbound keys are ignored in both contexts, and a control-modified navigation key
+        // is not a navigation key: the modifier check comes first.
         for code in [
             KeyCode::Char('x'),
-            KeyCode::Enter,
-            KeyCode::Up,
-            KeyCode::Down,
             KeyCode::Tab,
+            KeyCode::Left,
+            KeyCode::Right,
         ] {
-            assert_eq!(
-                event(press(code, KeyEventKind::Press, false)),
-                None,
-                "unbound {code:?} does nothing"
-            );
+            assert_eq!(closed(code), None, "unbound {code:?} does nothing");
+            assert_eq!(open(code), None, "unbound {code:?} does nothing");
         }
+        assert_eq!(
+            event(press(KeyCode::Up, KeyEventKind::Press, true), true),
+            None,
+            "Ctrl-Up is not the cursor"
+        );
     }
 }

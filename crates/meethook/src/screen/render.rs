@@ -1393,6 +1393,7 @@ mod tests {
         let plain = MeetingLabel {
             title: "Incident review".to_owned(),
             fit: MeetingFit::Started,
+            event_id: "EVENT-1".to_owned(),
         };
         let rows = painted_with(
             110,
@@ -1414,6 +1415,7 @@ mod tests {
         let late = MeetingLabel {
             title: "Incident review".to_owned(),
             fit: MeetingFit::JoinedLate,
+            event_id: "EVENT-1".to_owned(),
         };
         let rows = painted_with(
             110,
@@ -1449,6 +1451,7 @@ mod tests {
             title: "Quarterly infrastructure planning and migration review with the platform group"
                 .to_owned(),
             fit: MeetingFit::JoinedLate,
+            event_id: "EVENT-1".to_owned(),
         };
         let rows = painted_with(
             80,
@@ -1491,6 +1494,7 @@ mod tests {
         let unknown = MeetingLabel {
             title: "Standup".to_owned(),
             fit: MeetingFit::Unknown,
+            event_id: "EVENT-1".to_owned(),
         };
         let rows = painted_with(
             80,

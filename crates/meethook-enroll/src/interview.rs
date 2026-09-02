@@ -16,12 +16,14 @@ use crate::{EnrollRules, Refusal, run_enroll};
 
 /// The meeting a session was recorded during, as far as a terminal may see it.
 ///
-/// Only the title and how strongly the session's start supports the match. [`Meeting`] holds
-/// more -- organizer, attendees, location, URL, invite body -- and none of that may reach a
-/// terminal or a log line: attendee names and addresses exist in `session.json` for speaker
-/// identification and are deliberately never printed, and an invite body routinely carries a
-/// dial-in PIN. Projecting to these two fields makes "nothing sensitive crosses" a property
-/// of the type rather than a rule every consumer must remember.
+/// The title, how strongly the session's start supports the match, and the event's own
+/// identifier. [`Meeting`] holds more -- organizer, attendees, location, URL, invite body --
+/// and none of that may reach a terminal or a log line: attendee names and addresses exist in
+/// `session.json` for speaker identification and are deliberately never printed, and an invite
+/// body routinely carries a dial-in PIN. Projecting to these fields makes "nothing sensitive
+/// crosses" a property of the type rather than a rule every consumer must remember; the
+/// identifier is structural (it is already in `session.json`) and is carried for addressing,
+/// never rendered.
 ///
 /// It also owns the one display shape every surface derives: [`clause`](Self::clause) is what
 /// `meethook record`'s meeting line and the enroll queue announcement both print, so they
@@ -34,6 +36,11 @@ pub struct MeetingLabel {
     pub title: String,
     /// How strongly the session's start supports this being the meeting.
     pub fit: MeetingFit,
+    /// The event's own identifier, carried rather than printed: it is how a surface that
+    /// shows the label addresses the meeting again -- the record interface marks the offer a
+    /// guess points at and sends a hand pick back by it. Structural rather than sensitive:
+    /// it is already written to `session.json`, and nothing here renders it.
+    pub event_id: String,
 }
 
 impl MeetingLabel {
@@ -55,6 +62,7 @@ impl From<&Meeting> for MeetingLabel {
         Self {
             title: meeting.title.clone(),
             fit: meeting.fit,
+            event_id: meeting.event_id.clone(),
         }
     }
 }

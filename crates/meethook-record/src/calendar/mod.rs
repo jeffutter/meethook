@@ -15,6 +15,13 @@
 //! edited during the meeting resolves to its edited form, which is the better of the two
 //! errors.
 //!
+//! There is one other caller of the same read, and it is mid-recording rather than at finish:
+//! the record interface asks [`meetings_for`] once when a session opens, so the user can see
+//! what the automatic rule would attach and pick a different event by hand while the call is
+//! still live. That pause bounds the main thread's event loop, not the capture -- the engines
+//! run on their own threads -- and the *ask* for the grant happened once at record start,
+//! long before this read, so nothing here prompts.
+//!
 //! **The lookup only ever reads the grant; asking for one is a different call at a different
 //! time.** [`meeting_at`] calls `authorizationStatusForEntityType:` and nothing else, which is
 //! a pure read: no prompt, no daemon wake, no Info.plist requirement. That matters because the
@@ -90,34 +97,7 @@ const QUERY_WINDOW: SignedDuration = SignedDuration::from_secs(60 * 60);
 /// same outcome to the one function whose failure would cost a recording, so the branch
 /// belongs here rather than at the call site.
 pub(crate) fn meeting_at(at: Timestamp) -> Option<Meeting> {
-    let status = status();
-    if status != EKAuthorizationStatus::FullAccess {
-        debug(&format!(
-            "calendar access is not granted (status {}); no meeting will be recorded",
-            status.0
-        ));
-        return None;
-    }
-
-    // SAFETY: every call inside is a read against a freshly created store, made from the
-    // finishing thread with both capture engines already stopped. The store, the dates and
-    // the predicate all outlive the query, and every event is converted to owned Rust before
-    // any of them is dropped.
-    let candidates = caught("EKEventStore.eventsMatchingPredicate", || unsafe {
-        candidates_around(at)
-    })?;
-    if debugging() {
-        for candidate in &candidates {
-            debug(&summarize(candidate));
-        }
-    }
-
-    let chosen = select(candidates, at);
-    debug(&match chosen.as_ref() {
-        Some(meeting) => format!("selected {:?}", meeting.title),
-        None => "no candidate matched the session start".to_owned(),
-    });
-    chosen
+    meetings_for(at).chosen
 }
 
 /// Every meeting worth offering as a correction for a session that started at `at`.
@@ -137,17 +117,50 @@ pub(crate) fn meeting_at(at: Timestamp) -> Option<Meeting> {
 /// match, and only a person choosing one makes it
 /// [`meethook_session::MeetingFit::Confirmed`].
 pub fn meetings_around(at: Timestamp) -> Vec<Meeting> {
+    meetings_for(at).offered
+}
+
+/// Both halves of the question "what meeting does this session belong to", answered by one
+/// status check and one store query.
+///
+/// [`meetings_for`] is the shared heart of [`meeting_at`] and [`meetings_around`], and the
+/// answer the record interface asks mid-recording: the full-screen frame wants *both* halves
+/// at once -- the one the automatic rule would attach, to show with its fit, and everything
+/// worth offering, so a wrong guess can be corrected by hand without leaving the call. Two
+/// separate calls would take the store pass twice for the same window, and the split into one
+/// named value is what says they come from one query and cannot disagree about the window.
+///
+/// Total, exactly as each half is and for the same reasons: a missing grant, an empty
+/// calendar, a raise and a panic all leave both fields empty. The `chosen` meeting carries
+/// the fit [`select`] decided; every `offered` meeting keeps
+/// [`meethook_session::MeetingFit::Unknown`], and `chosen` is always one of `offered` when it
+/// is present -- `select` and `offerable` filter the same candidates, so a meeting the rules
+/// would attach is always one a person may offer themselves.
+pub struct MeetingLookup {
+    /// Every meeting worth offering as a hand correction, in [`select::offerable`]'s stable
+    /// order.
+    pub offered: Vec<Meeting>,
+    /// The one the automatic rule would attach, with the fit that rule decided.
+    pub chosen: Option<Meeting>,
+}
+
+pub fn meetings_for(at: Timestamp) -> MeetingLookup {
     let status = status();
     if status != EKAuthorizationStatus::FullAccess {
         debug(&format!(
-            "calendar access is not granted (status {}); no meetings can be offered",
+            "calendar access is not granted (status {}); no meeting will be recorded",
             status.0
         ));
-        return Vec::new();
+        return MeetingLookup {
+            offered: Vec::new(),
+            chosen: None,
+        };
     }
 
-    // SAFETY: as `meeting_at` -- a read against a freshly created store, with every event
-    // converted to owned Rust before the store, dates or predicate are dropped.
+    // SAFETY: every call inside is a read against a freshly created store, made from the
+    // calling thread with every event converted to owned Rust before the store, the dates or
+    // the predicate are dropped. At finish the engines are already stopped; mid-recording
+    // they run on their own threads, which is why this pause costs attention, not audio.
     let candidates = caught("EKEventStore.eventsMatchingPredicate", || unsafe {
         candidates_around(at)
     })
@@ -157,7 +170,16 @@ pub fn meetings_around(at: Timestamp) -> Vec<Meeting> {
             debug(&summarize(candidate));
         }
     }
-    offerable(candidates)
+
+    let chosen = select(candidates.clone(), at);
+    debug(&match chosen.as_ref() {
+        Some(meeting) => format!("selected {:?}", meeting.title),
+        None => "no candidate matched the session start".to_owned(),
+    });
+    MeetingLookup {
+        offered: offerable(candidates),
+        chosen,
+    }
 }
 
 /// The calendar authorization status.

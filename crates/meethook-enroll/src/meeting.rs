@@ -277,28 +277,77 @@ fn write_offer(
     Ok(())
 }
 
+/// One meeting as a person may see it *as an offer*, and the whole of what they may see.
+///
+/// The title, when it ran, the calendar it is in, and how many people were invited -- plus the
+/// event's own identifier, which is carried rather than printed: it is the address a hand pick
+/// travels back by, and it is structural rather than sensitive (already written to
+/// `session.json`). **Not** the attendees themselves, the organizer, the location, the URL or
+/// the invite body: those reach `session.json` because speaker identification and a reader's
+/// "what was this about" need them, and they reach nothing else -- no terminal, no log line, no
+/// pasted error report. The record interface's live selector stores these projections rather
+/// than [`Meeting`]s, so a widened-by-accident leak fails at the type instead of at a user's
+/// screen.
+///
+/// It owns the one offer line every surface derives: [`line`](Self::line) is what the numbered
+/// listing prints and what the live selector paints per row, so the two cannot drift into two
+/// wordings of the same meeting. The wording itself is this crate's -- `describe` builds
+/// through the projection precisely so it has one owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetingOffer {
+    /// The invite's title: the handle for "which call was this".
+    pub title: String,
+    /// When it ran, the instant the calendar stored it.
+    pub start: Timestamp,
+    pub end: Timestamp,
+    /// The containing calendar's display name.
+    pub calendar: String,
+    /// How many people were invited -- a count, never the roster.
+    pub attendee_count: usize,
+    /// The event's own identifier. Never rendered; it is how a selection of this offer is
+    /// addressed back to the run.
+    pub event_id: String,
+}
+
+impl MeetingOffer {
+    /// The one line a terminal may show about this offer.
+    ///
+    /// Local time rather than UTC, on the precedent a transcript's `created:` sets: this is
+    /// read beside a calendar the user has open, and 10:00 there has to be 10:00 here.
+    pub fn line(&self) -> String {
+        format!(
+            "{title:?}  {start} .. {end}  [{calendar}]  {count} attendee(s)",
+            title = self.title,
+            start = local(self.start, "%Y-%m-%d %H:%M"),
+            end = local(self.end, "%H:%M"),
+            calendar = self.calendar,
+            count = self.attendee_count,
+        )
+    }
+}
+
+impl From<&Meeting> for MeetingOffer {
+    fn from(meeting: &Meeting) -> Self {
+        Self {
+            title: meeting.title.clone(),
+            start: meeting.start,
+            end: meeting.end,
+            calendar: meeting.calendar.clone(),
+            attendee_count: meeting.attendee_count(),
+            event_id: meeting.event_id.clone(),
+        }
+    }
+}
+
 /// One meeting as a person may see it, and the whole of what they may see.
 ///
-/// The title, when it ran, the calendar it is in, and how many people were invited. **Not** the
-/// attendees themselves, the organizer, the location, the URL or the invite body: those reach
-/// `session.json` because speaker identification and a reader's "what was this about" need
-/// them, and they reach nothing else -- no terminal, no log line, no pasted error report.
-///
-/// One function, so the rule is a property of the code rather than a promise repeated at each
-/// call site. `meethook-record`'s own `summarize` is the same arrangement for the same reason,
-/// and both are tested against a meeting stuffed with everything that must not appear.
-///
-/// Local time rather than UTC, on the precedent a transcript's `created:` sets: this is read
-/// beside a calendar the user has open, and 10:00 there has to be 10:00 here.
+/// Built through [`MeetingOffer`], so the listing line and the live selector's rows share one
+/// composer and cannot drift. The rule the projection enforces -- no attendee, organizer,
+/// location, URL or invite body -- is tested against a meeting stuffed with everything that
+/// must not appear, and `meethook-record`'s own `summarize` is the same arrangement for the
+/// same reason.
 fn describe(meeting: &Meeting) -> String {
-    format!(
-        "{:?}  {} .. {}  [{}]  {} attendee(s)",
-        meeting.title,
-        local(meeting.start, "%Y-%m-%d %H:%M"),
-        local(meeting.end, "%H:%M"),
-        meeting.calendar,
-        meeting.attendee_count(),
-    )
+    MeetingOffer::from(meeting).line()
 }
 
 /// An instant in the machine's own zone, which is the one the calendar was written in.
@@ -339,6 +388,66 @@ mod tests {
     impl MeetingSource for NoCalendar {
         fn around(&self, _at: Timestamp) -> Vec<Meeting> {
             unreachable!("clearing a label must not consult the calendar");
+        }
+    }
+
+    /// TASK-056.01 acceptance criterion #7: a stuffed meeting projects into a line carrying
+    /// title, times, calendar and count -- and nothing from the secret list. The same promise
+    /// as [`nothing_printed_names_an_attendee_or_quotes_the_invite`], but checked at the type
+    /// boundary the record interface crosses: the frame stores this projection, so the rule
+    /// must hold on it, not only on the listing's printed output.
+    #[test]
+    fn the_offer_projection_carries_nothing_sensitive() {
+        let stuffed = meeting(
+            "EVENT-1",
+            "Incident review",
+            "2026-08-09T05:25:00Z",
+            "2026-08-09T06:25:00Z",
+        )
+        .with_people(
+            Some(Attendee {
+                name: Some("Alan Turing".to_owned()),
+                email: Some("alan@example.com".to_owned()),
+                status: AttendeeStatus::Accepted,
+                is_you: false,
+            }),
+            vec![Attendee {
+                name: Some("Grace Hopper".to_owned()),
+                email: Some("grace@example.com".to_owned()),
+                status: AttendeeStatus::Accepted,
+                is_you: false,
+            }],
+        )
+        .with_invite(
+            Some("https://example.com/j/12345".to_owned()),
+            Some("Babbage Room, 12 Ada Street".to_owned()),
+            Some("Dial-in 555-0100, passcode 481516".to_owned()),
+        );
+
+        let offer = MeetingOffer::from(&stuffed);
+        let line = offer.line();
+
+        // What makes an offer recognizable is all there.
+        assert!(line.contains("\"Incident review\""), "{line}");
+        assert!(line.contains("[Work]"), "{line}");
+        assert!(line.contains("attendee(s)"), "{line}");
+
+        // And nothing from the never-printed list survives into the projection itself --
+        // asserted over its full Debug form, which spans every field the frame will ever see.
+        let whole = format!("{offer:?}");
+        for secret in [
+            "Alan Turing",
+            "alan@example.com",
+            "Grace Hopper",
+            "grace@example.com",
+            "https://example.com/j/12345",
+            "Babbage Room",
+            "passcode 481516",
+        ] {
+            assert!(
+                !whole.contains(secret),
+                "{secret} leaked into the projection"
+            );
         }
     }
 

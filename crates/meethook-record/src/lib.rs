@@ -30,12 +30,15 @@ mod speaker;
 mod track;
 
 pub use activity::{Activity, MicActivityWatcher};
-// `calendar` stays private: only the request and the value it reports cross the boundary, so
-// no caller can learn an EventKit selector or a status enum from this crate.
-// `meetings_around` crosses it as a plain `Vec<Meeting>` for the same reason: `meethook
-// meeting` needs the events around a session to offer as a correction, and gets them without
-// learning that EventKit exists.
-pub use calendar::{NoCalendarAccess, meetings_around, request_calendar_access};
+// `calendar` stays private: only the request and the values it reports cross the boundary,
+// so no caller can learn an EventKit selector or a status enum from this crate.
+// `meetings_around` and `meetings_for` cross it as plain `Vec<Meeting>`s for the same reason:
+// `meethook meeting` needs the events around a session to offer as a correction, and the
+// record interface needs the same answer plus the automatic pick while a session is live --
+// neither learns that EventKit exists.
+pub use calendar::{
+    MeetingLookup, NoCalendarAccess, meetings_around, meetings_for, request_calendar_access,
+};
 pub use preflight::{Authorized, MissingPermissions, preflight};
 pub use track::TrackSummary;
 
@@ -43,7 +46,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use jiff::{Timestamp, Zoned};
-use meethook_session::{Paths, SessionId, SessionMetadata, SessionPaths};
+use meethook_session::{Meeting, Paths, SessionId, SessionMetadata, SessionPaths};
 
 /// Everything capture can fail with.
 ///
@@ -238,6 +241,16 @@ impl RunningSession {
         &self.paths
     }
 
+    /// When this session began, as the moment the metadata will store it.
+    ///
+    /// The CLI asks the calendar "what meeting does this session belong to" against exactly
+    /// this instant -- decision-009's rule that the recorded start, not now, identifies the
+    /// meeting -- so the frame's live offer list and the finish-line lookup cannot drift onto
+    /// two different questions about the same session.
+    pub fn start_time(&self) -> Timestamp {
+        self.start_time
+    }
+
     /// The input device's own rate, as reported. Printed at start so the user can see that
     /// the mic engine actually came up.
     pub fn mic_sample_rate(&self) -> u32 {
@@ -274,7 +287,19 @@ impl RunningSession {
     ///
     /// The metadata write is last and atomic, so the presence of `session.json` keeps
     /// meaning "this recording completed and both tracks are finalized".
-    pub fn finish(self) -> Result<Recording> {
+    ///
+    /// `hand` is the meeting a person chose while the session was live, if one was chosen.
+    /// It is applied *here* rather than written when it was made because `session.json` does
+    /// not exist until this write -- writing mid-flight would mark a still-recording session
+    /// complete to every other process -- and it is the single finalize point that keeps the
+    /// choice and the completion marker one atomic step apart. A hand pick enters through
+    /// [`SessionMetadata::label_by_hand`], the same function the `meethook meeting`
+    /// correction writes with, so the `Confirmed` stamp and the settle-by-hand derivation
+    /// come from one place whether the pick was made live or afterwards. When a pick exists
+    /// the automatic lookup is skipped entirely: a human who was in the call is stronger
+    /// evidence than any rule over start and end times, and computing-then-discarding would
+    /// wake the calendar daemon for nothing.
+    pub fn finish(self, hand: Option<Meeting>) -> Result<Recording> {
         let RunningSession {
             id,
             paths,
@@ -310,13 +335,23 @@ impl RunningSession {
         // what identifies the meeting it belongs to. The lookup cannot fail -- see
         // `calendar` for why a missing grant, no match and a framework raise all arrive here
         // as `None`, and why losing a recording over the calendar would be the wrong trade.
-        let metadata = SessionMetadata::new(
+        //
+        // Skipped altogether when a person picked the meeting while the session was live:
+        // the pick is the strongest evidence this tool holds, and asking the calendar anyway
+        // would cost a daemon wake for an answer that is discarded either way.
+        let mut metadata = SessionMetadata::new(
             id.clone(),
             start_time,
             clock::track_sync(mic_ticks),
             clock::track_sync(speaker_ticks),
-        )
-        .with_meeting(calendar::meeting_at(start_time));
+        );
+        if let Some(meeting) = hand {
+            metadata.label_by_hand(Some(meeting));
+        } else {
+            // Today's path, unchanged: the automatic rule decides, and `with_meeting`'s
+            // no-op guard on a hand-settled label keeps the two halves from ever disagreeing.
+            metadata = metadata.with_meeting(calendar::meeting_at(start_time));
+        }
         metadata.write(&paths.session_json())?;
 
         Ok(Recording {
