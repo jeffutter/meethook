@@ -114,8 +114,9 @@ session directory.** That contract is the thing to understand before touching an
   than printed directly (batch commands must never prompt).
 - **`meethook`** (bin crate) — the CLI (`clap`) and everything that can't be tested without a
   terminal: printing, prompting, playing audio clips, and the full-screen `enroll` TUI
-  (`ratatui`, under `src/screen/`). Subcommand bodies in `commands.rs` are thin dispatch onto
-  the library crates above.
+  (`ratatui`, under `src/screen/`) plus the `record` TUI (`src/record_screen/`), which is the
+  screen presenter behind the same typed-note seam `record`'s line output prints through.
+  Subcommand bodies in `commands.rs` are thin dispatch onto the library crates above.
 
 ### Invariants worth knowing before changing code
 

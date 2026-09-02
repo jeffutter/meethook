@@ -527,7 +527,8 @@ impl MeetingSource for Calendar {
     }
 }
 
-/// Whether the run is attached to a person, as the two streams `enroll` actually uses.
+/// Whether the run is attached to a person, as the two streams `enroll` and `record` actually
+/// use.
 ///
 /// A struct rather than two bools passed positionally, for the reason [`crate::EnrollArgs`] gives
 /// for itself: adjacent bools transpose silently, and a transposed one here would open a
@@ -536,20 +537,34 @@ impl MeetingSource for Calendar {
 /// Not stderr. Narration goes to stdout, through `Lines::new(&mut io::stdout())` in [`enroll`],
 /// and [`Terminal::identify`] asks its question with `println!` -- so stdout is the stream a
 /// full-screen frame would have to fight over, and stderr says nothing about whether it could.
+/// `record`'s line-based output is the same story: its status lines and its finish summary all
+/// go to stdout.
+///
+/// Shared with `record` rather than duplicated there: "is this run attached to a person" is one
+/// fact about the process, and reading `is_terminal()` twice in two modules is where the two
+/// answers drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Tty {
-    stdin: bool,
-    stdout: bool,
+pub(crate) struct Tty {
+    pub(crate) stdin: bool,
+    pub(crate) stdout: bool,
 }
 
 impl Tty {
     /// What this process is actually attached to. The one line of this decision no test can
-    /// decide, which is why it is the only thing in here that reads the process.
-    fn current() -> Tty {
+    /// decide, which is why it is the only thing in here that reads the process. Shared with
+    /// `record` rather than re-read there: both presenters must answer the same question about
+    /// the same two streams.
+    pub(crate) fn current() -> Tty {
         Tty {
             stdin: io::stdin().is_terminal(),
             stdout: io::stdout().is_terminal(),
         }
+    }
+
+    /// Whether both ends are attached to a terminal: the only case a full-screen interface may
+    /// open in. A pipe on either end keeps the run on its line output.
+    pub(crate) fn is_attached(self) -> bool {
+        self.stdin && self.stdout
     }
 }
 

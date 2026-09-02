@@ -10,6 +10,11 @@ mod clips;
 mod commands;
 mod headless;
 mod record;
+// Off macOS the whole interface would reference the record crate's types through a dependency
+// that does not compile there; under `test` it stays, because its state and render halves are
+// exactly what the platform-neutral test suite exercises.
+#[cfg(any(target_os = "macos", test))]
+mod record_screen;
 mod screen;
 
 use std::path::PathBuf;
@@ -106,13 +111,24 @@ struct Cli {
 enum Command {
     /// Record meetings until interrupted
     ///
-    /// Watches the default microphone and records each call as a session. Takes no
-    /// options: there is nothing to configure that the tool cannot detect itself.
+    /// Watches the default microphone and records each call as a session. On a real terminal
+    /// it opens a full-screen interface showing what it is doing; piped or redirected runs --
+    /// scripts, CI, `meethook record | tee log` -- get the plain status lines instead, decided
+    /// before anything session-specific happens.
     ///
     /// macOS only: the capture backend is built from Apple frameworks that do not compile
     /// anywhere else, so the subcommand is absent rather than stubbed on other platforms.
     #[cfg(target_os = "macos")]
-    Record,
+    Record {
+        /// Record line by line, never opening the full-screen interface
+        ///
+        /// What you get anyway when either end of the command is a pipe rather than a
+        /// terminal, so a script, a shell pipeline or CI needs nothing here. Give it on a real
+        /// terminal to keep the plain status lines, or to leave the interface out of a bug
+        /// report.
+        #[arg(long)]
+        plain: bool,
+    },
 
     /// Transcribe recorded sessions
     ///
@@ -377,7 +393,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         #[cfg(target_os = "macos")]
-        Command::Record => record::record(&paths),
+        Command::Record { plain } => record::record(&paths, plain),
         Command::Transcribe {
             session_ids,
             force,
@@ -640,6 +656,39 @@ mod tests {
     fn a_meeting_command_needs_a_session() {
         let message = refused(&["meethook", "meeting"]);
         assert!(message.contains("SESSION_ID"), "{message}");
+    }
+
+    /// What `meethook record` would run with, given these arguments: whether the plain flag was
+    /// set. `record` is the only subcommand with a single bool option, so the flag itself is
+    /// the whole parse result worth asserting.
+    #[cfg(target_os = "macos")]
+    fn record_args(args: &[&str]) -> bool {
+        match Cli::try_parse_from(args).expect("should parse").command {
+            Command::Record { plain } => plain,
+            other => panic!("expected a record command, got {other:?}"),
+        }
+    }
+
+    /// Typing the least still means exactly what it meant before `--plain` existed: a bare
+    /// `record` opens the interface on a terminal and asks for nothing else.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bare_record_is_unchanged_by_the_plain_flag_existing() {
+        assert!(!record_args(&["meethook", "record"]));
+    }
+
+    /// `--plain` composes with the global flags, the way enroll's does: a driver that points at
+    /// a scratch root and passes `--plain` unconditionally for safety must parse.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn record_plain_composes_with_root() {
+        assert!(record_args(&[
+            "meethook",
+            "--root",
+            "/tmp/scratch",
+            "record",
+            "--plain"
+        ]));
     }
 
     /// Typing the least still means exactly what it meant before `--plain` existed. Every

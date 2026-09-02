@@ -16,6 +16,13 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 #[cfg(any(target_os = "macos", test))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "macos", test))]
+use std::fmt;
+#[cfg(any(target_os = "macos", test))]
+use std::path::PathBuf;
+
+#[cfg(any(target_os = "macos", test))]
+use crate::commands::Tty;
 #[cfg(target_os = "macos")]
 use anyhow::Context;
 #[cfg(any(target_os = "macos", test))]
@@ -24,6 +31,8 @@ use anyhow::Result;
 use meethook_enroll::MeetingLabel;
 #[cfg(target_os = "macos")]
 use meethook_session::Paths;
+#[cfg(any(target_os = "macos", test))]
+use meethook_session::SessionId;
 // The capture backend exists only where its Apple frameworks compile; the platform-neutral
 // sequencing in `record_loop` below stays ungated and keeps testing without it.
 #[cfg(target_os = "macos")]
@@ -92,8 +101,10 @@ impl Timing {
 /// Anything the record loop waits on.
 ///
 /// One enum, one channel: a Ctrl-C during a recording has to be seen at the same instant
-/// as a microphone edge, and two separate waits cannot both be blocking.
-enum Event {
+/// as a microphone edge, and two separate waits cannot both be blocking. `pub(crate)` because
+/// the full-screen frame delivers its Ctrl-C through a clone of this channel's sender; the
+/// event set itself stays private to this module.
+pub(crate) enum Event {
     Started,
     Stopped,
     /// The default input device moved. Not an edge of the activity predicate: it says the
@@ -111,18 +122,338 @@ enum Event {
 /// to decide. This three-method seam is what makes it decidable in `cargo test`: the live
 /// implementation drives a [`Recorder`], and the test one records the order it was called
 /// in. Everything either of them knows about audio stays on their side of it.
+///
+/// Each method takes the run's note sink rather than printing: the backend is where the
+/// session's wording happens (its id, its rates, what a finish produced), and the sink is
+/// what decides whether those words land on a terminal or in a frame. Passing it in rather
+/// than storing it keeps the backend free of any reference into the run's presentation.
 trait Capture {
     /// Begins a session and announces it.
-    fn start(&mut self) -> Result<()>;
+    fn start(&mut self, sink: &mut dyn Reporter) -> Result<()>;
     /// Finalizes the current session and reports what it produced.
-    fn finish(&mut self) -> Result<()>;
+    fn finish(&mut self, sink: &mut dyn Reporter) -> Result<()>;
     /// Whether the microphone track has stopped receiving audio.
     ///
     /// Asked only while a session is live, once per `Timing::recheck`. The live backend
     /// answers from the track's own delivered frame count, so it catches every way an input
     /// tap can go quiet rather than only the ones that post a notification; nothing here
     /// needs a microphone to decide what the answer means.
-    fn mic_stalled(&mut self) -> bool;
+    fn mic_stalled(&mut self, sink: &mut dyn Reporter) -> bool;
+}
+
+#[cfg(any(target_os = "macos", test))]
+/// Which presentation a run gets.
+///
+/// Two rather than three, because `record` has no up-front answerer the way `enroll` has
+/// `--name`: every line it prints is decided by the loop itself, so the only question is
+/// whether those lines land on a real terminal or in a buffer somebody is capturing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Presenter {
+    /// The line-based output: what piped, redirected and CI runs have always gotten.
+    Lines,
+    /// The full-screen interface.
+    Screen,
+}
+
+/// Which presenter a run gets, given `--plain` and what the streams are attached to.
+///
+/// The order is the rule, and it is deliberate:
+///
+/// 1. A pipe on *either* end is the line output. Both streams, not just one: the plain lines
+///    go to stdout and the interface reads keys from stdin, so a run being driven -- by CI, by
+///    a shell pipeline, by a subprocess -- must not write escape sequences into a captured
+///    buffer and must not wait for a keypress a script cannot send.
+/// 2. `--plain` is the explicit override, for somebody on a real terminal who wants the lines
+///    back, or who needs the interface out of a reproduction.
+///
+/// A function rather than an inline `if`, for exactly the reason `answerer` and `meeting_line`
+/// are functions: the rule is then decidable in `cargo test` with no terminal in front of it,
+/// and "a driven run can never accidentally open a full-screen UI" stays independently
+/// testable. Called once at the top of [`record`], before any prompt or print.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn presenter(plain: bool, tty: Tty) -> Presenter {
+    if plain || !tty.is_attached() {
+        Presenter::Lines
+    } else {
+        Presenter::Screen
+    }
+}
+
+/// One thing the record run has to say, as the loop produces it.
+///
+/// Every user-visible message the run prints -- session start, device-change and mic-stall
+/// notices, the finish summary, the give-up line -- flows through this type rather than a
+/// `println!` at the point it happens. That is what lets the plain and the full-screen
+/// presenters share one source of truth for wording: the composers below produce today's exact
+/// literals, and both presenters render them.
+///
+/// The stream class is encoded in the variant itself rather than passed alongside, so that an
+/// exhaustive match forces a deliberate stream choice per note -- the same discipline the
+/// [`Recording`] enum applies to outcomes. Stdout-class notes describe the run to the user; in
+/// screen mode they also feed the narration buffer that restores scrollback parity. Stderr-class
+/// ones report faults and developer diagnostics; in screen mode they surface in-frame instead
+/// of drawing over the alternate screen.
+///
+/// The string-carrying variants carry the composed sentence rather than the error or problem
+/// value it came from: the calendar-problem text is static guidance that names no person, and
+/// the errors are flattened at the point they happen because a `String` is what a notice pane
+/// and a scrollback line alike can hold.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) enum Note {
+    // ---- stdout class ----
+    /// The calendar grant is missing: guidance, not an error, printed once at startup.
+    CalendarProblem(String),
+    /// The loop is idle, waiting for a call.
+    Watching,
+    /// A call was already in progress when the process started, so recording began at once.
+    AlreadyActive,
+    /// A session opened: its id, directory, and the rates both engines actually came up at.
+    SessionStarted {
+        id: SessionId,
+        dir: PathBuf,
+        mic_rate: u32,
+        mic_channels: u32,
+        speaker_rate: u32,
+    },
+    /// The default input device moved mid-session; the old one is being finalized.
+    DeviceChanged,
+    /// The microphone track stopped delivering audio; the session is being finalized.
+    MicStalled,
+    /// The session is ending on purpose: the call ended or the user interrupted.
+    Stopping,
+    /// A finalize-and-restart found the call was already over, so nothing new was opened.
+    NoNewSession,
+    /// A session finished: what it produced, and the meeting it was matched to if any.
+    ///
+    /// The meeting crosses as a [`MeetingLabel`] -- title and fit only -- never as the full
+    /// [`meethook_session::Meeting`]. Attendee names and addresses are written to
+    /// `session.json` for speaker identification and are deliberately never printed, and the
+    /// projection is what makes that a property of the type rather than a review of format
+    /// strings.
+    Recorded {
+        id: SessionId,
+        mic_secs: f64,
+        speaker_secs: f64,
+        dir: PathBuf,
+        meeting: Option<MeetingLabel>,
+    },
+
+    // ---- stderr class ----
+    /// The first failed attempt to open a session, in full.
+    BeginFailed(String),
+    /// A session that could not be finalized.
+    FinishFailed(String),
+    /// The start retry is exhausted; the loop goes back to watching.
+    ///
+    /// Stderr rather than stdout because the pre-interface run said it with `eprintln!`: the
+    /// give-up is a fault report about the recorder's own machinery, not narration of the
+    /// meeting, and AC #4 pins it to the stream it always had.
+    GivingUp(u32),
+    /// Developer diagnostics, gated at the call site on `MEETHOOK_ACTIVITY_DEBUG`.
+    ActivityDebug(String),
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Note {
+    /// This note's exact text, trailing newline included, as the line-based run prints it.
+    ///
+    /// Multi-line notes compose their whole block here -- `SessionStarted`'s five lines,
+    /// `Recorded`'s summary plus its conditional meeting clause -- so a presenter that prints
+    /// one string reproduces the byte sequence of the separate `println!` calls it replaced,
+    /// in the same order. `pub(crate)` because the full-screen state machine stores the
+    /// composed text verbatim rather than re-deriving it.
+    pub(crate) fn composed(&self) -> String {
+        match self {
+            Note::CalendarProblem(problem)
+            | Note::BeginFailed(problem)
+            | Note::FinishFailed(problem)
+            | Note::ActivityDebug(problem) => format!("{problem}\n"),
+            Note::Watching => format!("{WATCHING}\n"),
+            Note::AlreadyActive => format!("{ALREADY_ACTIVE}\n"),
+            Note::SessionStarted {
+                id,
+                dir,
+                mic_rate,
+                mic_channels,
+                speaker_rate,
+            } => session_started_lines(id, dir.display(), *mic_rate, *mic_channels, *speaker_rate),
+            Note::DeviceChanged => format!("{DEVICE_CHANGED}\n"),
+            Note::MicStalled => format!("{MIC_STALLED}\n"),
+            Note::Stopping => format!("{STOPPING}\n"),
+            Note::NoNewSession => format!("{NO_NEW_SESSION}\n"),
+            Note::Recorded {
+                id,
+                mic_secs,
+                speaker_secs,
+                dir,
+                meeting,
+            } => recorded_lines(
+                id,
+                *mic_secs,
+                *speaker_secs,
+                dir.display(),
+                meeting.as_ref(),
+            ),
+            Note::GivingUp(attempts) => giving_up_line(*attempts),
+        }
+    }
+
+    /// Whether this note goes to stderr: the faults and the developer diagnostics, and only
+    /// those. Everything the user is meant to read lands on stdout, which is the stream a
+    /// full-screen frame would fight over and the one a pipe captures. `pub(crate)` because
+    /// the full-screen state machine routes each note by its stream class rather than
+    /// re-deciding it.
+    pub(crate) fn to_stderr(&self) -> bool {
+        matches!(
+            self,
+            Note::BeginFailed(_)
+                | Note::FinishFailed(_)
+                | Note::GivingUp(_)
+                | Note::ActivityDebug(_)
+        )
+    }
+}
+
+/// The lines the run says while idle and between sessions.
+///
+/// Constants rather than inline formats because both presenters need them verbatim: the plain
+/// one prints them and the full-screen state machine stores them as notices, and one spelling
+/// is what keeps the frame and the scrollback from describing the same condition differently.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const WATCHING: &str = "Watching the default microphone. Press Ctrl-C to stop.";
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const ALREADY_ACTIVE: &str = "A microphone is already in use; recording immediately.";
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const RECORDING_PROMPT: &str = "Recording... press Ctrl-C to stop.";
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const DEVICE_CHANGED: &str = "The default input device changed. The microphone engine is bound to the device that went away, so this session is being finalized and a new one opened on the new device.";
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const MIC_STALLED: &str = "The microphone stopped delivering audio, so this session is being finalized and a new one opened. (The device did not change; something reconfigured or took the input, which stops the recording engine without any notice that it happened.)";
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const STOPPING: &str = "Stopping...";
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const NO_NEW_SESSION: &str =
+    "That call has ended as well, so no new session was opened.";
+
+/// The line naming a session as it opens.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn session_id_line(id: impl fmt::Display) -> String {
+    format!("Session {id}")
+}
+
+/// The line naming a session's directory.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn session_dir_line(dir: impl fmt::Display) -> String {
+    format!("  {dir}")
+}
+
+/// The line reporting the microphone engine's rate and channel count.
+///
+/// The padding aligns `mic` and `speaker` into one column in the plain output; the full-screen
+/// pane trims it away, since a bordered pane supplies its own margin.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn mic_line(rate: u32, channels: u32) -> String {
+    format!("  mic       {rate} Hz, {channels} channel(s) reported by the input device")
+}
+
+/// The line reporting the speaker engine's rate.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn speaker_line(rate: u32) -> String {
+    format!("  speaker   {rate} Hz")
+}
+
+/// The whole block a session opening prints: id, directory, both rates, and the prompt.
+///
+/// Printing both rates proves both engines actually came up; a user who sees only one line
+/// knows something is wrong before the meeting rather than after it.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn session_started_lines(
+    id: impl fmt::Display,
+    dir: impl fmt::Display,
+    mic_rate: u32,
+    mic_channels: u32,
+    speaker_rate: u32,
+) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        session_id_line(id),
+        session_dir_line(dir),
+        mic_line(mic_rate, mic_channels),
+        speaker_line(speaker_rate),
+        RECORDING_PROMPT,
+    )
+}
+
+/// The whole block a finished session prints: the summary line, and the meeting clause if a
+/// meeting was attached.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn recorded_lines(
+    id: impl fmt::Display,
+    mic_secs: f64,
+    speaker_secs: f64,
+    dir: impl fmt::Display,
+    meeting: Option<&MeetingLabel>,
+) -> String {
+    let mut lines =
+        format!("Recorded {id} ({mic_secs:.1}s mic, {speaker_secs:.1}s speaker) to {dir}\n");
+    if let Some(meeting) = meeting {
+        lines.push_str(&meeting_clause_line(meeting));
+        lines.push('\n');
+    }
+    lines
+}
+
+/// The give-up line, with the attempt count the retry actually burned.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn giving_up_line(attempts: u32) -> String {
+    format!("Giving up on this call after {attempts} attempts; still watching.\n")
+}
+
+/// Where a note goes.
+///
+/// The seam the loop writes into instead of a stream: the plain implementation reproduces the
+/// pre-interface binary byte for byte, and the screen-mode one feeds the state machine and the
+/// narration buffer. The loop's sequencing never learns which it holds.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) trait Reporter {
+    fn note(&mut self, note: Note);
+}
+
+/// The line-based reporter: each note composed and printed to its own stream.
+///
+/// Printing the composed block with `print!` rather than `println!` is byte-identical -- the
+/// newline is in the block -- and it is what lets a multi-line note stay one write per note,
+/// in the same order the old `println!`s ran.
+#[cfg(target_os = "macos")]
+pub(crate) struct Plain;
+
+#[cfg(target_os = "macos")]
+impl Reporter for Plain {
+    fn note(&mut self, note: Note) {
+        let text = note.composed();
+        if note.to_stderr() {
+            eprint!("{text}");
+        } else {
+            print!("{text}");
+        }
+    }
+}
+
+/// The two reporters [`record`] can hand the loop, behind one trait object.
+#[cfg(target_os = "macos")]
+enum Sink {
+    Lines(Plain),
+    Screen(crate::record_screen::Screen),
+}
+
+#[cfg(target_os = "macos")]
+impl Reporter for Sink {
+    fn note(&mut self, note: Note) {
+        match self {
+            Sink::Lines(plain) => plain.note(note),
+            Sink::Screen(screen) => screen.note(note),
+        }
+    }
 }
 
 /// The live backend: one session at a time, plus the user-facing report of it.
@@ -136,55 +467,53 @@ struct SessionCapture<'a> {
 
 #[cfg(target_os = "macos")]
 impl Capture for SessionCapture<'_> {
-    fn start(&mut self) -> Result<()> {
+    fn start(&mut self, sink: &mut dyn Reporter) -> Result<()> {
         let started_at = Instant::now();
         let session = self.recorder.start(self.paths, &jiff::Zoned::now())?;
         if self.debug {
             // This latency sits directly on the "no debounce, a late start loses the
             // opening" path, so it is worth being able to see rather than assume.
-            eprintln!(
+            sink.note(Note::ActivityDebug(format!(
                 "[activity] Recorder::start took {:.1} ms",
                 started_at.elapsed().as_secs_f64() * 1000.0
-            );
+            )));
         }
 
         // Printing both rates proves both engines actually came up; a user who sees only
         // one line knows something is wrong before the meeting rather than after it.
-        println!("Session {}", session.id());
-        println!("  {}", session.paths().dir().display());
-        println!(
-            "  mic       {} Hz, {} channel(s) reported by the input device",
-            session.mic_sample_rate(),
-            session.mic_channels()
-        );
-        println!("  speaker   {} Hz", session.speaker_sample_rate());
-        println!("Recording... press Ctrl-C to stop.");
+        sink.note(Note::SessionStarted {
+            id: session.id().clone(),
+            dir: session.paths().dir().to_path_buf(),
+            mic_rate: session.mic_sample_rate(),
+            mic_channels: session.mic_channels(),
+            speaker_rate: session.speaker_sample_rate(),
+        });
 
         self.running = Some(session);
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<()> {
+    fn finish(&mut self, sink: &mut dyn Reporter) -> Result<()> {
         // Nothing running is not an error. The loop only finishes a start it saw succeed, so
         // defining the case away here is cheaper than a branch that can only ever be wrong.
         let Some(session) = self.running.take() else {
             return Ok(());
         };
         let recording = session.finish()?;
-        println!(
-            "Recorded {} ({:.1}s mic, {:.1}s speaker) to {}",
-            recording.id,
-            recording.mic.seconds(),
-            recording.speaker.seconds(),
-            recording.paths.dir().display()
-        );
-        if let Some(meeting) = &recording.metadata.meeting {
-            println!("{}", meeting_line(meeting));
-        }
+        sink.note(Note::Recorded {
+            id: recording.id.clone(),
+            mic_secs: recording.mic.seconds(),
+            speaker_secs: recording.speaker.seconds(),
+            dir: recording.paths.dir().to_path_buf(),
+            // Projected at the point the full meeting exists: from here on the run only ever
+            // holds title and fit, which is what makes "nothing sensitive crosses" a property
+            // of the type.
+            meeting: recording.metadata.meeting.as_ref().map(MeetingLabel::from),
+        });
         Ok(())
     }
 
-    fn mic_stalled(&mut self) -> bool {
+    fn mic_stalled(&mut self, sink: &mut dyn Reporter) -> bool {
         // Nothing running cannot be stalled. The loop only asks while a session is live, so
         // defining the case away here is cheaper than a branch that can only ever be wrong --
         // the same reading `finish` above takes.
@@ -195,11 +524,11 @@ impl Capture for SessionCapture<'_> {
         if self.debug {
             // The only evidence a hardware run will have for what the counter was doing, so
             // it is printed on every re-check rather than only when it trips.
-            eprintln!(
+            sink.note(Note::ActivityDebug(format!(
                 "[activity] mic delivered {} frames{}",
                 session.mic_frames_delivered(),
                 if stalled { "  <- STALLED" } else { "" }
-            );
+            )));
         }
         stalled
     }
@@ -220,21 +549,37 @@ impl Capture for SessionCapture<'_> {
 /// Everything past the setup lives in [`record_loop`], which is where the sequencing is and
 /// where it can be tested without a microphone.
 #[cfg(target_os = "macos")]
-pub fn record(paths: &Paths) -> Result<()> {
+pub fn record(paths: &Paths, plain: bool) -> Result<()> {
+    // Decided first, before `preflight` and before anything session-specific: a driven run
+    // must never open the interface even when it aborts in preflight, so the decision cannot
+    // wait for the first line the run would print.
+    let presenter = presenter(plain, Tty::current());
+
     let authorized = preflight()?;
     let recorder = Recorder::new(authorized)?;
+
+    let debug = std::env::var_os("MEETHOOK_ACTIVITY_DEBUG").is_some();
+
+    let (tx, rx) = mpsc::channel::<Event>();
+
+    // The screen sink takes a clone of the sender because raw mode means no SIGINT arrives and
+    // the frame thread has to deliver Ctrl-C itself through the channel; the original stays
+    // with the ctrlc handler below, which remains the plain-mode path and the out-of-band
+    // fallback. A single Receiver either way: cloning Senders does not split the stream.
+    let mut sink = match presenter {
+        Presenter::Lines => Sink::Lines(Plain),
+        Presenter::Screen => {
+            Sink::Screen(crate::record_screen::Screen::new(tx.clone(), paths.clone()))
+        }
+    };
 
     // After `preflight` on purpose: a run about to abort for a missing microphone grant must
     // not first ask for an optional one, and the essential prompts should arrive before it.
     // Before the watcher on purpose too: nothing is being watched, and nothing can be
     // recorded, while this prompt is up.
     if let Some(problem) = meethook_record::request_calendar_access() {
-        println!("{problem}");
+        sink.note(Note::CalendarProblem(problem.to_string()));
     }
-
-    let debug = std::env::var_os("MEETHOOK_ACTIVITY_DEBUG").is_some();
-
-    let (tx, rx) = mpsc::channel::<Event>();
 
     // `ctrlc` runs its handler on a thread of its own rather than in signal context, so the
     // finalize path below is free to allocate and do I/O. The handler itself only signals.
@@ -255,9 +600,9 @@ pub fn record(paths: &Paths) -> Result<()> {
         });
     })?;
 
-    announce_watching();
+    sink.note(Note::Watching);
     if already_active {
-        println!("A microphone is already in use; recording immediately.");
+        sink.note(Note::AlreadyActive);
     }
 
     let mut capture = SessionCapture {
@@ -272,14 +617,17 @@ pub fn record(paths: &Paths) -> Result<()> {
         &|| watcher.recheck(),
         already_active,
         Timing::LIVE,
+        &mut sink,
     );
 
-    Ok(())
-}
+    // The screen-mode tail, wrapped in a function boundary so the frame structurally cannot
+    // outlive the call: frame down, then the narration flushed to stdout, then any stashed
+    // trouble. Plain mode owes nothing and falls straight through.
+    if let Sink::Screen(screen) = sink {
+        crate::record_screen::close(screen)?;
+    }
 
-#[cfg(any(target_os = "macos", test))]
-fn announce_watching() {
-    println!("Watching the default microphone. Press Ctrl-C to stop.");
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -304,6 +652,7 @@ fn record_loop(
     recheck: &dyn Fn() -> bool,
     already_active: bool,
     timing: Timing,
+    sink: &mut dyn Reporter,
 ) {
     let mut already_active = already_active;
     loop {
@@ -321,10 +670,10 @@ fn record_loop(
         }
         already_active = false;
 
-        match begin(rx, capture, recheck, timing) {
+        match begin(rx, capture, recheck, timing, sink) {
             Begin::Recording => {}
             Begin::Abandoned => {
-                announce_watching();
+                sink.note(Note::Watching);
                 continue;
             }
             Begin::Interrupted => break,
@@ -368,7 +717,7 @@ fn record_loop(
                     // Cheapest question first, and one atomic load at that. A dead engine also
                     // makes the activity level moot until after the finalize, which recomputes
                     // it anyway.
-                    if capture.mic_stalled() {
+                    if capture.mic_stalled(sink) {
                         break Recording::MicStalled;
                     }
                     let _ = recheck();
@@ -381,27 +730,20 @@ fn record_loop(
         // Said before the finish line rather than after it, so the two session reports the
         // user is about to see read as a consequence of the swap rather than as a fault.
         match outcome {
-            Recording::DeviceChanged => println!(
-                "The default input device changed. The microphone engine is bound to the \
-                 device that went away, so this session is being finalized and a new one \
-                 opened on the new device."
-            ),
-            Recording::MicStalled => println!(
-                "The microphone stopped delivering audio, so this session is being finalized \
-                 and a new one opened. (The device did not change; something reconfigured or \
-                 took the input, which stops the recording engine without any notice that it \
-                 happened.)"
-            ),
-            Recording::Ended | Recording::Interrupted => println!("Stopping..."),
+            Recording::DeviceChanged => sink.note(Note::DeviceChanged),
+            Recording::MicStalled => sink.note(Note::MicStalled),
+            Recording::Ended | Recording::Interrupted => sink.note(Note::Stopping),
         }
 
-        if let Err(e) = capture.finish() {
-            eprintln!("This session did not produce a usable recording: {e}");
+        if let Err(e) = capture.finish(sink) {
+            sink.note(Note::FinishFailed(format!(
+                "This session did not produce a usable recording: {e}"
+            )));
         }
 
         match outcome {
             Recording::Interrupted => break,
-            Recording::Ended => announce_watching(),
+            Recording::Ended => sink.note(Note::Watching),
             // The level, recomputed from the world, is what keeps a swap that coincides with
             // the call ending from opening a session for a call that is already over. When it
             // is still up, `already_active` is exactly the "record without waiting for a start
@@ -420,8 +762,8 @@ fn record_loop(
                     already_active = true;
                     continue;
                 }
-                println!("That call has ended as well, so no new session was opened.");
-                announce_watching();
+                sink.note(Note::NoNewSession);
+                sink.note(Note::Watching);
             }
         }
     }
@@ -477,13 +819,16 @@ fn begin(
     capture: &mut dyn Capture,
     recheck: &dyn Fn() -> bool,
     timing: Timing,
+    sink: &mut dyn Reporter,
 ) -> Begin {
     for attempt in 1..=timing.attempts {
-        match capture.start() {
+        match capture.start(sink) {
             Ok(()) => return Begin::Recording,
             // Only the first failure is printed in full, and only the give-up line follows
             // it: five copies of one message is noise to read past rather than information.
-            Err(e) if attempt == 1 => eprintln!("Could not start recording: {e:#}"),
+            Err(e) if attempt == 1 => sink.note(Note::BeginFailed(format!(
+                "Could not start recording: {e:#}"
+            ))),
             Err(_) => {}
         }
 
@@ -517,10 +862,7 @@ fn begin(
         }
     }
 
-    eprintln!(
-        "Giving up on this call after {} attempts; still watching.",
-        timing.attempts
-    );
+    sink.note(Note::GivingUp(timing.attempts));
     Begin::Abandoned
 }
 
@@ -566,27 +908,24 @@ fn await_end(rx: &Receiver<Event>, grace: Duration) -> Outcome {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-/// What `record` prints about the meeting a finished session was matched to.
+/// The finish summary's meeting line, off the label: the prefix plus [`MeetingLabel::clause`]'s
+/// wording, the same composer the enroll queue announcement derives its line from, so `record`
+/// and `enroll` cannot print two shapes of the same meeting.
 ///
 /// The title only, and only the title. It is the sole user-visible evidence that the calendar
 /// lookup worked, and it is the one field of a meeting that is safe to put on a terminal:
 /// attendee names and addresses are written to `session.json` for speaker identification and
-/// are deliberately never printed, and neither is the invite body.
-///
-/// A match the session's start does not actually support is qualified rather than stated flat,
-/// so a session that merely *sat inside* a booked hour does not read as that meeting. The
-/// wording is `MeetingFit`'s own -- this crate owns the stream, the library owns the sentence
-/// -- and it names only the timing, so the rule above survives it.
-///
-/// The clause after the prefix is [`MeetingLabel::clause`]'s -- the same composer the enroll
-/// queue announcement derives its line from -- so `record` and `enroll` cannot print two
-/// shapes of the same meeting.
+/// are deliberately never printed, and neither is the invite body. A match the session's start
+/// does not actually support is qualified rather than stated flat, so a session that merely
+/// *sat inside* a booked hour does not read as that meeting; the wording is `MeetingFit`'s own
+/// -- this crate owns the stream, the library owns the sentence -- and it names only the
+/// timing, so the rule above survives it.
 ///
 /// A function rather than the `println!` it replaced so that the whole rule is decidable in
 /// `cargo test` with no terminal, which is the split this module's own documentation describes.
-fn meeting_line(meeting: &meethook_session::Meeting) -> String {
-    format!("  meeting   {}", MeetingLabel::from(meeting).clause())
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn meeting_clause_line(label: &MeetingLabel) -> String {
+    format!("  meeting   {}", label.clause())
 }
 
 /// The record loop's sequencing, exercised without a microphone.
@@ -603,7 +942,45 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{Capture, Event, Outcome, Timing, await_end, meeting_line, record_loop};
+    use crate::commands::Tty;
+    use meethook_session::SessionId;
+
+    use super::{
+        Capture, DEVICE_CHANGED, Event, MIC_STALLED, Note, Outcome, Presenter, Timing, await_end,
+        meeting_clause_line, mic_line, presenter, record_loop, recorded_lines, session_dir_line,
+        session_id_line, speaker_line,
+    };
+
+    /// A reporter that records nothing.
+    ///
+    /// The sequencing tests below assert on the capture's call log, and a note they did not
+    /// expect would surface in the composer tests instead: wording is pinned there, ordering
+    /// here, and neither suite needs the other's eyes.
+    #[derive(Default)]
+    struct Silent;
+
+    impl super::Reporter for Silent {
+        fn note(&mut self, _note: Note) {}
+    }
+
+    /// Drives [`record_loop`] with a silent reporter at the test timing, so the call sites
+    /// read like the loop itself rather than like a plumbing exercise.
+    fn run(
+        rx: &mpsc::Receiver<Event>,
+        capture: &mut FakeCapture,
+        recheck: &dyn Fn() -> bool,
+        already_active: bool,
+    ) {
+        let mut silent = Silent;
+        record_loop(
+            rx,
+            capture,
+            recheck,
+            already_active,
+            LOOP_TIMING,
+            &mut silent,
+        );
+    }
 
     /// Long enough that scheduling noise cannot be mistaken for a timeout, short enough
     /// that the suite stays fast.
@@ -665,7 +1042,7 @@ mod tests {
             )
             .with_fit(fit);
 
-            let line = meeting_line(&meeting);
+            let line = meeting_clause_line(&super::MeetingLabel::from(&meeting));
             assert!(line.contains("Incident review"), "{fit:?}: {line}");
 
             if fit.is_strong() {
@@ -825,7 +1202,7 @@ mod tests {
     }
 
     impl Capture for FakeCapture {
-        fn start(&mut self) -> super::Result<()> {
+        fn start(&mut self, _sink: &mut dyn super::Reporter) -> super::Result<()> {
             self.calls.push("start");
             if self.rechecks_before_the_first_session.is_none() {
                 self.rechecks_before_the_first_session = Some(self.rechecks.load(Ordering::SeqCst));
@@ -838,13 +1215,13 @@ mod tests {
             Ok(())
         }
 
-        fn finish(&mut self) -> super::Result<()> {
+        fn finish(&mut self, _sink: &mut dyn super::Reporter) -> super::Result<()> {
             self.calls.push("finish");
             self.finished_at.get_or_insert_with(Instant::now);
             Ok(())
         }
 
-        fn mic_stalled(&mut self) -> bool {
+        fn mic_stalled(&mut self, _sink: &mut dyn super::Reporter) -> bool {
             self.mic_stalled_calls += 1;
             if self.stalling_sessions > 0 {
                 self.stalling_sessions -= 1;
@@ -890,7 +1267,7 @@ mod tests {
         ]);
 
         let mut capture = FakeCapture::default();
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "finish", "start", "finish"]);
     }
@@ -908,7 +1285,7 @@ mod tests {
         ]);
 
         let mut capture = FakeCapture::default();
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "finish"]);
     }
@@ -920,7 +1297,7 @@ mod tests {
         let (_tx, rx) = script(vec![(BLIP, Event::Started), (BLIP, Event::Interrupt)]);
 
         let mut capture = FakeCapture::default();
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "finish"]);
     }
@@ -932,7 +1309,7 @@ mod tests {
         let (_tx, rx) = script(vec![(BLIP, Event::Stopped), (SETTLE, Event::Interrupt)]);
 
         let mut capture = FakeCapture::default();
-        record_loop(&rx, &mut capture, &|| true, true, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, true);
 
         assert_eq!(capture.calls, ["start", "finish"]);
     }
@@ -952,7 +1329,7 @@ mod tests {
             failing_starts: 1,
             ..FakeCapture::default()
         };
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "start", "finish"]);
     }
@@ -973,7 +1350,7 @@ mod tests {
             failing_starts: LOOP_TIMING.attempts,
             ..FakeCapture::default()
         };
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         let attempts = LOOP_TIMING.attempts as usize;
         assert_eq!(capture.calls.len(), attempts + 2, "{:?}", capture.calls);
@@ -993,7 +1370,7 @@ mod tests {
         };
         // The level is false by the time the first retry is due: the stop edge was missed
         // outright, which is exactly the case the level check is there to cover.
-        record_loop(&rx, &mut capture, &|| false, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| false, false);
 
         assert_eq!(capture.calls, ["start"]);
     }
@@ -1025,7 +1402,7 @@ mod tests {
 
         let mut capture = FakeCapture::default();
         let started = Instant::now();
-        record_loop(&rx, &mut capture, &recheck, false, LOOP_TIMING);
+        run(&rx, &mut capture, &recheck, false);
 
         assert_eq!(capture.calls, ["start", "finish"]);
         let finished = capture
@@ -1053,7 +1430,7 @@ mod tests {
         ]);
 
         let mut capture = FakeCapture::default();
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "finish", "start", "finish"]);
     }
@@ -1069,7 +1446,7 @@ mod tests {
         ]);
 
         let mut capture = FakeCapture::default();
-        record_loop(&rx, &mut capture, &|| false, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| false, false);
 
         assert_eq!(capture.calls, ["start", "finish"]);
     }
@@ -1086,7 +1463,7 @@ mod tests {
 
         let mut capture = FakeCapture::default();
         let started = Instant::now();
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         assert!(capture.calls.is_empty(), "{:?}", capture.calls);
         // "Returned early" and "returned on the interrupt" are indistinguishable from an empty
@@ -1114,7 +1491,7 @@ mod tests {
             failing_starts: 1,
             ..FakeCapture::default()
         };
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "start", "finish"]);
     }
@@ -1136,7 +1513,7 @@ mod tests {
             ..FakeCapture::default()
         };
         let started = Instant::now();
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "finish", "start", "finish"]);
         let finished = capture
@@ -1159,7 +1536,7 @@ mod tests {
             stalling_sessions: 1,
             ..FakeCapture::default()
         };
-        record_loop(&rx, &mut capture, &|| false, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| false, false);
 
         assert_eq!(capture.calls, ["start", "finish"]);
     }
@@ -1180,7 +1557,7 @@ mod tests {
             stalling_sessions: 0,
             ..FakeCapture::default()
         };
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "finish"]);
         assert!(
@@ -1202,7 +1579,7 @@ mod tests {
         ]);
 
         let mut capture = FakeCapture::default();
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING);
+        run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "finish"]);
         assert_eq!(
@@ -1229,7 +1606,7 @@ mod tests {
 
         let mut capture = FakeCapture::default();
         let rechecks = Arc::clone(&capture.rechecks);
-        record_loop(
+        run(
             &rx,
             &mut capture,
             &|| {
@@ -1237,7 +1614,6 @@ mod tests {
                 true
             },
             false,
-            LOOP_TIMING,
         );
 
         assert_eq!(capture.calls, ["start", "finish"]);
@@ -1246,5 +1622,219 @@ mod tests {
             Some(0),
             "the idle wait recomputed the activity level"
         );
+    }
+
+    /// The plain mode's guarantee, pinned: every composer produces the pre-interface literal
+    /// verbatim. This suite is what makes AC #4 a test rather than a review -- a rewording
+    /// that slipped into a composer fails here instead of showing up in a user's scrollback.
+    #[test]
+    fn the_composers_reproduce_the_pre_interface_literals_verbatim() {
+        let id = SessionId::parse("20260809-052600").unwrap();
+        let dir = std::path::Path::new("/tmp/meethook/sessions/20260809-052600");
+
+        // The stream class first: the faults and the diagnostics go to stderr, everything
+        // the user reads goes to stdout.
+        assert!(!Note::CalendarProblem(String::new()).to_stderr());
+        assert!(!Note::Watching.to_stderr());
+        assert!(!Note::AlreadyActive.to_stderr());
+        assert!(
+            !Note::SessionStarted {
+                id: id.clone(),
+                dir: dir.to_path_buf(),
+                mic_rate: 48_000,
+                mic_channels: 1,
+                speaker_rate: 44_100,
+            }
+            .to_stderr()
+        );
+        assert!(!Note::DeviceChanged.to_stderr());
+        assert!(!Note::MicStalled.to_stderr());
+        assert!(!Note::Stopping.to_stderr());
+        assert!(!Note::NoNewSession.to_stderr());
+        assert!(
+            !Note::Recorded {
+                id: id.clone(),
+                mic_secs: 1.0,
+                speaker_secs: 2.0,
+                dir: dir.to_path_buf(),
+                meeting: None,
+            }
+            .to_stderr()
+        );
+        assert!(Note::GivingUp(3).to_stderr());
+        assert!(Note::BeginFailed(String::new()).to_stderr());
+        assert!(Note::FinishFailed(String::new()).to_stderr());
+        assert!(Note::ActivityDebug(String::new()).to_stderr());
+
+        // Then the wording itself, byte for byte.
+        assert_eq!(
+            Note::Watching.composed(),
+            "Watching the default microphone. Press Ctrl-C to stop.\n"
+        );
+        assert_eq!(
+            Note::AlreadyActive.composed(),
+            "A microphone is already in use; recording immediately.\n"
+        );
+        assert_eq!(Note::Stopping.composed(), "Stopping...\n");
+        assert_eq!(
+            Note::NoNewSession.composed(),
+            "That call has ended as well, so no new session was opened.\n"
+        );
+        assert_eq!(
+            Note::DeviceChanged.composed(),
+            format!("{DEVICE_CHANGED}\n")
+        );
+        assert_eq!(Note::MicStalled.composed(), format!("{MIC_STALLED}\n"));
+        assert_eq!(
+            Note::GivingUp(5).composed(),
+            "Giving up on this call after 5 attempts; still watching.\n"
+        );
+
+        assert_eq!(session_id_line(&id), "Session 20260809-052600");
+        assert_eq!(
+            session_dir_line(dir.display()),
+            "  /tmp/meethook/sessions/20260809-052600"
+        );
+        assert_eq!(
+            mic_line(48_000, 1),
+            "  mic       48000 Hz, 1 channel(s) reported by the input device"
+        );
+        assert_eq!(speaker_line(44_100), "  speaker   44100 Hz");
+
+        assert_eq!(
+            Note::SessionStarted {
+                id: id.clone(),
+                dir: dir.to_path_buf(),
+                mic_rate: 48_000,
+                mic_channels: 1,
+                speaker_rate: 44_100,
+            }
+            .composed(),
+            "Session 20260809-052600\n  /tmp/meethook/sessions/20260809-052600\n  mic       48000 Hz, 1 channel(s) reported by the input device\n  speaker   44100 Hz\nRecording... press Ctrl-C to stop.\n"
+        );
+
+        assert_eq!(
+            recorded_lines(&id, 7.5, 7.5, dir.display(), None),
+            "Recorded 20260809-052600 (7.5s mic, 7.5s speaker) to /tmp/meethook/sessions/20260809-052600\n"
+        );
+        assert_eq!(
+            Note::Recorded {
+                id: id.clone(),
+                mic_secs: 7.5,
+                speaker_secs: 7.5,
+                dir: dir.to_path_buf(),
+                meeting: None,
+            }
+            .composed(),
+            recorded_lines(&id, 7.5, 7.5, dir.display(), None)
+        );
+    }
+
+    /// `Recorded` carries only the meeting clause, never the meeting's other fields.
+    ///
+    /// Attendee names and addresses are written to `session.json` for speaker identification
+    /// and are deliberately never printed: the note holds a [`super::MeetingLabel`] projection,
+    /// so the assertion below can hold at all, and it pins the clause shape both presenters
+    /// render.
+    #[test]
+    fn the_recorded_block_carries_only_the_meeting_clause() {
+        use meethook_session::{Attendee, AttendeeStatus, Meeting};
+
+        let meeting = Meeting::new(
+            "EVENT-ABC".to_owned(),
+            "Incident review".to_owned(),
+            "Work".to_owned(),
+            "2026-08-15T10:00:00Z".parse().unwrap(),
+            "2026-08-15T11:00:00Z".parse().unwrap(),
+        )
+        .with_people(
+            Some(Attendee {
+                name: Some("Alan Turing".to_owned()),
+                email: Some("alan@example.com".to_owned()),
+                status: AttendeeStatus::Accepted,
+                is_you: false,
+            }),
+            vec![Attendee {
+                name: Some("Grace Hopper".to_owned()),
+                email: Some("grace@example.com".to_owned()),
+                status: AttendeeStatus::Accepted,
+                is_you: true,
+            }],
+        )
+        .with_invite(
+            None,
+            Some("Babbage Room".to_owned()),
+            Some("Dial-in 555-0100, passcode 481516".to_owned()),
+        );
+
+        let id = SessionId::parse("20260809-052600").unwrap();
+        let dir = std::path::Path::new("/tmp/meethook/sessions/20260809-052600");
+        let label = super::MeetingLabel::from(&meeting);
+        let block = recorded_lines(&id, 7.5, 7.5, dir.display(), Some(&label));
+
+        // The clause, and only the clause: title plus caveat if the fit is weak.
+        assert!(block.contains("  meeting   Incident review"), "{block}");
+        for secret in [
+            "Grace",
+            "Hopper",
+            "grace@example.com",
+            "Alan",
+            "Turing",
+            "@",
+            "Babbage",
+            "Dial-in",
+            "481516",
+        ] {
+            assert!(
+                !block.contains(secret),
+                "the finish block leaks {secret:?}: {block}"
+            );
+        }
+    }
+
+    /// Which presenter a run gets, given `--plain` and what the streams are attached to.
+    ///
+    /// AC #1, decidable with no terminal: a pipe on either end keeps driven runs on the line
+    /// output, `--plain` forces it on a real terminal, and only an attached run without the
+    /// flag opens the interface.
+    const STREAMS: [Tty; 4] = [
+        Tty {
+            stdin: false,
+            stdout: false,
+        },
+        Tty {
+            stdin: true,
+            stdout: false,
+        },
+        Tty {
+            stdin: false,
+            stdout: true,
+        },
+        Tty {
+            stdin: true,
+            stdout: true,
+        },
+    ];
+    const ATTACHED: Tty = Tty {
+        stdin: true,
+        stdout: true,
+    };
+
+    #[test]
+    fn a_pipe_on_either_end_is_the_lines() {
+        for tty in STREAMS.iter().filter(|t| !t.is_attached()) {
+            assert_eq!(presenter(false, *tty), Presenter::Lines);
+            assert_eq!(presenter(true, *tty), Presenter::Lines);
+        }
+    }
+
+    #[test]
+    fn plain_forces_the_lines_even_on_a_terminal() {
+        assert_eq!(presenter(true, ATTACHED), Presenter::Lines);
+    }
+
+    #[test]
+    fn an_attached_run_without_plain_is_the_screen() {
+        assert_eq!(presenter(false, ATTACHED), Presenter::Screen);
     }
 }
