@@ -852,18 +852,28 @@ fn record_loop(
                     {
                         hand = Some(meeting.clone());
                         // Lifted out before the Confirmed stamp moves the meeting into the
-                        // label: the supersedure below needs the same id and attendees.
+                        // label: the supersedure below needs the same id.
                         let event_id = meeting.event_id.clone();
-                        let attendees = meeting.attendees().to_vec();
+                        // A correction the frame already committed for this very meeting rides
+                        // along instead of the pristine snapshot: the pane replaces its copy
+                        // wholesale, so resending the calendar's people would visibly revert
+                        // the edit -- and a further edit made against that reverted display
+                        // would build on the wrong baseline and silently drop the first at
+                        // finish.
+                        let attendees = match &roster_edit {
+                            Some(edit) if edit.event_id == event_id => edit.attendees.clone(),
+                            _ => meeting.attendees().to_vec(),
+                        };
                         // What crosses to the frame is what `label_by_hand` will write at
                         // finish -- the Confirmed stamp -- never the candidate's own fit,
                         // whose caveat would qualify a pick a human just made.
                         sink.note(Note::MeetingSettled {
                             label: MeetingLabel::from(&meeting.with_fit(MeetingFit::Confirmed)),
                         });
-                        // The settled meeting supersedes whatever roster the frame was shown
-                        // for the guess: the pane's copy is replaced wholesale, mirroring how
-                        // the settlement supersedes the guess itself.
+                        // Supersedure, not merge: the pane's copy is replaced wholesale,
+                        // mirroring how the settlement supersedes the guess itself -- so what
+                        // crosses here must already be the roster the frame should keep (the
+                        // edit above, else the meeting's own people).
                         sink.note(Note::RosterAttached {
                             event_id,
                             attendees,
@@ -1888,6 +1898,73 @@ mod tests {
             })
             .collect();
         assert_eq!(attached, ["EVENT-A", "EVENT-B"]);
+    }
+
+    /// Re-picking a meeting whose roster the frame already edited must not revert the frame to
+    /// the pristine calendar snapshot: the resent attachment carries the committed edit, and
+    /// the loop's stashed edit is untouched by the re-pick alone.
+    #[test]
+    fn re_picking_an_already_edited_meeting_keeps_the_frame_on_the_edit() {
+        use meethook_session::{Attendee, AttendeeStatus};
+
+        let alan = Attendee {
+            name: Some("Alan Turing".to_owned()),
+            email: Some("alan@example.com".to_owned()),
+            status: AttendeeStatus::Accepted,
+            is_you: false,
+        };
+        let seeded = meeting_of("EVENT-A", "Standup").with_people(None, vec![alan.clone()]);
+
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (
+                BLIP,
+                Event::RosterEdited(RosterEdit {
+                    event_id: "EVENT-A".to_owned(),
+                    attendees: vec![],
+                }),
+            ),
+            (BLIP, Event::MeetingPicked("EVENT-A".to_owned())),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            candidates: Some(Offered {
+                meetings: vec![seeded.clone()],
+                chosen: Some(seeded),
+            }),
+            ..FakeCapture::default()
+        };
+        let notes = run_noted(&rx, &mut capture, &|| true, false);
+
+        // Two attachments in order: the guess at start (pristine, one attendee), then the
+        // re-pick -- which must carry the committed edit (empty), not the pristine snapshot.
+        let rosters: Vec<Vec<Attendee>> = notes
+            .iter()
+            .filter_map(|note| match note {
+                Note::RosterAttached {
+                    event_id,
+                    attendees,
+                } if event_id == "EVENT-A" => Some(attendees.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rosters,
+            [vec![alan], vec![]],
+            "the re-pick reverted the frame to the pristine roster"
+        );
+
+        // The pick still settles the hand, and the stashed edit rides to finish untouched.
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(capture.hands, [Some("EVENT-A".to_owned())]);
+        assert_eq!(capture.roster_edits.len(), 1);
+        let edit = capture.roster_edits[0]
+            .as_ref()
+            .expect("the edit reached finish");
+        assert_eq!(edit.event_id, "EVENT-A");
+        assert!(edit.attendees.is_empty());
     }
 
     /// An edit addressed to a meeting the frame was never shown changes nothing: finish
