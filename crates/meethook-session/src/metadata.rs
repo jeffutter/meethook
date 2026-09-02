@@ -160,9 +160,10 @@ impl MeetingFit {
 ///
 /// The attendee list is the load-bearing part rather than decoration: it is the per-session
 /// set of people who could plausibly be speaking, which is what a speaker-identification
-/// pass needs to avoid matching a voice against every person ever enrolled. It is reachable
-/// as a roster only through [`Meeting::speaker_roster`], which consults [`Meeting::fit`] --
-/// see that method for why.
+/// pass needs to avoid matching a voice against every person ever enrolled. That seedable
+/// view is reachable only through [`Meeting::speaker_roster`], which consults
+/// [`Meeting::fit`] -- see that method for why; plain display goes through
+/// [`Meeting::attendees`], ungated.
 ///
 /// `notes` is the invite body, stored because it is the field most likely to answer "what
 /// was this meeting about" for a transcript that has outlived anyone's memory of it. It is
@@ -183,8 +184,9 @@ pub struct Meeting {
     pub calendar: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organizer: Option<Attendee>,
-    /// Private, and the one field here that is: the list is reachable as a *roster* only
-    /// through [`Meeting::speaker_roster`]. It still serializes exactly as it always did, so a
+    /// Private, and the one field here that is: the list is reachable as a *seedable roster*
+    /// only through [`Meeting::speaker_roster`], and for plain display through
+    /// [`Meeting::attendees`]. It still serializes exactly as it always did, so a
     /// user's own transcript template can print the names into their own notes -- the guard is
     /// on code paths that consume the list to decide who is speaking, not on the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -259,8 +261,8 @@ impl Meeting {
     /// [`SessionMetadata::label_by_hand`] (which force-stamps [`MeetingFit::Confirmed`] -- a
     /// human correcting the roster is not a human confirming the meeting, decision-009).
     /// Because this touches only the private `attendees` field, [`Meeting::speaker_roster`]
-    /// remains the sole accessor and its `is_strong()` gate applies to an edited roster with
-    /// no further work.
+    /// remains the sole *seedable* accessor and its `is_strong()` gate applies to an edited
+    /// roster with no further work.
     #[must_use]
     pub fn with_attendees(mut self, attendees: Vec<Attendee>) -> Self {
         self.attendees = attendees;
@@ -289,8 +291,9 @@ impl Meeting {
     /// The people who could plausibly be speaking in this session, or `None` when the match is
     /// too weak to say.
     ///
-    /// The only way to obtain the attendee list as a whole, and the reason the field is
-    /// private. A per-session attendee whitelist is what fixes cross-session speaker
+    /// The only *seedable* way to obtain the attendee list as a whole -- display goes through
+    /// the ungated [`Meeting::attendees`] -- and the reason the field is private. A
+    /// per-session attendee whitelist is what fixes cross-session speaker
     /// contamination -- doc-001 records that finding -- so seeding one from a meeting the
     /// session merely *sat inside* is that same contamination arriving through the calendar
     /// instead. Routing the roster through [`Meeting::fit`] means a future
@@ -299,12 +302,38 @@ impl Meeting {
         self.fit.is_strong().then_some(self.attendees.as_slice())
     }
 
+    /// The attendee list for display, whatever the fit.
+    ///
+    /// Deliberately not fit-gated: the record TUI's roster pane (TASK-056.02.02) shows and
+    /// edits the attached meeting's roster whatever the match strength -- correcting a
+    /// merely-proximate guess is part of the point. Decision-009 gates the *seedable* view,
+    /// and that stays [`Meeting::speaker_roster`] alone: identification seeding keeps flowing
+    /// through the `is_strong()` gate, and this doc is the signpost that this lane is not it.
+    pub fn attendees(&self) -> &[Attendee] {
+        self.attendees.as_slice()
+    }
+
     /// How many people were invited -- what a diagnostic line needs, and all it needs.
     ///
     /// Deliberately not a way around [`Meeting::speaker_roster`]: a count names nobody.
     pub fn attendee_count(&self) -> usize {
         self.attendees.len()
     }
+}
+
+/// An edited roster, addressed by the calendar event it came from.
+///
+/// The value the record TUI's roster editor crosses into the run (TASK-056.02.02): the frame
+/// holds the attached meeting's roster, the user edits it, and each committed change rides
+/// here to the single finalize point, where [`SessionMetadata::apply_roster_edit`] applies it
+/// to whichever meeting wins -- hand pick or the automatic re-query -- matched by
+/// `event_id`. A mismatched id is dropped rather than misapplied: the calendar may have moved
+/// between the edit and finish, and applying a corrected roster to the wrong meeting would
+/// corrupt that meeting's people. Runtime value only -- never serialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterEdit {
+    pub event_id: String,
+    pub attendees: Vec<Attendee>,
 }
 
 /// `session.json`: the marker that a session shut down cleanly, plus the sync data
@@ -420,6 +449,33 @@ impl SessionMetadata {
                 self.meeting_cleared = true;
             }
         }
+    }
+
+    /// Apply the record TUI's roster edit to the attached meeting, if the ids match.
+    ///
+    /// The single application point the finalize path calls once the winning meeting is
+    /// resolved (hand pick or automatic re-query, TASK-056.02.02). Matching rides
+    /// [`Meeting::with_attendees`], so `fit` and `organizer` survive and the `is_strong()`
+    /// gate on [`Meeting::speaker_roster`] applies to the edited roster unchanged
+    /// (decision-009). A mismatched `event_id` leaves the meeting untouched -- the documented
+    /// drop, safer than misapplying a correction to a different meeting.
+    #[must_use]
+    pub fn apply_roster_edit(mut self, edit: Option<RosterEdit>) -> Self {
+        // The id check runs before anything is taken: an `if let` over
+        // `(edit, self.meeting.take())` would evaluate the `take()` even when the pattern
+        // falls through, dropping the meeting on every no-op path.
+        if let Some(edit) = edit
+            && self
+                .meeting
+                .as_ref()
+                .is_some_and(|meeting| meeting.event_id == edit.event_id)
+        {
+            self.meeting = self
+                .meeting
+                .take()
+                .map(|meeting| meeting.with_attendees(edit.attendees));
+        }
+        self
     }
 
     /// Records the user's assertion that this session's speaker track is one person, `name`.

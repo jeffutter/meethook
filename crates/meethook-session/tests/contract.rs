@@ -8,9 +8,9 @@ use std::path::Path;
 
 use jiff::Timestamp;
 use meethook_session::{
-    Attendee, AttendeeStatus, Classification, Meeting, MeetingFit, Paths, SESSION_SCHEMA_VERSION,
-    SessionId, SessionMetadata, SessionPaths, TrackSync, create_session_dir, discover_sessions,
-    write_atomic,
+    Attendee, AttendeeStatus, Classification, Meeting, MeetingFit, Paths, RosterEdit,
+    SESSION_SCHEMA_VERSION, SessionId, SessionMetadata, SessionPaths, TrackSync,
+    create_session_dir, discover_sessions, write_atomic,
 };
 use tempfile::TempDir;
 
@@ -638,6 +638,149 @@ fn replacing_attendees_changes_only_the_attendees_key() {
         before["meeting"]["attendees"],
         after["meeting"]["attendees"]
     );
+}
+
+/// The lane split decision-009 asks for, pinned together: the display roster is ungated at
+/// every fit, while the seedable one stays behind exactly the `is_strong()` gate -- and where
+/// the gate passes, both lanes hand out the same edited list.
+#[test]
+fn the_display_roster_is_ungated_but_the_seedable_one_stays_gated() {
+    // Drop Grace Hopper and rename Alan Turing, as the TASK-056.02.01 tests do: the edit
+    // touches the people, nothing else.
+    let edited = stuffed_meeting().with_attendees(vec![Attendee {
+        name: Some("A. Turing".to_owned()),
+        email: Some("alan@example.com".to_owned()),
+        status: AttendeeStatus::Accepted,
+        is_you: false,
+    }]);
+
+    for fit in MeetingFit::ALL {
+        let meeting = edited.clone().with_fit(fit);
+
+        // Display is ungated: the full EDITED list at every fit, weak ones included.
+        let display = meeting.attendees();
+        assert_eq!(display.len(), 1, "{fit:?}");
+        assert_eq!(display[0].name.as_deref(), Some("A. Turing"), "{fit:?}");
+
+        // Seeding stays gated: `Some` iff strong, and where strong it reflects the edit.
+        match meeting.speaker_roster() {
+            Some(roster) => {
+                assert!(fit.is_strong(), "{fit:?} handed out a roster");
+                assert_eq!(roster, display, "{fit:?}: the lanes must agree");
+            }
+            None => assert!(!fit.is_strong(), "{fit:?} withheld a roster"),
+        }
+    }
+}
+
+/// A matching roster edit replaces only the `attendees` array in `session.json`: every other
+/// key -- including `fit`, whose survival keeps the edited roster gated, and `organizer`,
+/// which the edit rides `with_attendees` rather than `with_people` to spare -- is
+/// byte-identical, and the schema version does not move.
+#[test]
+fn a_matching_roster_edit_replaces_only_the_attendees() {
+    let (_tmp, paths) = temp_root();
+    let session = make_session(&paths, "20260809-052607", &[]);
+    let target = session.session_json();
+
+    let original = sample_metadata("20260809-052607").with_meeting(Some(stuffed_meeting()));
+    original.write(&target).unwrap();
+    let first = fs::read_to_string(&target).unwrap();
+
+    let applied = original.apply_roster_edit(Some(RosterEdit {
+        event_id: "EVENT-ABC".to_owned(),
+        attendees: vec![Attendee {
+            name: Some("A. Turing".to_owned()),
+            email: Some("alan@example.com".to_owned()),
+            status: AttendeeStatus::Accepted,
+            is_you: false,
+        }],
+    }));
+
+    // In memory first: the edit touched only the people.
+    let applied_meeting = applied
+        .meeting
+        .as_ref()
+        .expect("the meeting survives the edit");
+    assert_eq!(
+        applied_meeting.fit,
+        stuffed_meeting().fit,
+        "the fit must survive"
+    );
+    assert_eq!(
+        applied_meeting
+            .organizer
+            .as_ref()
+            .and_then(|a| a.name.as_deref()),
+        Some("Ada Lovelace"),
+        "the organizer must survive"
+    );
+
+    applied.write(&target).unwrap();
+    let second = fs::read_to_string(&target).unwrap();
+
+    let before: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let after: serde_json::Value = serde_json::from_str(&second).unwrap();
+
+    // Everything but the attendees array is untouched -- asserted structurally with the key
+    // stripped, so a field added later is compared too rather than forgotten.
+    let mut stripped_before = before.clone();
+    let mut stripped_after = after.clone();
+    for value in [&mut stripped_before, &mut stripped_after] {
+        if let Some(meeting) = value
+            .get_mut("meeting")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            meeting.remove("attendees");
+        }
+    }
+    assert_eq!(
+        stripped_before, stripped_after,
+        "only `attendees` may differ"
+    );
+    assert_eq!(after["schema_version"], 1);
+    assert_ne!(
+        before["meeting"]["attendees"],
+        after["meeting"]["attendees"]
+    );
+}
+
+/// The documented drop: a mismatched `event_id` leaves the meeting untouched, and an absent
+/// edit or an absent meeting is a no-op too. Untouched means Debug-equal AND serializes
+/// byte-identically -- the calendar may have moved between the edit and finish, and the
+/// safe outcome is the correction arriving nowhere, not arriving at the wrong meeting.
+#[test]
+fn a_mismatched_or_absent_roster_edit_changes_nothing() {
+    let original = sample_metadata("20260809-052607").with_meeting(Some(stuffed_meeting()));
+    let first = serde_json::to_vec_pretty(&original).unwrap();
+
+    let replacement = RosterEdit {
+        event_id: "SOME-OTHER-EVENT".to_owned(),
+        attendees: vec![Attendee {
+            name: Some("A. Turing".to_owned()),
+            email: Some("alan@example.com".to_owned()),
+            status: AttendeeStatus::Accepted,
+            is_you: false,
+        }],
+    };
+
+    // Wrong `event_id`: dropped.
+    let mismatched = original
+        .clone()
+        .apply_roster_edit(Some(replacement.clone()));
+    assert_eq!(mismatched, original);
+    assert_eq!(
+        serde_json::to_vec_pretty(&mismatched).unwrap(),
+        first,
+        "a dropped edit must not even reorder bytes"
+    );
+
+    // No edit: no-op.
+    assert_eq!(original.clone().apply_roster_edit(None), original);
+
+    // No attached meeting: nothing to apply to.
+    let bare = sample_metadata("20260809-052607");
+    assert_eq!(bare.clone().apply_roster_edit(Some(replacement)), bare);
 }
 
 /// A weak fit always has a caveat to show a person, and a strong one never does -- the
