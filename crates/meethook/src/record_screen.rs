@@ -34,20 +34,41 @@
 mod render;
 mod state;
 
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use state::EditingField;
+
+// The frame/run/settle machinery below drives a real terminal (spawns a thread, opens the
+// alternate screen), so unlike `state` and `render` it has no platform-neutral unit-test path
+// -- its only production caller is `record::Sink`, which is macOS-only. Gated to match that
+// caller rather than left to the module's broader `any(macos, test)` gate, or a Linux `cargo
+// clippy --all-targets` finds every item below dead.
+#[cfg(target_os = "macos")]
 use std::io::{self, Write};
+#[cfg(target_os = "macos")]
 use std::sync::mpsc;
+#[cfg(target_os = "macos")]
 use std::thread;
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
 use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
 use meethook_session::Paths;
+#[cfg(target_os = "macos")]
 use ratatui::Terminal;
+#[cfg(target_os = "macos")]
 use ratatui::backend::CrosstermBackend;
+#[cfg(target_os = "macos")]
 use ratatui::crossterm::event::Event as CrosstermEvent;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read};
+#[cfg(target_os = "macos")]
+use ratatui::crossterm::event::{poll, read};
 
+#[cfg(target_os = "macos")]
 use crate::record::{Event, Note, Reporter};
-use state::{EditingField, Phase, State};
+#[cfg(target_os = "macos")]
+use state::{Phase, State};
 
 /// How often the frame wakes when nothing else is waiting on it.
 ///
@@ -55,6 +76,7 @@ use state::{EditingField, Phase, State};
 /// waits, and it must wait at most this long, or a Ctrl-C would sit unread until the next note
 /// happened to arrive. Two hundred fifty milliseconds is invisible in a redraw and short enough
 /// that the interface still feels like it is listening.
+#[cfg(target_os = "macos")]
 const TICK: Duration = Duration::from_millis(250);
 
 /// The full-screen presenter: owns the alternate screen and the frame thread.
@@ -66,6 +88,7 @@ const TICK: Duration = Duration::from_millis(250);
 /// out and settles them: `close` consumes the struct on the happy path, and a struct that is
 /// dropped unsettled -- an early error or a panic in the run -- still gets its frame stopped
 /// and its terminal restored by the fallback.
+#[cfg(target_os = "macos")]
 pub(crate) struct Screen {
     notes: mpsc::Sender<Note>,
     stop: Option<mpsc::Sender<()>>,
@@ -73,6 +96,7 @@ pub(crate) struct Screen {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(target_os = "macos")]
 impl Screen {
     /// Spawns the frame thread.
     ///
@@ -100,6 +124,7 @@ impl Screen {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Reporter for Screen {
     fn note(&mut self, note: Note) {
         // A frame that is already gone is a teardown race, not a fault: the run is ending
@@ -115,6 +140,7 @@ impl Reporter for Screen {
 /// once. The order is load-bearing: the frame stops first (nothing may draw over the
 /// restored screen), then the narration flushes to stdout in the order the run said it, then
 /// the stashed trouble is said on stderr.
+#[cfg(target_os = "macos")]
 fn settle(
     stop: mpsc::Sender<()>,
     done: mpsc::Receiver<Result<State>>,
@@ -155,6 +181,7 @@ fn settle(
 /// Called once per [`Screen`], after the run's loop has finished; the problems the settle met
 /// become the run's error. A run that ends some other way never gets here and drops instead --
 /// see [`Screen`]'s `Drop` -- which settles the same way and says its problems on stderr.
+#[cfg(target_os = "macos")]
 pub(crate) fn close(mut screen: Screen) -> Result<()> {
     let stop = screen.stop.take().expect("a screen settles once");
     let done = screen.done.take().expect("a screen settles once");
@@ -164,6 +191,7 @@ pub(crate) fn close(mut screen: Screen) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for Screen {
     /// The abnormal-exit guarantee: a run that errored out or panicked between the frame
     /// coming up and the loop finishing leaves this struct unsettled, and the terminal must
@@ -182,6 +210,7 @@ impl Drop for Screen {
 
 /// The frame thread's whole job: acquire the terminal lazily, draw until told to stop, restore
 /// the terminal unconditionally, and hand back whatever the notes accumulated.
+#[cfg(target_os = "macos")]
 fn frame(
     tx: mpsc::Sender<Event>,
     notes: mpsc::Receiver<Note>,
@@ -226,6 +255,7 @@ fn frame(
 /// One iteration is: wake on a key (bounded by [`TICK`]), drain whatever notes queued since
 /// the last draw, and redraw if anything changed or the clock is moving. Nothing here blocks
 /// longer than [`TICK`], which is what keeps Ctrl-C responsive while the run is idle.
+#[cfg(target_os = "macos")]
 fn run(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     tx: &mpsc::Sender<Event>,

@@ -1137,4 +1137,74 @@ mod tests {
             );
         }
     }
+
+    /// Esc closes the selector without picking: unlike the run's own settlement, which only
+    /// closes it on a pick that stuck, a direct close leaves nothing to confirm -- though the
+    /// list itself survives the close, so reopening still offers the same row.
+    #[test]
+    fn closing_the_selector_leaves_nothing_to_confirm() {
+        let mut s = State::default();
+        s.apply(&started(31));
+        s.apply(&Note::MeetingOffered {
+            offered: vec![offer_of("EVENT-A", "Standup")],
+            guess: None,
+        });
+        s.open_selector();
+        assert!(s.selector_open);
+
+        s.close_selector();
+        assert!(!s.selector_open);
+        s.open_selector();
+        assert_eq!(
+            s.confirm(),
+            Some("EVENT-A".to_owned()),
+            "the list survives a close"
+        );
+    }
+
+    /// Closing the roster pane cancels whatever correction was in flight, the same as a
+    /// session ending underneath it: the buffer and the editing field both clear.
+    #[test]
+    fn closing_the_roster_pane_cancels_an_in_flight_correction() {
+        let mut s = State::default();
+        s.apply(&started(32));
+        s.apply(&roster_of("EVENT-A"));
+        s.open_roster();
+        s.begin_edit(EditingField::Name);
+        s.feed_edit('x');
+
+        s.close_roster();
+        assert!(!s.roster_open);
+        assert!(
+            s.editing.is_none(),
+            "an in-flight correction dies with the pane"
+        );
+        assert_eq!(s.edit_buffer, "");
+    }
+
+    /// Backspace deletes the last character of the field under correction, and is a no-op
+    /// outside an edit or on an already-empty buffer -- never a panic.
+    #[test]
+    fn backspace_deletes_the_last_character_of_the_field_under_correction() {
+        let mut s = State::default();
+        s.apply(&started(33));
+        s.apply(&roster_of("EVENT-A"));
+        s.open_roster();
+
+        // No-op outside an edit.
+        s.backspace_edit();
+        assert_eq!(s.edit_buffer, "");
+
+        s.begin_edit(EditingField::Name);
+        for c in "Ada".chars() {
+            s.feed_edit(c);
+        }
+        s.backspace_edit();
+        assert_eq!(s.edit_buffer, "Ad");
+
+        // A no-op on an already-empty buffer.
+        s.edit_buffer.clear();
+        s.backspace_edit();
+        assert_eq!(s.edit_buffer, "");
+    }
 }
