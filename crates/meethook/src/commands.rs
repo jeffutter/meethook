@@ -563,6 +563,11 @@ impl Tty {
 
     /// Whether both ends are attached to a terminal: the only case a full-screen interface may
     /// open in. A pipe on either end keeps the run on its line output.
+    ///
+    /// Only `record` calls this, and only under its macOS-only presenter, so a non-macOS,
+    /// non-test build never reaches it -- hence the same cfg as that call site, or clippy
+    /// reports it dead.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn is_attached(self) -> bool {
         self.stdin && self.stdout
     }
