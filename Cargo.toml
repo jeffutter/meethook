@@ -21,7 +21,7 @@ exclude = ["crates/meethook-record"]
 # Darwin), and its manifest mirrors this file's versions instead of inheriting them.
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # 1.88 rather than 1.85 because `ropus` declares that floor, so a 1.85 toolchain can no longer
 # build this workspace and saying otherwise would be a false claim rather than a conservative
