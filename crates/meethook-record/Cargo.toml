@@ -23,7 +23,7 @@
 
 [package]
 name = "meethook-record"
-version = "0.1.0"
+version = "0.2.0"
 description = "Dual-track (microphone + system audio) macOS capture into a meethook session directory"
 edition = "2024"
 rust-version = "1.88"
