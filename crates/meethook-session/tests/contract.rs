@@ -506,6 +506,140 @@ fn the_attendee_roster_is_only_available_for_a_strong_match() {
     }
 }
 
+/// A meeting with more than one attendee, for the roster-editing tests below: the same
+/// shape as [`sample_meeting`], only with a second invitee so an edit can drop one and
+/// rename another.
+fn stuffed_meeting() -> Meeting {
+    sample_meeting().with_people(
+        Some(Attendee {
+            name: Some("Ada Lovelace".to_owned()),
+            email: Some("ada@example.com".to_owned()),
+            status: AttendeeStatus::Accepted,
+            is_you: false,
+        }),
+        vec![
+            Attendee {
+                name: Some("Alan Turing".to_owned()),
+                email: Some("alan@example.com".to_owned()),
+                status: AttendeeStatus::Accepted,
+                is_you: false,
+            },
+            Attendee {
+                name: Some("Grace Hopper".to_owned()),
+                email: Some("grace@example.com".to_owned()),
+                status: AttendeeStatus::Tentative,
+                is_you: true,
+            },
+        ],
+    )
+}
+
+/// A roster replaced after construction stays behind exactly the gate the recorder-written
+/// one sits behind: an edit corrects *who* was invited, not *how well matched* the meeting
+/// is, so [`Meeting::speaker_roster`]'s `is_strong()` guard applies to the edited list
+/// unchanged, over every variant.
+#[test]
+fn an_edited_roster_stays_behind_the_fit_gate() {
+    // Drop Grace Hopper and rename Alan Turing: the edit touches the people, nothing else.
+    let edited = stuffed_meeting().with_attendees(vec![Attendee {
+        name: Some("A. Turing".to_owned()),
+        email: Some("alan@example.com".to_owned()),
+        status: AttendeeStatus::Accepted,
+        is_you: false,
+    }]);
+
+    for fit in MeetingFit::ALL {
+        let meeting = edited.clone().with_fit(fit);
+
+        match meeting.speaker_roster() {
+            Some(roster) => {
+                assert!(fit.is_strong(), "{fit:?} handed out a roster");
+                assert_eq!(roster.len(), 1, "{fit:?}");
+                assert_eq!(roster[0].name.as_deref(), Some("A. Turing"), "{fit:?}");
+                assert!(
+                    !roster
+                        .iter()
+                        .any(|a| a.name.as_deref() == Some("Grace Hopper")),
+                    "{fit:?}: the removed attendee resurfaced"
+                );
+            }
+            None => assert!(!fit.is_strong(), "{fit:?} withheld a roster"),
+        }
+
+        // The replacement left the organizer alone: `with_people` would have been the wrong
+        // door for this edit.
+        assert_eq!(
+            meeting.organizer.as_ref().and_then(|a| a.name.as_deref()),
+            Some("Ada Lovelace"),
+            "{fit:?}"
+        );
+    }
+}
+
+/// Replacing attendees changes only the `attendees` array in `session.json`: every other
+/// key -- including `fit`, whose preservation is what keeps the edited roster gated -- is
+/// byte-identical, and the schema version does not move.
+#[test]
+fn replacing_attendees_changes_only_the_attendees_key() {
+    let (_tmp, paths) = temp_root();
+    let session = make_session(&paths, "20260809-052607", &[]);
+    let target = session.session_json();
+
+    let original = sample_metadata("20260809-052607").with_meeting(Some(stuffed_meeting()));
+    original.write(&target).unwrap();
+    let first = fs::read_to_string(&target).unwrap();
+
+    // A meeting nobody passed through `with_attendees` writes back byte-identically: the
+    // `skip_serializing_if` defaults keep absent fields absent across a read/write cycle.
+    SessionMetadata::read(&target)
+        .unwrap()
+        .write(&target)
+        .unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), first);
+
+    // Read back, replace the roster, write again.
+    let mut metadata = SessionMetadata::read(&target).unwrap();
+    metadata.meeting = Some(
+        metadata
+            .meeting
+            .take()
+            .expect("the meeting round-tripped")
+            .with_attendees(vec![Attendee {
+                name: Some("A. Turing".to_owned()),
+                email: Some("alan@example.com".to_owned()),
+                status: AttendeeStatus::Accepted,
+                is_you: false,
+            }]),
+    );
+    metadata.write(&target).unwrap();
+    let second = fs::read_to_string(&target).unwrap();
+
+    let before: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let after: serde_json::Value = serde_json::from_str(&second).unwrap();
+
+    // Everything but the attendees array is untouched -- asserted structurally with the key
+    // stripped, so a field added later is compared too rather than forgotten.
+    let mut stripped_before = before.clone();
+    let mut stripped_after = after.clone();
+    for value in [&mut stripped_before, &mut stripped_after] {
+        if let Some(meeting) = value
+            .get_mut("meeting")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            meeting.remove("attendees");
+        }
+    }
+    assert_eq!(
+        stripped_before, stripped_after,
+        "only `attendees` may differ"
+    );
+    assert_eq!(after["schema_version"], 1);
+    assert_ne!(
+        before["meeting"]["attendees"],
+        after["meeting"]["attendees"]
+    );
+}
+
 /// A weak fit always has a caveat to show a person, and a strong one never does -- the
 /// property the record command's finish line and the transcript frontmatter both rely on.
 #[test]

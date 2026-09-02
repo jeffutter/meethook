@@ -250,6 +250,23 @@ impl Meeting {
         self
     }
 
+    /// Replace the attendee list, leaving every other field -- in particular `fit` and
+    /// `organizer` -- untouched.
+    ///
+    /// The mutation path the record TUI's roster editor (TASK-056.02) rides: an edited roster
+    /// must keep the provenance of the meeting it came from. Deliberately not
+    /// [`Meeting::with_people`] (which also replaces the organizer) and deliberately not
+    /// [`SessionMetadata::label_by_hand`] (which force-stamps [`MeetingFit::Confirmed`] -- a
+    /// human correcting the roster is not a human confirming the meeting, decision-009).
+    /// Because this touches only the private `attendees` field, [`Meeting::speaker_roster`]
+    /// remains the sole accessor and its `is_strong()` gate applies to an edited roster with
+    /// no further work.
+    #[must_use]
+    pub fn with_attendees(mut self, attendees: Vec<Attendee>) -> Self {
+        self.attendees = attendees;
+        self
+    }
+
     #[must_use]
     pub fn with_invite(
         mut self,
