@@ -9,7 +9,8 @@ use std::path::Path;
 
 use hound::{SampleFormat, WavReader, WavSpec};
 use meethook_session::write_atomic_with;
-use rubato::{FftFixedIn, Resampler};
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+use rubato::{Fft, FixedSync, Resampler, WindowFunction};
 
 use crate::progress::Phase;
 use crate::{Error, Result};
@@ -148,8 +149,14 @@ pub(crate) fn write_track_16k_mono(path: &Path, audio: &[f32]) -> Result<()> {
 /// Push-shaped rather than slice-shaped because the caller that matters is reading a file:
 /// holding an hour of 48 kHz audio *and* its 16 kHz result at once costs ~900 MB, which is
 /// the whole reason the read loop above is streaming.
+///
+/// Rubato 1.0 and later route every `process` call through the `audioadapter` buffer traits
+/// instead of taking raw slices. `SequentialSliceOfVecs` is their name for the old
+/// `&[&[f32]]` shape -- one vector per channel -- so the chunk loop below keeps its old form
+/// and only pays for the wrapper struct, not for copying samples into an intermediate
+/// buffer.
 struct Resample {
-    resampler: FftFixedIn<f32>,
+    resampler: Fft<f32>,
     /// Input frames still waiting for a full [`CHUNK_FRAMES`] to hand the resampler.
     chunk: Vec<f32>,
     out: Vec<f32>,
@@ -173,12 +180,16 @@ impl Resample {
             ));
         }
 
-        let resampler = FftFixedIn::<f32>::new(
+        // BlackmanHarris2 is what the pre-1.0 `FftFixedIn` used internally, so the
+        // anti-aliasing filter is the same one the timestamps were measured against.
+        let resampler = Fft::<f32>::new_custom(
             source_rate as usize,
             TARGET_RATE as usize,
             CHUNK_FRAMES,
             SUB_CHUNKS,
             1,
+            WindowFunction::BlackmanHarris2,
+            FixedSync::Input,
         )
         .map_err(|e| Error::Resample(e.to_string()))?;
 
@@ -199,37 +210,54 @@ impl Resample {
         })
     }
 
+    /// Hands `chunk` to the resampler. `partial_len` says how many of its frames are real
+    /// when the last chunk is shorter than [`CHUNK_FRAMES`]; the resampler pads the missing
+    /// tail with silence itself, which is what `process_partial` did in the pre-1.0 API.
+    fn process_chunk(&mut self, chunk: &Vec<f32>, partial_len: Option<usize>) -> Result<()> {
+        let frames = partial_len.unwrap_or(chunk.len());
+        // One vector per channel; mono means the single vector is the whole track.
+        let buffer = SequentialSliceOfVecs::new(std::slice::from_ref(chunk), 1, frames)
+            .map_err(|e| Error::Resample(format!("{e:?}")))?;
+        let indexing = partial_len.map(|len| rubato::Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            partial_len: Some(len),
+            active_channels_mask: None,
+        });
+        let produced = self
+            .resampler
+            .process(&buffer, indexing.as_ref())
+            .map_err(|e| Error::Resample(e.to_string()))?;
+        // Mono: interleaved order is the sample order, so the buffer is the output itself.
+        self.out.extend_from_slice(&produced.take_data());
+        Ok(())
+    }
+
     fn push(&mut self, sample: f32) -> Result<()> {
         self.pushed += 1;
         self.chunk.push(sample);
         if self.chunk.len() == CHUNK_FRAMES {
-            let produced = self
-                .resampler
-                .process(&[&self.chunk], None)
-                .map_err(|e| Error::Resample(e.to_string()))?;
-            self.out.extend_from_slice(&produced[0]);
-            self.chunk.clear();
+            // Swap out the full chunk for a fresh pre-sized buffer: `process_chunk` needs
+            // `&mut self`, so the chunk cannot be borrowed across the call.
+            let full = std::mem::replace(&mut self.chunk, Vec::with_capacity(CHUNK_FRAMES));
+            self.process_chunk(&full, None)?;
         }
         Ok(())
     }
 
     fn finish(mut self) -> Result<Vec<f32>> {
         if !self.chunk.is_empty() {
-            let produced = self
-                .resampler
-                .process_partial(Some(&[&self.chunk]), None)
-                .map_err(|e| Error::Resample(e.to_string()))?;
-            self.out.extend_from_slice(&produced[0]);
+            let partial = std::mem::take(&mut self.chunk);
+            self.process_chunk(&partial, Some(partial.len()))?;
         }
 
-        // One flush of silence pushes the samples still inside the filter out, so the last
-        // fraction of a second of speech is not lost to the resampler's own latency.
-        if self.pushed > 0 {
-            let flushed = self
-                .resampler
-                .process_partial::<Vec<f32>>(None, None)
-                .map_err(|e| Error::Resample(e.to_string()))?;
-            self.out.extend_from_slice(&flushed[0]);
+        // Silence pumped through the filter pushes the samples still sitting in it out, so
+        // the last fraction of a second of speech is not lost to the resampler's own
+        // latency. Pump until the expected length is reached rather than flushing a fixed
+        // number of times: the truncation below discards the excess either way.
+        let zeros = vec![0.0f32; self.resampler.input_frames_next()];
+        while self.out.len() < self.expected {
+            self.process_chunk(&zeros, None)?;
         }
 
         self.out.drain(..self.delay.min(self.out.len()));

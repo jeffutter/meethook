@@ -163,12 +163,16 @@ thiserror = "2"
 # nor a native OpenSSL dependency in the flake.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
-# The classic (pre-1.0) rubato API. Every release from 1.0 onward -- 5.0 is the current one --
-# routes all I/O through the `audioadapter` traits, which buy nothing for one fixed-ratio mono
-# conversion. This is the workspace's one deliberately-behind dependency -- the only crate
-# `cargo update --dry-run --verbose` still reports as "Unchanged ... (available: ...)" -- and
-# staying here is the answer, not an oversight.
-rubato = "0.16"
+# Fixed-ratio resampling for meethook-transcribe::audio. Rubato 1.0 and later route every
+# process call through the `audioadapter` buffer traits instead of raw slices; that buys
+# nothing for one fixed-ratio mono conversion, but it is no longer a reason to stay behind,
+# so this tracks current. The pre-1.0 API pinned here until now was `FftFixedIn`; its
+# successor is `Fft` with `FixedSync::Input`, and `SequentialSliceOfVecs` (re-exported by
+# rubato) is the adapter name for the old `&[&[f32]]` shape, so the streaming chunk loop in
+# audio.rs keeps its form. `WindowFunction::BlackmanHarris2` matches what `FftFixedIn`
+# used internally, keeping the anti-aliasing filter -- and the timestamps measured against
+# it -- unchanged across the bump.
+rubato = "5"
 
 # Real-input FFT, for the GCC-PHAT delay estimate in meethook-transcribe::align. It wraps
 # rustfft, which rubato already pulls in, so this adds a thin layer rather than a second FFT
