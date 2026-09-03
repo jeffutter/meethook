@@ -587,11 +587,11 @@ fn line_to_play(selected: Option<(usize, Snippet<'_>)>) -> Result<(usize, &[f32]
 ///
 /// Ctrl-G ("g for go on to the next meeting") leaves the rest of this session's voices. It is
 /// the middle of three scopes -- Ctrl-S is one voice, this is the session, Ctrl-C is the run --
-/// and it is placed where no reflex reaches it and it reaches nothing: `f`, `h`, `t`, `y`, `v`
-/// and `b` are all unbound. Not Ctrl-X, which sits beside the key that ends the whole run; not
-/// Left, because Right is the harmless "work on that voice" and pairing the two by direction
-/// pairs them by accident too; and not Ctrl-E or Ctrl-K, since `e` is beside `s` and `k` beside
-/// both `l` and `o`.
+/// and it is placed where no reflex reaches it and it reaches nothing: `f`, `h`, `t`, `v`
+/// and `b` were all unbound when it was picked. Not Ctrl-X, which sits beside the key that ends
+/// the whole run; not Left, because Right is the harmless "work on that voice" and pairing the
+/// two by direction pairs them by accident too; and not Ctrl-E or Ctrl-K, since `e` is beside
+/// `s` and `k` beside both `l` and `o`.
 ///
 /// Ctrl-A ("a for assert") names the whole session's speaker track as one person at once, with
 /// the highlighted candidate. Its own key because its *scope* outranks every other answer here:
@@ -610,6 +610,21 @@ fn line_to_play(selected: Option<(usize, Snippet<'_>)>) -> Result<(usize, &[f32]
 /// over as `Enter` and the advertised key would answer the question instead of marking; Ctrl-K
 /// is the nearest free letter with its own byte (checked against a live terminal through this
 /// very decoder), and the bare letter types into the filter as every other unbound one does.
+///
+/// Ctrl-Y ("y for yes") confirms the tentative guess the current voice carries: the highlight
+/// moves onto the suggested name and the answer goes through exactly the path Enter takes --
+/// the same refusal gate, the same preview panes, the same Ctrl-O insistence behind it. Its own
+/// key rather than Enter because Enter answers whichever candidate happens to be highlighted,
+/// and confirming a guess must mean "that one" regardless of where the highlight sits. A
+/// control key for the reason choosing and creating are -- printable characters go to the
+/// filter -- and the bare letter types into the filter as every other unbound one does (checked
+/// against a live terminal through this very decoder).
+///
+/// Ctrl-R ("r for reject") refuses the same guess: the row goes back to the honest "Unknown N"
+/// its turns were written with, and the denial is written where a naming would have been. Its
+/// own key beside Ctrl-Y because the two are the two decisions a visible guess invites, and
+/// neither may ride the reflex keys -- Esc clears the filter and Enter chooses, so a guess
+/// action on either would reach by accident what a decision should not.
 ///
 /// A free function taking a `KeyEvent` because a `KeyEvent` is constructible without a terminal,
 /// which is what makes this whole rule testable -- and it is where a stray Ctrl or a paste-shaped
@@ -631,6 +646,8 @@ fn event(key: KeyEvent) -> Option<Event> {
         (KeyCode::Char('o'), true) => Some(Event::Anyway),
         (KeyCode::Char('a'), true) => Some(Event::Assert),
         (KeyCode::Char('k'), true) => Some(Event::Mark),
+        (KeyCode::Char('y'), true) => Some(Event::Confirm),
+        (KeyCode::Char('r'), true) => Some(Event::Deny),
         (KeyCode::Up, false) => Some(Event::Up),
         (KeyCode::Down, false) => Some(Event::Down),
         (KeyCode::Right, false) => Some(Event::Select),
@@ -751,12 +768,16 @@ mod tests {
             (KeyCode::Char('o'), KeyModifiers::CONTROL, Event::Anyway),
             (KeyCode::Char('a'), KeyModifiers::CONTROL, Event::Assert),
             (KeyCode::Char('k'), KeyModifiers::CONTROL, Event::Mark),
+            (KeyCode::Char('y'), KeyModifiers::CONTROL, Event::Confirm),
+            (KeyCode::Char('r'), KeyModifiers::CONTROL, Event::Deny),
             (KeyCode::Char('a'), KeyModifiers::NONE, Event::Filter('a')),
             (KeyCode::Char(' '), KeyModifiers::NONE, Event::Filter(' ')),
             // The non-regression that matters for a new letter key: without the modifier it is
             // still text, because printable characters type into the candidate filter.
             (KeyCode::Char('g'), KeyModifiers::NONE, Event::Filter('g')),
             (KeyCode::Char('k'), KeyModifiers::NONE, Event::Filter('k')),
+            (KeyCode::Char('y'), KeyModifiers::NONE, Event::Filter('y')),
+            (KeyCode::Char('r'), KeyModifiers::NONE, Event::Filter('r')),
         ];
         for (code, modifiers, expected) in bound {
             assert_eq!(

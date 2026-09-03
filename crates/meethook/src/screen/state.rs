@@ -130,6 +130,27 @@ pub enum Event {
     /// the same reflex as the harmless one. It is what makes the cost pane load-bearing: the
     /// frame prints which voice pays and what it loses before this key exists to be pressed.
     Anyway,
+    /// Confirm the tentative guess the current voice carries: move the highlight onto the
+    /// suggested name and answer with it through exactly the path Enter takes -- the same
+    /// refusal gate, the same preview panes, the same insistence behind [`Event::Anyway`].
+    ///
+    /// Live only while the question is about a guessed fragment **and** the guess is still
+    /// among the candidates the filter resolves. The second half is the seam this ticket keeps:
+    /// a confirm that could not be reached by Tabbing to the guess and pressing Enter would be
+    /// a second path into the same answer, and confirming must never drift from typing it. Its
+    /// own key rather than Enter because Enter answers whichever candidate happens to be
+    /// highlighted, and confirming a guess must mean "that one" regardless of where the
+    /// highlight sits.
+    Confirm,
+    /// Refuse the tentative guess the current voice carries: the row goes back to the honest
+    /// "Unknown N" its turns were written with, and the denial is written where a naming would
+    /// have been, so every later run stops guessing the same name for the same voice.
+    ///
+    /// Live only while the question is about a guessed fragment. Deliberately independent of
+    /// the filter, where [`Event::Confirm`] is not: refusing the guess the screen is showing is
+    /// unambiguous even while the user is typing, whereas confirming is not -- which is why
+    /// this key does not need the guess to be among the resolved candidates.
+    Deny,
     /// Assert that the session's speaker track is one person, named with the highlighted
     /// candidate, and answer every voice in it with that name.
     ///
@@ -229,6 +250,10 @@ pub struct Row {
     /// needs to see that it exists.
     pub below_floor: bool,
     pub mark: Option<Mark>,
+    /// Whether the label is a marked guess rather than a naming: rendered as a `[guess]` tag
+    /// beside the similarity, so a row the database claimed reads differently from one it named
+    /// and from one nothing has said about.
+    pub guess: bool,
     /// Whether the row counts as one person together with the other marked rows: the staged
     /// group, rendered beside the decision marks rather than instead of them.
     pub in_group: bool,
@@ -262,6 +287,10 @@ pub struct View<'a> {
     /// The voice's label as it reads now -- a guess owns its allocated "Name?" rather than
     /// borrowing one, which is what makes this `Cow`.
     pub label: Cow<'a, str>,
+    /// The tentative guess the current voice carries, without its mark -- `Some` exactly when
+    /// the question is about a guessed fragment. The footer gates its two keys off this rather
+    /// than re-reading the attribution, so advertisement and actuation cannot drift apart.
+    pub guess: Option<&'a str>,
     pub speech_seconds: f64,
     pub rows: Vec<Row>,
     /// Index into [`View::rows`] of the queue cursor.
@@ -545,19 +574,7 @@ impl Screen {
                     // only way to create somebody is the key that says so.
                     return Step::Waiting;
                 };
-                if self.group.contains(view.number) {
-                    return self.commit_group(view, name, costs);
-                }
-                // Unchanged by the override: *every* refusal refuses this key, the overridable
-                // one included. Insisting is the other key's job.
-                if refusal.is_some() {
-                    return Step::Waiting;
-                }
-                self.decided.insert(view.number.to_string(), Mark::Answered);
-                return Step::Answered(Answer::Named {
-                    name,
-                    anyway: false,
-                });
+                return self.answer_named(view, name, refusal, costs);
             }
             Event::Anyway => {
                 let Some((name, refusal)) = self.chosen(view, costs) else {
@@ -579,6 +596,45 @@ impl Screen {
                 }
                 self.decided.insert(view.number.to_string(), Mark::Answered);
                 return Step::Answered(Answer::Named { name, anyway: true });
+            }
+            Event::Confirm => {
+                // A guess to confirm lives on the voice the question is about; nothing
+                // guessed means nothing to confirm, and the footer does not advertise the
+                // key there either.
+                let Attribution::Tentative { name, .. } = view.attribution else {
+                    return Step::Waiting;
+                };
+                // The guess must still be among the candidates the filter resolves: a confirm
+                // that could not be reached by Tabbing to the guess and pressing Enter would
+                // be a second path into the same answer, and that is the drift the ticket
+                // forbids.
+                let Some(index) = self
+                    .candidates(view)
+                    .iter()
+                    .position(|candidate| candidate.as_str() == *name)
+                else {
+                    return Step::Waiting;
+                };
+                // Onto the guess, so the cost and consequence panes preview what the confirm
+                // commits, and a subsequent Ctrl-O insists on the guess rather than whatever
+                // happened to be highlighted.
+                self.candidate = index;
+                // From here it is Enter verbatim: the same lookup, the same tail.
+                let Some((answer, refusal)) = self.chosen(view, costs) else {
+                    return Step::Waiting;
+                };
+                return self.answer_named(view, answer, refusal, costs);
+            }
+            Event::Deny => {
+                // Nothing guessed to refuse on this voice; the footer does not advertise the
+                // key there either.
+                let Attribution::Tentative { name, .. } = view.attribution else {
+                    return Step::Waiting;
+                };
+                // A decision, not a deferral: the row settles like every settling answer, and
+                // the queue's pass-over gate counts it as answered from here on.
+                self.decided.insert(view.number.to_string(), Mark::Answered);
+                return Step::Answered(Answer::Deny { name: name.clone() });
             }
             Event::Assert => {
                 let Some((name, _)) = self.chosen(view, costs) else {
@@ -649,6 +705,35 @@ impl Screen {
         Step::Waiting
     }
 
+    /// What answering with a resolved name does -- or whether it may not.
+    ///
+    /// Shared by [`Event::Choose`] and [`Event::Confirm`]: confirming a guess is Enter after
+    /// Tabbing to it, so the two must provably never disagree about what the same row commits
+    /// -- the group routing, the refusal gate, the mark and the answer itself. The one thing
+    /// this tail does not share is how the name got there: Enter resolves whichever candidate
+    /// is highlighted, and confirm has just moved the highlight onto the guess.
+    fn answer_named(
+        &mut self,
+        view: &VoiceView<'_>,
+        name: String,
+        refusal: Option<Refusal>,
+        costs: &dyn Costs,
+    ) -> Step {
+        if self.group.contains(view.number) {
+            return self.commit_group(view, name, costs);
+        }
+        // Unchanged by the override: *every* refusal refuses this key, the overridable
+        // one included. Insisting is the other key's job.
+        if refusal.is_some() {
+            return Step::Waiting;
+        }
+        self.decided.insert(view.number.to_string(), Mark::Answered);
+        Step::Answered(Answer::Named {
+            name,
+            anyway: false,
+        })
+    }
+
     /// Which line the pane has selected: the state's index, clamped to the lines this voice has.
     ///
     /// One rule rather than two, because [`Screen::selected`] and [`View::snippet`] must not be
@@ -693,13 +778,15 @@ impl Screen {
                 speech_seconds: row.speech_seconds,
                 similarity: match row.attribution {
                     // A guess carries its machine similarity like an identification: the pane
-                    // shows the number, and how it is treated is 059.04's surface work.
+                    // shows the number, and the `[guess]` tag beside it says the cut was the
+                    // wider one rather than a lower number pretending to be a tighter one.
                     Attribution::Identified { similarity, .. }
                     | Attribution::Tentative { similarity, .. } => Some(*similarity),
                     Attribution::Unknown(_) | Attribution::Assigned { .. } => None,
                 },
                 below_floor: row.below_floor,
                 mark: self.decided.get(row.number).copied(),
+                guess: matches!(row.attribution, Attribution::Tentative { .. }),
                 in_group: self.group.contains(row.number),
                 current: row.number == view.number,
             })
@@ -758,6 +845,10 @@ impl Screen {
             position: view.position,
             number: view.number,
             label: view.attribution.label(),
+            guess: match view.attribution {
+                Attribution::Tentative { name, .. } => Some(name),
+                _ => None,
+            },
             speech_seconds: view.speech_seconds,
             rows,
             cursor: self.cursor.min(view.queue.len().saturating_sub(1)),
@@ -1704,6 +1795,434 @@ pub(crate) mod tests {
             None,
             "a key that did nothing may not mark the voice as answered"
         );
+    }
+
+    /// The queue rows as owned tuples, the shape [`queue`] projects into `Queued`. Named rather
+    /// than spelled out at every signature, which would trip `clippy::type_complexity`.
+    type OwnedRows = Vec<(String, Attribution, f64, bool)>;
+
+    /// The question about a guessed fragment, with the guess reachable in the ranking: the
+    /// fixture every test below this one asks about. The queue is built by the caller because
+    /// it borrows from `owned`.
+    fn guessed_voice() -> (
+        SessionId,
+        OwnedRows,
+        Vec<Resemblance>,
+        &'static [&'static str],
+    ) {
+        let session = session();
+        let owned = vec![
+            (
+                "Unknown 1".to_string(),
+                Attribution::Identified {
+                    name: "Milo".to_string(),
+                    similarity: 0.81,
+                },
+                240.0,
+                false,
+            ),
+            (
+                "Unknown 2".to_string(),
+                Attribution::Tentative {
+                    name: "Ivan".to_string(),
+                    similarity: 0.38,
+                },
+                95.0,
+                false,
+            ),
+            (
+                "Unknown 3".to_string(),
+                Attribution::Unknown("Unknown 3".to_string()),
+                60.0,
+                false,
+            ),
+        ];
+        let similar = resembles(&[("Milo", 0.71, 3), ("Ivan", 0.38, 1)]);
+        let enrolled: &[&str] = &["Milo", "Ivan"];
+        (session, owned, similar, enrolled)
+    }
+
+    /// AC #2, the frame half: confirming sends exactly the answer typing the suggested name
+    /// would -- `Named` with `anyway: false`, through the same tail Enter takes -- and the row
+    /// settles like any other answer.
+    #[test]
+    fn confirming_a_guess_answers_named_with_the_suggested_name() {
+        let (session, owned, similar, enrolled) = guessed_voice();
+        let queue = queue(&owned);
+        let voice = view(
+            &session,
+            "Unknown 2",
+            2,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[1].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        assert_eq!(
+            screen.answer(&voice, Event::Confirm, &Free),
+            Step::Answered(Answer::Named {
+                name: "Ivan".to_string(),
+                anyway: false,
+            })
+        );
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert_eq!(derived.rows[1].mark, Some(Mark::Answered));
+        // The queue advances as after any answer: the next voice arrives without deferring.
+        let third = view(
+            &session,
+            "Unknown 3",
+            3,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[2].1,
+        );
+        assert_eq!(screen.arrive(&third), None);
+        assert!(!screen.still_working());
+    }
+
+    /// Confirming is Enter after Tabbing to the guess: the highlight moves onto the suggested
+    /// name, so the consequence pane previews what the confirm commits -- and a subsequent
+    /// Ctrl-O would insist on the guess rather than whatever was highlighted.
+    #[test]
+    fn a_confirmed_guess_moves_the_highlight_onto_itself() {
+        let (session, owned, similar, enrolled) = guessed_voice();
+        let queue = queue(&owned);
+        let voice = view(
+            &session,
+            "Unknown 2",
+            2,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[1].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        // `Counted` rather than `Free`: its summary names the candidate, which is what makes
+        // "the consequence follows the guess" assertable.
+        let counted = Counted(Cell::new(0), Cell::new(0));
+
+        assert_eq!(
+            screen.answer(&voice, Event::Confirm, &counted),
+            Step::Answered(Answer::Named {
+                name: "Ivan".to_string(),
+                anyway: false,
+            })
+        );
+        // Ivan is the second of the ranked candidates; the highlight sits on it, and the
+        // consequence follows the guess.
+        assert_eq!(screen.candidate, 1);
+        let derived = screen.view(&voice, &counted, Context::Reading);
+        assert_eq!(derived.candidate, Some(1));
+        assert_eq!(derived.consequence, vec!["would name this voice Ivan"]);
+        // The footer's gate reads off the same data the arm does.
+        assert_eq!(derived.guess, Some("Ivan"));
+    }
+
+    /// AC #2, the refusal half: a guess the gate refuses cannot be confirmed at all -- the no-op
+    /// leaves nothing marked, and the override stays carried on the answer itself, aimed at the
+    /// guess because the highlight moved onto it.
+    #[test]
+    fn a_refused_guess_cannot_be_confirmed_and_anyway_overrides_the_guess() {
+        let (session, owned, similar, enrolled) = guessed_voice();
+        let queue = queue(&owned);
+        let voice = view(
+            &session,
+            "Unknown 2",
+            2,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[1].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let takes = Takes("Ivan");
+
+        assert_eq!(
+            screen.answer(&voice, Event::Confirm, &takes),
+            Step::Waiting,
+            "confirming goes through the identical refusal gate as typing"
+        );
+        assert_eq!(
+            screen.view(&voice, &takes, Context::Reading).rows[1].mark,
+            None,
+            "a refused confirm marks nothing"
+        );
+        // The highlight now sits on the refused guess, which is exactly where insisting works.
+        assert_eq!(
+            screen.answer(&voice, Event::Anyway, &takes),
+            Step::Answered(Answer::Named {
+                name: "Ivan".to_string(),
+                anyway: true,
+            })
+        );
+    }
+
+    /// Neither guess key exists on a voice nothing guessed about: the keys are not advertised
+    /// there either, and pressing them changes nothing.
+    #[test]
+    fn confirm_and_deny_do_nothing_on_a_voice_without_a_guess() {
+        let session = session();
+        let identified = [(
+            "Unknown 1".to_string(),
+            Attribution::Identified {
+                name: "Milo".to_string(),
+                similarity: 0.81,
+            },
+            240.0,
+            false,
+        )];
+        let unknown = rows(&[("Unknown 1", 60.0, false)]);
+        for (what, owned) in [
+            ("an identified voice", &identified[..]),
+            ("a plain unknown voice", &unknown[..]),
+        ] {
+            let queue = queue(owned);
+            let voice = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
+            let mut screen = Screen::default();
+            screen.arrive(&voice);
+
+            assert_eq!(
+                screen.answer(&voice, Event::Confirm, &Free),
+                Step::Waiting,
+                "{what}"
+            );
+            assert_eq!(
+                screen.answer(&voice, Event::Deny, &Free),
+                Step::Waiting,
+                "{what}"
+            );
+            let derived = screen.view(&voice, &Free, Context::Reading);
+            assert_eq!(
+                derived.rows[0].mark, None,
+                "neither key marks anything on {what}"
+            );
+            assert_eq!(derived.guess, None, "{what}");
+        }
+    }
+
+    /// A divergent filter takes the guess out of the resolved candidates, and a confirm that
+    /// could not be reached by Enter+Tab is a second path into the same answer -- which the
+    /// ticket forbids, so the key gives nothing back.
+    #[test]
+    fn confirm_does_nothing_while_the_filter_resolves_elsewhere() {
+        let (session, owned, similar, enrolled) = guessed_voice();
+        let queue = queue(&owned);
+        let voice = view(
+            &session,
+            "Unknown 2",
+            2,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[1].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        // Nobody enrolled matches: the candidate list is empty and the guess is not in it.
+        for c in "zzz".chars() {
+            screen.answer(&voice, Event::Filter(c), &Free);
+        }
+
+        assert_eq!(screen.answer(&voice, Event::Confirm, &Free), Step::Waiting);
+        assert_eq!(
+            screen.view(&voice, &Free, Context::Reading).rows[1].mark,
+            None,
+            "a confirm that could not be typed marks nothing"
+        );
+    }
+
+    /// AC #3, the frame half: refusing sends the denial answer with the guess as its name --
+    /// the label minus its mark -- and the row settles like any other answer.
+    #[test]
+    fn denying_a_guess_commits_the_deny_answer_and_marks_the_row() {
+        let (session, owned, similar, enrolled) = guessed_voice();
+        let queue = queue(&owned);
+        let voice = view(
+            &session,
+            "Unknown 2",
+            2,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[1].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        assert_eq!(
+            screen.answer(&voice, Event::Deny, &Free),
+            Step::Answered(Answer::Deny {
+                name: "Ivan".to_string(),
+            })
+        );
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert_eq!(derived.rows[1].mark, Some(Mark::Answered));
+    }
+
+    /// Refusing is independent of the filter: the guess on screen is unambiguous even while
+    /// the user is typing, so the key answers rather than waiting.
+    #[test]
+    fn denying_a_guess_works_while_typing() {
+        let (session, owned, similar, enrolled) = guessed_voice();
+        let queue = queue(&owned);
+        let voice = view(
+            &session,
+            "Unknown 2",
+            2,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[1].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        for c in "mi".chars() {
+            screen.answer(&voice, Event::Filter(c), &Free);
+        }
+
+        assert_eq!(
+            screen.answer(&voice, Event::Deny, &Free),
+            Step::Answered(Answer::Deny {
+                name: "Ivan".to_string(),
+            })
+        );
+    }
+
+    /// AC #5: steering to a guess row, deferring it, and coming back round behaves as today's
+    /// Mark/Position machinery specifies -- the deferral lands, the target clears on arrival,
+    /// and the confirm there uses the steered voice's own suggestion.
+    #[test]
+    fn deferring_a_guess_row_steers_and_confirm_uses_the_steered_guess() {
+        let (session, owned, similar, enrolled) = guessed_voice();
+        let queue = queue(&owned);
+        let mut screen = Screen::default();
+
+        // Asked about the guessed fragment; steer away from it.
+        let second = view(
+            &session,
+            "Unknown 2",
+            2,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[1].1,
+        );
+        screen.arrive(&second);
+        screen.answer(&second, Event::Up, &Free);
+        assert_eq!(
+            screen.answer(&second, Event::Select, &Free),
+            Step::Answered(Answer::Later)
+        );
+        assert!(screen.still_working());
+
+        // The pass re-offers: Unknown 1 is the target, then the user steers back to the guess.
+        let first = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[0].1,
+        );
+        assert_eq!(screen.arrive(&first), None);
+        assert!(!screen.still_working());
+        screen.answer(&first, Event::Down, &Free);
+        assert_eq!(
+            screen.answer(&first, Event::Select, &Free),
+            Step::Answered(Answer::Later)
+        );
+        assert!(screen.still_working());
+
+        // The guess comes round again as the target; confirming there names its suggestion.
+        assert_eq!(screen.arrive(&second), None);
+        assert!(!screen.still_working());
+        assert_eq!(
+            screen.answer(&second, Event::Confirm, &Free),
+            Step::Answered(Answer::Named {
+                name: "Ivan".to_string(),
+                anyway: false,
+            })
+        );
+    }
+
+    /// Group interaction inherited wholesale: a confirm on a marked anchor routes through the
+    /// group commit exactly as Choose does, members in queue order and the staging consumed.
+    #[test]
+    fn confirming_a_guess_on_a_marked_anchor_returns_the_group_answer() {
+        let session = session();
+        let owned = vec![
+            (
+                "Unknown 1".to_string(),
+                Attribution::Unknown("Unknown 1".to_string()),
+                60.0,
+                false,
+            ),
+            (
+                "Unknown 2".to_string(),
+                Attribution::Tentative {
+                    name: "Grace".to_string(),
+                    similarity: 0.40,
+                },
+                60.0,
+                false,
+            ),
+            (
+                "Unknown 3".to_string(),
+                Attribution::Unknown("Unknown 3".to_string()),
+                60.0,
+                false,
+            ),
+        ];
+        let queue = queue(&owned);
+        let similar = resembles(&[("Grace", 0.40, 1)]);
+        let enrolled = ["Grace"];
+        let voice = view(
+            &session,
+            "Unknown 2",
+            2,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[1].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        // Stage the anchor and the third row together.
+        screen.answer(&voice, Event::Mark, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+        let groups = Groups("Grace");
+
+        assert_eq!(
+            screen.answer(&voice, Event::Confirm, &groups),
+            Step::Answered(Answer::Group {
+                name: "Grace".to_string(),
+                members: vec!["Unknown 2".to_string(), "Unknown 3".to_string()],
+            })
+        );
+        assert!(
+            screen.group.is_empty(),
+            "one confirmation is one group commit: the staging is consumed"
+        );
+        let derived = screen.view(&voice, &groups, Context::Reading);
+        assert_eq!(derived.rows[1].mark, Some(Mark::Answered));
     }
 
     /// AC #8: unrecognised text with Choose pressed does nothing at all, and creating somebody is

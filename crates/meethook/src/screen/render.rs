@@ -226,6 +226,11 @@ fn voice_line(row: &Row) -> Line<'static> {
             spans.push(Span::raw(format!(" {similarity:.2}")).dim());
         }
     }
+    // A guess is the database's claim, not a naming the user made: the tag says so beside the
+    // similarity, the way [group] sits beside the decision marks rather than instead of them.
+    if row.guess {
+        spans.push(Span::raw("  [guess]"));
+    }
     if let Some(mark) = row.mark {
         spans.push(Span::raw(match mark {
             Mark::Answered => "  [named]",
@@ -257,7 +262,16 @@ fn question(frame: &mut Frame, area: Rect, view: &View<'_>) {
     let heard = speech(view.speech_seconds);
     let text = match view.label == view.number {
         true => format!(" who is {}?  {heard}", view.number),
-        false => format!(" is {} {}?  {heard}", view.number, view.label),
+        false => {
+            // A guess owns its own question mark in the label; appending the frame's would
+            // double it. Driven off the attribution kind, not a suffix sniff: a person named
+            // "Ivan?" would otherwise lose their mark.
+            let mark = match view.guess {
+                Some(_) => "",
+                None => "?",
+            };
+            format!(" is {} {}{mark}  {heard}", view.number, view.label)
+        }
     };
     frame.render_widget(Paragraph::new(Line::from(text).bold()), area);
 }
@@ -627,8 +641,35 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sound
                 Some(Refusal::Taken { .. }) => "^O anyway",
                 _ => "enter choose",
             };
+            // The guess keys actuate the choosing act, so they sit beside the slot they
+            // interact with -- early enough to survive the clip at the pane edge, where a
+            // tail append would hide them entirely. Both advertised only while the question
+            // is about a guessed fragment, mirroring the gate the events carry in `state`;
+            // ^Y additionally only while the guess is still among the resolved candidates,
+            // because a confirm that could not be reached by Enter+Tab would be a key that
+            // cannot work.
+            let guess_keys = match view.guess {
+                Some(guess) => {
+                    let confirm = view
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.name == guess)
+                        .then_some("^Y confirm");
+                    [confirm, Some("^R reject")]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                }
+                None => String::new(),
+            };
+            let guess_segment = if guess_keys.is_empty() {
+                String::new()
+            } else {
+                format!("  {guess_keys}")
+            };
             format!(
-                "up/down voice  right work on it  tab candidate  {choose}  \
+                "up/down voice  right work on it  tab candidate  {choose}{guess_segment}  \
                  ^A assert  ^K mark  ^N new  {clip}{line}  ^S skip  ^G leave  ^C quit"
             )
         }
@@ -791,6 +832,59 @@ mod tests {
         context: Context<'_>,
         meeting: Option<&MeetingLabel>,
     ) -> Vec<String> {
+        frame(
+            width,
+            height,
+            costs,
+            keys,
+            snippets,
+            sounding,
+            status,
+            context,
+            meeting,
+            Attribution::Unknown("Unknown 2".to_string()),
+            vec!["20260819-100000  3 voice(s) to ask about".to_string()],
+        )
+    }
+
+    /// [`painted_with`], with the middle voice carrying a marked guess rather than an
+    /// unconfident number: the row the guess tests ask about. Ivan is already in the
+    /// fixture's ranking, so the guess is reachable by Enter+Tab and both guess keys are live.
+    fn guessed(width: u16, height: u16, costs: &dyn Costs, keys: &[Event]) -> Vec<String> {
+        frame(
+            width,
+            height,
+            costs,
+            keys,
+            &said(),
+            None,
+            None,
+            Context::Reading,
+            None,
+            Attribution::Tentative {
+                name: "Ivan".to_string(),
+                similarity: 0.38,
+            },
+            vec!["20260819-100000  3 voice(s) to ask about".to_string()],
+        )
+    }
+
+    /// The whole frame as text, one string per terminal row, given the fixture's middle voice
+    /// and the run's narration: everything above delegates here with the defaults.
+    #[allow(clippy::too_many_arguments)]
+    fn frame(
+        width: u16,
+        height: u16,
+        costs: &dyn Costs,
+        keys: &[Event],
+        snippets: &[Snippet<'_>],
+        sounding: Option<Sounding>,
+        status: Option<&str>,
+        context: Context<'_>,
+        meeting: Option<&MeetingLabel>,
+        middle: Attribution,
+        narration: Vec<String>,
+    ) -> Vec<String> {
         let session = SessionId::parse("20260819-100000").expect("a well-formed session id");
         let labels = [
             (
@@ -802,12 +896,7 @@ mod tests {
                 240.0,
                 false,
             ),
-            (
-                "Unknown 2".to_string(),
-                Attribution::Unknown("Unknown 2".to_string()),
-                95.0,
-                false,
-            ),
+            ("Unknown 2".to_string(), middle, 95.0, false),
             (
                 "Unknown 3".to_string(),
                 Attribution::Unknown("Unknown 3".to_string()),
@@ -862,7 +951,6 @@ mod tests {
             screen.say(status.to_string());
         }
         let view = screen.view(&voice, costs, context);
-        let narration = vec!["20260819-100000  3 voice(s) to ask about".to_string()];
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
         terminal
@@ -1074,6 +1162,7 @@ mod tests {
             similarity: None,
             below_floor: false,
             mark: Some(Mark::Skipped),
+            guess: false,
             in_group: true,
             current: false,
         };
@@ -1096,6 +1185,7 @@ mod tests {
             similarity: None,
             below_floor: true,
             mark: None,
+            guess: false,
             in_group: false,
             current: false,
         };
@@ -1104,6 +1194,102 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert!(!rendered.contains("[group]"), "{rendered}");
+    }
+
+    /// AC #1, the drawing side: a guessed row carries its similarity like an identification and
+    /// a `[guess]` tag beside it that neither an identified row nor a plain unknown row has --
+    /// the three kinds of label read differently, and the tag sits before the question mark on
+    /// the line the way `[group]` sits before the decision marks.
+    #[test]
+    fn a_tentative_row_carries_the_guess_tag() {
+        let row = Row {
+            number: "Unknown 2".to_string(),
+            label: "Ivan?".to_string(),
+            speech_seconds: 95.0,
+            similarity: Some(0.38),
+            below_floor: false,
+            mark: None,
+            guess: true,
+            in_group: false,
+            current: true,
+        };
+        let rendered: String = voice_line(&row)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.contains("Ivan?"), "{rendered}");
+        assert!(
+            rendered.contains("0.38"),
+            "the machine similarity is shown: {rendered}"
+        );
+        assert!(rendered.contains("[guess]"), "{rendered}");
+        assert!(
+            rendered.find("0.38").unwrap() < rendered.find("[guess]").unwrap(),
+            "the tag follows the similarity: {rendered}"
+        );
+        assert!(
+            rendered.find("[guess]").unwrap() < rendered.find("<- asking").unwrap(),
+            "the tag precedes the question mark on the line: {rendered}"
+        );
+
+        // An identified row keeps its similarity without the tag...
+        let named = Row {
+            number: "Unknown 1".to_string(),
+            label: "Milo".to_string(),
+            speech_seconds: 240.0,
+            similarity: Some(0.81),
+            below_floor: false,
+            mark: None,
+            guess: false,
+            in_group: false,
+            current: false,
+        };
+        let rendered: String = voice_line(&named)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.contains("0.81"), "{rendered}");
+        assert!(
+            !rendered.contains("[guess]"),
+            "an identification is not a guess: {rendered}"
+        );
+
+        // ...and a plain unknown row carries neither.
+        let unknown = Row {
+            number: "Unknown 3".to_string(),
+            label: "Unknown 3".to_string(),
+            speech_seconds: 60.0,
+            similarity: None,
+            below_floor: false,
+            mark: None,
+            guess: false,
+            in_group: false,
+            current: false,
+        };
+        let rendered: String = voice_line(&unknown)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(!rendered.contains("[guess]"), "{rendered}");
+    }
+
+    /// The question about a guessed fragment reads the guess once: the mark rides the label,
+    /// and appending the frame's own would double it into a typo.
+    #[test]
+    fn the_question_does_not_double_the_guess_mark() {
+        let whole = guessed(140, 30, &Free, &[]).join("\n");
+        assert!(
+            whole.contains("is Unknown 2 Ivan?  1m 35s"),
+            "one question mark, on the label\n{whole}"
+        );
+        assert!(
+            !whole.contains("Ivan??"),
+            "the mark is not doubled\n{whole}"
+        );
+
+        // A voice nothing guessed about keeps the frame's own mark.
+        let plain = painted(140, 30, &Free, &[]).join("\n");
+        assert!(plain.contains("who is Unknown 2?"), "{plain}");
     }
 
     /// AC #2, the drawing side: while marks are active the consequence pane previews the
@@ -1356,6 +1542,70 @@ mod tests {
         }
     }
 
+    /// AC #4, the drawing side: the guess keys are advertised exactly where the state machine
+    /// lets them work -- both while the question is about a guessed fragment whose guess is
+    /// still resolvable, only ^R once a divergent filter takes the guess out of the candidates,
+    /// and neither on any other voice. Asserted adjacent to their neighbours rather than as a
+    /// whole line, for the width reason the footer's stance documents.
+    #[test]
+    fn the_footer_offers_the_guess_keys_only_where_they_work() {
+        let live = guessed(140, 30, &Free, &[]).join("\n");
+        assert!(
+            live.contains("enter choose  ^Y confirm  ^R reject  ^A assert"),
+            "beside the choose slot they interact with\n{live}"
+        );
+
+        // A divergent filter leaves the guess out of the resolved candidates: confirming could
+        // not be reached by Enter+Tab, so the key that cannot work is not offered -- refusing
+        // the guess on screen stays unambiguous, so ^R remains.
+        let typing = guessed(140, 30, &Free, &[Event::Filter('z')]).join("\n");
+        assert!(
+            typing.contains("enter choose  ^R reject  ^A assert"),
+            "{typing}"
+        );
+        assert!(
+            !typing.contains("^Y confirm"),
+            "unreachable confirms are not advertised\n{typing}"
+        );
+
+        // Neither key on a voice nothing guessed about.
+        let plain = painted(140, 30, &Free, &[]).join("\n");
+        assert!(!plain.contains("^Y confirm"), "{plain}");
+        assert!(!plain.contains("^R reject"), "{plain}");
+    }
+
+    /// AC #3, the log-pane half: the denial note the run narrates lands in the pane through the
+    /// existing string plumbing, asserted once rather than re-invented here.
+    #[test]
+    fn the_log_pane_shows_the_denial_note() {
+        let narration = vec![
+            "20260819-100000  not Ivan: Ivan? reads Unknown 2 again -- meethook will not guess \
+             Ivan for this voice again"
+                .to_string(),
+        ];
+        let rows = frame(
+            140,
+            30,
+            &Free,
+            &[],
+            &said(),
+            None,
+            None,
+            Context::Reading,
+            None,
+            Attribution::Tentative {
+                name: "Ivan".to_string(),
+                similarity: 0.38,
+            },
+            narration,
+        );
+        let whole = rows.join("\n");
+        assert!(
+            whole.contains("not Ivan: Ivan? reads Unknown 2 again"),
+            "{whole}"
+        );
+    }
+
     /// The minimum this frame claims to work at. Every pane still has a border and a title, which
     /// is what says nothing was laid out at a negative height. Painted with each cost the footer
     /// now varies on, since the override swaps the widest key on the line.
@@ -1382,6 +1632,25 @@ mod tests {
                     "{title} missing from\n{whole}"
                 );
             }
+        }
+
+        // And the guess context: the row carries its tag and the footer its two keys, which is
+        // the widest the idle line gets.
+        let guessed = guessed(80, 24, &Free, &[]);
+        assert_eq!(guessed.len(), 24);
+        let whole = guessed.join("\n");
+        for title in [
+            " voices ",
+            " resembles ",
+            " would ",
+            " who ",
+            " said ",
+            " run ",
+        ] {
+            assert!(
+                whole.contains(title.trim()),
+                "{title} missing from\n{whole}"
+            );
         }
     }
 
