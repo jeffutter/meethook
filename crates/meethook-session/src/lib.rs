@@ -59,7 +59,7 @@ pub use speaker_clusters::{
     MIN_REPRESENTATIVE_SECONDS, RepresentativeSegment, SPEAKER_CLUSTERS_SCHEMA_VERSION,
     SpeakerCluster, SpeakerClusters, unknown_labels,
 };
-pub use speaker_names::{AssignedName, SPEAKER_NAMES_SCHEMA_VERSION, SpeakerNames};
+pub use speaker_names::{AssignedName, DeniedName, SPEAKER_NAMES_SCHEMA_VERSION, SpeakerNames};
 pub use speakers::{
     Displaced, ENROLLED_SPEAKERS_SCHEMA_VERSION, EnrolledSpeaker, EnrolledSpeakers,
     MAX_REFERENCES_PER_SPEAKER, Stored,
