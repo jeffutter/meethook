@@ -386,6 +386,12 @@ fn print_dry_run_lines(
 fn question(number: &str, label: &str) -> String {
     if label == number {
         format!("who is {number}?")
+    } else if label.ends_with('?') {
+        // A guess owns its own question mark in the label ("Ivan?"); appending the frame's
+        // would double it. A suffix sniff rather than the attribution kind because the
+        // serialized document carries only the label string -- the TUI drives off the kind
+        // where it has one.
+        format!("is {number} {label}")
     } else {
         format!("is {number} {label}?")
     }
@@ -556,6 +562,35 @@ mod tests {
 20260810-093047  is Unknown 1 Milo?  3m 25s of speech
     Milo                   0.91   1 ref
 "
+        );
+    }
+
+    #[test]
+    fn the_guess_mark_is_not_doubled_in_the_question_line() {
+        let mut surveyor = Surveyor::new();
+        surveyor_from_parts::push_session(
+            &mut surveyor,
+            "20260818-143027",
+            None,
+            &[("Unknown 7", "Ivan?", 1.2, Vec::new())],
+        );
+        let doc = ListOutput::from_surveyor(&surveyor);
+
+        // The line asks the frame's question with one mark: the guess owns its own.
+        let mut out = Vec::new();
+        doc.print_lines(&mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "20260818-143027  is Unknown 7 Ivan?  1s of speech\n"
+        );
+
+        // The document keeps the honest raw label; only the line form drops the second mark.
+        let mut json = Vec::new();
+        serde_json::to_writer(&mut json, &doc).unwrap();
+        assert!(
+            String::from_utf8(json)
+                .unwrap()
+                .contains(r#""label":"Ivan?""#)
         );
     }
 
