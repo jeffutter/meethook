@@ -36,11 +36,14 @@
 //! outright: on a track the user has called one person, every voice reads the asserted name
 //! whatever was forced.
 //!
-//! Below it, a hand-given name beats identification, which beats the number. The order is
-//! not a preference between two guesses: a row in `speaker_names.json` is a person saying
-//! *that voice, in this recording, is this human*, and identification is a cosine distance
-//! between two vectors. Where they disagree, the one that saw the meeting wins. The number
-//! is what is left when nobody has made a claim at all.
+//! Below it, a hand-given name beats identification, which beats the tentative guess, which
+//! beats the number. The order is not a preference between two guesses: a row in
+//! `speaker_names.json` is a person saying *that voice, in this recording, is this human*,
+//! and identification is a cosine distance between two vectors. Where they disagree, the one
+//! that saw the meeting wins. A tentative guess is a looser cosine distance still -- see
+//! [`crate::identify::tentative_identifications`] -- and it loses to both of them for the
+//! same reason it exists at all: it is only ever a marked question, never an answer. The
+//! number is what is left when nobody has made a claim at all.
 //!
 //! # "Attribution" here means what a cluster is *called*
 //!
@@ -51,9 +54,10 @@
 //! senses are in the codebase and neither is going away, so they are stated together here
 //! rather than left for a reader to collide with.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 
-use meethook_session::{AssignedName, SpeakerCluster};
+use meethook_session::{AssignedName, DeniedName, SpeakerCluster};
 
 use crate::identify::{Identification, heard_at_once};
 
@@ -76,6 +80,19 @@ pub enum Attribution {
     /// Matched to an enrolled reference in `speakers.json`, at this similarity.
     Identified { name: String, similarity: f32 },
 
+    /// A marked guess at a name the session already confirmed elsewhere, at the similarity
+    /// it was guessed at.
+    ///
+    /// Different from [`Self::Identified`] in exactly the way the marker is different: the cut
+    /// that admitted it is the looser one documented on
+    /// [`crate::identify::TENTATIVE_DISTANCE`], so it is a machine similarity -- unlike
+    /// [`Self::Assigned`], which carries none -- but a similarity measured against a wider
+    /// tolerance, and it says so by rendering as `Name?`. It is also deliberately NOT named,
+    /// below: a guess is an open question, and that single bit is what keeps `enroll`
+    /// surfacing these voices and its pass-over gate honest rather than reading a guess as a
+    /// settled answer.
+    Tentative { name: String, similarity: f32 },
+
     /// Named by the user against this session alone, from `speaker_names.json`.
     ///
     /// A name with no similarity behind it, because there is no reference to have been near
@@ -88,24 +105,34 @@ pub enum Attribution {
 }
 
 impl Attribution {
-    /// The label as the transcript reads it.
-    pub fn label(&self) -> &str {
+    /// The label as the transcript reads it: the bare name, the marked guess, or the number.
+    ///
+    /// The `?` rides the label string itself rather than living in any renderer: `merge`
+    /// projects `label()` into `Turn.speaker`, and the json/md/VTT renderers see only the
+    /// string (decision-010's contract is a stable JSON shape plus whatever the template can
+    /// see), so a mark made here is a mark made everywhere with zero renderer changes.
+    pub fn label(&self) -> Cow<'_, str> {
         match self {
-            Attribution::Unknown(label) => label,
-            Attribution::Identified { name, .. } => name,
-            Attribution::Assigned { name } => name,
+            Attribution::Unknown(label) => Cow::Borrowed(label.as_str()),
+            Attribution::Identified { name, .. } => Cow::Borrowed(name.as_str()),
+            Attribution::Tentative { name, .. } => Cow::Owned(format!("{name}?")),
+            Attribution::Assigned { name } => Cow::Borrowed(name.as_str()),
         }
     }
 
     /// How confident the identity claim in [`label`] is, or `None` when it makes none.
     ///
-    /// This is what lands in [`meethook_session::Turn::speaker_id_confidence`].
+    /// This is what lands in [`meethook_session::Turn::speaker_id_confidence`]. A tentative
+    /// guess reports its real similarity, like an identification: the number is true, and the
+    /// marker is what records the wider tolerance it was measured under rather than a lower
+    /// number pretending to be a tighter one.
     ///
     /// [`label`]: Attribution::label
     pub fn confidence(&self) -> Option<f32> {
         match self {
             Attribution::Unknown(_) | Attribution::Assigned { .. } => None,
-            Attribution::Identified { similarity, .. } => Some(*similarity),
+            Attribution::Identified { similarity, .. }
+            | Attribution::Tentative { similarity, .. } => Some(*similarity),
         }
     }
 
@@ -114,6 +141,12 @@ impl Attribution {
     /// The question `enroll` is actually asking everywhere it decides what to prompt about,
     /// which voices are already resolved, and whether an answer given earlier in the run has
     /// since named this one.
+    ///
+    /// A tentative guess is deliberately NOT named, although it carries a name: it is an open
+    /// question rendered as text, and counting it as settled would make `enroll` stop asking
+    /// about exactly the voices the band exists to surface. The name in the label and the
+    /// answer to this question are independent facts, the same way [`Self::Assigned`] shows they
+    /// are independent of confidence.
     ///
     /// Deliberately **not** "carries a similarity", and deliberately not spelled
     /// `confidence().is_some()`. [`Attribution::Assigned`] is exactly the case the two answers
@@ -157,6 +190,18 @@ pub struct Naming<'a> {
     /// award below -- which is what leaves the vetoed demotion for the dry run's refusal to fire
     /// off. `None` on every reading that is not previewing an answer.
     pending: Option<u32>,
+    /// The tentative band's answers: sub-floor fragments guessed at names the session already
+    /// confirmed elsewhere, under the looser cut documented on
+    /// [`crate::identify::TENTATIVE_DISTANCE`]. An empty map applies no such claims and the
+    /// rule runs exactly as it always has; the tier's rank and its demotions are stated in
+    /// the module doc and on the variant itself.
+    tentative: &'a BTreeMap<u32, Identification>,
+    /// Standing denials, resolved: the `(cluster, name)` pairs a user refused, ready to apply.
+    /// Supplied by the caller through [`resolve_denials`] -- one implementation, called from
+    /// both `transcribe` and `enroll` -- because bit-exact matching against the session's
+    /// clusters is the removal's own rule, and a second copy of it could drift out of
+    /// agreement with the write it previews.
+    denied: &'a BTreeSet<(u32, String)>,
 }
 
 /// Somewhere for [`Naming::nothing`] to point its identification map at.
@@ -164,6 +209,12 @@ static NOBODY: BTreeMap<u32, Identification> = BTreeMap::new();
 
 /// Somewhere for [`Naming::new`] and [`Naming::nothing`] to point their forced set at.
 static NO_FORCED: BTreeMap<u32, String> = BTreeMap::new();
+
+/// Somewhere for every caller before the tentative band existed to point it at.
+static NO_TENTATIVE: BTreeMap<u32, Identification> = BTreeMap::new();
+
+/// Somewhere for every caller without standing denials to point them at.
+static NO_DENIED: BTreeSet<(u32, String)> = BTreeSet::new();
 
 impl<'a> Naming<'a> {
     pub fn new(
@@ -178,6 +229,8 @@ impl<'a> Naming<'a> {
             one_remote_speaker: None,
             forced: &NO_FORCED,
             pending: None,
+            tentative: &NO_TENTATIVE,
+            denied: &NO_DENIED,
         }
     }
 
@@ -190,6 +243,8 @@ impl<'a> Naming<'a> {
             one_remote_speaker: None,
             forced: &NO_FORCED,
             pending: None,
+            tentative: &NO_TENTATIVE,
+            denied: &NO_DENIED,
         }
     }
 
@@ -235,6 +290,25 @@ impl<'a> Naming<'a> {
         }
     }
 
+    /// The same naming with the tentative band's answers filled in: a sub-floor fragment reads
+    /// its marked guess wherever the tiers above it do not speak, subject to the same
+    /// heard-at-once demotion an identification gets and to the standing denials below. An
+    /// empty map -- and every caller before the band existed -- leaves the rule byte-identical
+    /// to how it ran.
+    pub fn with_tentative(self, tentative: &'a BTreeMap<u32, Identification>) -> Self {
+        Naming { tentative, ..self }
+    }
+
+    /// The same naming under standing denials: the `(cluster, name)` pairs a user refused,
+    /// resolved through [`resolve_denials`]. A denied pair suppresses the tentative guess it
+    /// names -- a refusal is about the voice, and the embedding is the identity that ties the
+    /// fragment to the refused cluster -- leaving the voice with its number rather than a
+    /// guess the user has already answered. No denial applies to a definite name here: that
+    /// is the database's business, done where the reference goes.
+    pub fn with_denials(self, denied: &'a BTreeSet<(u32, String)>) -> Self {
+        Naming { denied, ..self }
+    }
+
     /// The same naming with identification's answers filled in.
     pub fn with_identified(self, identified: &'a BTreeMap<u32, Identification>) -> Self {
         Naming { identified, ..self }
@@ -273,13 +347,9 @@ impl<'a> Naming<'a> {
     fn awarded(&self) -> BTreeMap<u32, String> {
         let mut resolved: BTreeMap<u32, &str> = BTreeMap::new();
         for row in self.assigned {
-            let mut matching = self
-                .clusters
-                .iter()
-                .filter(|cluster| cluster.embedding == row.embedding);
             // Unique or nothing. `or_insert` settles a hand-edited file that named one
             // cluster twice by keeping the first row, so the outcome is still deterministic.
-            if let (Some(cluster), None) = (matching.next(), matching.next()) {
+            if let Some(cluster) = resolve_by_embedding(self.clusters, &row.embedding) {
                 resolved.entry(cluster.id).or_insert(&row.name);
             }
         }
@@ -414,12 +484,75 @@ pub fn attributions(
                     name: who.name.clone(),
                     similarity: who.similarity,
                 }
+            } else if let Some(guess) = naming
+                .tentative
+                .get(&id)
+                // A standing denial suppresses the guess it names, whatever the distance says:
+                // the refusal is about the voice, and this is the voice it was recorded against.
+                .filter(|guess| !naming.denied.contains(&(id, guess.name.clone())))
+                // The same demotion an identification gets, for the same reason: a hand-named
+                // holder on an overlapping voice is a human claim, and a human claim outranks a
+                // vector distance -- a looser one at that.
+                .filter(|guess| !naming.overlaps_a_holder_of(id, &guess.name, &assigned))
+            {
+                Attribution::Tentative {
+                    name: guess.name.clone(),
+                    similarity: guess.similarity,
+                }
             } else {
                 Attribution::Unknown(label.clone())
             };
             (id, attribution)
         })
         .collect()
+}
+
+/// Which `(cluster, name)` pairs a set of denials removes from a rewrite, resolved against
+/// the session's own clusters.
+///
+/// The matching rule is deliberately the affirmation path's own (`Naming::awarded`):
+/// bit-exact embedding equality, and a match that is not unique is DROPPED rather than
+/// guessed at. Two clusters sharing one centroid -- the shape a stale model or a
+/// re-clustering leaves behind -- are exactly where suppressing the wrong one is most costly,
+/// so the conservative answer (suppress nothing) is the only defensible one, and it is the
+/// answer the rows the user DID give get for the same input. One implementation, called from
+/// both `transcribe` and `enroll`, is what keeps a preview and a write from resolving the
+/// same refusal to different rows: a preview that demotes a different voice than the write
+/// does is a lie with extra steps.
+pub fn resolve_denials(
+    clusters: &[SpeakerCluster],
+    denied: &[DeniedName],
+) -> BTreeSet<(u32, String)> {
+    let mut removed = BTreeSet::new();
+    for denial in denied {
+        // The same unique-or-nothing rule `awarded` resolves its rows through, and the same
+        // function: a preview and a write that resolved a stored embedding to two different
+        // clusters would be a lie with extra steps.
+        if let Some(cluster) = resolve_by_embedding(clusters, &denial.embedding) {
+            removed.insert((cluster.id, denial.name.clone()));
+        }
+    }
+    removed
+}
+
+/// Resolves a stored embedding to the one cluster it bit-exactly matches, or `None` when the
+/// match is not unique.
+///
+/// The shared rule an affirmation ([`Naming::awarded`]) and a denial ([`resolve_denials`])
+/// both resolve their rows through: a stored embedding is a handle into *some* clustering, and
+/// re-clustering can leave it matching zero or several current clusters. Either way there is no
+/// single answer to apply the row to, so the conservative one -- resolve to nothing -- is what
+/// both callers get, from one place, so they cannot drift into resolving the same embedding to
+/// different clusters.
+fn resolve_by_embedding<'a>(
+    clusters: &'a [SpeakerCluster],
+    embedding: &[f32],
+) -> Option<&'a SpeakerCluster> {
+    let mut matching = clusters.iter().filter(|c| c.embedding == embedding);
+    match (matching.next(), matching.next()) {
+        (Some(cluster), None) => Some(cluster),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -499,7 +632,10 @@ mod tests {
 
     /// `is_named` asserted as the question it asks -- does this label name a person -- rather
     /// than through `confidence()`. A name the user assigned has no similarity behind it and
-    /// must still count as named, or `enroll` would ask about that voice again every run.
+    /// must still count as named, or `enroll` would ask about that voice again every run. And
+    /// a tentative guess carries a name yet is NOT named: it is an open question rendered as
+    /// text, and counting it as settled would make `enroll` stop asking about exactly the
+    /// voices the band exists to surface.
     #[test]
     fn only_a_label_that_names_somebody_is_named() {
         assert!(
@@ -516,6 +652,13 @@ mod tests {
             .is_named()
         );
         assert!(!Attribution::Unknown("Unknown 1".to_string()).is_named());
+        assert!(
+            !Attribution::Tentative {
+                name: "Ivan".to_string(),
+                similarity: 0.59,
+            }
+            .is_named()
+        );
     }
 
     /// The label a user gave reads as a name and claims no confidence, which is what makes it
@@ -988,5 +1131,171 @@ mod tests {
                 name: "Grace".to_string()
             }
         );
+    }
+
+    // --- the tentative band ---------------------------------------------------------------
+
+    /// The three facts that keep a guess a question rather than an answer: it reads marked,
+    /// it carries its real similarity, and it is not named.
+    #[test]
+    fn a_tentative_guess_reads_marked_carries_its_similarity_and_is_not_named() {
+        let guess = Attribution::Tentative {
+            name: "Ivan".to_string(),
+            similarity: 0.59,
+        };
+
+        assert_eq!(guess.label(), "Ivan?");
+        assert_eq!(guess.confidence(), Some(0.59));
+        assert!(!guess.is_named());
+    }
+
+    /// The whole stack in one voice: forced beats assigned, which beats identified, which
+    /// beats the tentative guess, which beats the number -- each tier visible the moment the
+    /// one above it steps aside.
+    #[test]
+    fn the_precedence_ladder_runs_forced_assigned_identified_tentative_unknown() {
+        let clusters = clusters(&[0]);
+        let id = identified(&[(0, "Alice", 0.83)]);
+        let rows = vec![assignment(0, "Alex")];
+        let tent = identified(&[(0, "Ivan", 0.59)]);
+        let f = forced(&[(0, "Grace")]);
+        let numbers = unknown(&[(0, "Unknown 1")]);
+
+        let naming = Naming::new(&clusters, &id, &rows)
+            .with_tentative(&tent)
+            .with_forced(&f);
+        let map = attributions(&numbers, naming);
+        assert_eq!(map[&0].label(), "Grace");
+
+        let naming = Naming::new(&clusters, &id, &rows).with_tentative(&tent);
+        let map = attributions(&numbers, naming);
+        assert_eq!(map[&0].label(), "Alex");
+
+        let naming = Naming::new(&clusters, &id, &[]).with_tentative(&tent);
+        let map = attributions(&numbers, naming);
+        assert_eq!(
+            map[&0],
+            Attribution::Identified {
+                name: "Alice".to_string(),
+                similarity: 0.83,
+            }
+        );
+
+        let naming = Naming::new(&clusters, &NOBODY, &[]).with_tentative(&tent);
+        let map = attributions(&numbers, naming);
+        assert_eq!(
+            map[&0],
+            Attribution::Tentative {
+                name: "Ivan".to_string(),
+                similarity: 0.59,
+            }
+        );
+
+        let map = attributions(&numbers, Naming::new(&clusters, &NOBODY, &[]));
+        assert_eq!(map[&0], Attribution::Unknown("Unknown 1".to_string()));
+    }
+
+    /// A hand-named holder on an overlapping voice beats a guess, the way it beats an
+    /// identification: the human claim outranks the vector distance -- a looser one at that
+    /// -- and the fragment falls to its number rather than keeping a mark the segmentation
+    /// evidence contradicts.
+    #[test]
+    fn a_tentative_guess_an_overlapping_hand_named_holder_contradicts_falls_back_to_the_number() {
+        let clusters = vec![cluster(0, vec![1]), cluster(1, vec![0])];
+        let tent = identified(&[(1, "Alex", 0.59)]);
+
+        let map = attributions(
+            &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
+            Naming::new(&clusters, &NOBODY, &[assignment(0, "Alex")]).with_tentative(&tent),
+        );
+
+        assert_eq!(
+            map[&0],
+            Attribution::Assigned {
+                name: "Alex".to_string()
+            }
+        );
+        assert_eq!(map[&1], Attribution::Unknown("Unknown 2".to_string()));
+    }
+
+    /// The refusal is one-sided like the demotion's: a holder of the guessed name on a voice
+    /// nothing says overlaps earns nothing against the guess, because clustering splitting one
+    /// person in two is the ordinary reason a name appears on two non-overlapping voices.
+    #[test]
+    fn a_tentative_guess_stands_when_no_holder_of_the_name_overlaps_it() {
+        let clusters = clusters(&[0, 1]);
+        let tent = identified(&[(1, "Alex", 0.59)]);
+
+        let map = attributions(
+            &unknown(&[(0, "Unknown 1"), (1, "Unknown 2")]),
+            Naming::new(&clusters, &NOBODY, &[assignment(0, "Alex")]).with_tentative(&tent),
+        );
+
+        assert_eq!(
+            map[&1],
+            Attribution::Tentative {
+                name: "Alex".to_string(),
+                similarity: 0.59,
+            }
+        );
+    }
+
+    /// A standing denial suppresses the guess it names, whatever the similarity says: the user
+    /// already answered this voice, and the answer was no.
+    #[test]
+    fn a_denied_name_suppresses_the_tentative_guess_even_at_high_similarity() {
+        let clusters = clusters(&[0]);
+        let tent = identified(&[(0, "Ivan", 0.97)]);
+        let denial = DeniedName {
+            cluster: 0,
+            name: "Ivan".to_string(),
+            embedding: cluster(0, Vec::new()).embedding,
+        };
+        let denied = resolve_denials(&clusters, &[denial]);
+
+        let map = attributions(
+            &unknown(&[(0, "Unknown 1")]),
+            Naming::new(&clusters, &NOBODY, &[])
+                .with_tentative(&tent)
+                .with_denials(&denied),
+        );
+
+        assert_eq!(map[&0], Attribution::Unknown("Unknown 1".to_string()));
+    }
+
+    /// Resolution is the removal's own rule: a unique bit-exact match resolves; a stale one
+    /// and a twin-centroid one drop, so a denial suppresses nothing rather than the wrong
+    /// voice.
+    #[test]
+    fn denials_resolve_unique_bit_exact_matches_only() {
+        let good = cluster(0, Vec::new());
+        let stale = DeniedName {
+            cluster: 0,
+            name: "Stale".to_string(),
+            embedding: vec![9.0, 0.5],
+        };
+        let hit = DeniedName {
+            cluster: 0,
+            name: "Ivan".to_string(),
+            embedding: good.embedding.clone(),
+        };
+
+        // Unique match: resolved.
+        let mut expected = BTreeSet::new();
+        expected.insert((0u32, "Ivan".to_string()));
+        assert_eq!(
+            resolve_denials(std::slice::from_ref(&good), std::slice::from_ref(&hit)),
+            expected
+        );
+
+        // No match: dropped.
+        assert!(resolve_denials(std::slice::from_ref(&good), &[stale]).is_empty());
+
+        // Two clusters holding the same centroid: ambiguous, so dropped.
+        let twin = SpeakerCluster {
+            embedding: good.embedding.clone(),
+            ..cluster(1, Vec::new())
+        };
+        assert!(resolve_denials(&[good, twin], &[hit]).is_empty());
     }
 }

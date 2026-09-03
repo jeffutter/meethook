@@ -51,7 +51,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use meethook_session::{
-    AssignedName, Classification, EnrolledSpeakers, Paths, SessionId, SpeakerClusters,
+    AssignedName, Classification, DeniedName, EnrolledSpeakers, Paths, SessionId, SpeakerClusters,
     SpeakerNames, discover_sessions, unknown_labels,
 };
 use meethook_transcribe::Attribution;
@@ -170,6 +170,10 @@ pub(crate) struct Labelled {
     /// labellings, so a change can always be named by the voice it happened to.
     pub(crate) unknown: BTreeMap<u32, String>,
     pub(crate) assigned: Vec<AssignedName>,
+    /// The session's standing denials, beside their affirmations: both labellings suppress the
+    /// guesses they name, so a diff that ignored them would report a rewrite committing past a
+    /// guess the user already refused.
+    pub(crate) denied: Vec<DeniedName>,
     /// The session's one-remote-speaker assertion, if there is one. Both labellings honour it,
     /// which is what keeps a removal from being reported as moving a label the assertion --
     /// not the removed row -- still holds in place.
@@ -194,6 +198,7 @@ impl Labelled {
             self.one_remote_speaker.as_deref(),
             None,
             None,
+            &self.denied,
         )
     }
 
@@ -278,8 +283,8 @@ pub(crate) fn label_sessions(paths: &Paths, speakers: &EnrolledSpeakers) -> Resu
                 continue;
             }
         };
-        let assigned = match SpeakerNames::read_or_empty(&session.paths, &session.id) {
-            Ok(assigned) => assigned.names,
+        let (assigned, denied) = match SpeakerNames::read_or_empty(&session.paths, &session.id) {
+            Ok(names) => (names.names, names.denied),
             // No re-transcribe recovers this one: the file holds names a person typed, so the
             // only honest instruction is to go and look at it.
             Err(e) => {
@@ -319,12 +324,14 @@ pub(crate) fn label_sessions(paths: &Paths, speakers: &EnrolledSpeakers) -> Resu
             one_remote_speaker.as_deref(),
             None,
             None,
+            &denied,
         );
         labelling.sessions.push(Labelled {
             session: session.id.clone(),
             clusters,
             unknown,
             assigned,
+            denied,
             one_remote_speaker,
             baseline,
         });

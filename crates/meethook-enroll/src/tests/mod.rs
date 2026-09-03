@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
@@ -11,7 +12,10 @@ use meethook_session::{
 };
 // The cut the ranking is deliberately *not* made at, named rather than spelled 0.40, so
 // the fixtures below still mean "outside identification's reach" if it moves.
-use meethook_transcribe::{Attribution, IDENTIFY_DISTANCE, Resemblance, identify_clusters};
+use meethook_transcribe::{
+    Attribution, IDENTIFY_DISTANCE, Naming, Resemblance, attributions, identify_clusters,
+    tentative_identifications,
+};
 
 use super::*;
 
@@ -82,7 +86,9 @@ struct Shown {
 }
 
 impl Shown {
-    fn label(&self) -> &str {
+    /// A guess owns its allocated "Name?", so this hands over the label the way
+    /// [`Attribution::label`] does.
+    fn label(&self) -> Cow<'_, str> {
         self.attribution.label()
     }
 
@@ -93,7 +99,7 @@ impl Shown {
     /// The queue as a pane would list it: the handle, what the row reads as, and whether
     /// the floor held it back. For the assertions that are about the shape of the queue
     /// rather than about the basis of one row.
-    fn rows(&self) -> Vec<(&str, &str, bool)> {
+    fn rows(&self) -> Vec<(&str, Cow<'_, str>, bool)> {
         self.queue
             .iter()
             .map(|row| {
@@ -146,7 +152,9 @@ impl Scripted {
         }
     }
 
-    fn labels(&self) -> Vec<&str> {
+    /// Owned guesses allocate their "Name?", so the list carries them as [`Cow`] -- which
+    /// still compares equal to the `&str` literals the assertions write.
+    fn labels(&self) -> Vec<Cow<'_, str>> {
         self.seen.iter().map(Shown::label).collect()
     }
 
@@ -222,9 +230,10 @@ pub(crate) fn voice(id: u32) -> Vec<f32> {
     embedding
 }
 
-/// A unit vector `degrees` away from cluster 0's, for the fixtures that are about how
+/// A unit vector `degrees` away from the x axis, for the fixtures that are about how
 /// close two voices are: one person clustering split in two, or one reference that matches
-/// both halves. 0.35 of cosine distance is `IDENTIFY_DISTANCE`, so 49 degrees is the edge.
+/// both halves. Cosine distance is `1 - cos(degrees)`, so 54 degrees sits at 0.41 -- inside
+/// the tentative window `(0.40, 0.42)` and outside the strict cut.
 pub(crate) fn nearly(degrees: f32) -> Vec<f32> {
     let radians = degrees.to_radians();
     vec![radians.cos(), radians.sin(), 0.0, 0.0]
@@ -561,6 +570,20 @@ const ALL_AND_CORRECT: Offer = Offer {
     quiet: true,
     named: true,
 };
+
+/// The floors the three decisions sit on must not drift apart silently. The prose above has
+/// said so for a while, but nothing failed when it was written -- this is the assertion that
+/// makes the statement true. `TENTATIVE_FLOOR_SECONDS` lives in `meethook-transcribe`
+/// because the band does, and `PROMPT_FLOOR_SECONDS` is `pub(crate)` here, so parity is
+/// pinned by this test rather than by a shared definition: the band scores exactly the
+/// fragments this floor holds back from questions, and disagreeing about the answer would
+/// leave it guessing at voices enroll decided not to ask about, or missing voices it does.
+#[test]
+fn the_three_floors_stay_on_the_same_value() {
+    let prompt = crate::queue::PROMPT_FLOOR_SECONDS;
+    assert_eq!(prompt, REFERENCE_FLOOR_SECONDS);
+    assert_eq!(prompt, meethook_transcribe::TENTATIVE_FLOOR_SECONDS);
+}
 
 /// Rewrites this session's clusters with the talk times given, ids in order, leaving
 /// first appearances and representatives as [`make_session`] wrote them.

@@ -60,11 +60,21 @@
 //! "one person has now been named twice" -- newest-wins replacement, a normalized mean, and
 //! keeping both and taking the nearest -- through [`meethook_transcribe::policy_sweep`]. The
 //! arithmetic and every verdict live in the crate and are unit-tested there; this file prints.
+//!
+//! # `--tentative`: what the band would have guessed at
+//!
+//! Off by default, for the same byte-stability reason as `--policies`. With it, every item is
+//! re-measured -- fragments are exactly what the embedding cache does not keep -- and each
+//! fragment under the floor that the strict pass did not award is scored through the real
+//! [`meethook_transcribe::tentative_identifications`] against the names its own session
+//! strictly identified, with the guess marked right or wrong against the manifest's ground
+//! truth.
 
 mod cache;
 mod identify_sim;
 mod manifest;
 mod policies;
+mod tentative;
 mod trials;
 mod voices;
 
@@ -81,6 +91,7 @@ use identify_sim::report_identification;
 use manifest::read_manifest;
 use policies::report_policies;
 use support::fail;
+use tentative::report_tentative;
 use trials::{pair_up, report_scores, report_shape};
 use voices::embed_items;
 
@@ -107,7 +118,7 @@ fn main() {
         eprintln!(
             "usage: speaker-trials [--root <dir>] [--seconds <n>] [--min-speech <n>]\n       \
              [--threshold <distance>] [--embeddings <file>] [--fresh] [--keep-sessions]\n       \
-             [--policies] <manifest.tsv>\n       \
+             [--policies] [--tentative] <manifest.tsv>\n       \
              the root may also come from $MEETHOOK_ROOT; there is no default"
         );
         std::process::exit(2);
@@ -153,6 +164,9 @@ fn main() {
     if args.policies {
         report_policies(&voices, args.threshold);
     }
+    if args.tentative {
+        report_tentative(&paths, &args, &items, &voices);
+    }
 }
 
 pub struct Args {
@@ -168,6 +182,10 @@ pub struct Args {
     /// Also score the three reference policies. Off by default: an extra block would change
     /// the output of every earlier calibration re-run, and this one is about TASK-027.
     pub policies: bool,
+    /// Also score the tentative band's guesses on the corpus fragments. Off by default for
+    /// the same byte-stability reason, and it re-measures every item because fragments are
+    /// exactly what the embedding cache does not keep.
+    pub tentative: bool,
 }
 
 /// Hand-rolled rather than clap, matching the other examples in this crate: a diagnostic must
@@ -186,6 +204,7 @@ fn parse() -> Result<Args, String> {
     let mut fresh = false;
     let mut keep_sessions = false;
     let mut policies = false;
+    let mut tentative = false;
 
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -208,6 +227,7 @@ fn parse() -> Result<Args, String> {
             }
             Some("--fresh") => fresh = true,
             Some("--policies") => policies = true,
+            Some("--tentative") => tentative = true,
             Some("--keep-sessions") => keep_sessions = true,
             Some(flag) if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ if manifest.is_none() => manifest = Some(PathBuf::from(arg)),
@@ -225,5 +245,6 @@ fn parse() -> Result<Args, String> {
         fresh,
         keep_sessions,
         policies,
+        tentative,
     })
 }

@@ -627,6 +627,33 @@ mod tests {
             "{rendered:?}"
         );
     }
+    /// A guess is a different label from the unmarked name it guesses at, and the grouping
+    /// must not paper over that: an "Ivan?" run never collapses into an "Ivan" run, because
+    /// the two carry different epistemic status and a reader who watches the question mark
+    /// has to see where the guessing started and stopped. Grouping is on the label text alone,
+    /// which is exactly what keeps them apart -- this pins that rather than fixing it.
+    #[test]
+    fn a_marked_guess_never_collapses_with_the_unmarked_name_it_guesses() {
+        let turn = |speaker: &str, start: f64| Turn {
+            speaker: speaker.to_string(),
+            start,
+            end: start + 2.0,
+            text: "words".to_string(),
+            source_track: SourceTrack::Speaker,
+            cluster: Some(1),
+            speaker_id_confidence: None,
+        };
+        let transcript = Transcript::new(
+            session_id(),
+            vec![turn("Ivan", 20.0), turn("Ivan?", 25.0), turn("Ivan", 30.0)],
+        );
+        let rendered = render(&transcript, &TranscriptTemplate::builtin(), &metadata());
+        let (_, body) = frontmatter(&rendered);
+        assert_eq!(
+            body, "\n**[00:20] Ivan:** words\n**[00:25] Ivan?:** words\n**[00:30] Ivan:** words\n",
+            "{rendered:?}"
+        );
+    }
     /// Acceptance criterion #2: a turn between two different speakers renders the line it
     /// rendered before collapsing existed, asserted as a byte equality rather than by
     /// re-deriving it -- a one-turn block is meant to be an identity, not an approximation.

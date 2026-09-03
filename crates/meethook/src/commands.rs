@@ -662,6 +662,13 @@ impl Interviewer for Terminal {
             Attribution::Assigned { name } => {
                 (name.as_str(), ", named for this session".to_string())
             }
+            // A guess is an open question, not an assertion: `is_named()` below is false for
+            // it, so this asks "who is this" and Enter keeps the guess standing -- the same
+            // epistemic status the transcript carries in the label's question mark.
+            Attribution::Tentative { name, similarity } => (
+                name.as_str(),
+                format!(", tentatively {name} at {similarity:.2}"),
+            ),
             Attribution::Unknown(label) => (label.as_str(), String::new()),
         };
         // The position sits right after the session id, at a fixed column: what it is for is

@@ -33,14 +33,22 @@ pub struct Voice {
 ///
 /// A run that re-scores a cache at a new threshold should not need the models on disk at all
 /// -- that is the whole point of the cache -- so loading is lazy rather than up front.
-struct Models {
+pub struct Models {
     root: PathBuf,
     segmenter: Option<ort::session::Session>,
     embedder: Option<ort::session::Session>,
 }
 
 impl Models {
-    fn graphs(&mut self) -> (&mut ort::session::Session, &mut ort::session::Session) {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            segmenter: None,
+            embedder: None,
+        }
+    }
+
+    pub fn graphs(&mut self) -> (&mut ort::session::Session, &mut ort::session::Session) {
         let root = &self.root;
         let segmenter = self
             .segmenter
@@ -64,11 +72,7 @@ pub fn embed_items(paths: &Paths, args: &Args, items: &[Item]) -> Vec<Voice> {
         _ => BTreeMap::new(),
     };
 
-    let mut models = Models {
-        root: args.root.clone(),
-        segmenter: None,
-        embedder: None,
-    };
+    let mut models = Models::new(args.root.clone());
     let mut voices = Vec::new();
     let mut dropped: Vec<(String, String)> = Vec::new();
 

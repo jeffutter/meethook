@@ -615,6 +615,33 @@ mod tests {
         assert_eq!(speakers, ["Alice", "Unknown 2", "Alice"]);
     }
 
+    /// A guess reads exactly as its marked label and carries its similarity like an
+    /// identification does: the marker rides the string `merge` projects into `Turn.speaker`,
+    /// so nothing downstream of this line knows or cares which tier produced it.
+    #[test]
+    fn a_tentative_guess_reads_marked_and_carries_its_similarity() {
+        let merged = merge(
+            Vec::new(),
+            0.0,
+            vec![segment(0.0, 1.0, "first"), segment(2.0, 3.0, "second")],
+            0.0,
+            &[turn(0.0, 1.0, 0), turn(2.0, 3.0, 1)],
+            Naming::nothing()
+                .with_identified(&named(&[(0, "Alice", 0.9)]))
+                .with_tentative(&named(&[(1, "Alice", 0.59)])),
+        );
+
+        assert_eq!(
+            said(&merged),
+            [("Alice", 0.0, "first"), ("Alice?", 2.0, "second")]
+        );
+        let confidences: Vec<(&str, Option<f32>)> = merged
+            .iter()
+            .map(|t| (t.speaker.as_str(), t.speaker_id_confidence))
+            .collect();
+        assert_eq!(confidences, [("Alice", Some(0.9)), ("Alice?", Some(0.59))]);
+    }
+
     /// An identification for a cluster diarization did not produce cannot name anything.
     /// Nothing generates that today, but `merge` must not index a stale map into a wrong
     /// label if the two ever drift apart.

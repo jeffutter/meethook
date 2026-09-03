@@ -10,7 +10,7 @@
 //! which clusters are which people. Everything it does is a dot product, so the thresholds
 //! and tie-breaks below are testable in microseconds against hand-written vectors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use meethook_session::{EnrolledSpeakers, SpeakerCluster};
 use serde::Serialize;
@@ -145,6 +145,111 @@ use serde::Serialize;
 /// compares against this on its own will call a reference that clears the cut but is not the
 /// closest a match, which it is not.
 pub const IDENTIFY_DISTANCE: f32 = 0.40;
+
+/// How far apart a meeting's *fragment* and an in-session name's voice may be and still earn
+/// a **marked** guess at the name, where the strict pass earns nothing.
+///
+/// # What this thresholds
+///
+/// The same quantity [`IDENTIFY_DISTANCE`] does -- cosine distance between two single
+/// vectors, the fragment's normalized mean-pooled centroid against an enrolled reference --
+/// compared the same way (`1.0 - similarity < TENTATIVE_DISTANCE`, strictly below), so the
+/// calibration report and the shipping pass cannot differ by one `<`. What differs is where
+/// the number is allowed to sit, and why it may sit wider than [`IDENTIFY_DISTANCE`]:
+///
+/// - **Tail-only.** Only clusters under [`TENTATIVE_FLOOR_SECONDS`] are ever scored against
+///   it. A wrong guess there costs one visibly-marked line -- `Name?` in the transcript --
+///   rather than one person's words filed unmarked under another's name, which is the mistake
+///   [`IDENTIFY_DISTANCE`] prices itself against.
+/// - **In-session pool only.** [`tentative_identifications`] scores against names the strict
+///   pass already awarded elsewhere in this session, never against the whole database. The
+///   guess space is the meeting's own confirmed cast, and the tool never guesses somebody who
+///   was not in the room.
+///
+/// Those two scopes are what make a looser cut admissible at all; see the decision record
+/// revising decision-004's no-middle-tier ruling for the argument.
+///
+/// # Where the value comes from
+///
+/// From the populations [`tentative_pairs`] measures over real sessions, through the trials
+/// harness (`examples/speaker-trials --tentative`), not from [`IDENTIFY_DISTANCE`]. Two
+/// things about that measurement have to travel with the number:
+///
+/// **What the on-disk contract can and cannot label.** A pair of clusters carries one free
+/// supervision signal: whether segmentation heard them talking over each other. That labels
+/// *negatives* -- provably two people, so a guess of one's name for the other would be wrong
+/// -- and it is also the guard the production rule applies, so those pairs are vetoed there
+/// whatever the cut is. *Positives* -- a fragment and the cluster of the person it really is
+/// -- require per-cluster identity, which neither `speaker_clusters.json` nor an unnamed
+/// transcript holds; labelling them is ear confirmation against representative clips, and
+/// that sitting has not been done for this constant yet. So the value below is the
+/// conservative edge of the admissible window the negative side and the demonstrated
+/// confusable pair bound, and it is flagged for re-pricing when an ear-labelled population
+/// exists. It is not an assumed number presented as a measurement: every number in its
+/// documentation was measured, and the gap between what was measured and what the value
+/// claims is stated rather than papered over.
+///
+/// **The populations themselves**, measured with `examples/speaker-trials --tentative` over
+/// the two real multi-speaker sessions on file (sessions of the same shape the
+/// [`IDENTIFY_DISTANCE`] documentation prices against):
+///
+/// - `20260818-132033` -- 181 clusters over 17.1 min of speech, seven people, 145 of the
+///   clusters under the floor. Heard-at-once (fragment, partner) negatives: 74 pairs,
+///   min **0.207** / p05 0.359 / median 0.722. Nearest *non-overlapping* partner per
+///   fragment, unlabelled: min 0.231 / p05 0.302 / median 0.458 / p95 0.605.
+/// - `20260818-143027` -- 21 clusters, 14 under the floor. Negatives: 7 pairs, min
+///   **0.509**. Nearest non-overlapping partner: min 0.249 / median 0.526.
+///
+/// Three readings belong with those numbers.
+///
+/// The negative minimum of 0.207 says how close two *provably different* people's centroids
+/// come inside one session on one microphone. It does not bound this cut directly, because
+/// the heard-at-once veto refuses exactly those pairs in production whatever the cut is --
+/// it bounds *trust in the veto*: a cut this wide is safe only while the veto stands, and a
+/// future change that weakens it must re-price this constant against 0.207 rather than
+/// inherit it.
+///
+/// The upper bound is the demonstrated in-session confusable pair the
+/// [`IDENTIFY_DISTANCE`] documentation records: two ear-confirmed different people whose
+/// centroids sit at **0.429** within one session. A cut at or past it admits the geometry
+/// that misfiles one real person under another's name, even in the marked form.
+///
+/// The lower bound is [`IDENTIFY_DISTANCE`] itself: anything at or below 0.40 is already
+/// decided by the strict pass, and a fragment the strict pass refused cannot clear a tighter
+/// cut against the same reference, so the band would be vacuous.
+///
+/// So the admissible window is `(0.40, 0.429)`, and the value is **0.42**: inside it, below
+/// the demonstrated confusable-pair distance by 0.009, and above the strict cut by 0.02. The
+/// margin to the confusable pair is thinner than the one [`IDENTIFY_DISTANCE`] keeps, and
+/// that is deliberate -- the marker is what buys the width -- but it is a margin, and it is
+/// stated. Rejected alternatives: anything at or past 0.429, on the pair above; anything at
+/// or below 0.40, on vacuity; and a wider cut justified by the unlabelled nearest-partner
+/// distribution (median 0.458), which mixes correct and wrong neighbours and therefore cannot
+/// price the false-guess side at all until it is labelled by ear.
+///
+/// Public for the same reason [`IDENTIFY_DISTANCE`] is: a calibration constant a diagnostic
+/// has to hard-code a copy of is a constant that drifts out of agreement with the code it
+/// claims to describe.
+pub const TENTATIVE_DISTANCE: f32 = 0.42;
+
+/// How little speech a cluster may hold and still be a *fragment* rather than a speaker.
+///
+/// The eligibility gate for [`tentative_identifications`]: a cluster is scored against
+/// [`TENTATIVE_DISTANCE`] only when `speech_seconds < TENTATIVE_FLOOR_SECONDS`. The
+/// comparison is strict the way every floor in the codebase spells it -- a cluster sitting
+/// exactly on the floor is a speaker, full stop, and keeps the strict pass's honest behaviour
+/// of staying unnamed until a human says otherwise.
+///
+/// # Not a shared constant with enroll's `PROMPT_FLOOR_SECONDS`
+///
+/// That one is `pub(crate)` in `meethook-enroll` and cannot be imported here, so the two
+/// live in separate crates at the same value and a test pins the parity rather than a shared
+/// definition importing it. They ask the same question -- "too little speech to be worth the
+/// machinery aimed at speakers" -- and disagreeing about the answer would leave a band that
+/// guesses at voices enroll has already decided not to ask about, or misses voices it does
+/// ask about. See the three-floors block in `meethook-enroll`'s `queue.rs` for the relation
+/// to the other two floors.
+pub const TENTATIVE_FLOOR_SECONDS: f64 = 5.0;
 
 /// A cluster matched to an enrolled speaker.
 #[derive(Debug, Clone, PartialEq)]
@@ -291,6 +396,128 @@ pub fn identify_clusters(
         }
     }
     identified
+}
+
+/// The second, looser band of identification: marked guesses for the fragments the strict
+/// pass left unnamed.
+///
+/// Runs **after** [`identify_clusters`] completes and reads its finished map: the guess
+/// space is the map's image -- names the strict pass already awarded on other clusters of
+/// this session -- and the veto runs against those definite holders plus whatever this pass
+/// awards, over the whole set as the award proceeds. The strict pass is untouched and stays
+/// byte-identical; this function is additive, and vacuous when the pool is empty (nobody
+/// strictly identified in-session -> no guesses, which is the normal state of a short
+/// recording).
+///
+/// # The rule, per fragment
+///
+/// A fragment is a cluster under [`TENTATIVE_FLOOR_SECONDS`] that the strict pass did not
+/// award. For each, in ascending cluster id:
+///
+/// - Score it with [`rank_enrolled`] -- the same unthresholded per-person nearest-reference
+///   ranking, the same `comparable_cosine`, the same tie-break -- and restrict its entries to
+///   the in-session pool. Do not re-implement the cosine arithmetic and do not re-rank:
+///   `rank_enrolled` already orders descending similarity, ties by ascending name, which is
+///   the walk order this pass uses.
+/// - Walk that list and award the fragment the first pooled entry that clears
+///   [`TENTATIVE_DISTANCE`] (strictly below, the `best_match` spelling) **and** is not
+///   heard-at-once with any holder of that name -- definite or already-tentative. When a
+///   name vetoes the fragment, the fragment may still take its *next* pooled name if it
+///   clears the cut: that is the next entry of the ranked list, not a runner-up fallback on
+///   the same person's second reference, which is the prohibited mechanism the strict pass
+///   documents refusing.
+/// - One name per fragment, and an awarded fragment becomes a tentative holder of its name
+///   for the rest of the walk.
+///
+/// The veto is whole-set for the same non-transitivity reason the strict pass gives: it is
+/// checked against every holder already holding the name as the walk proceeds, never against
+/// the winner alone, and the fixed walk order (ascending fragment id, descending similarity
+/// then ascending name within a fragment) is what makes a rerun move no fragment between
+/// names with nothing having changed.
+///
+/// The result reuses [`Identification`] rather than a new type: the tier's meaning lives in
+/// WHICH map a row came from ([`Naming`](crate::attribution::Naming)'s `identified` versus
+/// its `tentative`), and a reader asking whether a tentative row can carry over into a
+/// definite one is answered by the types staying separate.
+pub fn tentative_identifications(
+    clusters: &[SpeakerCluster],
+    enrolled: &EnrolledSpeakers,
+    identified: &BTreeMap<u32, Identification>,
+) -> BTreeMap<u32, Identification> {
+    // The pool: the finished definite map's image. Empty means nobody was confirmed in this
+    // session, and there is nothing to guess from -- return before doing any scoring at all.
+    let pool: BTreeSet<&str> = identified.values().map(|who| who.name.as_str()).collect();
+    if pool.is_empty() {
+        return BTreeMap::new();
+    }
+
+    // Definite holders per name: the veto below runs against these plus this pass's own
+    // awards, and a fragment the strict pass already named is a holder, not a candidate.
+    let mut definite: BTreeMap<&str, Vec<u32>> = BTreeMap::new();
+    for (id, who) in identified {
+        definite.entry(&who.name).or_default().push(*id);
+    }
+    let by_id: BTreeMap<u32, &SpeakerCluster> = clusters
+        .iter()
+        .map(|cluster| (cluster.id, cluster))
+        .collect();
+
+    // Fragments only, ascending id: the walk order is the determinism contract, and cluster
+    // ids rank by talk time rather than arrival, so the sort is explicit.
+    let mut fragments: Vec<&SpeakerCluster> = clusters
+        .iter()
+        .filter(|cluster| {
+            cluster.speech_seconds < TENTATIVE_FLOOR_SECONDS
+                && !identified.contains_key(&cluster.id)
+        })
+        .collect();
+    fragments.sort_by_key(|cluster| cluster.id);
+
+    let mut tentative: BTreeMap<u32, Identification> = BTreeMap::new();
+    let mut tentative_holders: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    for fragment in fragments {
+        // Descending similarity overall, so the first entry that fails the cut ends the walk
+        // for this fragment: nothing further down can clear it either.
+        for entry in rank_enrolled(&fragment.embedding, enrolled) {
+            if 1.0 - entry.similarity >= TENTATIVE_DISTANCE {
+                break;
+            }
+            if !pool.contains(entry.name.as_str()) {
+                continue;
+            }
+            // The whole-set veto: heard-at-once with ANY holder of this name, definite or
+            // already-tentative. A vetoed name loses this fragment only -- the next pooled
+            // name still competes.
+            let blocked = [
+                definite.get(entry.name.as_str()).map(Vec::as_slice),
+                tentative_holders.get(&entry.name).map(Vec::as_slice),
+            ]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|&held| {
+                by_id
+                    .get(&held)
+                    .is_some_and(|holder| heard_at_once(fragment, holder))
+            });
+            if blocked {
+                continue;
+            }
+            tentative.insert(
+                fragment.id,
+                Identification {
+                    name: entry.name.clone(),
+                    similarity: entry.similarity,
+                },
+            );
+            tentative_holders
+                .entry(entry.name)
+                .or_default()
+                .push(fragment.id);
+            break;
+        }
+    }
+    tentative
 }
 
 /// Whether segmentation proved these two clusters are different people.
@@ -450,6 +677,95 @@ pub fn rank_enrolled(embedding: &[f32], enrolled: &EnrolledSpeakers) -> Vec<Rese
             .then(a.name.cmp(&b.name))
     });
     ranked
+}
+
+/// One measured distance between a sub-floor fragment and another cluster of the same
+/// session, carrying the only label the on-disk contract can supply for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TentativePair {
+    /// The fragment side: always under [`TENTATIVE_FLOOR_SECONDS`].
+    pub fragment: u32,
+    /// The partner side: any other cluster of the session, above or below the floor alike --
+    /// the strict pass has no floor gate, so a definite holder may be a fragment too, and a
+    /// population that excluded them would measure a rule the production veto does not use.
+    pub partner: u32,
+
+    /// Cosine distance between the two centroids: `1.0 - dot` over unit vectors, 0 for the
+    /// same direction and 1 orthogonal. The same arithmetic `comparable_cosine` decides
+    /// with, which is what stops this from being able to disagree with it.
+    pub distance: f32,
+
+    /// Segmentation heard the two talking over each other: proof of two people, and the only
+    /// direction the on-disk contract labels. See [`tentative_pairs`] for what that buys and
+    /// what it cannot.
+    pub different_speaker: bool,
+}
+
+/// The labelled population [`TENTATIVE_DISTANCE`] is priced from, and nothing else.
+///
+/// Every sub-floor fragment against every other cluster of the session, in ascending fragment
+/// id then ascending partner id, so two runs over one file are diffable -- the only way "the
+/// output did not change" gets checked at all.
+///
+/// # What the labels are, and the gap that has to travel with them
+///
+/// The on-disk contract carries one free supervision signal per pair: whether segmentation
+/// heard the two clusters talking over each other. That labels **negatives** -- provably two
+/// people, so a guess of one's name for the other would be wrong -- and it is the same
+/// evidence the production veto acts on, so those pairs are refused there whatever the cut
+/// is. What they price is how close two provably different people's centroids come at this
+/// granularity, which bounds trust in a cut on the *unguarded* pairs, where no constraint
+/// protects anybody. That caveat is stated here because a threshold read off guarded
+/// negatives alone would otherwise look like it had been measured against the unguarded
+/// pairs it actually governs.
+///
+/// **Positives are not derivable from the file.** A fragment and the cluster of the person
+/// it really is need per-cluster identity, and neither `speaker_clusters.json` nor an
+/// unnamed transcript holds it. Labelling them is ear confirmation against representative
+/// clips; until that sitting exists, the constant's documentation says so rather than
+/// presenting the unlabelled nearest-partner distances as a same-speaker population. They are
+/// carried anyway (`different_speaker: false`) so the report shows their shape beside the
+/// labelled side instead of hiding it.
+///
+/// This function measures; it picks no threshold and holds no constant beyond the floor that
+/// selects its fragments. Scoring belongs to [`crate::score_trials`], presentation to
+/// `examples/speaker-trials`. The arithmetic is in the crate rather than the example for the
+/// reason [`crate::adoption_populations`] gives: a diagnostic whose conventions nobody can
+/// test is a number to believe rather than evidence.
+///
+/// Pairs whose embeddings differ in length, or are empty, take part in no distance: a cosine
+/// between unrelated spaces or across nothing is the fabricated comparison
+/// `comparable_cosine` refuses to make, and skipping is silent the way it is there, so one
+/// bad row cannot stop the rest of a session from being measured.
+pub fn tentative_pairs(clusters: &[SpeakerCluster]) -> Vec<TentativePair> {
+    let mut fragments: Vec<&SpeakerCluster> = clusters
+        .iter()
+        .filter(|cluster| cluster.speech_seconds < TENTATIVE_FLOOR_SECONDS)
+        .collect();
+    fragments.sort_by_key(|cluster| cluster.id);
+
+    let mut partners: Vec<&SpeakerCluster> = clusters.iter().collect();
+    partners.sort_by_key(|cluster| cluster.id);
+
+    let mut pairs = Vec::new();
+    for fragment in &fragments {
+        for partner in &partners {
+            if partner.id == fragment.id {
+                continue;
+            }
+            let Some(similarity) = comparable_cosine(&fragment.embedding, &partner.embedding)
+            else {
+                continue;
+            };
+            pairs.push(TentativePair {
+                fragment: fragment.id,
+                partner: partner.id,
+                distance: 1.0 - similarity,
+                different_speaker: heard_at_once(fragment, partner),
+            });
+        }
+    }
+    pairs
 }
 
 #[cfg(test)]
@@ -974,5 +1290,383 @@ mod tests {
         assert_eq!(ranked[0].name, identified[&0].name);
         assert_eq!(ranked[0].similarity, identified[&0].similarity);
         assert_eq!(ranked[0].references, 2);
+    }
+
+    // --- the tentative band ---------------------------------------------------------------
+
+    /// A sub-floor cluster, since the band scores fragments only and the plain helper above
+    /// hardcodes ten seconds of speech.
+    fn fragment(id: u32, embedding: Vec<f32>, seconds: f64) -> SpeakerCluster {
+        SpeakerCluster {
+            speech_seconds: seconds,
+            ..cluster(id, embedding)
+        }
+    }
+
+    /// The whole point of the band, at its decision point: a fragment the strict pass refused
+    /// takes the name when that name was strictly awarded elsewhere in the session, carrying
+    /// the similarity it was guessed at.
+    #[test]
+    fn a_sub_floor_fragment_takes_a_name_strictly_awarded_in_session() {
+        // The fragment sits at a centroid distance of 0.41 from Alice's reference: past the
+        // strict cut of 0.40, inside the tentative cut of 0.42. Built from the distance
+        // rather than an angle so the margin to each cut is exact rather than trigonometric.
+        let similarity: f32 = 1.0 - 0.41;
+        let fragment_emb = vec![similarity, (1.0 - similarity * similarity).sqrt()];
+        let database = enrolled(&[("Alice", voice(0.0))]);
+        let clusters = vec![
+            cluster(1, voice(0.0)),         // the definite holder, above the floor
+            fragment(0, fragment_emb, 4.0), // the candidate, under the floor
+        ];
+
+        let identified = identify_clusters(&clusters, &database);
+        assert!(
+            !identified.contains_key(&0),
+            "the fixture must sit outside the strict cut for this test to mean anything"
+        );
+
+        let tentative = tentative_identifications(&clusters, &database, &identified);
+
+        assert_eq!(tentative[&0].name, "Alice");
+        assert!((tentative[&0].similarity - similarity).abs() < 1e-6);
+    }
+
+    /// Acceptance criterion #1, negative half: a name that is enrolled but was never strictly
+    /// awarded in this session is not in the pool, and the fragment gets nothing however
+    /// close. The tool never guesses somebody who was not confirmed in the meeting.
+    #[test]
+    fn an_enrolled_name_absent_from_the_session_is_not_guessed() {
+        // One cluster only: Alice sits inside the tentative cut -- close enough to tempt a
+        // guess -- but no other cluster carries her name, so the pool is empty.
+        let similarity: f32 = 1.0 - 0.41;
+        let emb = vec![similarity, (1.0 - similarity * similarity).sqrt()];
+        let database = enrolled(&[("Alice", voice(0.0))]);
+        let clusters = vec![fragment(0, emb, 3.0)];
+
+        let identified = identify_clusters(&clusters, &database);
+        assert!(
+            identified.is_empty(),
+            "outside the strict cut by construction"
+        );
+        let tentative = tentative_identifications(&clusters, &database, &identified);
+
+        assert!(tentative.is_empty(), "{tentative:?}");
+    }
+
+    /// ...and the same fragment earns the name the moment a sibling cluster is strictly
+    /// awarded it: the pool is the finished definite map's image, nothing more.
+    #[test]
+    fn the_same_fragment_is_guessed_once_a_sibling_cluster_is_awarded_the_name() {
+        let similarity: f32 = 1.0 - 0.41;
+        let emb = vec![similarity, (1.0 - similarity * similarity).sqrt()];
+        let database = enrolled(&[("Alice", voice(0.0))]);
+        let clusters = vec![cluster(1, voice(0.0)), fragment(0, emb, 3.0)];
+
+        let identified = identify_clusters(&clusters, &database);
+        assert_eq!(identified[&1].name, "Alice");
+
+        let tentative = tentative_identifications(&clusters, &database, &identified);
+
+        assert_eq!(tentative[&0].name, "Alice");
+    }
+
+    /// Acceptance criterion #2: the floor is a hard gate on eligibility, not on the cut. The
+    /// same fragment, one tick of speech either side of the floor, is guessed or is not.
+    #[test]
+    fn a_fragment_exactly_on_the_floor_is_a_speaker_and_keeps_its_honest_unknown() {
+        let similarity: f32 = 1.0 - 0.41;
+        let emb = vec![similarity, (1.0 - similarity * similarity).sqrt()];
+        let database = enrolled(&[("Alice", voice(0.0))]);
+        let make = |seconds: f64| {
+            let clusters = vec![cluster(1, voice(0.0)), fragment(0, emb.clone(), seconds)];
+            let identified = identify_clusters(&clusters, &database);
+            tentative_identifications(&clusters, &database, &identified)
+        };
+
+        assert_eq!(make(TENTATIVE_FLOOR_SECONDS - 0.1)[&0].name, "Alice");
+        assert!(
+            make(TENTATIVE_FLOOR_SECONDS).is_empty(),
+            "exactly on the floor is a speaker, the codebase-wide convention"
+        );
+    }
+
+    /// Acceptance criterion #7's boundary, mirrored from the strict pass by name so the test
+    /// moves with the constant: the same fragment and the same in-session name land on
+    /// opposite sides of the cut.
+    #[test]
+    fn the_tentative_decision_is_a_single_cut_at_the_tentative_distance() {
+        let holder = voice(0.0);
+        let database = enrolled(&[("Alice", holder)]);
+
+        for (similarity, expected) in [
+            (1.0 - TENTATIVE_DISTANCE + 0.01, true),
+            (1.0 - TENTATIVE_DISTANCE - 0.01, false),
+        ] {
+            let emb = vec![similarity, (1.0f32 - similarity * similarity).sqrt()];
+            let clusters = vec![cluster(1, voice(0.0)), fragment(0, emb, 2.0)];
+            let identified = identify_clusters(&clusters, &database);
+            let tentative = tentative_identifications(&clusters, &database, &identified);
+
+            assert_eq!(
+                tentative.contains_key(&0),
+                expected,
+                "similarity {similarity} should {} have been guessed",
+                if expected { "" } else { "not" }
+            );
+        }
+    }
+
+    /// Acceptance criterion #3, first half: a fragment heard at once with the definite holder
+    /// of a name does not take that name -- whatever the distance says -- but may still take
+    /// its NEXT pooled name if that one clears the cut. The runner-up on the same person's
+    /// second reference is not the mechanism.
+    #[test]
+    fn a_vetoed_name_loses_only_that_name_to_the_fragment() {
+        // Both distances are built exact: the fragment sits 0.4001 from Alice (outside the
+        // strict cut, inside the tentative one) and 0.4101 from Bob (inside the tentative
+        // one), so Alice ranks first and Bob is the next pooled name that clears.
+        let alice = voice(0.0);
+        let at_distance = |d: f32| {
+            let similarity = 1.0 - d;
+            vec![similarity, (1.0 - similarity * similarity).sqrt()]
+        };
+        let fragment_emb = at_distance(0.4001);
+        // Bob's reference is the unit vector at cosine 0.5899 to the fragment, rotated off
+        // the x axis so that his holder cannot also match Alice.
+        let theta = fragment_emb[1].atan2(fragment_emb[0]);
+        let bob = vec![
+            (theta + 0.5899f32.acos()).cos(),
+            (theta + 0.5899f32.acos()).sin(),
+        ];
+        let database = enrolled(&[("Alice", alice), ("Bob", bob.clone())]);
+        let clusters = vec![
+            cluster(1, voice(0.0)),
+            cluster(2, bob),
+            fragment(0, fragment_emb, 2.0),
+        ];
+        let identified = identify_clusters(&clusters, &database);
+        assert_eq!(identified[&1].name, "Alice");
+        assert_eq!(identified[&2].name, "Bob");
+        assert!(!identified.contains_key(&0));
+
+        // The same fragment, heard talking over Alice's holder: Alice vetoes it, Bob stands.
+        let clusters = vec![
+            cluster(1, voice(0.0)),
+            cluster(2, database.speakers[1].embedding.clone()),
+            SpeakerCluster {
+                speech_seconds: 2.0,
+                heard_at_once_with: vec![1],
+                ..cluster(0, at_distance(0.4001))
+            },
+        ];
+        let identified = identify_clusters(&clusters, &database);
+        let tentative = tentative_identifications(&clusters, &database, &identified);
+
+        assert_eq!(tentative[&0].name, "Bob");
+    }
+
+    /// Acceptance criterion #3, the non-transitivity case in the C1/C2/C3 shape: three
+    /// fragments all claim the pooled name, and the only exclusion is between the two
+    /// *losers*. "Drop whoever the winner excludes" vetoes nobody here and files all three,
+    /// leaving two provably-different fragments under one marked name. Greedy against every
+    /// holder already holding the name drops the third.
+    #[test]
+    fn a_tentative_contender_is_vetoed_by_any_holder_not_just_the_nearest() {
+        let database = enrolled(&[("Alice", voice(0.0))]);
+        // All three fragments sit just outside the strict cut and inside the tentative one --
+        // close enough to be guessed, far enough that the strict pass leaves them unnamed.
+        // The angles are arccos of the similarities, so the distances are 0.405, 0.410 and
+        // 0.415: C1 nearest, all three inside the band.
+        let clusters = vec![
+            cluster(5, voice(0.0)),         // the definite holder
+            fragment(0, voice(53.46), 2.0), // C1, nearest
+            fragment(1, voice(53.85), 2.0), // C2
+            SpeakerCluster {
+                speech_seconds: 2.0,
+                heard_at_once_with: vec![1],
+                ..cluster(2, voice(54.23)) // C3
+            },
+        ];
+        let identified = identify_clusters(&clusters, &database);
+        let tentative = tentative_identifications(&clusters, &database, &identified);
+
+        assert_eq!(tentative[&0].name, "Alice");
+        assert_eq!(tentative[&1].name, "Alice");
+        assert!(
+            !tentative.contains_key(&2),
+            "C3 is heard at once with C2, which holds the name: {tentative:?}"
+        );
+    }
+
+    /// A fragment heard at once with a TENTATIVE holder is excluded too -- the veto runs
+    /// against the union of definite and tentative holders -- and the outcome must not depend
+    /// on the order the slice arrived in, which is what the fixed ascending-id walk exists to
+    /// guarantee.
+    #[test]
+    fn a_fragment_heard_at_once_with_a_tentative_holder_is_vetoed_regardless_of_input_order() {
+        let database = enrolled(&[("Alice", voice(0.0))]);
+        let make = |lower_first: bool| {
+            // Equidistant from Alice at a centroid distance of 0.41 -- just outside the
+            // strict cut, inside the tentative one -- mirrored about the x axis.
+            let low = SpeakerCluster {
+                speech_seconds: 2.0,
+                heard_at_once_with: vec![1],
+                ..cluster(0, voice(53.85))
+            };
+            let high = SpeakerCluster {
+                speech_seconds: 2.0,
+                heard_at_once_with: vec![0],
+                ..cluster(1, voice(-53.85))
+            };
+            let clusters = if lower_first {
+                vec![cluster(5, voice(0.0)), low, high]
+            } else {
+                vec![cluster(5, voice(0.0)), high, low]
+            };
+            let identified = identify_clusters(&clusters, &database);
+            tentative_identifications(&clusters, &database, &identified)
+        };
+
+        for lower_first in [true, false] {
+            let tentative = make(lower_first);
+            // Both fragments are equally close to Alice; the lower id walks first and takes
+            // the name, and the other is heard at once with it.
+            assert_eq!(
+                tentative[&0].name, "Alice",
+                "input order lower-first={lower_first}"
+            );
+            assert!(
+                !tentative.contains_key(&1),
+                "input order lower-first={lower_first}: {tentative:?}"
+            );
+        }
+    }
+
+    /// An exact similarity tie between two pooled names resolves to the lexicographically
+    /// first, the way `rank_enrolled` orders them, so a rerun cannot flip a guess between
+    /// two people with nothing having changed.
+    #[test]
+    fn a_tentative_tie_between_two_names_goes_to_the_lexicographically_first() {
+        // Two references mirrored about the x axis and a fragment on it: exactly equidistant
+        // from both, at a centroid distance of 0.41 -- outside the strict cut, inside the
+        // tentative one.
+        let a = 0.59f32;
+        let b = (1.0 - a * a).sqrt();
+        let database = enrolled(&[("Zoe", vec![a, b]), ("Andrew", vec![a, -b])]);
+        let clusters = vec![
+            cluster(1, vec![a, b]),
+            cluster(2, vec![a, -b]),
+            fragment(0, vec![1.0, 0.0], 2.0),
+        ];
+        let identified = identify_clusters(&clusters, &database);
+        let tentative = tentative_identifications(&clusters, &database, &identified);
+
+        assert_eq!(tentative[&0].name, "Andrew");
+    }
+
+    /// Nobody strictly identified in-session means an empty pool and an empty map, with no
+    /// scoring done at all: short recordings behave exactly as they always have. This is the
+    /// regression guard on the band staying vacuous where it must be.
+    #[test]
+    fn an_empty_pool_leaves_every_fragment_unnamed() {
+        let database = enrolled(&[("Alice", voice(90.0)), ("Bob", voice(180.0))]);
+        // Every cluster is far enough out that the strict pass awards nobody.
+        let clusters = vec![fragment(0, voice(0.0), 3.0), fragment(1, voice(20.0), 2.0)];
+
+        let identified = identify_clusters(&clusters, &database);
+        assert!(identified.is_empty());
+
+        let tentative = tentative_identifications(&clusters, &database, &identified);
+        assert!(tentative.is_empty(), "{tentative:?}");
+    }
+
+    /// A fragment the strict pass ALREADY named is a holder, not a candidate: the band must
+    /// not re-guess a voice that has a definite answer, even though it is under the floor.
+    #[test]
+    fn a_strictly_identified_fragment_is_not_reguessed() {
+        let database = enrolled(&[("Alice", voice(0.0))]);
+        let clusters = vec![
+            cluster(1, voice(0.0)),
+            fragment(0, voice(5.0), 2.0), // close enough for the strict pass itself
+        ];
+        let identified = identify_clusters(&clusters, &database);
+        assert_eq!(identified[&0].name, "Alice");
+
+        let tentative = tentative_identifications(&clusters, &database, &identified);
+
+        assert!(
+            !tentative.contains_key(&0),
+            "a definite answer is not a candidate: {tentative:?}"
+        );
+    }
+
+    // --- the calibration population -------------------------------------------------------
+
+    /// The fragment side is sub-floor only, the partner side is the rest of the session
+    /// above or below the floor alike, and no pair measures a cluster against itself.
+    #[test]
+    fn the_population_pairs_every_sub_floor_fragment_with_every_other_cluster() {
+        let clusters = vec![
+            cluster(0, voice(0.0)),        // above the floor: a partner, never a fragment
+            fragment(1, voice(30.0), 4.0), // a fragment
+            fragment(2, voice(60.0), 4.0), // a fragment, and a partner too
+        ];
+
+        let pairs = tentative_pairs(&clusters);
+
+        let keys: Vec<(u32, u32)> = pairs.iter().map(|p| (p.fragment, p.partner)).collect();
+        assert_eq!(keys, [(1, 0), (1, 2), (2, 0), (2, 1)]);
+        assert!(pairs.iter().all(|p| p.fragment != p.partner));
+    }
+
+    /// The label is the only supervision the file carries, read both directions the way
+    /// [`heard_at_once`] does: one side asserting the relation is enough.
+    #[test]
+    fn the_population_labels_a_pair_different_speaker_when_segmentation_heard_them_overlap() {
+        let clusters = vec![
+            excluding(0, voice(0.0), vec![1]),
+            fragment(1, voice(10.0), 2.0),
+        ];
+
+        let pairs = tentative_pairs(&clusters);
+
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs[0].different_speaker, "{pairs:?}");
+
+        // And the unlabelled side stays unlabelled rather than being guessed at.
+        let clusters = vec![cluster(0, voice(0.0)), fragment(1, voice(10.0), 2.0)];
+        let pairs = tentative_pairs(&clusters);
+        assert!(!pairs[0].different_speaker, "{pairs:?}");
+    }
+
+    /// The distances are the same arithmetic the decision uses: `1 - dot` over unit vectors,
+    /// so a pair at `theta` degrees reads `1 - cos(theta)` rather than merely some number.
+    #[test]
+    fn the_population_carries_centroid_distances_the_decision_arithmetic_produces() {
+        let clusters = vec![cluster(0, voice(0.0)), fragment(1, voice(30.0), 2.0)];
+
+        let pairs = tentative_pairs(&clusters);
+
+        assert!((pairs[0].distance - (1.0 - 30.0f32.to_radians().cos())).abs() < 1e-6);
+    }
+
+    /// A partner from a different embedding model takes part in no distance, and skipping it
+    /// costs nothing else: the comparable pairs of the same session are still measured.
+    #[test]
+    fn an_incomparable_partner_is_skipped_rather_than_measured() {
+        let stale = vec![1.0, 0.0, 0.0, 0.0];
+        let clusters = vec![
+            SpeakerCluster {
+                embedding: stale,
+                ..cluster(0, voice(0.0))
+            },
+            fragment(1, voice(10.0), 2.0),
+            cluster(2, voice(20.0)),
+        ];
+
+        let pairs = tentative_pairs(&clusters);
+
+        let keys: Vec<(u32, u32)> = pairs.iter().map(|p| (p.fragment, p.partner)).collect();
+        assert_eq!(keys, [(1, 2)], "the stale partner is no comparison at all");
     }
 }

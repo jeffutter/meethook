@@ -9,13 +9,13 @@
 use std::collections::BTreeMap;
 
 use meethook_session::{
-    AssignedName, Classification, DiscoveredSession, EnrolledSpeakers, Paths, SessionMetadata,
-    SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Transcript, TranscriptContext,
-    unknown_labels,
+    AssignedName, Classification, DeniedName, DiscoveredSession, EnrolledSpeakers, Paths,
+    SessionMetadata, SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Transcript,
+    TranscriptContext, unknown_labels,
 };
 use meethook_transcribe::{
     Attribution, Naming, attributions, heard_at_once, identify_clusters, rank_enrolled,
-    read_track_16k_mono, speaker_offset_seconds,
+    read_track_16k_mono, resolve_denials, speaker_offset_seconds, tentative_identifications,
 };
 
 use crate::consequence::{Preview, Refusal, handle};
@@ -175,6 +175,7 @@ pub(crate) fn enroll_session(
         assertion.as_deref(),
         None,
         None,
+        &assigned.denied,
     );
 
     // The transcript may predate an answer given in an earlier session -- name somebody in
@@ -870,6 +871,7 @@ fn commit_named<'d, 'm>(
             assertion,
             Some(&previous_forced),
             None,
+            &assigned.denied,
         );
         let mut overlapped: Vec<String> = Vec::new();
         for (id, label) in pre.iter() {
@@ -963,6 +965,7 @@ fn commit_named<'d, 'm>(
         assertion,
         forced,
         None,
+        &assigned.denied,
     );
     if relabel(transcript, &now) {
         transcript.write(
@@ -1152,6 +1155,7 @@ fn report_rename(
 /// Visible to the crate rather than to this file because [`references`] labels sessions through
 /// exactly this too: the claim that a reference is naming some voice is only as good as its
 /// being the same labelling the transcript is written with.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn effective_labels(
     clusters: &[SpeakerCluster],
     unknown: &BTreeMap<u32, String>,
@@ -1160,6 +1164,7 @@ pub(crate) fn effective_labels(
     one_remote_speaker: Option<&str>,
     forced: Option<&BTreeMap<u32, String>>,
     pending: Option<u32>,
+    denied: &[DeniedName],
 ) -> BTreeMap<u32, Attribution> {
     // `pending` is the voice an in-progress answer is about: its hand-given row is what the
     // answer would create rather than a standing declaration, so it earns no co-declaration
@@ -1167,8 +1172,18 @@ pub(crate) fn effective_labels(
     // dry run's refusal to fire off. Every other reading passes `None`, where every standing
     // row stands.
     let identified = identify_clusters(clusters, speakers);
-    let mut naming =
-        Naming::new(clusters, &identified, assigned).with_one_remote_speaker(one_remote_speaker);
+    // The tentative band runs here rather than at each caller for the same reason the strict
+    // pass does: one labelling rule, one place. A preview and a write that skipped it would
+    // demote different voices -- the guess is part of what a rewrite commits past.
+    let tentative = tentative_identifications(clusters, speakers, &identified);
+    // Resolved here rather than at each caller: bit-exact matching against this session's
+    // clusters is one rule, and a preview that resolved a denial to a different row than the
+    // write would is a lie with extra steps.
+    let denied = resolve_denials(clusters, denied);
+    let mut naming = Naming::new(clusters, &identified, assigned)
+        .with_one_remote_speaker(one_remote_speaker)
+        .with_tentative(&tentative)
+        .with_denials(&denied);
     if let Some(forced) = forced {
         naming = naming.with_forced(forced);
     }

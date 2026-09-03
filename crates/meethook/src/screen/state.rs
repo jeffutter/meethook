@@ -34,6 +34,7 @@
 //! than deferring, so it neither sets a target nor depends on [`Screen::still_working`], and the
 //! fixed point that bounds a steer does not bound it.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use meethook_enroll::{
@@ -258,7 +259,9 @@ pub struct View<'a> {
     pub meeting: Option<&'a MeetingLabel>,
     pub position: Position,
     pub number: &'a str,
-    pub label: &'a str,
+    /// The voice's label as it reads now -- a guess owns its allocated "Name?" rather than
+    /// borrowing one, which is what makes this `Cow`.
+    pub label: Cow<'a, str>,
     pub speech_seconds: f64,
     pub rows: Vec<Row>,
     /// Index into [`View::rows`] of the queue cursor.
@@ -689,7 +692,10 @@ impl Screen {
                 label: row.attribution.label().to_string(),
                 speech_seconds: row.speech_seconds,
                 similarity: match row.attribution {
-                    Attribution::Identified { similarity, .. } => Some(*similarity),
+                    // A guess carries its machine similarity like an identification: the pane
+                    // shows the number, and how it is treated is 059.04's surface work.
+                    Attribution::Identified { similarity, .. }
+                    | Attribution::Tentative { similarity, .. } => Some(*similarity),
                     Attribution::Unknown(_) | Attribution::Assigned { .. } => None,
                 },
                 below_floor: row.below_floor,

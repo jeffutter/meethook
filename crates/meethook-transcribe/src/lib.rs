@@ -55,12 +55,14 @@ pub use adoption::{
 pub use aec::{Cleaned, Cleaning, PassThrough, cancel_bleed};
 pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
-pub use attribution::{Attribution, Naming, attributions};
+pub use attribution::{Attribution, Naming, attributions, resolve_denials};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
 pub use gpu::NoMetalDevice;
 pub use identify::{
-    IDENTIFY_DISTANCE, Identification, Resemblance, heard_at_once, identify_clusters, rank_enrolled,
+    IDENTIFY_DISTANCE, Identification, Resemblance, TENTATIVE_DISTANCE, TENTATIVE_FLOOR_SECONDS,
+    TentativePair, heard_at_once, identify_clusters, rank_enrolled, tentative_identifications,
+    tentative_pairs,
 };
 pub use import::{BuiltSession, ImportedSource, MIC_SILENCE_S, SPLICE_GAP_S, build_session};
 pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
@@ -306,10 +308,16 @@ pub fn transcribe_session(
     clusters.write(&session.paths)?;
 
     let identified = identify::identify_clusters(&clusters.clusters, speakers);
+    // The second band runs after the strict pass and guesses only from its image: fragments
+    // below the floor that clear the looser cut against a name this session already confirmed
+    // elsewhere. Vacuous when the strict pass named nobody, which is the short-recording case.
+    let tentative = identify::tentative_identifications(&clusters.clusters, speakers, &identified);
     // Voices the user named by hand in an earlier `enroll` run over this session. Read here
     // rather than passed in like `speakers` because it is one file per session, so there is no
     // batch-level read to hoist it into -- and reading it is what makes a `--force`
-    // re-transcribe keep the names a person gave instead of silently reverting them.
+    // re-transcribe keep the names a person gave instead of silently reverting them. Its
+    // denials resolve through the same bit-exact rule as its affirmations, so a refused guess
+    // stays refused on every rewrite rather than coming back on the next force run.
     let assigned = SpeakerNames::read_or_empty(&session.paths, &session.id)?;
 
     let turns = merge::merge(
@@ -319,7 +327,12 @@ pub fn transcribe_session(
         speaker_offset_seconds(&metadata)?,
         &diarization.turns,
         Naming::new(&clusters.clusters, &identified, &assigned.names)
-            .with_one_remote_speaker(metadata.one_remote_speaker.as_deref()),
+            .with_one_remote_speaker(metadata.one_remote_speaker.as_deref())
+            .with_tentative(&tentative)
+            .with_denials(&attribution::resolve_denials(
+                &clusters.clusters,
+                &assigned.denied,
+            )),
     );
 
     Ok(Transcript::new(session.id.clone(), turns))

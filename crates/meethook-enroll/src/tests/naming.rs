@@ -114,6 +114,95 @@ fn the_rewritten_transcript_is_what_a_force_re_transcribe_would_produce() {
     assert_eq!(written, expected);
 }
 
+/// The same invariant where the tentative band has something to say: the fragment sits at
+/// cosine distance 0.41 from Alice -- past the strict cut, inside the tentative window -- so
+/// neither process may name it unmarked, and whatever the pass-over relabel wrote must be
+/// what a `--force` re-transcribe would now derive through the same two passes.
+#[test]
+fn the_rewritten_transcript_of_a_tentative_session_is_what_a_force_re_transcribe_would_produce() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let session = make_session(&paths, "20260809-052600");
+    let id = SessionId::parse("20260809-052600").unwrap();
+
+    // Alice is enrolled against cluster 0's exact voice before the run, which is what puts
+    // her in the in-session pool the band may guess from.
+    let mut speakers = EnrolledSpeakers::new(Vec::new());
+    speakers.store_reference("Alice", voice(0), 40.0);
+    speakers.write(&paths).unwrap();
+
+    // The third voice exists only so the fragment is not the sole unresolved one: a floor that
+    // hides every voice in a session offers them all instead, and then nothing is held back
+    // for this test to pin. Above the floor and far from everything, it is asked about once
+    // and skipped.
+    let mut clusters = vec![
+        cluster(0, 0.0, (0.5, 2.5)),
+        cluster(1, 3.0, (3.0, 3.5)),
+        cluster(2, 6.0, (6.0, 7.0)),
+    ];
+    clusters[1].embedding = nearly(54.0);
+    for (cluster, seconds) in clusters.iter_mut().zip([40.0, 1.5, 8.0]) {
+        cluster.speech_seconds = seconds;
+    }
+    SpeakerClusters::new(id.clone(), clusters)
+        .write(&session)
+        .unwrap();
+    write_transcript(
+        &Transcript::new(
+            id.clone(),
+            vec![
+                speaker_turn(0.0, 0, "Unknown 1", "hi there"),
+                speaker_turn(3.0, 1, "Unknown 2", "mm"),
+                speaker_turn(6.0, 2, "Unknown 3", "over here"),
+            ],
+        ),
+        &paths,
+        &session,
+        &session_metadata(&id),
+    );
+
+    // One question, about the voice above the floor; the fragment is held back, not asked.
+    let mut interviewer = Scripted::default();
+    let (report, output) = run(&paths, &[], &mut interviewer);
+    assert_eq!(interviewer.seen.len(), 1, "{output}");
+    assert_eq!(report.held_back, 1, "{output}");
+
+    // What `transcribe --force` would now derive: the strict pass, then the band over its
+    // image, then the tier rule both processes share.
+    let clusters = SpeakerClusters::read(&session.speaker_clusters_json()).unwrap();
+    let speakers = EnrolledSpeakers::read_or_empty(&paths).unwrap();
+    let identified = identify_clusters(&clusters.clusters, &speakers);
+    let tentative = tentative_identifications(&clusters.clusters, &speakers, &identified);
+    let unknown = unknown_labels(
+        clusters
+            .clusters
+            .iter()
+            .map(|c| (c.id, c.first_spoke_seconds)),
+    );
+    let labels = attributions(
+        &unknown,
+        Naming::new(&clusters.clusters, &identified, &[]).with_tentative(&tentative),
+    );
+    let expected: Vec<(String, Option<f32>)> = [0u32, 1, 2]
+        .iter()
+        .map(|id| {
+            let label = &labels[id];
+            (label.label().to_string(), label.confidence())
+        })
+        .collect();
+    let written: Vec<(String, Option<f32>)> = transcript_of(&session)
+        .turns
+        .iter()
+        .filter(|t| t.source_track == SourceTrack::Speaker)
+        .map(|t| (t.speaker.clone(), t.speaker_id_confidence))
+        .collect();
+    assert_eq!(written, expected);
+    // And the guess is marked, not asserted: the band's whole cost model is that a wrong
+    // one costs a visibly-questionable line rather than an unmarked misfiling.
+    let markdown = std::fs::read_to_string(session.transcript_md()).unwrap();
+    assert!(markdown.contains("Alice?"), "{markdown}");
+}
+
 /// The guard on `merge` staying the sole producer of a turn's provenance: `enroll` changes
 /// what a cluster is called and never which cluster a turn came from. That is what keeps
 /// a rewritten transcript identical to a `--force` re-transcribe, since the field would

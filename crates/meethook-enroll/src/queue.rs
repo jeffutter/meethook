@@ -76,6 +76,10 @@ use meethook_session::unknown_labels;
 ///   8 s of audio is what TASK-019 measured going wrong. It landed on the same 5.0 s this one
 ///   sits on, which is why both state the same boundary convention below: a value offered here
 ///   and then refused there would be a question asked for nothing.
+/// - [`meethook_transcribe::TENTATIVE_FLOOR_SECONDS`] decides **which fragments the tentative
+///   band may guess at**, and it is this floor's own number: the band scores exactly the
+///   voices held back here. It lives in `meethook-transcribe` because the band does, so the
+///   parity is pinned by a test in `meethook-enroll` rather than by a shared definition.
 ///
 /// The comparison is `speech_seconds >= PROMPT_FLOOR_SECONDS`, the same convention
 /// `SPEAKER_FLOOR_SECONDS` states: a cluster sitting exactly on the floor is offered. Two

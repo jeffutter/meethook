@@ -118,10 +118,10 @@ fn the_queue_holds_the_voices_the_floor_held_back_and_marks_them() {
     assert_eq!(
         interviewer.seen[0].rows(),
         [
-            ("Unknown 1", "Unknown 1", false),
-            ("Unknown 2", "Unknown 2", true),
-            ("Unknown 3", "Unknown 3", true),
-            ("Unknown 4", "Unknown 4", true),
+            ("Unknown 1", Cow::Borrowed("Unknown 1"), false),
+            ("Unknown 2", Cow::Borrowed("Unknown 2"), true),
+            ("Unknown 3", Cow::Borrowed("Unknown 3"), true),
+            ("Unknown 4", Cow::Borrowed("Unknown 4"), true),
         ],
         "{output}"
     );

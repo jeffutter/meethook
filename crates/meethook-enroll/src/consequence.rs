@@ -42,6 +42,7 @@
 //! Nothing on the `--name` path reaches [`Preview::of`] at all, so the non-interactive command
 //! pays for the preview it never asks for exactly nothing.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use meethook_session::{Displaced, EnrolledSpeakers, SpeakerCluster, SpeakerNames, Stored};
@@ -208,6 +209,7 @@ impl<'a> Preview<'a> {
             self.one_remote_speaker,
             forced,
             None,
+            &candidate_assigned.denied,
         );
 
         // The addition. `None` on the below-floor path, where no reference is stored at all.
@@ -271,6 +273,7 @@ impl<'a> Preview<'a> {
             self.one_remote_speaker,
             forced,
             Some(self.cluster.id),
+            &candidate_assigned.denied,
         );
 
         // A legacy reference that *is* this exact fragment, still standing under somebody
@@ -448,6 +451,7 @@ impl<'a> Preview<'a> {
                     self.one_remote_speaker,
                     Some(&previous_forced),
                     None,
+                    &running_assigned.denied,
                 );
                 let overlapped = pre.iter().any(|(&id, label)| {
                     id != member.id
@@ -850,7 +854,7 @@ fn refusal_of(
     corrected: &BTreeMap<u32, Attribution>,
     after: &BTreeMap<u32, Attribution>,
 ) -> Option<Refusal> {
-    if after.get(&answered).map(Attribution::label) != Some(name) {
+    if after.get(&answered).map(Attribution::label) != Some(Cow::Borrowed(name)) {
         return Some(Refusal::Vetoed {
             holder: after
                 .iter()
@@ -1255,6 +1259,7 @@ mod tests {
             Some("Alice"),
             None,
             None,
+            &[],
         );
         assert_eq!(after[&0].label(), "Alice");
         assert_eq!(after[&1].label(), "Alice");
@@ -1856,6 +1861,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         );
         assert_eq!(later[&0].label(), "Grace");
     }
