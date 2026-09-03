@@ -60,6 +60,7 @@ fn one_runs_narration_reads_as_these_lines_in_this_order() {
             kept: 0,
             held_back: 3,
             refused: 1,
+            denied: 0,
             passed_over: 1,
             failed: 0,
             asserted: 0,

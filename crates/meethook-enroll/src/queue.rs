@@ -7,7 +7,7 @@
 //! whole session, and [`targeted`] and [`at_timestamp`] are its two siblings for a run aimed at
 //! one voice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use meethook_session::{
     DiscoveredSession, SpeakerCluster, Transcript, TranscriptTime, VoiceAt, unknown_speaker,
@@ -345,9 +345,35 @@ pub(crate) fn queue<'c>(
     sessions: Sessions,
     meeting: Option<MeetingLabel>,
     session: &DiscoveredSession,
+    denied: &BTreeSet<u32>,
     notes: &mut dyn Narrator,
     report: &mut EnrollReport,
 ) -> Result<Option<Vec<&'c SpeakerCluster>>> {
+    // A voice is *settled* when it sits below the prompt floor and the transcript already
+    // says something about it: a standing tentative guess ("Ivan?" on its turns) or a
+    // standing denial (the user said this voice is not Ivan). Asking about it again would
+    // only re-ask a question the run can already see an answer to in the file, which is how
+    // a guessed tail nagged forty-eight times once the regulars were enrolled -- while the
+    // voice stays reachable, because `--all`, `--correct` and a [`Selection`] all bypass
+    // this exactly as they bypass the floor.
+    //
+    // Settledness is a queue-side computation rather than an attribution change: a guess
+    // stays an open question wherever else it is read (`Attribution::Tentative` is not
+    // named), and only the offer decides whether an open question is worth a prompt. It is
+    // computed from `shown` plus the resolved denial ids, because denials do not reach
+    // `shown` at all -- they are applied into it upstream, so a denied fragment arrives as
+    // an ordinary "Unknown N" indistinguishable from an open one, and only the ids say it
+    // was spoken for. A rejected voice counts here too: refusing a guess is a deliberate
+    // choice the user made, and settling it is what keeps the pass-over gate honest about
+    // it.
+    //
+    // The floor check guards the denial arm: a stale-matched denial can resolve to an
+    // above-floor cluster after re-clustering, and there it claims nothing -- no guess to
+    // suppress, no question to hold back.
+    let settled = |c: &'c SpeakerCluster| {
+        c.speech_seconds < PROMPT_FLOOR_SECONDS
+            && (matches!(shown[&c.id], Attribution::Tentative { .. }) || denied.contains(&c.id))
+    };
     // The one place "already named" is decided. Everything below -- the floor, the in-run
     // guard, the prompt -- treats a voice the same however it got into this list, which is
     // what lets `--all` and `--correct` compose without either knowing about the other.
@@ -355,6 +381,11 @@ pub(crate) fn queue<'c>(
         .iter()
         .copied()
         .filter(|c| offer.named || !shown[&c.id].is_named())
+        // Settled voices drop out of the DEFAULT offer only: either widening flag lifts the
+        // exclusion exactly as it lifts the floor, and a targeted run never reaches this
+        // function at all. With both flags off this is the whole of settledness's effect on
+        // the offer -- everything below sees the same list it saw before the tail existed.
+        .filter(|c| (offer.quiet || offer.named) || !settled(c))
         .collect();
     // The two halves of the pass-over, which used to be one: a session with no candidates at
     // all, and a session whose candidates are all already named. Only the second is
@@ -378,11 +409,17 @@ pub(crate) fn queue<'c>(
         // A session whose voices are all identified is exactly where somebody stands when one
         // of those identifications is wrong, and this note is the only thing it produces -- so
         // it carries the count that reaches the escape, the way the held-back one names `--all`.
+        // The settled count is the other half of the same escape, for the settled tail the
+        // default offer dropped above: a session passed over because every fragment was
+        // already guessed or dismissed has to say so, or the user cannot tell "nothing left"
+        // from "the guesses you saw went away". Zero under every combination that predates
+        // the tail, which is what keeps the older wordings byte-identical.
         let named = shown.values().filter(|label| label.is_named()).count();
+        let settled = order.iter().filter(|c| settled(c)).count();
         about(
             notes,
             &session.id,
-            SessionNote::PassedOver(PassedOver::NothingUnresolved { named }),
+            SessionNote::PassedOver(PassedOver::NothingUnresolved { named, settled }),
         )?;
         report.passed_over += 1;
         return Ok(None);
@@ -395,6 +432,12 @@ pub(crate) fn queue<'c>(
     // a meeting of seven people, measured on `20260810-093047` -- and asking about each of
     // them is how a five-minute job becomes an hour. Filtering preserves first-appearance
     // order, which is what the user reads the transcript in.
+    //
+    // Settled voices are already out of `candidates` under the default offer, so they drop
+    // out of `queued` with them and no longer count in `held_back`: the "quieter voice(s)
+    // not offered" clause now refers only to genuinely-open quiet voices, and a run that
+    // settled its tail reports nothing held back rather than advertising `--all` for voices
+    // that have nothing left to offer.
     let mut offered: Vec<&SpeakerCluster> = if offer.quiet {
         candidates.clone()
     } else {

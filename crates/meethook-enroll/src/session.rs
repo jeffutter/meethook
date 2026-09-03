@@ -6,7 +6,7 @@
 //! because a transcript rewritten any other way would be a second producer of the labels
 //! `merge` writes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use meethook_session::{
     AssignedName, Classification, DeniedName, DiscoveredSession, EnrolledSpeakers, Paths,
@@ -18,7 +18,7 @@ use meethook_transcribe::{
     read_track_16k_mono, resolve_denials, speaker_offset_seconds, tentative_identifications,
 };
 
-use crate::consequence::{Preview, Refusal, handle};
+use crate::consequence::{Demotion, Preview, Refusal, handle};
 use crate::interview::{Answer, Interviewer, MeetingLabel};
 use crate::narration::{
     self, AnswerNote, Narrator, PassedOver, SessionFile, SessionNote, about, after,
@@ -211,6 +211,17 @@ pub(crate) fn enroll_session(
             .then(a.id.cmp(&b.id))
     });
 
+    // Standing denials resolved against this session's clusters: the ids the queue treats as
+    // settled alongside its tentative guesses. A second pure call beside the one inside
+    // `effective_labels` above -- same inputs, same outputs, no drift possible -- reduced to
+    // ids because the queue only needs to know WHICH fragments were spoken for, not what they
+    // were spoken for. Under an assertion the queue never runs, so the set goes unused there;
+    // computing it unconditionally keeps the borrow of `assigned` out of the match arms below.
+    let denied: BTreeSet<u32> = resolve_denials(&clusters.clusters, &assigned.denied)
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+
     // Which voices this run is about: one the user named, or the queue. The only thing a
     // selector changes -- everything from here down runs on whichever list comes back, so a
     // targeted prompt is not a second implementation of a prompt, it is the same one asked
@@ -245,6 +256,7 @@ pub(crate) fn enroll_session(
                 rules.sessions,
                 meeting.clone(),
                 session,
+                &denied,
                 notes,
                 report,
             )?,
@@ -458,6 +470,10 @@ pub(crate) fn enroll_session(
                             anyway: false,
                         }
                     }
+                    // Everything else passes through unchanged: a `Deny` or a `Group` can only
+                    // be built by an answerer, and under an assertion the one above never asks
+                    // one -- so the arm is unreachable here, and the catch-all is kept rather
+                    // than naming them because naming would promise a door the seam cannot reach.
                     other => other,
                 }
             };
@@ -532,6 +548,32 @@ pub(crate) fn enroll_session(
                         anyway,
                         under_assertion,
                         None,
+                    )?;
+                    continue;
+                }
+                // Refusing the tentative guess this voice reads as: the same preview and
+                // fixed-order writes a naming takes, in reverse -- nothing stored, nothing
+                // displaced, one label moved back. Only reached when there is no assertion,
+                // like a group: under one the seam is never consulted, and a denial has no
+                // business overriding anything anyway, because it takes a name off nobody.
+                Answer::Deny { name } => {
+                    commit_denied(
+                        &clusters.clusters,
+                        &unknown,
+                        speakers,
+                        &mut assigned,
+                        &mut transcript,
+                        &mut shown,
+                        &mut committed,
+                        report,
+                        notes,
+                        session,
+                        paths,
+                        &rules,
+                        &metadata,
+                        assertion.as_deref(),
+                        cluster,
+                        name,
                     )?;
                     continue;
                 }
@@ -986,6 +1028,116 @@ fn commit_named<'d, 'm>(
     }
     *shown = now;
     Ok(CommitOutcome::Committed)
+}
+
+/// What refusing a guess writes, and what it says as it does so.
+///
+/// The write-side twin of [`Preview::deny_to`]: the same candidate state applied through the
+/// same fixed order naming commits use -- the database (which never changes on this path),
+/// then this session's names, then the transcript -- and with the cluster committed, which is
+/// what keeps the run from offering the denied guess again and what makes the pass-over gate
+/// count it as settled. There is no refusal or unanswered outcome for a denial: it takes a
+/// name off nobody, so nothing about it can be declined, and `name` is the guess as displayed,
+/// non-empty by construction.
+#[allow(clippy::too_many_arguments)]
+fn commit_denied<'d, 'm>(
+    clusters: &'d [SpeakerCluster],
+    unknown: &'d BTreeMap<u32, String>,
+    speakers: &'m mut EnrolledSpeakers,
+    assigned: &'m mut SpeakerNames,
+    transcript: &'m mut Transcript,
+    shown: &'m mut BTreeMap<u32, Attribution>,
+    committed: &'m mut Vec<&'d SpeakerCluster>,
+    report: &'m mut EnrollReport,
+    notes: &'m mut dyn Narrator,
+    session: &'d DiscoveredSession,
+    paths: &'d Paths,
+    rules: &'d EnrollRules<'d>,
+    metadata: &SessionMetadata,
+    assertion: Option<&str>,
+    cluster: &'d SpeakerCluster,
+    name: String,
+) -> Result<()> {
+    // Built here rather than held from the prompt above, for the reason `commit_named` gives:
+    // the commit needs `speakers` mutably and a live `Preview` would keep it borrowed. Same
+    // references and same dry run, so a preview an answerer saw and the write cannot disagree.
+    let consequence = Preview::new(
+        clusters,
+        unknown,
+        speakers,
+        assigned,
+        cluster,
+        rules.enrolment,
+        assertion,
+        &committed[..],
+    )
+    .with_forced(None)
+    .deny_to(&name);
+    let name = name.trim();
+
+    // The demotion is the whole of the write: nothing else moves, so the one note says both
+    // halves of it plus the durable half -- the suppression row that keeps every later run
+    // and re-transcribe from guessing the same name for the same voice again. Narrated before
+    // the copies are taken out of the consequence below, the way `commit_named` narrates its
+    // block: nothing between here and there writes a byte.
+    let Demotion { from, to } = consequence
+        .demoted
+        .expect("deny_to always carries the demotion it measured");
+    after(
+        notes,
+        &session.id,
+        AnswerNote::Denied {
+            name,
+            from: &from,
+            to: &to,
+        },
+    )?;
+    report.denied += 1;
+
+    // Committed by taking the copies the dry run produced, so what lands on disk is the state
+    // that was checked rather than a second construction of it. Both comparisons are whole-
+    // value on purpose: a denial touches the denied rows rather than the names, and a file
+    // written only where something changed stays byte-identical when the row already stood --
+    // refusing the same guess twice is a no-op the second time around, not an error.
+    let speakers_changed = *speakers != consequence.speakers;
+    let assignments_changed = *assigned != consequence.assigned;
+    *speakers = consequence.speakers;
+    *assigned = consequence.assigned;
+
+    if speakers_changed {
+        speakers.write(paths)?;
+    }
+    if assignments_changed {
+        assigned.write(&session.paths)?;
+    }
+    // Recorded after the writes, like `commit_named`: the cluster is spoken for now, and the
+    // rest of the run -- the in-run guard, the left-behind count, the deferred fixed point --
+    // all exclude committed clusters, which is what keeps the refused voice from being offered
+    // twice in one session.
+    committed.push(cluster);
+
+    // Re-labelled against the updated rows rather than assumed: the guess this denial removes
+    // may have been riding the labelling `shown` holds, and a `--force` re-transcribe would
+    // read it exactly this way -- denials resolved, guess suppressed, number restored.
+    let now = effective_labels(
+        clusters,
+        unknown,
+        speakers,
+        &assigned.names,
+        assertion,
+        None,
+        None,
+        &assigned.denied,
+    );
+    if relabel(transcript, &now) {
+        transcript.write(
+            &session.paths,
+            rules.template,
+            &TranscriptContext::now(metadata),
+        )?;
+    }
+    *shown = now;
+    Ok(())
 }
 
 /// Resolves a group's "Unknown N" handles to the clusters they name, deduplicated and sorted

@@ -93,7 +93,7 @@ mod references;
 mod resolve;
 mod session;
 
-pub use consequence::{Assertion, Consequence, GroupConsequence, Preview, Refusal};
+pub use consequence::{Assertion, Consequence, Demotion, GroupConsequence, Preview, Refusal};
 pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
 pub use interview::{Answer, GivenName, Interviewer, MeetingLabel};
 pub use meethook_session::Stored;
@@ -308,6 +308,12 @@ pub struct EnrollRules<'a> {
 /// carries on; it is counted so the summary can say a question was answered and came to
 /// nothing, which is the one outcome a silent revert used to hide.
 ///
+/// `denied` counts tentative guesses the user refused. A denial commits -- the suppression row
+/// lands in `speaker_names.json` and the transcript moves the guess back to its "Unknown N" --
+/// so it is neither a `refused` (the answer was honoured) nor a `skipped` (it wrote something),
+/// and it is counted so the summary can say how many guesses were turned down rather than
+/// leaving a run that denied three of them reporting only what it named.
+///
 /// `asserted` is a **sub-count of `named`**, like `session_only`: those voices were named, and
 /// the naming came from the one-remote-speaker assertion rather than from an answer given per
 /// voice. Counted apart because the summary says what the assertion did in its own sentence,
@@ -326,6 +332,7 @@ pub struct EnrollReport {
     pub kept: usize,
     pub held_back: usize,
     pub refused: usize,
+    pub denied: usize,
     pub passed_over: usize,
     pub failed: usize,
     pub asserted: usize,

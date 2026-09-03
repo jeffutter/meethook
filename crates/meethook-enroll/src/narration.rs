@@ -203,6 +203,15 @@ pub enum PassedOver {
     NothingUnresolved {
         /// How many of them carry a name, which is the escape `--correct` reaches.
         named: usize,
+        /// The settled tail the default offer held back: below-floor fragments the transcript
+        /// already speaks for (a standing tentative guess or a standing denial). It is the other
+        /// half of the same honesty as `named` -- a run that passed over because every fragment
+        /// was already guessed or dismissed has to say so, or "nothing unresolved" reads as
+        /// "your guesses went away" -- and it is what points the escape at `--all` instead of
+        /// `--correct`, since reaching those voices lifts the floor rather than offering the
+        /// named ones. Zero under every combination that predates the tail, which is what keeps
+        /// the older wordings byte-identical.
+        settled: usize,
     },
 }
 
@@ -416,6 +425,23 @@ pub enum AnswerNote<'a> {
         /// The earlier-named voices it was heard at once with, by their "Unknown N"s.
         overlapped: &'a [String],
     },
+
+    /// The user refused the tentative guess this voice currently reads as, and the run moved
+    /// it back to the "Unknown N" its turns were written with.
+    ///
+    /// Its own note rather than a [`Committed`](Self::Committed) block because a denial has no
+    /// stored/displaced/stale lines to render: the whole of the write is one label moving
+    /// back, and this line says both halves of that plus the durable half -- the suppression
+    /// row that keeps every later run and re-transcribe from guessing the same name for the
+    /// same voice again.
+    Denied {
+        /// The guess being refused, without its mark.
+        name: &'a str,
+        /// What the voice read before the answer -- the marked guess, e.g. "Ivan?".
+        from: &'a str,
+        /// What it reads after -- the "Unknown N", e.g. "Unknown 3".
+        to: &'a str,
+    },
 }
 
 /// The narration as the command-line tool prints it: one line per note, to a writer.
@@ -491,15 +517,39 @@ impl Lines<'_> {
             }
             // A session whose voices are all identified is exactly where somebody stands when
             // one of those identifications is wrong, and this line is the only thing it prints
-            // -- so it names the escape, the way the held-back line already names `--all`.
-            SessionNote::PassedOver(PassedOver::NothingUnresolved { named: 0 }) => {
-                writeln!(out, "{session}  passed over: nothing unresolved")?
+            // -- so it names the escape, the way the held-back line already names `--all`. Every
+            // clause is conditional on its own count, so a pass-over with neither a named voice
+            // nor a settled tail renders exactly the bare line it always did.
+            SessionNote::PassedOver(PassedOver::NothingUnresolved { named, settled }) => {
+                let mut parts = String::new();
+                if named > 0 {
+                    parts.push_str(&format!("{named} named voice(s)"));
+                }
+                if settled > 0 {
+                    if !parts.is_empty() {
+                        parts.push_str(", ");
+                    }
+                    parts.push_str(&format!("{settled} guessed or dismissed"));
+                }
+                if parts.is_empty() {
+                    writeln!(out, "{session}  passed over: nothing unresolved")?;
+                } else {
+                    // Reaching a settled tail lifts the floor (`--all`); correcting a named
+                    // voice offers the named ones (`--correct`). A settled tail outranks the
+                    // correction hint because it is the reason the session has nothing left to
+                    // OFFER at all, and `--all` reaches the named voices too.
+                    let escape = if settled > 0 {
+                        "meethook enroll --all"
+                    } else {
+                        "meethook enroll --correct"
+                    };
+                    writeln!(
+                        out,
+                        "{session}  passed over: nothing unresolved ({parts} -- \
+                     {escape})"
+                    )?;
+                }
             }
-            SessionNote::PassedOver(PassedOver::NothingUnresolved { named }) => writeln!(
-                out,
-                "{session}  passed over: nothing unresolved ({named} named voice(s) -- \
-                 meethook enroll --correct)"
-            )?,
             SessionNote::Unreadable { file, error } => {
                 writeln!(out, "{session}  failed: {error} -- {}", file.remedy())?
             }
@@ -702,6 +752,14 @@ impl Lines<'_> {
                      the heard-at-once veto: it was heard at once with {} -- you chose \
                      these voices as one person",
                     overlapped.join(", ")
+                )?;
+                Ok(())
+            }
+            AnswerNote::Denied { name, from, to } => {
+                writeln!(
+                    self.out,
+                    "{session}  not {name}: {from} reads {to} again -- meethook will not \
+                     guess {name} for this voice again"
                 )?;
                 Ok(())
             }

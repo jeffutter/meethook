@@ -197,6 +197,32 @@ pub enum Answer {
         /// The "Unknown N" handles the user chose, in whatever order the interface listed them.
         members: Vec<String>,
     },
+    /// This voice is not `name`: refuse the tentative guess its turns currently read as.
+    ///
+    /// The complement of [`Named`](Self::Named) for a guessed fragment. Naming adds a claim --
+    /// to the database or to this session's rows -- and denial removes one: the row that lands
+    /// in `speaker_names.json` suppresses the guess everywhere it would otherwise appear, in
+    /// this run's relabel and in every later `transcribe --force`, because both resolve their
+    /// denials through the same rule. That is what makes the answer durable rather than a
+    /// cosmetic edit to one transcript: the band will keep finding the resemblance on every
+    /// re-run, and only a standing row says the user has already decided about it.
+    ///
+    /// Unlike [`Skip`](Self::Skip) and [`Later`](Self::Later), answering it commits: the
+    /// cluster goes into the run's committed set and is not offered again this session, and it
+    /// counts as settled for the pass-over gate the queue applies to the rest of the tail.
+    /// Refusing a guess is a decision, and a decision the transcript can show -- which is also
+    /// why refusing writes something where skipping writes nothing.
+    ///
+    /// Only an interface that shows the guess on screen has any use for it: a line prompt has
+    /// no surface for the cost, and neither do the scripted answerers, which is why none of
+    /// them ever returns this -- the seam stays open for it exactly the way it stayed open for
+    /// [`Group`](Self::Group) until the frame needed it.
+    ///
+    /// `name` is the guess being refused -- what the voice reads with its mark stripped --
+    /// trimmed the same way every other name in this file is.
+    Deny {
+        name: String,
+    },
 }
 
 /// Asks a user who one voice is.

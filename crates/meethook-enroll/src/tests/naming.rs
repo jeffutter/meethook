@@ -161,11 +161,15 @@ fn the_rewritten_transcript_of_a_tentative_session_is_what_a_force_re_transcribe
         &session_metadata(&id),
     );
 
-    // One question, about the voice above the floor; the fragment is held back, not asked.
+    // One question, about the voice above the floor. The fragment is settled by its standing
+    // guess -- below the floor and already spoken for in the transcript -- so it drops out of
+    // the default offer entirely: neither offered nor counted as held back, which is what
+    // stops a guessed tail from advertising `--all` on every later run. Reaching it takes
+    // `--all`, which lifts the exclusion exactly as it lifts the floor.
     let mut interviewer = Scripted::default();
     let (report, output) = run(&paths, &[], &mut interviewer);
     assert_eq!(interviewer.seen.len(), 1, "{output}");
-    assert_eq!(report.held_back, 1, "{output}");
+    assert_eq!(report.held_back, 0, "{output}");
 
     // What `transcribe --force` would now derive: the strict pass, then the band over its
     // image, then the tier rule both processes share.

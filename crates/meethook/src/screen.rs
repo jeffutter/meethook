@@ -499,15 +499,16 @@ impl Interface {
 /// A function beside [`wait`] and [`event`], for the same reason: a rule about which of the
 /// answers costs a re-scan is then decidable in `cargo test` with no terminal in front of it.
 ///
-/// Names are the only answers that write to `speakers.json`; the others write nothing at all. An
-/// assertion writes every voice in the session at once, so it rewrites too. A `Named` can still
-/// be refused by the veto and write nothing either, so this over-triggers -- deliberately,
-/// because an extra background scan nobody waits for is cheaper than a wrong number on the
-/// screen.
+/// Names are the only answers that write to `speakers.json`; denials write to the session's
+/// `speaker_names.json` instead; and both move the transcript, which is what the pane reports.
+/// The rest write nothing at all. An assertion writes every voice in the session at once, so it
+/// rewrites too. A `Named` can still be refused by the veto and write nothing either, so this
+/// over-triggers -- deliberately, because an extra background scan nobody waits for is cheaper
+/// than a wrong number on the screen.
 fn rewrites(answer: &Answer) -> bool {
     matches!(
         answer,
-        Answer::Named { .. } | Answer::OneSpeaker(_) | Answer::Group { .. }
+        Answer::Named { .. } | Answer::OneSpeaker(_) | Answer::Group { .. } | Answer::Deny { .. }
     )
 }
 
@@ -833,6 +834,11 @@ mod tests {
         assert!(rewrites(&Answer::Group {
             name: "Grace".to_string(),
             members: vec!["Unknown 1".to_string()],
+        }));
+        // A denial writes the session's `speaker_names.json` and demotes the transcript, so it
+        // moves what the pane reports too -- without moving `speakers.json` at all.
+        assert!(rewrites(&Answer::Deny {
+            name: "Milo".to_string()
         }));
         for quiet in [Answer::Skip, Answer::Later, Answer::Leave, Answer::Quit] {
             assert!(!rewrites(&quiet), "{quiet:?} writes nothing");

@@ -292,7 +292,65 @@ impl<'a> Preview<'a> {
             stored,
             displaced,
             stale,
+            demoted: None,
             speakers: candidate,
+            assigned: candidate_assigned,
+        }
+    }
+
+    /// What refusing this voice's standing guess would do, without writing anything.
+    ///
+    /// The complement of [`Preview::of`] on a guessed fragment. Where naming adds a claim --
+    /// to the database or to this session's rows -- denial removes one: the tentative "Name?"
+    /// the band wrote into the transcript is refused, and the row that suppresses it from here
+    /// on goes through exactly the candidate state the commit will apply, so a preview and a
+    /// write cannot disagree about what the fragment reads afterwards.
+    ///
+    /// There is no refusal path for a denial: it takes nothing off any other voice -- the
+    /// label it removes is this cluster's own -- so there is nothing to refuse and no `None`
+    /// to return. And `name` is the guess as displayed, non-empty by construction, so the
+    /// trimming [`Preview::of`] applies is the only normalisation this needs too.
+    pub fn deny_to(&self, name: &str) -> Consequence {
+        let name = name.trim();
+        let mut candidate_assigned = self.assigned.clone();
+        candidate_assigned.deny(self.cluster.id, name, &self.cluster.embedding);
+
+        // What every voice read before the answer, and once the denial alone has been applied:
+        // the demotion is measured between these two, the way a refusal is measured against
+        // its baseline in [`Self::commit_to`]. Two labellings rather than one is the same cost
+        // model the module doc spells out, and the same reason: the baseline is what says what
+        // moved.
+        let before = effective_labels(
+            self.clusters,
+            self.unknown,
+            self.speakers,
+            &self.assigned.names,
+            self.one_remote_speaker,
+            self.forced,
+            None,
+            &self.assigned.denied,
+        );
+        let after = effective_labels(
+            self.clusters,
+            self.unknown,
+            self.speakers,
+            &candidate_assigned.names,
+            self.one_remote_speaker,
+            self.forced,
+            None,
+            &candidate_assigned.denied,
+        );
+
+        Consequence {
+            refused: None,
+            stored: None,
+            displaced: Vec::new(),
+            stale: Vec::new(),
+            demoted: Some(Demotion {
+                from: before[&self.cluster.id].label().to_string(),
+                to: after[&self.cluster.id].label().to_string(),
+            }),
+            speakers: self.speakers.clone(),
             assigned: candidate_assigned,
         }
     }
@@ -641,6 +699,18 @@ pub struct Assertion {
 ///
 /// There is deliberately no second enum restating that mapping. A parallel outcome type is
 /// precisely the duplicated set of thresholds this module exists to avoid.
+/// A label moving back rather than forward: the shape of a denial's effect on the transcript.
+///
+/// Owned like [`Displaced`], for the same reason: the frame carries it into its view and a
+/// test must be able to construct it across the seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Demotion {
+    /// What the voice read before the answer -- the marked guess, e.g. "Ivan?".
+    pub from: String,
+    /// What it reads after -- the "Unknown N" its turns were written with, e.g. "Unknown 3".
+    pub to: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Consequence {
     /// Why this answer would not be honoured, if it would not be.
@@ -668,6 +738,15 @@ pub struct Consequence {
     /// argmax under the wrong name. Empty on every other path, because the correction has
     /// already dropped every such row.
     pub stale: Vec<String>,
+
+    /// One label moving back rather than forward, or `None` when the answer moves labels the
+    /// usual way.
+    ///
+    /// `Some` only for a denial, where the demotion is the whole of the write: a denial stores
+    /// nothing and displaces nothing, so what it does to the transcript is all there is to
+    /// preview and all there is to report. `None` on every naming path, where the transcript
+    /// change rides the new label the user already sees.
+    pub demoted: Option<Demotion>,
 
     /// The database this answer would leave. Crate-visible on purpose: an [`crate::Interviewer`]
     /// able to read it could write it, behind the back of the one loop that decides what lands
@@ -731,6 +810,9 @@ impl Consequence {
             lines.push(format!(
                 "leaves a recording of this voice standing under {name}"
             ));
+        }
+        if let Some(Demotion { from, to }) = &self.demoted {
+            lines.push(format!("moves {from} back to {to}"));
         }
         lines
     }

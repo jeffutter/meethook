@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use meethook_enroll::{
-    Answer, Confirm, EnrollRules, Enrolment, Forgotten, GivenName, Interviewer, Labelled, Lines,
-    MeetingChoice, MeetingSource, Offer, Selection, Sessions, Target, Voice, VoiceSelector,
-    incomplete, run_enroll, run_forget, run_meeting, run_speakers, speech,
+    Answer, Confirm, EnrollReport, EnrollRules, Enrolment, Forgotten, GivenName, Interviewer,
+    Labelled, Lines, MeetingChoice, MeetingSource, Offer, Selection, Sessions, Target, Voice,
+    VoiceSelector, incomplete, run_enroll, run_forget, run_meeting, run_speakers, speech,
 };
 use meethook_models::{ModelSpec, ensure_model};
 use meethook_session::{Paths, SessionId, TranscriptTemplate};
@@ -174,53 +174,76 @@ pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Resu
     // of `ask`'s still holding the screen.
     let chosen = answerer(args.name.is_some(), args.plain, Tty::current());
     let report = ask(paths, &requested, args, &template, chosen)?;
+    // The last thing the command writes, so the lock on stdout dies with the function.
+    let mut out = io::stdout().lock();
+    run_summary(&mut out, &report)
+}
 
-    println!(
+/// What a finished run says about itself, off the report alone.
+///
+/// A function rather than inline because every clause is conditional on its own count and the
+/// wording of each one is pinned by test -- including the ones this ticket added -- and a seam
+/// is what lets a test hold the whole block without a terminal behind it. The `bail!` at the
+/// end is the exit status: a request that could not be served makes the run unsuccessful,
+/// exactly as in `transcribe`.
+fn run_summary(out: &mut dyn Write, report: &EnrollReport) -> Result<()> {
+    writeln!(
+        out,
         "\n{} named, {} skipped, {} session(s) passed over",
         report.named, report.skipped, report.passed_over
-    );
+    )?;
     // A sub-count of `named` rather than a separate outcome, so this reads as a qualification
     // of the line above rather than as more voices. Says where the name went, because "named"
     // on its own would leave a user expecting those people to be recognised in the next
     // meeting -- which is exactly what a session-scoped name does not do.
     if report.session_only > 0 {
-        println!(
+        writeln!(
+            out,
             "{} of those named in their own session only, with no reference stored -- \
              each said why on its own line above",
             report.session_only
-        );
+        )?;
     }
     // A voice left as it was found is a kept identification, not an unanswered question, and
     // only ever arises under `--correct`.
     if report.kept > 0 {
-        println!("{} identification(s) kept as they were", report.kept);
+        writeln!(out, "{} identification(s) kept as they were", report.kept)?;
     }
     // Only when there were any: a run that asked about everything should not end on a line
     // about the nothing it held back.
     if report.held_back > 0 {
-        println!(
+        writeln!(
+            out,
             "{} quieter voice(s) not offered -- meethook enroll --all asks about those too",
             report.held_back
-        );
+        )?;
     }
     // An answer declined because honouring it would have taken a name off another voice. Only
     // when there were any, like the two above, and worth its own line rather than being folded
     // into the skips: those voices are still unnamed *and* the user has already answered them,
     // so the next step is to read the refusal lines rather than to answer again.
     if report.refused > 0 {
-        println!(
+        writeln!(
+            out,
             "{} answer(s) refused: honouring them would have un-named another voice",
             report.refused
-        );
+        )?;
+    }
+    // Tentative guesses the user turned down. Honoured answers that wrote something -- the
+    // suppression row and the demoted label -- so they are neither refused nor skipped, and
+    // worth their own line rather than disappearing into the named count they are not in.
+    if report.denied > 0 {
+        writeln!(out, "{} guess(es) denied", report.denied)?;
     }
     // The run-wide half of the veto override, beside the per-session lines the narration
     // already printed: an assertion that never hit a pair it overrode says nothing here, which
     // is the same as saying nothing happened.
     if report.vetoes_overridden > 0 {
-        println!(
+        writeln!(
+            out,
             "overrode the heard-at-once veto on {} voice(s)",
             report.vetoes_overridden
-        );
+        )?;
     }
     // Skips and pass-overs are ordinary; a request that could not be served -- a session that
     // could not be read, an id that is not on disk, a `--voice` matching no voice or several --
@@ -739,7 +762,7 @@ fn parse_session_ids(raw: &[String]) -> Result<Vec<SessionId>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answerer, Tty, answerer};
+    use super::{Answerer, EnrollReport, Tty, answerer};
 
     /// Every shape the two streams can be in, so a rule is asserted over all of them rather
     /// than at the one point a spot check happened to pick.
@@ -813,6 +836,38 @@ mod tests {
     #[test]
     fn a_terminal_with_no_flags_is_the_interactive_arm() {
         assert_eq!(answerer(false, false, ATTACHED), Answerer::Screen);
+    }
+
+    /// Every clause of the run summary is conditional on its own count, and each wording is
+    /// what a user copies into an issue report -- including the denied-guess line, whose only
+    /// producer is the full-screen reject answer no scripted answerer can give.
+    #[test]
+    fn the_summary_says_what_a_run_denied_and_stays_quiet_when_it_denied_nothing() {
+        let mut out = Vec::new();
+        super::run_summary(
+            &mut out,
+            &EnrollReport {
+                named: 1,
+                skipped: 2,
+                refused: 1,
+                denied: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\n1 named, 2 skipped, 0 session(s) passed over"),
+            "{text}"
+        );
+        assert!(text.contains("1 answer(s) refused"), "{text}");
+        assert!(text.contains("3 guess(es) denied"), "{text}");
+
+        let mut quiet = Vec::new();
+        super::run_summary(&mut quiet, &EnrollReport::default()).unwrap();
+        let quiet = String::from_utf8(quiet).unwrap();
+        assert!(!quiet.contains("denied"), "{quiet}");
+        assert!(!quiet.contains("refused"), "{quiet}");
     }
 
     /// The off-macOS calendar seam, pinned at its source: whatever instant is asked about, the

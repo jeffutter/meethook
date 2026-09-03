@@ -366,3 +366,261 @@ fn enrolling_a_voice_that_was_named_for_its_session_drops_its_row() {
         "the same name, now on the basis of a match"
     );
 }
+
+// A standing denial written into `speaker_names.json` before the run, exactly as an earlier
+// reject would have left it: cluster `cluster` is not `name`, matched by this embedding.
+fn with_denial(session: &SessionPaths, id: &str, cluster: u32, name: &str, embedding: Vec<f32>) {
+    let parsed = SessionId::parse(id).unwrap();
+    let mut names = SpeakerNames::read_or_empty(session, &parsed).unwrap();
+    names.deny(cluster, name, &embedding);
+    names.write(session).unwrap();
+}
+
+// Alice against the x-axis, so a cluster at `nearly(0.0)` identifies strictly and one at
+// `nearly(54.0)` -- cosine distance 0.41, past the strict cut, inside the tentative window --
+// can only be guessed.
+fn alice_enrolled(paths: &Paths) {
+    enrolled(&[("Alice", voice(0))], paths);
+}
+
+/// A session whose every voice is already spoken for: the main identified, the fragment
+/// below the floor carrying a standing guess. The default offer has nothing left to ask, so
+/// the run passes over instead of falling back to offering everybody -- which is what the
+/// floor used to do when its only candidates were settled, nagging the tail on every run.
+#[test]
+fn a_session_whose_every_voice_is_already_settled_is_passed_over_counting_the_tail() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+
+    // Guessed: the fragment reads "Alice?" in the transcript, and that guess is what settles
+    // it for the queue.
+    let guessed = make_session(&paths, "20260809-052600");
+    with_speech_seconds(&guessed, &[40.0, 1.5]);
+    with_embeddings(&guessed, &[nearly(0.0), nearly(54.0)]);
+    alice_enrolled(&paths);
+
+    // Denied: the same shape with a standing denial pre-written, so the guess never appears
+    // and the fragment reads an ordinary "Unknown 2" -- indistinguishable from an open
+    // fragment except through the denial ids the queue was given.
+    let denied = make_session(&paths, "20260809-052700");
+    with_speech_seconds(&denied, &[40.0, 1.5]);
+    with_embeddings(&denied, &[nearly(0.0), nearly(54.0)]);
+    with_denial(&denied, "20260809-052700", 1, "Alice", nearly(54.0));
+
+    let mut interviewer = Scripted::default();
+    let (report, output) = run(&paths, &[], &mut interviewer);
+
+    assert!(interviewer.seen.is_empty(), "{output}");
+    assert_eq!(report.passed_over, 2, "{output}");
+    // Both sessions say why they were passed over and how to reach the tail anyway: the
+    // guess and the denial settle identically, because both are deliberate state the user
+    // can see in the file.
+    assert!(
+        output.contains(
+            "20260809-052600  passed over: nothing unresolved \
+             (1 named voice(s), 1 guessed or dismissed -- meethook enroll --all)"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "20260809-052700  passed over: nothing unresolved \
+             (1 named voice(s), 1 guessed or dismissed -- meethook enroll --all)"
+        ),
+        "{output}"
+    );
+    // And the denial did its job upstream too: the suppressed guess is not in the file.
+    let markdown = std::fs::read_to_string(denied.transcript_md()).unwrap();
+    assert!(!markdown.contains("Alice?"), "{markdown}");
+    assert!(markdown.contains("Unknown 2"), "{markdown}");
+}
+
+/// The mixed case: an open voice above the floor plus a settled tail. The run asks about
+/// the open voice only -- the settled fragment is in neither the offer nor the held-back
+/// count, so the queue line carries no `--all` clause at all.
+#[test]
+fn a_mixed_session_offers_only_its_open_voices_and_counts_nothing_held_back() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let session = make_session(&paths, "20260809-052600");
+    let id = SessionId::parse("20260809-052600").unwrap();
+
+    // Main identified, fragment guessed, third voice open above the floor.
+    let mut clusters = vec![
+        cluster(0, 0.0, (0.5, 2.5)),
+        cluster(1, 3.0, (3.0, 3.5)),
+        cluster(2, 6.0, (6.0, 7.0)),
+    ];
+    clusters[1].embedding = nearly(54.0);
+    for (c, seconds) in clusters.iter_mut().zip([40.0, 1.5, 8.0]) {
+        c.speech_seconds = seconds;
+    }
+    clusters[0].embedding = nearly(0.0);
+    clusters[2].embedding = voice(2);
+    SpeakerClusters::new(id.clone(), clusters)
+        .write(&session)
+        .unwrap();
+    write_transcript(
+        &Transcript::new(
+            id.clone(),
+            vec![
+                speaker_turn(0.0, 0, "Unknown 1", "hi there"),
+                speaker_turn(3.0, 1, "Unknown 2", "mm"),
+                speaker_turn(6.0, 2, "Unknown 3", "over here"),
+            ],
+        ),
+        &paths,
+        &session,
+        &session_metadata(&id),
+    );
+    alice_enrolled(&paths);
+
+    let mut interviewer = Scripted::default();
+    let (report, output) = run(&paths, &[], &mut interviewer);
+
+    // One question, about the open voice; the settled tail is invisible to the offer.
+    assert_eq!(interviewer.labels(), ["Unknown 3"], "{output}");
+    assert_eq!(report.held_back, 0, "{output}");
+    assert!(
+        !output.contains("quieter voice(s) not offered"),
+        "the settled tail must not advertise --all: {output}"
+    );
+    assert!(
+        output.contains("20260809-052600  1 unresolved voice(s)"),
+        "{output}"
+    );
+}
+
+/// `--all` lifts the settled exclusion exactly as it lifts the floor: the guessed fragment
+/// comes back into the offer, marked, beside the open voices.
+#[test]
+fn all_still_reaches_a_settled_fragment_marked_as_a_guess() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let session = make_session(&paths, "20260809-052600");
+    let id = SessionId::parse("20260809-052600").unwrap();
+
+    let mut clusters = vec![
+        cluster(0, 0.0, (0.5, 2.5)),
+        cluster(1, 3.0, (3.0, 3.5)),
+        cluster(2, 6.0, (6.0, 7.0)),
+    ];
+    clusters[0].embedding = nearly(0.0);
+    clusters[1].embedding = nearly(54.0);
+    clusters[2].embedding = voice(2);
+    for (c, seconds) in clusters.iter_mut().zip([40.0, 1.5, 8.0]) {
+        c.speech_seconds = seconds;
+    }
+    SpeakerClusters::new(id.clone(), clusters)
+        .write(&session)
+        .unwrap();
+    write_transcript(
+        &Transcript::new(
+            id.clone(),
+            vec![
+                speaker_turn(0.0, 0, "Unknown 1", "hi there"),
+                speaker_turn(3.0, 1, "Unknown 2", "mm"),
+                speaker_turn(6.0, 2, "Unknown 3", "over here"),
+            ],
+        ),
+        &paths,
+        &session,
+        &session_metadata(&id),
+    );
+    alice_enrolled(&paths);
+
+    let mut interviewer = Scripted::default();
+    let (report, output) = run_asking(&paths, &[], ALL, &mut interviewer);
+
+    // The guess first (it spoke first), still marked as a guess: reaching it is the user's
+    // choice, and the mark is what says the answer costs nothing but a label.
+    assert_eq!(interviewer.labels(), ["Alice?", "Unknown 3"], "{output}");
+    assert_eq!(report.held_back, 0, "{output}");
+}
+
+/// `--correct` is byte-identical to what it printed before settledness existed: the settled
+/// fragment is still held back by the floor and counted as such, because the widening flag
+/// lifted the exclusion the moment it lifted everything else.
+#[test]
+fn correct_treats_a_settled_fragment_exactly_as_it_did_before() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let session = make_session(&paths, "20260809-052600");
+    let id = SessionId::parse("20260809-052600").unwrap();
+
+    let mut clusters = vec![
+        cluster(0, 0.0, (0.5, 2.5)),
+        cluster(1, 3.0, (3.0, 3.5)),
+        cluster(2, 6.0, (6.0, 7.0)),
+    ];
+    clusters[0].embedding = nearly(0.0);
+    clusters[1].embedding = nearly(54.0);
+    clusters[2].embedding = voice(2);
+    for (c, seconds) in clusters.iter_mut().zip([40.0, 1.5, 8.0]) {
+        c.speech_seconds = seconds;
+    }
+    SpeakerClusters::new(id.clone(), clusters)
+        .write(&session)
+        .unwrap();
+    write_transcript(
+        &Transcript::new(
+            id.clone(),
+            vec![
+                speaker_turn(0.0, 0, "Unknown 1", "hi there"),
+                speaker_turn(3.0, 1, "Unknown 2", "mm"),
+                speaker_turn(6.0, 2, "Unknown 3", "over here"),
+            ],
+        ),
+        &paths,
+        &session,
+        &session_metadata(&id),
+    );
+    alice_enrolled(&paths);
+
+    let mut interviewer = Scripted::default();
+    let (report, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+    assert_eq!(interviewer.labels(), ["Alice", "Unknown 3"], "{output}");
+    assert_eq!(report.held_back, 1, "{output}");
+    assert!(
+        output.contains(
+            "20260809-052600  2 voice(s) to review, 1 of them already named, \
+             1 quieter voice(s) not offered -- meethook enroll --all"
+        ),
+        "{output}"
+    );
+}
+
+/// Targeting bypasses the queue and its gates alike, settledness included: the fragment is
+/// reachable by its marked label and by its number, while the bare name reaches the voice
+/// that reads it -- the main -- not the guess.
+#[test]
+fn targeting_reaches_a_settled_fragment_by_label_or_number_but_not_by_bare_name() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let session = make_session(&paths, "20260809-052600");
+    with_speech_seconds(&session, &[40.0, 1.5]);
+    with_embeddings(&session, &[nearly(0.0), nearly(54.0)]);
+    alice_enrolled(&paths);
+
+    // By the marked label the transcript prints.
+    let mut by_label = Scripted::default();
+    let (_, output) = run_targeting(&paths, &["20260809-052600"], "Alice?", &mut by_label);
+    assert_eq!(by_label.labels(), ["Alice?"], "{output}");
+
+    // By the number, which keeps pointing at the same voice whatever it reads as.
+    let mut by_number = Scripted::default();
+    let (_, output) = run_targeting(&paths, &["20260809-052600"], "2", &mut by_number);
+    assert_eq!(by_number.labels(), ["Alice?"], "{output}");
+
+    // By the moment it spoke: `--at` resolves through the transcript rather than the queue,
+    // so it reaches the guess the same way the number does.
+    let mut by_time = Scripted::default();
+    let (_, output) = run_at(&paths, &["20260809-052600"], "00:03", &mut by_time);
+    assert_eq!(by_time.labels(), ["Alice?"], "{output}");
+
+    // The bare name matches the voice that reads it: the identified main, not the guess.
+    let mut by_name = Scripted::default();
+    let (_, output) = run_targeting(&paths, &["20260809-052600"], "Alice", &mut by_name);
+    assert_eq!(by_name.labels(), ["Alice"], "{output}");
+}
