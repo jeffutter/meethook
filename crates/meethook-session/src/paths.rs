@@ -20,6 +20,10 @@ const TRANSCRIPT_JSON: &str = "transcript.json";
 const TRANSCRIPT_MD: &str = "transcript.md";
 const TRANSCRIPT_VTT: &str = "transcript.vtt";
 
+/// Apps excluded from the mic-activity trigger. Root-level, like the template: the list
+/// applies to every session, and meethook never writes it.
+const EXCLUSIONS_JSON: &str = "exclusions.json";
+
 /// The optional user template `transcript.md` is rendered through. Root-level, not
 /// per-session: see [`Paths::transcript_template`].
 const TRANSCRIPT_TEMPLATE: &str = "transcript.md.jinja";
@@ -68,6 +72,16 @@ impl Paths {
     /// Absent is the normal case: with no file here the built-in default is used.
     pub fn transcript_template(&self) -> PathBuf {
         self.root.join(TRANSCRIPT_TEMPLATE)
+    }
+
+    /// Apps the user has excluded from the mic-activity trigger, when the file exists.
+    ///
+    /// Root-level rather than per-session for the same reason as the template: the list
+    /// applies to every session, and nothing in the pipeline writes it -- it is authored by
+    /// the user and read once at `record` startup. Absent is the normal case and means no
+    /// exclusions; see the exclusions module for what a corrupt one does instead.
+    pub fn exclusions_json(&self) -> PathBuf {
+        self.root.join(EXCLUSIONS_JSON)
     }
 
     pub fn session(&self, id: &SessionId) -> SessionPaths {

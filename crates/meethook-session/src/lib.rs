@@ -10,6 +10,7 @@
 //! ```text
 //! <root>/
 //!   speakers.json                 enrolled-speaker embedding DB
+//!   exclusions.json               apps excluded from the mic-activity trigger (user-authored)
 //!   transcript.md.jinja           optional template every transcript.md is rendered through
 //!   models/                       lazily fetched model weights
 //!   sessions/
@@ -28,6 +29,7 @@
 mod atomic;
 mod cleaning;
 mod discovery;
+mod exclusions;
 mod id;
 mod metadata;
 mod paths;
@@ -49,6 +51,7 @@ pub use cleaning::{
     PassThrough,
 };
 pub use discovery::{Classification, DiscoveredSession, discover_sessions};
+pub use exclusions::{AppExclusions, EXCLUSIONS_SCHEMA_VERSION};
 pub use id::{SessionId, create_session_dir, discard_session_dir};
 pub use metadata::{
     Attendee, AttendeeStatus, Meeting, MeetingFit, RosterEdit, SESSION_SCHEMA_VERSION,

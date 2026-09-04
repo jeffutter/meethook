@@ -711,7 +711,9 @@ pub fn record(paths: &Paths, plain: bool) -> Result<()> {
     let activity_tx = tx.clone();
     // Bound to the whole function: dropping the watcher removes its listeners, and a
     // recorder that has stopped watching is the failure this command exists to prevent.
-    let (watcher, already_active) = MicActivityWatcher::start(move |activity| {
+    // The root lets the watcher resolve the user's app-exclusion list once at start; a
+    // corrupt file fails here, before any listener is installed.
+    let (watcher, already_active) = MicActivityWatcher::start(paths.root(), move |activity| {
         let _ = activity_tx.send(match activity {
             Activity::Started => Event::Started,
             Activity::Stopped => Event::Stopped,

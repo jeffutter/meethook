@@ -21,6 +21,7 @@
 //!                                 and pid(P) != our pid
 //!                                 and bundle_id(P) is not one of our helpers
 //!                                 and executable(P) != our executable
+//!                                 and neither fact names a user-excluded app
 //! ```
 //!
 //! Excluding ourselves is what makes the signal immune to our own capture: when recording
@@ -67,6 +68,26 @@
 //! caught. That is the development-time shape rather than the user-facing one, and the
 //! general answer is a single-instance lock at startup, which would define the whole class
 //! away instead of filtering it.
+//!
+//! # User-excluded apps
+//!
+//! The exclusions above are fixed: they name what *meethook* is. A fourth class names what
+//! the user says is not a meeting, in `<root>/exclusions.json` -- a dictation tool that opens
+//! the microphone for local dictation is the reported case, and it looks like a meeting in
+//! every respect the fixed rules can see.
+//!
+//! Entries are exact matches on bundle id or executable path; there are deliberately no
+//! wildcards or prefixes. The predicate fails asymmetrically -- an over-exclusion costs
+//! *every* session, a missed entry costs one stray one -- so a user entry must match
+//! positively and never act as a catch-all: a `com.apple.` prefix would swallow FaceTime.
+//!
+//! The list is loaded once in [`MicActivityWatcher::start`], beside the other one-time facts,
+//! and never read again: the re-check runs under the watcher lock every couple of seconds
+//! while a session is live, and a file read there would be disk I/O on the hottest path in
+//! the recorder. Changes therefore take effect on the next `meethook record` run. A corrupt
+//! file is a hard error at startup, never a fallback to the empty list -- the fallback is
+//! exactly the bug the user was fixing, and a `record` that quietly ignored their fix would
+//! leave them debugging why nothing changed.
 //!
 //! # Shape
 //!
@@ -149,6 +170,8 @@ use objc2_core_audio::{
 };
 use objc2_core_foundation::{CFRetained, CFString};
 
+use meethook_session::{AppExclusions, Paths};
+
 use crate::{Error, Result};
 
 /// What the microphone world did.
@@ -201,12 +224,23 @@ impl MicActivityWatcher {
     /// the default input device moving. When one notification does both -- unplugging the
     /// device a call was using -- [`Activity::InputDeviceChanged`] is delivered first, because
     /// the device bookkeeping runs before the predicate is recomputed.
+    ///
+    /// `root` is the meethook data directory: the user's app-exclusion list is read from
+    /// `<root>/exclusions.json` here, once, before any listener is installed. An absent file
+    /// means no exclusions; a corrupt one is an error naming the path, so a `record` started
+    /// with a broken list fails before watching begins rather than ignoring the user's fix.
     pub fn start(
+        root: &Path,
         on_change: impl Fn(Activity) + Send + Sync + 'static,
     ) -> Result<(MicActivityWatcher, bool)> {
         // Serial: every listener block is dispatched here, so all recomputation is
         // serialized and the listener bookkeeping needs no ordering beyond the mutex.
         let queue = DispatchQueue::new("com.meethook.activity", DispatchQueueAttr::SERIAL);
+
+        // Resolved once here, outside the state, so a load failure propagates through this
+        // `Result` before any listener exists to unwind. It happens once at command start,
+        // before the session-start retry loop, so a plain `?` is the whole retry story.
+        let exclusions = AppExclusions::read_or_empty(&Paths::new(root))?;
 
         // Cyclic because a listener block must be able to install *more* listeners -- the
         // `DefaultInputDevice` one re-attaches the device listener as the default moves --
@@ -224,6 +258,7 @@ impl MicActivityWatcher {
                 our_exe: std::env::current_exe()
                     .ok()
                     .and_then(|path| std::fs::canonicalize(path).ok()),
+                exclusions,
                 debug: std::env::var_os("MEETHOOK_ACTIVITY_DEBUG").is_some(),
                 active: false,
                 system: Vec::new(),
@@ -334,6 +369,9 @@ struct State {
     /// Our own executable, canonicalized. `None` when it cannot be resolved, which turns
     /// the second-instance exclusion off rather than making it fire on everything.
     our_exe: Option<PathBuf>,
+    /// Apps the user named in `exclusions.json`, resolved once at `start`. Consulted per
+    /// process object by [`bearing`]; never re-read, see the module docs for why.
+    exclusions: AppExclusions,
     debug: bool,
     /// The last value delivered to `on_change`.
     active: bool,
@@ -385,6 +423,11 @@ impl State {
 
         self.active = self.someone_else_is_capturing();
         if self.debug {
+            eprintln!(
+                "[activity] user exclusions: {} bundle ids, {} executables",
+                self.exclusions.bundle_ids.len(),
+                self.exclusions.executables.len(),
+            );
             self.log(Trigger::Install, self.active);
         }
         Ok(self.active)
@@ -500,6 +543,7 @@ impl State {
             pid.and_then(process_executable).as_deref(),
             self.our_pid,
             self.our_exe.as_deref(),
+            &self.exclusions,
         )
     }
 
@@ -634,12 +678,18 @@ enum Bearing {
 /// every process whose path we cannot read would silence the trigger for whole classes of
 /// meeting app. Missing an exclusion costs a session that overstays; over-excluding costs
 /// every session, so the unknown is counted as activity.
+///
+/// A user entry participates under the same rule: it fires only when the fact it keys on is
+/// present. A bundle-id entry cannot fire for a process whose bundle id is unreadable --
+/// that process still counts as activity unless its executable entry names it -- so an
+/// unreadable fact never silently widens the user's list.
 fn bearing(
     pid: Option<i32>,
     bundle_id: Option<&str>,
     executable: Option<&Path>,
     our_pid: i32,
     our_exe: Option<&Path>,
+    exclusions: &AppExclusions,
 ) -> Bearing {
     let Some(pid) = pid else {
         return Bearing::Excluded("pid unreadable, so it cannot be shown not to be meethook");
@@ -650,10 +700,16 @@ fn bearing(
     if bundle_id.is_some_and(|id| OUR_HELPER_BUNDLE_IDS.contains(&id)) {
         return Bearing::Excluded("captures on meethook's behalf");
     }
+    if bundle_id.is_some_and(|id| exclusions.contains_bundle_id(id)) {
+        return Bearing::Excluded("user-excluded bundle id");
+    }
     if let (Some(exe), Some(ours)) = (executable, our_exe)
         && exe == ours
     {
         return Bearing::Excluded("another meethook instance");
+    }
+    if executable.is_some_and(|exe| exclusions.contains_executable(exe)) {
+        return Bearing::Excluded("user-excluded executable");
     }
     Bearing::Activity
 }
@@ -867,7 +923,9 @@ fn process_executable(pid: i32) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    use meethook_session::AppExclusions;
 
     use super::{Activity, Bearing, bearing, device_changed, edge, process_executable};
 
@@ -876,6 +934,15 @@ mod tests {
     /// Our own executable, as `MicActivityWatcher::start` would have canonicalized it.
     fn our_exe() -> &'static Path {
         Path::new("/usr/local/bin/meethook")
+    }
+
+    /// No user exclusions: the whole pre-`exclusions.json` matrix below runs against this.
+    fn no_exclusions() -> &'static AppExclusions {
+        static EXCLUSIONS: AppExclusions = AppExclusions {
+            bundle_ids: Vec::new(),
+            executables: Vec::new(),
+        };
+        &EXCLUSIONS
     }
 
     #[test]
@@ -889,12 +956,20 @@ mod tests {
                 )),
                 OUR_PID,
                 Some(our_exe()),
+                no_exclusions(),
             ),
             Bearing::Activity
         );
         // A meeting app that reports no bundle id is still a meeting app.
         assert_eq!(
-            bearing(Some(26975), None, None, OUR_PID, Some(our_exe())),
+            bearing(
+                Some(26975),
+                None,
+                None,
+                OUR_PID,
+                Some(our_exe()),
+                no_exclusions(),
+            ),
             Bearing::Activity
         );
     }
@@ -908,6 +983,7 @@ mod tests {
                 Some(our_exe()),
                 OUR_PID,
                 Some(our_exe()),
+                no_exclusions(),
             ),
             Bearing::Excluded(_)
         ));
@@ -925,9 +1001,105 @@ mod tests {
                 Some(Path::new("/usr/libexec/replayd")),
                 OUR_PID,
                 Some(our_exe()),
+                no_exclusions(),
             ),
             Bearing::Excluded(_)
         ));
+    }
+
+    #[test]
+    fn a_user_excluded_bundle_id_is_not_the_signal() {
+        // The reported trigger case: a dictation tool opening the microphone for local
+        // dictation, named by the user rather than by a rebuild. The reason is asserted
+        // exactly, not just matched: `State::log` renders it as `<- excluded: {why}`, so
+        // this string is what a hardware run shows against the filtered pid.
+        let exclusions = AppExclusions {
+            bundle_ids: vec!["com.example.voiceink".to_owned()],
+            executables: Vec::new(),
+        };
+        assert_eq!(
+            bearing(
+                Some(777),
+                Some("com.example.voiceink"),
+                Some(Path::new(
+                    "/Applications/VoiceInk.app/Contents/MacOS/VoiceInk"
+                )),
+                OUR_PID,
+                Some(our_exe()),
+                &exclusions,
+            ),
+            Bearing::Excluded("user-excluded bundle id")
+        );
+    }
+
+    #[test]
+    fn a_user_excluded_executable_is_not_the_signal() {
+        // The plain-binary case: no bundle id to key on, so the executable entry is the
+        // only fact that can name it -- which is also why the file documents listing the
+        // real executable inside `.app/Contents/MacOS/`.
+        let exclusions = AppExclusions {
+            bundle_ids: Vec::new(),
+            executables: vec![PathBuf::from("/opt/homebrew/bin/some-dictation-tool")],
+        };
+        assert_eq!(
+            bearing(
+                Some(777),
+                None,
+                Some(Path::new("/opt/homebrew/bin/some-dictation-tool")),
+                OUR_PID,
+                Some(our_exe()),
+                &exclusions,
+            ),
+            Bearing::Excluded("user-excluded executable")
+        );
+    }
+
+    #[test]
+    fn an_unlisted_app_is_still_the_signal_with_a_populated_exclusion_list() {
+        // The over-exclusion guard with the list populated: membership is exact, so an app
+        // the list does not name -- even a near-miss spelling of an entry -- is still the
+        // meeting signal.
+        let exclusions = AppExclusions {
+            bundle_ids: vec!["com.example.voiceink".to_owned()],
+            executables: Vec::new(),
+        };
+        assert_eq!(
+            bearing(
+                Some(26975),
+                Some("com.example.voiceink.helper"),
+                Some(Path::new("/Applications/Other.app/Contents/MacOS/Other")),
+                OUR_PID,
+                Some(our_exe()),
+                &exclusions,
+            ),
+            Bearing::Activity
+        );
+    }
+
+    #[test]
+    fn a_user_entry_only_fires_when_its_fact_is_present() {
+        // An unreadable fact never silently widens the user's list: a bundle-id entry cannot
+        // fire for a process whose bundle id is unreadable (counted as activity unless its
+        // executable entry names it), and the pid-unreadable exclusion still outranks it.
+        let exclusions = AppExclusions {
+            bundle_ids: vec!["com.example.voiceink".to_owned()],
+            executables: Vec::new(),
+        };
+        assert_eq!(
+            bearing(Some(777), None, None, OUR_PID, Some(our_exe()), &exclusions,),
+            Bearing::Activity
+        );
+        assert_eq!(
+            bearing(
+                None,
+                Some("com.example.voiceink"),
+                None,
+                OUR_PID,
+                Some(our_exe()),
+                &exclusions,
+            ),
+            Bearing::Excluded("pid unreadable, so it cannot be shown not to be meethook")
+        );
     }
 
     #[test]
@@ -941,7 +1113,14 @@ mod tests {
         // `<- excluded: {why}`, so this string is what a hardware run shows against the
         // filtered pid.
         assert_eq!(
-            bearing(Some(41809), None, Some(our_exe()), OUR_PID, Some(our_exe())),
+            bearing(
+                Some(41809),
+                None,
+                Some(our_exe()),
+                OUR_PID,
+                Some(our_exe()),
+                no_exclusions(),
+            ),
             Bearing::Excluded("another meethook instance")
         );
     }
@@ -957,6 +1136,7 @@ mod tests {
                 Some(Path::new("/opt/homebrew/bin/some-meeting-app")),
                 OUR_PID,
                 Some(our_exe()),
+                no_exclusions(),
             ),
             Bearing::Activity
         );
@@ -969,13 +1149,27 @@ mod tests {
         // is -- and excluding every path we cannot read would silence the trigger for whole
         // classes of meeting app.
         assert_eq!(
-            bearing(Some(26975), None, None, OUR_PID, Some(our_exe())),
+            bearing(
+                Some(26975),
+                None,
+                None,
+                OUR_PID,
+                Some(our_exe()),
+                no_exclusions(),
+            ),
             Bearing::Activity
         );
         // Same when it is *our* path that could not be resolved: the exclusion turns off
         // rather than firing on everything.
         assert_eq!(
-            bearing(Some(26975), None, Some(our_exe()), OUR_PID, None),
+            bearing(
+                Some(26975),
+                None,
+                Some(our_exe()),
+                OUR_PID,
+                None,
+                no_exclusions(),
+            ),
             Bearing::Activity
         );
     }
@@ -990,7 +1184,8 @@ mod tests {
                 Some("com.example.mystery"),
                 None,
                 OUR_PID,
-                Some(our_exe())
+                Some(our_exe()),
+                no_exclusions()
             ),
             Bearing::Excluded(_)
         ));
@@ -1014,6 +1209,7 @@ mod tests {
                 process_executable(std::process::id() as i32).as_deref(),
                 OUR_PID,
                 Some(&ours),
+                no_exclusions(),
             ),
             Bearing::Excluded("another meethook instance")
         );

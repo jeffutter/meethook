@@ -82,8 +82,26 @@ sessions if you pass session ids (the directory name each one is recorded under,
 ### `meethook record`
 
 *macOS only.* Watches the default microphone and records each call as a session — your mic and
-the system/speaker audio as two independent tracks — until interrupted (Ctrl-C). Takes no
-options; there's nothing to configure that the tool can't detect itself.
+the system/speaker audio as two independent tracks — until interrupted (Ctrl-C).
+
+It starts a session whenever *another* app opens the microphone, so an app that does that
+without it being a meeting — a dictation tool, say — can be named as one that never counts,
+in `<data dir>/exclusions.json`:
+
+```json
+{
+  "schema_version": 1,
+  "bundle_ids": ["com.example.voiceink"],
+  "executables": ["/Applications/VoiceInk.app/Contents/MacOS/VoiceInk"]
+}
+```
+
+Entries match exactly — no wildcards or prefixes, so a near-miss spelling excludes nothing.
+A bundle id names a bundled app; an executable entry is the real binary inside
+`.app/Contents/MacOS/` (not the bundle directory), which is what plain binaries that report
+no bundle id are matched by. An app's bundle id is `mdls -name kMDItemCFBundleIdentifier
+/path/to/App.app`. The file is read once when `meethook record` starts, so restart `record`
+after editing it; with no file, or empty lists, nothing is excluded.
 
 ### `meethook transcribe [SESSION_ID...]`
 
@@ -172,6 +190,8 @@ Everything meethook writes lives under one root (`~/meethook` by default, overri
 - `models/` — downloaded model weights (Whisper, diarization, speaker embedding), fetched and
   hash-verified on first use
 - `speakers.json` — enrolled voice references, shared across every session
+- `exclusions.json` — apps excluded from the mic-activity trigger (`record` only); user-
+  authored, absent by default
 
 Nothing here is ever uploaded anywhere; recording, transcription, and enrollment all run
 entirely on-device.

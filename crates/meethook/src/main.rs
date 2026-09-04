@@ -116,6 +116,9 @@ enum Command {
     /// scripts, CI, `meethook record | tee log` -- get the plain status lines instead, decided
     /// before anything session-specific happens.
     ///
+    /// Apps that should never count as a meeting (a dictation tool opening the microphone,
+    /// say) can be named in `<root>/exclusions.json`; the README documents the format.
+    ///
     /// macOS only: the capture backend is built from Apple frameworks that do not compile
     /// anywhere else, so the subcommand is absent rather than stubbed on other platforms.
     #[cfg(target_os = "macos")]

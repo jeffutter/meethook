@@ -24,6 +24,10 @@
 //!   and none at startup or across the repeat `DefaultInputDevice` notifications macOS emits;
 //! - the `IsRunningSomewhere listener attached to device N` debug line naming the new device.
 //!
+//! With an app named in `<root>/exclusions.json` (`$MEETHOOK_ROOT`, else `~/meethook`) opening
+//! the microphone instead of a meeting app: no edge at all, and in the debug lines the app
+//! marked `<- excluded: user-excluded bundle id` (or `executable`).
+//!
 //! That edge is what `meethook record` finalizes a session on, so this is where to check that
 //! the notification arrives at all and arrives once. What this example cannot show is the other
 //! half -- that `AVAudioEngine` really has stopped delivering buffers by then -- because it
@@ -35,6 +39,7 @@
 //! ask how often that race actually fires. The recovery re-check lives in the record loop,
 //! where there is a live session for it to protect.
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -46,8 +51,15 @@ fn main() {
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(120);
 
+    // The same root the binary resolves: `$MEETHOOK_ROOT`, else `~/meethook`. The watcher
+    // reads `<root>/exclusions.json` from it once at start.
+    let root = std::env::var_os("MEETHOOK_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|home| home.join("meethook")))
+        .unwrap_or_default();
+
     let (tx, rx) = mpsc::channel();
-    let (_watcher, active) = match MicActivityWatcher::start(move |activity| {
+    let (_watcher, active) = match MicActivityWatcher::start(&root, move |activity| {
         let _ = tx.send(activity);
     }) {
         Ok(started) => started,
