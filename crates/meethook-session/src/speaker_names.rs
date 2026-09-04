@@ -9,6 +9,15 @@ use crate::{Error, Result, SessionId, SessionPaths, write_atomic};
 /// in one session, and evolves on its own schedule.
 pub const SPEAKER_NAMES_SCHEMA_VERSION: u32 = 2;
 
+/// The oldest `speaker_names.json` this build can read. Below this nothing exists to migrate
+/// from.
+///
+/// A v1 file already satisfies v2's invariant -- absence of the `denied` key means no
+/// denials, which `#[serde(default)]` gives for free -- so reading one is a normalization,
+/// not a data transformation, exactly as [`crate::EnrolledSpeakers::read_or_empty`] treats
+/// its own v1 -> v2 step.
+const OLDEST_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
 /// One voice in one session that the user named by hand, without that name becoming a
 /// reference anybody could be recognised by elsewhere.
 ///
@@ -240,7 +249,23 @@ impl SpeakerNames {
             }
             Err(e) => return Err(Error::io(&path, e)),
         };
-        serde_json::from_slice(&bytes).map_err(|e| Error::json(&path, e))
+        let mut names: SpeakerNames =
+            serde_json::from_slice(&bytes).map_err(|e| Error::json(&path, e))?;
+        if !(OLDEST_SUPPORTED_SCHEMA_VERSION..=SPEAKER_NAMES_SCHEMA_VERSION)
+            .contains(&names.schema_version)
+        {
+            return Err(Error::UnsupportedSchema {
+                path,
+                found: names.schema_version,
+                oldest: OLDEST_SUPPORTED_SCHEMA_VERSION,
+                newest: SPEAKER_NAMES_SCHEMA_VERSION,
+            });
+        }
+        // Normalize on read rather than forcing the constant in `write`: a file this build
+        // accepted is one it can write, and carrying an old number in memory would write it
+        // straight back and leave the file claiming a version its contents no longer match.
+        names.schema_version = SPEAKER_NAMES_SCHEMA_VERSION;
+        Ok(names)
     }
 }
 
@@ -462,6 +487,94 @@ mod tests {
         assert_eq!(read.names.len(), 1);
         assert_eq!(read.names[0].name, "Alex");
         assert!(read.denied.is_empty());
+    }
+
+    /// Normalizing on read is what makes the stamp come out right on the way back: a v1 file
+    /// that picks up a denial must leave disk stamped 2, not still claiming 1 while holding
+    /// v2-shaped contents.
+    #[test]
+    fn a_v1_file_is_normalized_to_the_current_version_and_rewritten_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(dir.path().join("20260809-052600"));
+        std::fs::create_dir_all(paths.dir()).unwrap();
+        std::fs::write(
+            paths.speaker_names_json(),
+            r#"{
+  "schema_version": 1,
+  "session_id": "20260809-052600",
+  "names": []
+}
+"#,
+        )
+        .unwrap();
+
+        let mut read = SpeakerNames::read_or_empty(&paths, &session_id()).unwrap();
+        assert_eq!(read.schema_version, SPEAKER_NAMES_SCHEMA_VERSION);
+
+        read.deny(1, "Ivan", &[0.6, 0.8]);
+        read.write(&paths).unwrap();
+
+        let on_disk = std::fs::read_to_string(paths.speaker_names_json()).unwrap();
+        assert!(on_disk.contains("\"schema_version\": 2"), "{on_disk}");
+    }
+
+    /// A version from the future can only be a downgrade, and reading it as though it were
+    /// this one would believe a shape nothing here has a rule for. Refused, with the path
+    /// and a remedy, because "unsupported schema" with no file name is a support question.
+    #[test]
+    fn a_version_this_build_does_not_recognise_is_refused_with_a_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(dir.path().join("20260809-052600"));
+        std::fs::create_dir_all(paths.dir()).unwrap();
+        std::fs::write(
+            paths.speaker_names_json(),
+            format!(
+                r#"{{
+  "schema_version": {},
+  "session_id": "20260809-052600",
+  "names": []
+}}
+"#,
+                SPEAKER_NAMES_SCHEMA_VERSION + 1
+            ),
+        )
+        .unwrap();
+
+        let error = SpeakerNames::read_or_empty(&paths, &session_id()).unwrap_err();
+
+        assert!(
+            matches!(error, Error::UnsupportedSchema { .. }),
+            "expected an unsupported-schema error, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("speaker_names.json"), "{message}");
+        assert!(message.contains("upgrade meethook"), "{message}");
+    }
+
+    /// The gate is a range rather than a ceiling: version 0 was never written by anything, so
+    /// there is no migration to run and believing it would be a guess.
+    #[test]
+    fn a_version_below_the_readable_range_is_refused_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(dir.path().join("20260809-052600"));
+        std::fs::create_dir_all(paths.dir()).unwrap();
+        std::fs::write(
+            paths.speaker_names_json(),
+            r#"{
+  "schema_version": 0,
+  "session_id": "20260809-052600",
+  "names": []
+}
+"#,
+        )
+        .unwrap();
+
+        let error = SpeakerNames::read_or_empty(&paths, &session_id()).unwrap_err();
+
+        assert!(
+            matches!(error, Error::UnsupportedSchema { found: 0, .. }),
+            "{error:?}"
+        );
     }
 
     /// The reverse half: a file that *does* carry denials must stay readable by a reader
