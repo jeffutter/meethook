@@ -133,6 +133,13 @@ impl SpeakerNames {
     /// Replace rather than append, for the same reason `speakers.json` replaces: answering the
     /// same prompt twice is a correction, and two rows for one voice would make which of them
     /// wins a question about file order.
+    ///
+    /// The affirmation also purges the denial of the exact same pair: denying "Ivan?" and then
+    /// affirming "Ivan" leaves the second answer standing, so a file asserting both "this
+    /// cluster is Ivan" and "this cluster is not Ivan" would be a self-contradiction a human
+    /// reading it could not trust. Only that pair goes -- denials of other names on the same
+    /// cluster stand untouched, because a voice can be affirmed as Alex while still being
+    /// denied as Ivan, exactly as [`SpeakerNames::deny`] records such coexistence.
     pub fn assign(&mut self, cluster: u32, name: &str, embedding: Vec<f32>) {
         let row = AssignedName {
             cluster,
@@ -143,6 +150,8 @@ impl SpeakerNames {
             Ok(at) => self.names[at] = row,
             Err(at) => self.names.insert(at, row),
         }
+        self.denied
+            .retain(|row| !(row.cluster == cluster && row.name == name));
     }
 
     /// Records that one cluster is *not* `name`, replacing any earlier denial of the same
@@ -363,6 +372,36 @@ mod tests {
                 .map(|row| (row.cluster, row.name.as_str()))
                 .collect::<Vec<_>>(),
             [(1, "Alex"), (4, "Ryan")]
+        );
+    }
+
+    /// Denying a guess and then affirming the very same name is a retraction of the denial:
+    /// the assignment stands alone, and every other denial on the cluster keeps standing
+    /// beside it.
+    #[test]
+    fn assigning_a_denied_pair_purges_only_that_denial() {
+        let mut names = SpeakerNames::new(session_id(), Vec::new());
+
+        names.deny(1, "Ivan", &[0.6, 0.8]);
+        names.deny(1, "Boris", &[0.6, 0.8]);
+        names.assign(1, "Ivan", vec![0.6, 0.8]);
+
+        assert_eq!(
+            names
+                .names
+                .iter()
+                .map(|row| (row.cluster, row.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "Ivan")]
+        );
+        assert_eq!(
+            names
+                .denied
+                .iter()
+                .map(|row| (row.cluster, row.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "Boris")],
+            "the Boris denial stands; only the contradicted Ivan denial goes"
         );
     }
 
