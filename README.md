@@ -99,7 +99,7 @@ in `<data dir>/exclusions.json`:
 Entries match exactly — no wildcards or prefixes, so a near-miss spelling excludes nothing.
 A bundle id names a bundled app; an executable entry is the real binary inside
 `.app/Contents/MacOS/` (not the bundle directory), which is what plain binaries that report
-no bundle id are matched by. An app's bundle id is `mdls -name kMDItemCFBundleIdentifier
+no bundle id are matched by. Find an app's bundle id with `mdls -name kMDItemCFBundleIdentifier
 /path/to/App.app`. The file is read once when `meethook record` starts, so restart `record`
 after editing it; with no file, or empty lists, nothing is excluded.
 
