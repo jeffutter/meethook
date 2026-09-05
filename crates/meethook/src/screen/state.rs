@@ -826,6 +826,15 @@ impl Screen {
                 };
                 // A decision, not a deferral: the row settles like every settling answer, and
                 // the queue's pass-over gate counts it as answered from here on.
+                if self.group.contains(view.number) {
+                    // Settling takes the row out of the staging: the group answer enumerates
+                    // its members by number alone, so a denied row left standing would be
+                    // named again by a commit from another anchor -- the one-member case of
+                    // the staleness Assert already clears for the whole group.
+                    self.group.remove(view.number);
+                    // Every cached preview was computed against a bigger group.
+                    self.groups.clear();
+                }
                 self.decided.insert(view.number.to_string(), Mark::Answered);
                 return Step::Answered(Answer::Deny { name: name.clone() });
             }
@@ -890,6 +899,14 @@ impl Screen {
             // silently do nothing.
             Event::Play | Event::PlaySnippet => {}
             Event::Skip => {
+                if self.group.contains(view.number) {
+                    // Skipping settles the row too, so it leaves the staging for the reason
+                    // the denial gives: a skipped row left standing would ride along in a
+                    // later group commit.
+                    self.group.remove(view.number);
+                    // Every cached preview was computed against a bigger group.
+                    self.groups.clear();
+                }
                 self.decided.insert(view.number.to_string(), Mark::Skipped);
                 return Step::Answered(Answer::Skip);
             }
@@ -2536,6 +2553,133 @@ pub(crate) mod tests {
             Step::Answered(Answer::Deny {
                 name: "Ivan".to_string(),
             })
+        );
+    }
+
+    /// A denial settles its row, so the row leaves any staging it holds: the group answer
+    /// enumerates members by number alone, and a denied row left standing would be named again
+    /// by a commit from another anchor -- the one-member case of the staleness Assert already
+    /// clears for the whole group. Only the denied row leaves; the rest of the staging stands.
+    #[test]
+    fn denying_a_marked_row_takes_just_that_row_out_of_the_staged_group() {
+        let session = session();
+        let owned: OwnedRows = vec![
+            (
+                "Unknown 1".to_string(),
+                Attribution::Tentative {
+                    name: "Ivan".to_string(),
+                    similarity: 0.38,
+                },
+                95.0,
+                false,
+            ),
+            (
+                "Unknown 2".to_string(),
+                Attribution::Tentative {
+                    name: "Ivan".to_string(),
+                    similarity: 0.41,
+                },
+                80.0,
+                false,
+            ),
+            (
+                "Unknown 3".to_string(),
+                Attribution::Tentative {
+                    name: "Ivan".to_string(),
+                    similarity: 0.36,
+                },
+                70.0,
+                false,
+            ),
+        ];
+        let queue = queue(&owned);
+        let similar = resembles(&[("Ivan", 0.38, 1)]);
+        let enrolled: &[&str] = &["Ivan"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        // Stage all three rows together with the anchor.
+        screen.answer(&voice, Event::Mark, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+        let groups = Groups("Ivan");
+
+        assert_eq!(
+            screen.answer(&voice, Event::Deny, &Free),
+            Step::Answered(Answer::Deny {
+                name: "Ivan".to_string(),
+            })
+        );
+        assert!(
+            !screen.group.contains("Unknown 1"),
+            "the denial takes its row out of the staging"
+        );
+        assert!(
+            screen.group.contains("Unknown 2") && screen.group.contains("Unknown 3"),
+            "only the denied row leaves: the rest of the staging stands"
+        );
+        // The denied row can no longer ride along in a group commit either: out of the
+        // staging, the same key meets the lone-row gate instead, where the vetoed candidate
+        // waits rather than naming a voice the denial just refused.
+        assert_eq!(screen.answer(&voice, Event::Choose, &groups), Step::Waiting);
+        // The remaining staged rows still commit together as a group from their own anchor.
+        let second = view(
+            &session,
+            "Unknown 2",
+            2,
+            &queue,
+            &[],
+            &similar,
+            enrolled,
+            &owned[1].1,
+        );
+        assert_eq!(screen.arrive(&second), None);
+
+        assert_eq!(
+            screen.answer(&second, Event::Choose, &groups),
+            Step::Answered(Answer::Group {
+                name: "Ivan".to_string(),
+                members: vec!["Unknown 2".to_string(), "Unknown 3".to_string()],
+            })
+        );
+    }
+
+    /// Skipping settles the row too, so it leaves the staging for the reason the denial gives:
+    /// consistency between the two keys that settle a row without naming it.
+    #[test]
+    fn skipping_a_marked_row_takes_just_that_row_out_of_the_staged_group() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false), ("Unknown 2", 60.0, false)]);
+        let queue = queue(&owned);
+        let voice = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        screen.answer(&voice, Event::Mark, &Free);
+        screen.answer(&voice, Event::Down, &Free);
+        screen.answer(&voice, Event::Mark, &Free);
+
+        assert_eq!(
+            screen.answer(&voice, Event::Skip, &Free),
+            Step::Answered(Answer::Skip)
+        );
+        assert!(
+            !screen.group.contains("Unknown 1"),
+            "the skip takes its row out of the staging"
+        );
+        assert!(
+            screen.group.contains("Unknown 2"),
+            "only the skipped row leaves: the rest of the staging stands"
         );
     }
 
