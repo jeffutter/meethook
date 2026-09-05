@@ -213,19 +213,44 @@ fn voices(frame: &mut Frame, area: Rect, view: &View<'_>) {
 }
 
 fn voice_line(row: &Row) -> Line<'static> {
-    let mut spans = vec![Span::raw(format!(
-        "{:<12} {:>8}  ",
-        row.number,
-        speech(row.speech_seconds)
-    ))];
-    if row.label == row.number {
-        spans.push(Span::raw("--".to_string()).dim());
-    } else {
-        spans.push(Span::raw(row.label.clone()).bold());
-        if let Some(similarity) = row.similarity {
-            spans.push(Span::raw(format!(" {similarity:.2}")).dim());
+    let mut spans = match row.fragments {
+        // A composite stands in for its members: the count and the total talk time say what
+        // answering would commit, not what any one member said, and "most like Ivan" rides the
+        // label/similarity pair the ordinary rows use, so the composite borrows their styling.
+        // An empty label is a bundle with nothing enrolled to resemble, and carries no clause.
+        Some(count) => {
+            let mut spans = vec![Span::raw(format!("{:<12} ", row.number))];
+            spans.push(Span::raw(format!(
+                "{count} fragments · {}",
+                speech(row.speech_seconds)
+            )));
+            if !row.label.is_empty() {
+                spans.push(Span::raw(" · ").dim());
+                spans.push(Span::raw(row.label.clone()).bold());
+                if let Some(similarity) = row.similarity {
+                    spans.push(Span::raw(format!(" ({similarity:.2})")).dim());
+                }
+            }
+            spans.push(Span::raw("  "));
+            spans
         }
-    }
+        None => {
+            let mut spans = vec![Span::raw(format!(
+                "{:<12} {:>8}  ",
+                row.number,
+                speech(row.speech_seconds)
+            ))];
+            if row.label == row.number {
+                spans.push(Span::raw("--".to_string()).dim());
+            } else {
+                spans.push(Span::raw(row.label.clone()).bold());
+                if let Some(similarity) = row.similarity {
+                    spans.push(Span::raw(format!(" {similarity:.2}")).dim());
+                }
+            }
+            spans
+        }
+    };
     // A guess is the database's claim, not a naming the user made: the tag says so beside the
     // similarity, the way [group] sits beside the decision marks rather than instead of them.
     if row.guess {
@@ -352,8 +377,17 @@ fn consequence(frame: &mut Frame, area: Rect, view: &View<'_>) {
     // The staged group previews the operation the user is about to perform -- what committing
     // it with the highlighted name would do -- so while it is on screen the pane shows only
     // that: two previews in a two-inner-row pane is noise, and the group's own lines already
-    // carry the refusal of every member it refused.
-    let (title, lines) = if let Some(group) = view.group {
+    // carry the refusal of every member it refused. The bundle owns the pane the same way: it
+    // is the operation the answering keys will perform, and staging is refused while it is open,
+    // so the two doors never contend here.
+    let (title, lines) = if let Some(bundle) = view.bundle {
+        (
+            " would ",
+            std::iter::once(Line::from(bundle_line(bundle)))
+                .chain(bundle.would_do().into_iter().map(Line::from))
+                .collect::<Vec<_>>(),
+        )
+    } else if let Some(group) = view.group {
         (
             " would ",
             std::iter::once(Line::from(group_line(group)))
@@ -418,6 +452,20 @@ fn group_line(group: &GroupConsequence) -> String {
         group.name,
         group.references_after,
         group.vetoes_overridden
+    )
+}
+
+/// The pane's bundle header line, in the run's own labelling: the same "reference(s)" and
+/// "veto(s) overridden" the fan-out reports once the answer has walked, so a preview and its
+/// write cannot disagree about what they counted. The numbers come off the same
+/// [`GroupConsequence`] the fan-out reports from.
+fn bundle_line(bundle: &GroupConsequence) -> String {
+    format!(
+        "answering names {} fragment(s) as {}: {} reference(s), {} veto(s) overridden",
+        bundle.applied.len(),
+        bundle.name,
+        bundle.references_after,
+        bundle.vetoes_overridden
     )
 }
 
@@ -681,7 +729,9 @@ fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sound
 mod tests {
     use std::time::Duration;
 
-    use meethook_enroll::{Assertion, GroupConsequence, MeetingLabel, Position, Queued, Refusal};
+    use meethook_enroll::{
+        Assertion, FragmentGroup, GroupConsequence, MeetingLabel, Position, Queued, Refusal,
+    };
     use meethook_session::{MeetingFit, SessionId};
     use meethook_transcribe::{Attribution, Resemblance};
     use ratatui::Terminal;
@@ -710,6 +760,10 @@ mod tests {
         fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
             None
         }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
     }
 
     /// [`Free`]'s counterpart where the highlighted candidate also previews an assertion: the
@@ -731,6 +785,10 @@ mod tests {
         fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
             None
         }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
     }
 
     struct Vetoes;
@@ -747,6 +805,10 @@ mod tests {
         }
 
         fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
             None
         }
     }
@@ -768,6 +830,10 @@ mod tests {
         }
 
         fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
             None
         }
     }
@@ -937,6 +1003,8 @@ mod tests {
             snippets,
             resembles: &resembles,
             enrolled: &enrolled,
+            fragment_groups: &[],
+            bundle_members: None,
             clip_is_empty: false,
         };
 
@@ -990,6 +1058,152 @@ mod tests {
         assert!(whole.contains("3 voice(s) to ask about"), "{whole}");
         assert!(whole.contains("+ somebody new"), "{whole}");
         assert!(whole.contains("^S skip"), "{whole}");
+    }
+
+    /// [`frame`], with the quiet tail folded into one open bundle: two above-floor voices, then
+    /// three below-floor fragments the run bundled and offers as the question about its first
+    /// member. The composite-row tests vary nothing else.
+    fn bundled(width: u16, height: u16, costs: &dyn Costs, keys: &[Event]) -> Vec<String> {
+        let session = SessionId::parse("20260819-100000").expect("a well-formed session id");
+        let labels = [
+            (
+                "Unknown 1".to_string(),
+                Attribution::Identified {
+                    name: "Milo".to_string(),
+                    similarity: 0.81,
+                },
+                240.0,
+                false,
+            ),
+            (
+                "Unknown 2".to_string(),
+                Attribution::Unknown("Unknown 2".to_string()),
+                95.0,
+                false,
+            ),
+            (
+                "Unknown 3".to_string(),
+                Attribution::Unknown("Unknown 3".to_string()),
+                1.5,
+                true,
+            ),
+            (
+                "Unknown 4".to_string(),
+                Attribution::Unknown("Unknown 4".to_string()),
+                0.9,
+                true,
+            ),
+            (
+                "Unknown 5".to_string(),
+                Attribution::Unknown("Unknown 5".to_string()),
+                2.0,
+                true,
+            ),
+        ];
+        let queue: Vec<Queued<'_>> = labels
+            .iter()
+            .map(|(number, attribution, seconds, below)| Queued {
+                number,
+                attribution,
+                speech_seconds: *seconds,
+                below_floor: *below,
+            })
+            .collect();
+        let members = vec![
+            "Unknown 3".to_string(),
+            "Unknown 4".to_string(),
+            "Unknown 5".to_string(),
+        ];
+        let groups = [FragmentGroup {
+            members: members.clone(),
+            speech_seconds: 4.4,
+            best: Some(Resemblance {
+                name: "Ivan".to_string(),
+                similarity: 0.71,
+                references: 1,
+            }),
+        }];
+        let resembles = [
+            Resemblance {
+                name: "Milo".to_string(),
+                similarity: 0.71,
+                references: 3,
+            },
+            Resemblance {
+                name: "Ivan".to_string(),
+                similarity: 0.38,
+                references: 1,
+            },
+        ];
+        let enrolled = ["Milo", "Ivan"];
+        let snippets = said();
+        let narration: Vec<String> = Vec::new();
+        let voice = VoiceView {
+            session: &session,
+            meeting: None,
+            position: Position { nth: 3, of: 5 },
+            number: "Unknown 3",
+            speech_seconds: 1.5,
+            attribution: &labels[2].1,
+            queue: &queue,
+            snippets: &snippets,
+            resembles: &resembles,
+            enrolled: &enrolled,
+            fragment_groups: &groups,
+            bundle_members: Some(&members),
+            clip_is_empty: false,
+        };
+
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        for key in keys {
+            screen.answer(&voice, *key, costs);
+        }
+        let view = screen.view(&voice, costs, Context::Reading);
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
+        terminal
+            .draw(|frame| draw(frame, &view, &narration, None))
+            .expect("drawing into a buffer cannot fail");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// AC from the drawing side: an open bundle renders as one composite row -- the count and
+    /// total talk time say what answering would commit, and the resemblance rides the
+    /// label/similarity pair the ordinary rows use -- while the members behind it are hidden
+    /// rather than rendered as rows of their own.
+    #[test]
+    fn an_open_bundle_renders_as_one_composite_row_on_the_frame() {
+        let painted = bundled(140, 30, &Free, &[]);
+        let whole = painted.join("\n");
+        // The composite stands in for its three members, reporting the fan-out's numbers and
+        // resemblance rather than any single fragment's.
+        assert!(whole.contains("3 fragments"), "{whole}");
+        assert!(whole.contains("most like Ivan"), "{whole}");
+        // The fold hides the members behind their composite; only the anchor's handle survives.
+        assert!(
+            !whole.contains("Unknown 4"),
+            "hidden members must not render: {whole}"
+        );
+        assert!(
+            !whole.contains("Unknown 5"),
+            "hidden members must not render: {whole}"
+        );
+        assert!(
+            whole.contains("Unknown 3"),
+            "the composite keeps its anchor's handle: {whole}"
+        );
+        // The floor separator still marks where the quiet tail begins.
+        assert!(whole.contains("quieter than the prompt floor"), "{whole}");
     }
 
     /// AC #7 from the drawing side: the reason is on the screen, beside the candidate it refuses.
@@ -1149,6 +1363,10 @@ mod tests {
                 stale: Vec::new(),
             })
         }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
     }
 
     /// A row staged into the group renders the suffix beside its decision mark, not instead of
@@ -1165,6 +1383,7 @@ mod tests {
             guess: false,
             in_group: true,
             current: false,
+            fragments: None,
         };
         let rendered: String = voice_line(&row)
             .iter()
@@ -1188,6 +1407,7 @@ mod tests {
             guess: false,
             in_group: false,
             current: false,
+            fragments: None,
         };
         let rendered: String = voice_line(&quiet)
             .iter()
@@ -1212,6 +1432,7 @@ mod tests {
             guess: true,
             in_group: false,
             current: true,
+            fragments: None,
         };
         let rendered: String = voice_line(&row)
             .iter()
@@ -1243,6 +1464,7 @@ mod tests {
             guess: false,
             in_group: false,
             current: false,
+            fragments: None,
         };
         let rendered: String = voice_line(&named)
             .iter()
@@ -1265,6 +1487,7 @@ mod tests {
             guess: false,
             in_group: false,
             current: false,
+            fragments: None,
         };
         let rendered: String = voice_line(&unknown)
             .iter()

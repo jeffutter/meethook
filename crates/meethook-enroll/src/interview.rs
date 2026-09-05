@@ -197,6 +197,33 @@ pub enum Answer {
         /// The "Unknown N" handles the user chose, in whatever order the interface listed them.
         members: Vec<String>,
     },
+    /// These below-floor fragments are all one person, named together with `name`: the answer
+    /// to a *bundled* question, where the library rather than the user decided which fragments
+    /// travel together.
+    ///
+    /// The sibling of [`Group`](Self::Group) aimed at the questions the bundling forms, and
+    /// different from it in exactly the one way that matters: it carries **no veto authority**.
+    /// A staged group is the user's explicit act of saying "these voices are one person", and
+    /// two or more of them may override the heard-at-once veto on that claim; a bundle is a
+    /// convenience the library proposed, and honouring it must respect the veto per member --
+    /// a fragment segmentation heard at once with somebody already holding the name stays
+    /// unnamed while the rest of the bundle commits, which is the same per-member refusal the
+    /// staged walk reports, without the override.
+    ///
+    /// Only formed under [`crate::Enrolment::AboveTheFloor`], because only there does a sub-floor
+    /// answer store no reference: naming nine fragments as one person writes nine session rows
+    /// and nothing into `speakers.json`, so a wrong bundle costs a relabel, not a poisoned
+    /// reference. The commit enforces the same gate the preview does.
+    ///
+    /// `members` are the stable "Unknown N" handles, and an unresolvable handle goes
+    /// unanswered rather than partially answered, on [`Group`](Self::Group)'s precedent.
+    FragmentGroup {
+        /// Who the bundle is, trimmed the same way every other name in this file is.
+        name: String,
+
+        /// The "Unknown N" handles the bundle was built from, in queue order.
+        members: Vec<String>,
+    },
     /// This voice is not `name`: refuse the tentative guess its turns currently read as.
     ///
     /// The complement of [`Named`](Self::Named) for a guessed fragment. Naming adds a claim --
@@ -246,6 +273,23 @@ pub trait Interviewer {
     /// the answerer: the caller cannot be trusted to remember which of the two it passed, and
     /// [`run_enroll`] is where the answerer and the selection are both in hand.
     fn needs_one_voice(&self) -> bool {
+        false
+    }
+
+    /// Whether this answerer wants below-floor fragments asked about as bundles rather than
+    /// one question per fragment.
+    ///
+    /// `false` by default, and `false` for everyone but the full-screen frame today: a line
+    /// prompt has no surface for a composite row, and a scripted answerer answers per voice, so
+    /// headless runs keep asking one question per fragment and their printed output stays
+    /// byte for byte what it was before the bundling existed. The frame answers `true`, which
+    /// is also what makes its queue pane able to show the bundles at all -- the field carrying
+    /// them across the seam is populated only for an answerer that asks for them.
+    ///
+    /// A method on this trait beside `needs_one_voice` for the same reason that one is: the
+    /// preference belongs to the answerer, and the run is where the answerer and the queue are
+    /// both in hand.
+    fn accepts_fragment_groups(&self) -> bool {
         false
     }
 

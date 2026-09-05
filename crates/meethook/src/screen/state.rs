@@ -38,8 +38,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use meethook_enroll::{
-    Answer, Assertion, GroupConsequence, MeetingLabel, Position, Queued, Refusal, Resolution,
-    Snippet, resolve,
+    Answer, Assertion, FragmentGroup, GroupConsequence, MeetingLabel, Position, Queued, Refusal,
+    Resolution, Snippet, resolve,
 };
 use meethook_session::SessionId;
 use meethook_transcribe::{Attribution, Resemblance};
@@ -71,6 +71,24 @@ pub struct VoiceView<'a> {
     pub snippets: &'a [Snippet<'a>],
     pub resembles: &'a [Resemblance],
     pub enrolled: &'a [&'a str],
+    /// The bundles this session's quiet tail was built into -- or none, which is the common
+    /// case rather than the exception: most sessions have no below-floor fragments close
+    /// enough to fold together.
+    ///
+    /// Static membership, fresh resemblance: the handles are fixed when the queue is built so
+    /// the pane's picture does not change shape while the questions move through them, and
+    /// [`FragmentGroup::best`] is re-ranked against the database as it stands when the
+    /// question is offered. What makes one of these render as a composite row at all is a
+    /// liveness decision made against the queue's current attributions, not against this list.
+    pub fragment_groups: &'a [FragmentGroup],
+    /// The live members' handles of the bundle the question is about, in queue order -- or
+    /// `None` when the question is about one voice.
+    ///
+    /// Read across the seam rather than re-derived from [`Self::fragment_groups`]: the run has
+    /// already dropped whatever settled before the question formed, and the frame answering
+    /// with a member set of its own would be a second source of truth about what the answer
+    /// commits.
+    pub bundle_members: Option<&'a [String]>,
     /// Whether there is audio to play. The clip itself is the shell's business, and a state
     /// machine holding a quarter of a megabyte of samples per redraw would be paying for nothing.
     ///
@@ -219,6 +237,18 @@ pub trait Costs {
     /// than defaulted so every implementation declares its stance: a fake that pretended the
     /// frame had no group door would make the group tests vacuous without saying so.
     fn group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence>;
+    /// What answering a library-formed bundle -- the below-floor fragments the run bundled
+    /// into one question -- with one name would do, as the aggregate the commit reports.
+    ///
+    /// `None` where the name is blank or a member handle does not resolve to this session,
+    /// on [`Self::group_of`]'s precedent. Required rather than defaulted for the reason
+    /// `group_of` gives: a fake that pretended the frame had no bundle door would make the
+    /// bundle tests vacuous without saying so.
+    ///
+    /// The difference from `group_of` is authority: a bundle carries none, so a member the
+    /// run vetoes reads as refused here rather than overridden, and the preview the pane shows
+    /// is the write the fan-out performs.
+    fn fragment_group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence>;
 }
 
 /// What this run did to a voice, which the session's own labels cannot say.
@@ -259,6 +289,10 @@ pub struct Row {
     pub in_group: bool,
     /// Whether this is the voice the question is about.
     pub current: bool,
+    /// How many fragments this row stands for, when it does: the bundle collapsed into its
+    /// composite row, counted against the queue's current attributions so the number says what
+    /// answering would commit. `None` for an ordinary voice.
+    pub fragments: Option<usize>,
 }
 
 /// One enrolled person the user could answer with.
@@ -317,7 +351,15 @@ pub struct View<'a> {
     /// off the same [`GroupConsequence`] the commit reports from. Borrowed from the memo the
     /// way [`View::status`] borrows from the screen, which is safe for the reason `status`
     /// already relies on: the memo is cleared only between questions, never mid-frame.
+    ///
+    /// Suppressed while a bundle question is open: the bundle preview is the operation the
+    /// user is about to perform, and one preview owns the pane rather than two sharing it.
     pub group: Option<&'a GroupConsequence>,
+    /// What answering the bundle question with the highlighted name would do -- or `None`
+    /// when the question is not a bundle or nothing is highlighted. The pane's bundle lines
+    /// read these numbers off the same [`GroupConsequence`] the fan-out reports from, borrowed
+    /// from the same memo [`View::group`] is.
+    pub bundle: Option<&'a GroupConsequence>,
     /// Every snippet, with the pane scrolled to [`View::snippet`].
     pub snippets: &'a [Snippet<'a>],
     /// Index into [`View::snippets`] of the selected line -- the row the pane marks, the row at
@@ -384,15 +426,111 @@ pub struct Screen {
     /// accepted answer, so a memo outliving one question would be stale as well as expensive.
     /// That clearing is the whole reason this is keyed by name rather than by (voice, name).
     costs: BTreeMap<String, Cost>,
-    /// Memo for [`Costs::group_of`], keyed by candidate name and **cleared on every arrival**,
-    /// for the reason the cost memo gives: the database moves after every accepted answer, so a
-    /// preview taken against the old database would be stale as well as expensive -- and one
-    /// `group_of` is N clone pairs and 2N labellings, acceptable once per distinct candidate
-    /// name and never per keystroke. The name alone keys the memo only while the member set is
-    /// fixed, so a mark toggle clears it too: marks are placed while the question is open, and
-    /// a preview computed against a smaller group would understate what the commit would do.
+    /// Memo for [`Costs::group_of`] and [`Costs::fragment_group_of`], keyed by candidate name
+    /// and **cleared on every arrival**, for the reason the cost memo gives: the database moves
+    /// after every accepted answer, so a preview taken against the old database would be stale
+    /// as well as expensive -- and one `group_of` is N clone pairs and 2N labellings,
+    /// acceptable once per distinct candidate name and never per keystroke. The name alone keys
+    /// the memo only while the member set is fixed, so a mark toggle clears it too: marks are
+    /// placed while the question is open, and a preview computed against a smaller group would
+    /// understate what the commit would do.
+    ///
+    /// Sharing one memo between the two doors is safe because within any question at most one
+    /// of them is consulted: a bundle question refuses marking and routes every answering key
+    /// to the bundle path first, and a solo question never reaches the bundle path at all.
     groups: BTreeMap<String, Option<GroupConsequence>>,
+    /// The live members of the bundle the question is about, in queue order -- or `None` when
+    /// the question is about one voice.
+    ///
+    /// Set from [`VoiceView::bundle_members`] on every arrival, which is what clears it: an
+    /// answer consumes the question it was formed for, and the next arrival says whether the
+    /// next question is a bundle too. Owned rather than borrowed because the answer outlives
+    /// the view it came from: the event loop hands back an [`Answer`] the shell feeds to the
+    /// run after this frame has gone, and the bundle's members ride in it.
+    bundle: Option<Vec<String>>,
     status: Option<String>,
+}
+
+/// One row the queue pane renders: one voice, or a still-open bundle collapsed into its
+/// composite row at the position of its first member.
+struct DisplayRow<'a> {
+    /// Index into [`VoiceView::queue`] of the voice this row stands for -- the bundle's first
+    /// member for a composite.
+    queue: usize,
+    /// The bundle this row collapses, or `None` for an ordinary voice.
+    bundle: Option<&'a FragmentGroup>,
+}
+
+/// The queue as the pane renders it, with each still-open bundle folded into its composite
+/// row.
+///
+/// A bundle folds while at least two of its members still read as unnamed: the moment a
+/// member settles through any door -- this question's own answer included -- the rows come
+/// back as themselves, labelled, which is the feedback that the naming landed. The fold is
+/// decided against the attributions the queue carries now rather than the bundles' static
+/// membership, because those are the live set the question actually covers: a member named
+/// earlier in the run left the bundle when it was answered, and the composite must not keep
+/// counting it. A denial reads back as unnamed from this side and would count one too high;
+/// the run's fan-out skips settled members anyway, so the write stays correct where the row's
+/// number does not.
+///
+/// Every caller agrees on the layout because they all come through here: the cursor is an
+/// index into the result rather than into the queue, and a cursor indexing the queue would
+/// point past the fold the moment a bundle closed up above it.
+fn display_rows<'a>(view: &'a VoiceView<'a>) -> Vec<DisplayRow<'a>> {
+    let by_handle: BTreeMap<&str, &Queued<'_>> =
+        view.queue.iter().map(|row| (row.number, row)).collect();
+    // Which bundles still stand, keyed by the member their composite sits on: the first,
+    // whose handle the row keeps. Two or more members reading as unnamed is the whole test --
+    // the same unsettledness the run decides the live set by, as far as this side can see it.
+    let mut standing: BTreeMap<&str, &FragmentGroup> = BTreeMap::new();
+    for group in view.fragment_groups {
+        let live = group
+            .members
+            .iter()
+            .filter(|handle| {
+                by_handle
+                    .get(handle.as_str())
+                    .is_some_and(|row| matches!(row.attribution, Attribution::Unknown(_)))
+            })
+            .count();
+        if live >= 2 {
+            standing.insert(
+                group
+                    .members
+                    .first()
+                    .expect("two or more by construction")
+                    .as_str(),
+                group,
+            );
+        }
+    }
+    // Queue order is the order the bundles' members were collected in, so folding on the
+    // first member hides exactly the rows after it; components are disjoint, so a member
+    // never belongs to two folds.
+    let mut hidden = BTreeSet::new();
+    let mut rows = Vec::with_capacity(view.queue.len());
+    for (index, row) in view.queue.iter().enumerate() {
+        if hidden.contains(row.number) {
+            continue;
+        }
+        match standing.get(row.number) {
+            Some(group) => {
+                for rest in &group.members[1..] {
+                    hidden.insert(rest.as_str());
+                }
+                rows.push(DisplayRow {
+                    queue: index,
+                    bundle: Some(group),
+                });
+            }
+            None => rows.push(DisplayRow {
+                queue: index,
+                bundle: None,
+            }),
+        }
+    }
+    rows
 }
 
 impl Screen {
@@ -414,6 +552,9 @@ impl Screen {
         }
         self.costs.clear();
         self.groups.clear();
+        // Reassigned rather than cleared-and-maybe-set: a session with no bundles arrives
+        // with `None`, and the previous question's members must not outlive its question.
+        self.bundle = view.bundle_members.map(|members| members.to_vec());
 
         match self.target.as_deref() {
             // Reached. Whatever the user was steering toward is now the question, so the steering
@@ -452,10 +593,20 @@ impl Screen {
         // while this runs after the mark is removed above.
         self.group
             .retain(|handle| !self.decided.contains_key(handle));
-        self.cursor = view
-            .queue
+        // Onto the row the question renders as: its own row for a solo question, and the
+        // composite for a bundle question whose anchor is anywhere inside the fold -- the
+        // containment half is what covers the rare arrival where the built-time first member
+        // settled elsewhere and the anchor sits behind it.
+        self.cursor = display_rows(view)
             .iter()
-            .position(|row| row.number == view.number)
+            .position(|row| {
+                row.bundle
+                    .is_some_and(|group| group.members.iter().any(|member| member == view.number))
+                    || view
+                        .queue
+                        .get(row.queue)
+                        .is_some_and(|queued| queued.number == view.number)
+            })
             .unwrap_or(0);
         None
     }
@@ -494,11 +645,20 @@ impl Screen {
                 self.cursor = self.cursor.saturating_sub(1);
             }
             Event::Down => {
-                let last = view.queue.len().saturating_sub(1);
+                // The rows the pane renders, not the queue: a fold above the cursor would
+                // otherwise let it wander onto a row that is not drawn.
+                let last = display_rows(view).len().saturating_sub(1);
                 self.cursor = (self.cursor + 1).min(last);
             }
             Event::Select => {
-                let Some(row) = view.queue.get(self.cursor) else {
+                // The cursor indexes the rendered rows, so through them to the voice: a
+                // composite steers to its first member's handle, which is the anchor the run
+                // offers for the bundle.
+                let rows = display_rows(view);
+                let Some(display) = rows.get(self.cursor) else {
+                    return Step::Waiting;
+                };
+                let Some(row) = view.queue.get(display.queue) else {
                     return Step::Waiting;
                 };
                 if row.number == view.number {
@@ -513,9 +673,34 @@ impl Screen {
                 return Step::Answered(Answer::Later);
             }
             Event::Mark => {
-                let Some(row) = view.queue.get(self.cursor) else {
+                let rows = display_rows(view);
+                let Some(display) = rows.get(self.cursor) else {
                     return Step::Waiting;
                 };
+                let Some(row) = view.queue.get(display.queue) else {
+                    return Step::Waiting;
+                };
+                if self.bundle.is_some() {
+                    // The question is about the whole bundle, and staging one of its members
+                    // apart from the rest would answer a question the run does not ask. The
+                    // bundle commits as one name either way; the mark has nothing to add.
+                    self.status = Some(
+                        "these fragments are one question, so they cannot be marked".to_string(),
+                    );
+                    return Step::Waiting;
+                }
+                if display.bundle.is_some() {
+                    // A composite row standing in for a solo question folds two or more live
+                    // members, and marking it would stage only the anchor -- a one-member
+                    // group, which is a plain naming wearing a group's key. The individual
+                    // rows come back once the bundle settles; until then there is nothing
+                    // separable to mark.
+                    self.status = Some(format!(
+                        "{number} stands for several fragments asked about together, so it cannot be marked",
+                        number = row.number
+                    ));
+                    return Step::Waiting;
+                }
                 if self.group.contains(row.number) {
                     // Toggling off is silent: the suffix leaving the row is the feedback.
                     // Every cached preview was computed against a bigger group.
@@ -580,6 +765,14 @@ impl Screen {
                 let Some((name, refusal)) = self.chosen(view, costs) else {
                     return Step::Waiting;
                 };
+                // The bundle answer carries no insist flag and no veto authority either: a
+                // refusal that keeps a member out of the bundle stays out however insistent
+                // the key is, and a candidate nothing refuses is answered by Enter. Nothing
+                // on a bundle question, in either direction -- the mirror of the library,
+                // which honours every per-member refusal on the fan-out.
+                if self.bundle.is_some() {
+                    return Step::Waiting;
+                }
                 // The group answer carries no insist flag and a `Taken` refusal is never
                 // overridable, so on a marked anchor insisting adds nothing: the same commit,
                 // through the same gate.
@@ -660,6 +853,14 @@ impl Screen {
                     return Step::Waiting;
                 }
                 let name = typed.to_string();
+                if let Some(members) = self.bundle.clone() {
+                    // A typed name is a person nothing holds yet, so no refusal gate stands in
+                    // the way -- the reasoning the staged-group arm gives -- and the bundle
+                    // commits as a whole through the fan-out.
+                    self.decided.insert(view.number.to_string(), Mark::Answered);
+                    self.bundle = None;
+                    return Step::Answered(Answer::FragmentGroup { name, members });
+                }
                 if self.group.contains(view.number) {
                     // A typed name is a person nothing holds yet, so no refusal gate stands in
                     // the way -- none today, none added -- and the group commits as a whole.
@@ -719,6 +920,9 @@ impl Screen {
         refusal: Option<Refusal>,
         costs: &dyn Costs,
     ) -> Step {
+        if let Some(members) = self.bundle.clone() {
+            return self.commit_bundle(view, name, members, costs);
+        }
         if self.group.contains(view.number) {
             return self.commit_group(view, name, costs);
         }
@@ -769,26 +973,65 @@ impl Screen {
         costs: &dyn Costs,
         context: Context<'_>,
     ) -> View<'a> {
-        let rows = view
-            .queue
+        // The pane renders the folded rows, not the queue: a still-open bundle stands as one
+        // composite at its first member's position, and the members behind it are hidden -- the
+        // layout [`display_rows`] owns for every caller, cursor clamping included.
+        let display = display_rows(view);
+        let rows = display
             .iter()
-            .map(|row| Row {
-                number: row.number.to_string(),
-                label: row.attribution.label().to_string(),
-                speech_seconds: row.speech_seconds,
-                similarity: match row.attribution {
-                    // A guess carries its machine similarity like an identification: the pane
-                    // shows the number, and the `[guess]` tag beside it says the cut was the
-                    // wider one rather than a lower number pretending to be a tighter one.
-                    Attribution::Identified { similarity, .. }
-                    | Attribution::Tentative { similarity, .. } => Some(*similarity),
-                    Attribution::Unknown(_) | Attribution::Assigned { .. } => None,
-                },
-                below_floor: row.below_floor,
-                mark: self.decided.get(row.number).copied(),
-                guess: matches!(row.attribution, Attribution::Tentative { .. }),
-                in_group: self.group.contains(row.number),
-                current: row.number == view.number,
+            .map(|display| {
+                let row = &view.queue[display.queue];
+                let mut row = Row {
+                    number: row.number.to_string(),
+                    label: row.attribution.label().to_string(),
+                    speech_seconds: row.speech_seconds,
+                    similarity: match row.attribution {
+                        // A guess carries its machine similarity like an identification: the pane
+                        // shows the number, and the `[guess]` tag beside it says the cut was the
+                        // wider one rather than a lower number pretending to be a tighter one.
+                        Attribution::Identified { similarity, .. }
+                        | Attribution::Tentative { similarity, .. } => Some(*similarity),
+                        Attribution::Unknown(_) | Attribution::Assigned { .. } => None,
+                    },
+                    below_floor: row.below_floor,
+                    mark: self.decided.get(row.number).copied(),
+                    guess: matches!(row.attribution, Attribution::Tentative { .. }),
+                    in_group: self.group.contains(row.number),
+                    current: row.number == view.number,
+                    fragments: None,
+                };
+                if let Some(group) = display.bundle {
+                    // Counted against the attributions the queue carries now rather than the
+                    // bundle's static membership, so the number says what answering would
+                    // commit: the members still reading as unnamed, and their talk time with
+                    // them. A denial reads back as unnamed from this side and counts one too
+                    // high; the run's fan-out skips settled members, so the write stays right.
+                    let live: Vec<_> = group
+                        .members
+                        .iter()
+                        .filter_map(|handle| {
+                            view.queue
+                                .iter()
+                                .find(|queued| queued.number == handle.as_str())
+                        })
+                        .filter(|queued| matches!(queued.attribution, Attribution::Unknown(_)))
+                        .collect();
+                    row.fragments = Some(live.len());
+                    row.speech_seconds = live.iter().map(|queued| queued.speech_seconds).sum();
+                    // "most like Ivan" rides the label/similarity pair the ordinary rows use,
+                    // so the composite borrows their styling rather than inventing its own.
+                    match &group.best {
+                        Some(best) => {
+                            row.label = format!("most like {}", best.name);
+                            row.similarity = Some(best.similarity);
+                        }
+                        None => {
+                            row.label.clear();
+                            row.similarity = None;
+                        }
+                    }
+                }
+                row
             })
             .collect();
 
@@ -817,17 +1060,28 @@ impl Screen {
         // takes `&mut self` and this borrow has to survive to the `View` below beside the
         // shared borrows `filter` and `status` take -- a `&mut self` method cannot share its
         // receiver with them, but the field can.
+        // One preview owns the pane: a bundle question previews the fan-out, a staged group
+        // previews the group commit, and the two never stand together -- staging is refused
+        // while a bundle is open, and each door routes its keys to its own preview first.
         let mut group: Option<&GroupConsequence> = None;
-        if !self.group.is_empty()
-            && let Some(name) = highlighted.as_deref()
-        {
-            let members = self.group_handles(view);
-            if !self.groups.contains_key(name) {
-                let handles: Vec<&str> = members.iter().map(String::as_str).collect();
-                self.groups
-                    .insert(name.to_string(), costs.group_of(name, &handles));
+        let mut bundle: Option<&GroupConsequence> = None;
+        if let Some(name) = highlighted.as_deref() {
+            if let Some(members) = self.bundle.as_ref() {
+                if !self.groups.contains_key(name) {
+                    let handles: Vec<&str> = members.iter().map(String::as_str).collect();
+                    self.groups
+                        .insert(name.to_string(), costs.fragment_group_of(name, &handles));
+                }
+                bundle = self.groups[name].as_ref();
+            } else if !self.group.is_empty() {
+                let members = self.group_handles(view);
+                if !self.groups.contains_key(name) {
+                    let handles: Vec<&str> = members.iter().map(String::as_str).collect();
+                    self.groups
+                        .insert(name.to_string(), costs.group_of(name, &handles));
+                }
+                group = self.groups[name].as_ref();
             }
-            group = self.groups[name].as_ref();
         }
         let candidates = names
             .iter()
@@ -860,6 +1114,7 @@ impl Screen {
             assertion,
             who: who(context, highlighted.as_deref()),
             group,
+            bundle,
             snippets: view.snippets,
             snippet: self.selected_index(view),
             clip_is_empty: view.clip_is_empty,
@@ -969,13 +1224,61 @@ impl Screen {
         self.group.clear();
         Step::Answered(Answer::Group { name, members })
     }
+
+    /// What committing the bundle with one name would do, computed at most once per name per
+    /// question.
+    ///
+    /// Shares the memo [`Self::group_cost`] keeps for the reason the field doc gives: within
+    /// any question at most one of the two doors is consulted, and the memo clears on every
+    /// arrival, so a name keyed by one door never answers the other's question.
+    fn bundle_cost(
+        &mut self,
+        name: &str,
+        members: &[String],
+        costs: &dyn Costs,
+    ) -> &Option<GroupConsequence> {
+        if !self.groups.contains_key(name) {
+            let handles: Vec<&str> = members.iter().map(String::as_str).collect();
+            let bundle = costs.fragment_group_of(name, &handles);
+            self.groups.insert(name.to_string(), bundle);
+        }
+        &self.groups[name]
+    }
+
+    /// What answering the bundle with one name does -- or whether it may not.
+    ///
+    /// The mirror of [`Self::commit_group`] through the bundle door: the deciding fact is the
+    /// bundle preview's applied list rather than the single-voice refusal, because a candidate
+    /// the run vetoes for the anchor keeps the anchor out of `applied`, and there is no insist
+    /// channel that reaches it -- [`Event::Anyway`] refuses the bundle outright, honouring every
+    /// per-member refusal the way the library's fan-out does.
+    fn commit_bundle(
+        &mut self,
+        view: &VoiceView<'_>,
+        name: String,
+        members: Vec<String>,
+        costs: &dyn Costs,
+    ) -> Step {
+        let proceeds = self
+            .bundle_cost(&name, &members, costs)
+            .as_ref()
+            .is_some_and(|bundle| bundle.applied.iter().any(|handle| handle == view.number));
+        if !proceeds {
+            return Step::Waiting;
+        }
+        self.decided.insert(view.number.to_string(), Mark::Answered);
+        // One confirmation is one fan-out: consume the bundle rather than leave it standing on
+        // the next question, where its members may have settled behind it.
+        self.bundle = None;
+        Step::Answered(Answer::FragmentGroup { name, members })
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::Cell;
 
-    use meethook_enroll::{Answer, Assertion, Position, Queued, Snippet};
+    use meethook_enroll::{Answer, Assertion, FragmentGroup, Position, Queued, Snippet};
     use meethook_session::SessionId;
     use meethook_transcribe::{Attribution, Resemblance};
 
@@ -997,6 +1300,10 @@ pub(crate) mod tests {
         fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
             None
         }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
     }
 
     /// One named candidate is refused, everything else is free.
@@ -1014,6 +1321,10 @@ pub(crate) mod tests {
         }
 
         fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
             None
         }
     }
@@ -1040,6 +1351,10 @@ pub(crate) mod tests {
         fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
             None
         }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
     }
 
     /// One named candidate is refused for taking a name off another voice, which is the only
@@ -1062,6 +1377,10 @@ pub(crate) mod tests {
         fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
             None
         }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
     }
 
     /// Counts calls, which is the only way AC #9 is assertable: "once per highlighted candidate"
@@ -1081,6 +1400,10 @@ pub(crate) mod tests {
 
         fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
             self.1.set(self.1.get() + 1);
+            None
+        }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
             None
         }
     }
@@ -1119,6 +1442,10 @@ pub(crate) mod tests {
                 stale: Vec::new(),
             })
         }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
     }
 
     /// [`Groups`]'s counterpart where the group's dry run refuses every member: the anchor is
@@ -1143,6 +1470,84 @@ pub(crate) mod tests {
                     meethook_enroll::Refusal::Taken {
                         voice: "Unknown 2".to_string(),
                         losing: "Bob".to_string(),
+                    },
+                )],
+                vetoes_overridden: 0,
+                references_after: 0,
+                displaced: Vec::new(),
+                stale: Vec::new(),
+            })
+        }
+
+        fn fragment_group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
+    }
+
+    /// [`Groups`] through the bundle door: the highlighted candidate previews the fan-out, and
+    /// every member lands in `applied`, so a name nothing refuses commits the whole bundle on
+    /// Enter rather than naming one fragment of it.
+    struct Bundles;
+
+    impl Costs for Bundles {
+        fn of(&self, name: &str) -> Cost {
+            Cost {
+                refusal: None,
+                summary: vec![format!("would enrol {name} from this voice")],
+                assertion: None,
+            }
+        }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
+
+        fn fragment_group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence> {
+            Some(GroupConsequence {
+                name: name.to_string(),
+                applied: members.iter().map(|member| (*member).to_string()).collect(),
+                refused: Vec::new(),
+                vetoes_overridden: 0,
+                references_after: 1,
+                displaced: Vec::new(),
+                stale: Vec::new(),
+            })
+        }
+    }
+
+    /// [`Bundles`] where the dry run vetoes the anchor: the anchor stays out of `applied`, so
+    /// the gate must hold whichever key is pressed -- the mirror of [`RefusesGroup`] across the
+    /// seam the bundle answer uses, and what keeps the frame from offering a commit the library
+    /// would then refuse.
+    struct VetoesBundle;
+
+    impl Costs for VetoesBundle {
+        fn of(&self, name: &str) -> Cost {
+            Cost {
+                refusal: None,
+                summary: vec![format!("would enrol {name} from this voice")],
+                assertion: None,
+            }
+        }
+
+        fn group_of(&self, _name: &str, _members: &[&str]) -> Option<GroupConsequence> {
+            None
+        }
+
+        fn fragment_group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence> {
+            Some(GroupConsequence {
+                name: name.to_string(),
+                // The vetoed anchor is out of `applied`; the rest of the bundle would still
+                // commit if some other member were the question.
+                applied: members
+                    .iter()
+                    .filter(|member| **member != "Unknown 3")
+                    .map(|member| (*member).to_string())
+                    .collect(),
+                refused: vec![(
+                    "Unknown 3".to_string(),
+                    meethook_enroll::Refusal::Vetoed {
+                        holder: Some("Unknown 4".to_string()),
                     },
                 )],
                 vetoes_overridden: 0,
@@ -1220,7 +1625,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// A question about `number`, with everything else defaulted by the caller's slices.
+    /// A question about `number`, with everything else defaulted by the caller's slices --
+    /// bundles included: a run that does not group fragments carries none across the seam, and
+    /// the bundle tests build their own through [`bundled_view`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn view<'a>(
         session: &'a SessionId,
@@ -1231,6 +1638,35 @@ pub(crate) mod tests {
         resembles: &'a [Resemblance],
         enrolled: &'a [&'a str],
         attribution: &'a Attribution,
+    ) -> VoiceView<'a> {
+        bundled_view(
+            session,
+            number,
+            nth,
+            queue,
+            snippets,
+            resembles,
+            enrolled,
+            attribution,
+            &[],
+            None,
+        )
+    }
+
+    /// The same question carrying the bundles the run built for it: every multi-member bundle
+    /// the quiet tail folded, and -- when the question is one of them -- its live members.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bundled_view<'a>(
+        session: &'a SessionId,
+        number: &'a str,
+        nth: usize,
+        queue: &'a [Queued<'a>],
+        snippets: &'a [Snippet<'a>],
+        resembles: &'a [Resemblance],
+        enrolled: &'a [&'a str],
+        attribution: &'a Attribution,
+        fragment_groups: &'a [FragmentGroup],
+        bundle_members: Option<&'a [String]>,
     ) -> VoiceView<'a> {
         VoiceView {
             session,
@@ -1246,6 +1682,8 @@ pub(crate) mod tests {
             snippets,
             resembles,
             enrolled,
+            fragment_groups,
+            bundle_members,
             clip_is_empty: false,
         }
     }
@@ -2951,6 +3389,10 @@ pub(crate) mod tests {
             self.1.set(self.1.get() + 1);
             self.0.group_of(name, members)
         }
+
+        fn fragment_group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence> {
+            self.0.fragment_group_of(name, members)
+        }
     }
 
     /// Marks are placed while the question is open, so the member set is not constant within
@@ -3169,5 +3611,246 @@ pub(crate) mod tests {
         );
         let derived = screen.view(&voice, &Free, Context::Reading);
         assert_eq!(derived.rows[0].mark, Some(Mark::Answered));
+    }
+
+    /// AC from the drawing side: an open bundle stands as one composite row at its first
+    /// member's position, reporting what answering would commit -- the count, the total talk
+    /// time and the resemblance -- rather than any single fragment's numbers, and the members
+    /// behind it are hidden rather than rendered as their own rows.
+    #[test]
+    fn an_open_bundle_folds_into_one_composite_row() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 240.0, false),
+            ("Unknown 2", 95.0, false),
+            ("Unknown 3", 1.5, true),
+            ("Unknown 4", 0.9, true),
+            ("Unknown 5", 2.0, true),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Ivan", 0.71, 1)]);
+        let enrolled = ["Ivan"];
+        let members = vec![
+            "Unknown 3".to_string(),
+            "Unknown 4".to_string(),
+            "Unknown 5".to_string(),
+        ];
+        let groups = [FragmentGroup {
+            members: members.clone(),
+            speech_seconds: 4.4,
+            best: Some(Resemblance {
+                name: "Ivan".to_string(),
+                similarity: 0.71,
+                references: 1,
+            }),
+        }];
+        let voice = bundled_view(
+            &session,
+            "Unknown 3",
+            3,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[2].1,
+            &groups,
+            Some(&members),
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let derived = screen.view(&voice, &Free, Context::Reading);
+
+        // Five voices render as three rows: the two above-floor ones, and the bundle collapsed
+        // into its first member.
+        assert_eq!(
+            derived.rows.len(),
+            3,
+            "the fold hides the members behind their composite"
+        );
+        let composite = &derived.rows[2];
+        assert_eq!(composite.number, "Unknown 3");
+        assert_eq!(composite.fragments, Some(3));
+        assert!((composite.speech_seconds - 4.4).abs() < f64::EPSILON);
+        assert_eq!(composite.label, "most like Ivan");
+        assert_eq!(composite.similarity, Some(0.71));
+        // The hidden members do not stand as rows of their own.
+        assert!(derived.rows.iter().all(|row| row.number != "Unknown 4"));
+        assert!(derived.rows.iter().all(|row| row.number != "Unknown 5"));
+    }
+
+    /// A bundle carries no veto authority and no subset door either: while the question covers
+    /// several fragments, marking one of them apart from the rest would answer a question the
+    /// run does not ask, so the mark is refused rather than staged.
+    #[test]
+    fn marking_is_refused_while_a_bundle_question_is_open() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 240.0, false),
+            ("Unknown 2", 95.0, false),
+            ("Unknown 3", 1.5, true),
+            ("Unknown 4", 0.9, true),
+            ("Unknown 5", 2.0, true),
+        ]);
+        let queue = queue(&owned);
+        let members = vec![
+            "Unknown 3".to_string(),
+            "Unknown 4".to_string(),
+            "Unknown 5".to_string(),
+        ];
+        let groups = [FragmentGroup {
+            members: members.clone(),
+            speech_seconds: 4.4,
+            best: None,
+        }];
+        let voice = bundled_view(
+            &session,
+            "Unknown 3",
+            3,
+            &queue,
+            &[],
+            &[],
+            &[],
+            &owned[2].1,
+            &groups,
+            Some(&members),
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+
+        assert_eq!(screen.answer(&voice, Event::Mark, &Free), Step::Waiting);
+        assert!(
+            screen.group.is_empty(),
+            "no subset of an open bundle may be staged"
+        );
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert!(
+            derived.status.unwrap_or_default().contains("one question"),
+            "the refusal is on the frame: {:?}",
+            derived.status
+        );
+    }
+
+    /// Choosing a name on an open bundle commits the whole fan-out, not the anchor alone: the
+    /// answer the state machine hands back names every member the preview applied, which is what
+    /// keeps the frame and the library's walk from disagreeing about who got named.
+    #[test]
+    fn choosing_a_name_on_an_open_bundle_commits_the_whole_fan_out() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 240.0, false),
+            ("Unknown 2", 95.0, false),
+            ("Unknown 3", 1.5, true),
+            ("Unknown 4", 0.9, true),
+            ("Unknown 5", 2.0, true),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Ivan", 0.71, 1)]);
+        let enrolled = ["Ivan"];
+        let members = vec![
+            "Unknown 3".to_string(),
+            "Unknown 4".to_string(),
+            "Unknown 5".to_string(),
+        ];
+        let groups = [FragmentGroup {
+            members: members.clone(),
+            speech_seconds: 4.4,
+            best: Some(Resemblance {
+                name: "Ivan".to_string(),
+                similarity: 0.71,
+                references: 1,
+            }),
+        }];
+        let voice = bundled_view(
+            &session,
+            "Unknown 3",
+            3,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[2].1,
+            &groups,
+            Some(&members),
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let bundles = Bundles;
+
+        assert_eq!(
+            screen.answer(&voice, Event::Choose, &bundles),
+            Step::Answered(Answer::FragmentGroup {
+                name: "Ivan".to_string(),
+                members: vec![
+                    "Unknown 3".to_string(),
+                    "Unknown 4".to_string(),
+                    "Unknown 5".to_string(),
+                ],
+            })
+        );
+        assert!(
+            screen.bundle.is_none(),
+            "one confirmation is one fan-out: the bundle is consumed"
+        );
+        let derived = screen.view(&voice, &bundles, Context::Reading);
+        assert_eq!(derived.rows[2].mark, Some(Mark::Answered));
+    }
+
+    /// The mirror of [`RefusesGroup`] across the bundle seam: a dry run that vetoes the anchor
+    /// leaves it out of `applied`, and there is no insist channel that reaches a bundle, so the
+    /// gate holds whichever key is pressed and nothing is marked or committed.
+    #[test]
+    fn a_vetoed_anchor_holds_the_bundle_gate() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 240.0, false),
+            ("Unknown 2", 95.0, false),
+            ("Unknown 3", 1.5, true),
+            ("Unknown 4", 0.9, true),
+            ("Unknown 5", 2.0, true),
+        ]);
+        let queue = queue(&owned);
+        let similar = resembles(&[("Ivan", 0.71, 1)]);
+        let enrolled = ["Ivan"];
+        let members = vec![
+            "Unknown 3".to_string(),
+            "Unknown 4".to_string(),
+            "Unknown 5".to_string(),
+        ];
+        let groups = [FragmentGroup {
+            members: members.clone(),
+            speech_seconds: 4.4,
+            best: Some(Resemblance {
+                name: "Ivan".to_string(),
+                similarity: 0.71,
+                references: 1,
+            }),
+        }];
+        let voice = bundled_view(
+            &session,
+            "Unknown 3",
+            3,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[2].1,
+            &groups,
+            Some(&members),
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let vetoes = VetoesBundle;
+
+        for key in [Event::Choose, Event::Anyway] {
+            assert_eq!(screen.answer(&voice, key, &vetoes), Step::Waiting);
+        }
+        assert!(
+            screen.bundle.is_some(),
+            "the vetoed bundle stays open to be asked again"
+        );
+        assert!(
+            !screen.decided.contains_key("Unknown 3"),
+            "nothing was marked answered"
+        );
     }
 }

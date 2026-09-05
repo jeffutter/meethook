@@ -14,11 +14,13 @@ use meethook_session::{
     TranscriptContext, unknown_labels,
 };
 use meethook_transcribe::{
-    Attribution, Naming, attributions, heard_at_once, identify_clusters, rank_enrolled,
-    read_track_16k_mono, resolve_denials, speaker_offset_seconds, tentative_identifications,
+    Attribution, Naming, Resemblance, attributions, heard_at_once, identify_clusters,
+    rank_enrolled, read_track_16k_mono, resolve_denials, speaker_offset_seconds,
+    tentative_identifications,
 };
 
 use crate::consequence::{Demotion, Preview, Refusal, handle};
+use crate::groups::{FragmentGroup, fragment_groups};
 use crate::interview::{Answer, Interviewer, MeetingLabel};
 use crate::narration::{
     self, AnswerNote, Narrator, PassedOver, SessionFile, SessionNote, about, after,
@@ -27,10 +29,38 @@ use crate::prompt::{Voice, clip_for, snippets_for};
 use crate::queue::{
     PROMPT_FLOOR_SECONDS, Position, Queued, Selection, at_timestamp, queue, targeted,
 };
-use crate::{EnrollReport, EnrollRules, Outcome, Result};
+use crate::{EnrollReport, EnrollRules, Enrolment, Outcome, Result};
 
 #[cfg(doc)]
 use crate::{forget, references};
+
+/// One question the pass asks about: one voice, or a bundle of below-floor fragments asked
+/// about together.
+///
+/// The pass walks questions rather than voices so that an answerer which accepts fragment
+/// bundles gets one question per bundle instead of one per fragment, and every arm of the walk
+/// acts over the question's members rather than a single cluster. An answerer that does not
+/// accept bundles gets only [`Question::Solo`], which is byte for byte the walk this module
+/// used to be.
+#[derive(Clone)]
+enum Question<'c> {
+    /// One voice, asked about the ordinary way.
+    Solo(&'c SpeakerCluster),
+    /// A bundle of below-floor fragments asked about together. Two or more members by
+    /// construction, in queue order; answering it names every member still open.
+    Group(Vec<&'c SpeakerCluster>),
+}
+
+impl<'c> Question<'c> {
+    /// The members in queue order. A solo is a one-element view of itself, so the arms never
+    /// special-case the shape.
+    fn members(&self) -> &[&'c SpeakerCluster] {
+        match self {
+            Question::Solo(cluster) => std::slice::from_ref(cluster),
+            Question::Group(members) => members,
+        }
+    }
+}
 
 /// Asks about every unresolved voice in one session, writing after each accepted name.
 ///
@@ -285,17 +315,60 @@ pub(crate) fn enroll_session(
     // legitimately be one the database had already named.
     let baseline = shown.clone();
 
-    // The total every prompt below carries. Read off the same list the session line counted
-    // one call ago, so the two cannot drift apart.
-    let of = offered.len();
+    // Bundles, if this run groups them at all. The assertion stands in for the queue and its
+    // gates alike, so no; and a run that stores references for sub-floor answers would be
+    // naming nine fragments as one person against the poisoned-reference risk the enrolment
+    // floor exists to prevent, so no there either -- the commit enforces the same gate.
+    let bundles: Vec<Vec<u32>> = if assertion.is_none()
+        && rules.enrolment == Enrolment::AboveTheFloor
+        && interviewer.accepts_fragment_groups()
+    {
+        fragment_groups(&order, &shown, &denied)
+    } else {
+        Vec::new()
+    };
+    let bundle_of: BTreeMap<u32, usize> = bundles
+        .iter()
+        .enumerate()
+        .flat_map(|(bundle, members)| members.iter().map(move |&id| (id, bundle)))
+        .collect();
 
-    // The queue, numbered once. `nth` travels with the voice from here on rather than being
-    // counted per pass, which is what makes a deferred voice come back as the same question --
-    // see [`Position`].
-    let mut pending: Vec<(usize, &SpeakerCluster)> = offered
+    // The queue, folded into questions and numbered once. A multi-member bundle becomes one
+    // [`Question::Group`] at the position of its first offered member, emitted exactly once:
+    // the later members of the same bundle are not skipped questions, they are the question.
+    // Singletons and everything above the floor stay [`Question::Solo`], which is the whole of
+    // the change for an answerer that does not accept bundles -- `bundles` is empty and the
+    // fold below is the identity.
+    //
+    // `nth` travels with the question from here on rather than being counted per pass, which
+    // is what makes a deferred question come back as the same question -- see [`Position`].
+    let mut questions: Vec<Question<'_>> = Vec::new();
+    let mut emitted: BTreeSet<usize> = BTreeSet::new();
+    for cluster in offered.iter().copied() {
+        if let Some(&bundle) = bundle_of.get(&cluster.id) {
+            let members: Vec<&SpeakerCluster> = bundles[bundle]
+                .iter()
+                .filter_map(|&id| offered.iter().find(|c| c.id == id).copied())
+                .collect();
+            if members.len() > 1 {
+                if !emitted.contains(&bundle) {
+                    emitted.insert(bundle);
+                    questions.push(Question::Group(members));
+                }
+                continue;
+            }
+        }
+        questions.push(Question::Solo(cluster));
+    }
+
+    // The total every prompt below carries: the number of *questions*, read off the same list
+    // the walk about to start will take, so the two cannot drift apart. In a run that does not
+    // group fragments it is the voice count the session line announced, exactly as before.
+    let of = questions.len();
+    let mut pending: Vec<(usize, Question<'_>)> = questions
         .into_iter()
         .enumerate()
-        .map(|(index, cluster)| (index + 1, cluster))
+        .map(|(index, question)| (index + 1, question))
         .collect();
 
     // Assertion-mode bookkeeping. `committed` is every voice this run has put a name on so far,
@@ -313,40 +386,51 @@ pub(crate) fn enroll_session(
     // again on the next one.
     loop {
         let asked = pending.len();
-        let mut deferred: Vec<(usize, &SpeakerCluster)> = Vec::new();
+        let mut deferred: Vec<(usize, Question<'_>)> = Vec::new();
 
         // Iterated by reference rather than consumed, because [`Answer::Leave`] has to reach the
-        // tail of the queue -- the voices this pass has not asked about yet -- from inside the
-        // body, and a consuming `for` has thrown them away by then. `(usize, &SpeakerCluster)` is
-        // `Copy`, so the pattern costs nothing, and nothing in the body mutates `pending`: it is
-        // reassigned only below the loop.
-        for (index, &(nth, cluster)) in pending.iter().enumerate() {
-            // A voice an answer given earlier in this run has already put a name to: clustering
-            // that split one person in two must not ask about them twice. Only an in-run answer
-            // can have moved a label since `baseline` was taken, so "named, and not the name it
-            // had when we queued it" is exactly that case and nothing else. The `is_named()`
-            // half matters as much: an in-run answer can also *un*-name a voice -- re-anchoring a
-            // reference to another cluster drops this one back to its "Unknown N" -- and that is a
-            // question this run created and has not answered.
+        // tail of the queue -- the questions this pass has not asked about yet -- from inside the
+        // body, and a consuming `for` has thrown them away by then. Nothing in the body mutates
+        // `pending`: it is reassigned only below the loop.
+        for (index, (nth, question)) in pending.iter().enumerate() {
+            // The members still open. A member an answer given earlier in this run has already
+            // put a name to is out of the question: clustering that split one person in two must
+            // not ask about them twice. Only an in-run answer can have moved a label since
+            // `baseline` was taken, so "named, and not the name it had when we queued it" is
+            // exactly that case and nothing else. The `is_named()` half matters as much: an
+            // in-run answer can also *un*-name a voice -- re-anchoring a reference to another
+            // cluster drops this one back to its "Unknown N" -- and that is a question this run
+            // created and has not answered.
             //
-            // This `continue` is the one place a [`Position`] skips a number, and it is skipped
-            // rather than compressed on purpose: the voice really was in the queue and really is
-            // now answered, so the gap says work disappeared and the end came closer.
+            // Or a member this run has committed through any door: a group member re-named
+            // identically to what it read when the queue was built (shown == baseline) is
+            // answered too, and only `committed` says so.
             //
             // Never under an assertion: there, the first commit lands the asserted name on
             // every voice at once, and reading that as "already answered" would skip the rest
             // of the track -- the opposite of what the assertion asks. Each voice still needs
             // its own row and its own reference offer, so the walk commits all of them.
             //
-            // Or a voice this run has committed through any door: a group member re-named
-            // identically to what it read when the queue was built (shown == baseline) is
-            // answered too, and only `committed` says so.
-            if assertion.is_none()
-                && (shown[&cluster.id].is_named() && shown[&cluster.id] != baseline[&cluster.id]
-                    || committed.iter().any(|done| done.id == cluster.id))
-            {
+            // A bundle whose members are all settled is a question with nothing left in it:
+            // skipped rather than compressed, the way a settled solo is, so the gap says work
+            // disappeared and the end came closer.
+            let live: Vec<&SpeakerCluster> = question
+                .members()
+                .iter()
+                .copied()
+                .filter(|c| {
+                    !(assertion.is_none()
+                        && (shown[&c.id].is_named() && shown[&c.id] != baseline[&c.id]
+                            || committed.iter().any(|done| done.id == c.id)))
+                })
+                .collect();
+            if live.is_empty() {
                 continue;
             }
+            // The anchor: the first member still open. It carries the question's number, label,
+            // preview and clip identity, which is what makes a bundle read like one voice with
+            // several lines behind it rather than a new kind of prompt.
+            let anchor = live[0];
 
             // Under the assertion there is no question at all: the assertion is the answer for
             // every voice, which is what makes the run prompt-free -- so the seam is not reached
@@ -360,11 +444,18 @@ pub(crate) fn enroll_session(
                 // Scoped so the borrows of `transcript` and `shown` inside the voice end before
                 // the answer is acted on.
                 let answer = {
-                    let attribution = &shown[&cluster.id];
-                    // Keyed on the cluster, not on the label text: under `--correct` two voices can
+                    let attribution = &shown[&anchor.id];
+                    // Keyed on the anchor, not on the label text: under `--correct` two voices can
                     // sit under one enrolled name -- which is the false accept being corrected -- and
-                    // a prompt showing the other person's lines cannot be answered.
-                    let snippets = snippets_for(&transcript, cluster.id, snippet_track, offset);
+                    // a prompt showing the other person's lines cannot be answered. A bundle shows
+                    // every member's lines behind the anchor's number, in queue order.
+                    let snippets = if live.len() > 1 {
+                        live.iter()
+                            .flat_map(|c| snippets_for(&transcript, c.id, snippet_track, offset))
+                            .collect()
+                    } else {
+                        snippets_for(&transcript, anchor.id, snippet_track, offset)
+                    };
 
                     // Every voice in the session, built here and now rather than once above the
                     // loop, for the reason `Voice::queue` gives and because the borrow checker
@@ -388,35 +479,79 @@ pub(crate) fn enroll_session(
 
                     // Computed eagerly for every voice, including on the `--name` path where nothing
                     // reads it, and deliberately not deferred behind a closure: two dozen people at
-                    // 256 dimensions is a few thousand multiply-adds, against a run that has already
+                    // 256 dimensions are a few thousand multiply-adds, against a run that has already
                     // read and resampled the whole speaker track a few lines above. An owned `Vec`
                     // rather than a borrow of the database, so the reborrow ends here and nothing
                     // downstream -- least of all an `Interviewer` -- has to reason about the write
-                    // that replaces `speakers` once this answer is accepted.
+                    // that replaces `speakers` once this answer is accepted. A bundle ranks its
+                    // members together: one person appears once, scored at their nearest member,
+                    // which is what "most like Ivan" on the composite row means.
+                    let resembles = if live.len() > 1 {
+                        merge_rankings(
+                            live.iter()
+                                .map(|c| rank_enrolled(&c.embedding, speakers))
+                                .collect(),
+                        )
+                    } else {
+                        rank_enrolled(&anchor.embedding, speakers)
+                    };
+                    // The bundles as this question sees them: built once when the queue was built,
+                    // projected now. Empty for an answerer that does not accept them, which is
+                    // also what keeps a headless run's output byte for byte what it used to be.
+                    let fragment_groups = project_bundles(&bundles, &order, &unknown, speakers);
+                    // The members this question covers, or `None` for a solo: the frame answers
+                    // the bundle with these handles rather than re-deriving membership from rows
+                    // whose attributions move as the run names voices.
+                    let bundle_members = (live.len() > 1)
+                        .then(|| live.iter().map(|c| unknown[&c.id].clone()).collect());
+                    // A bundle plays its longest fragment: the members are near-duplicates of one
+                    // voice, and nine clips in a row is nine times the listening for one answer.
+                    // Every cluster carries at least one representative, so `first` here is only
+                    // there to keep the comparison total.
+                    let clip_member = if live.len() > 1 {
+                        live.iter()
+                            .max_by(|a, b| {
+                                let seconds = |c: &&SpeakerCluster| {
+                                    c.representatives
+                                        .first()
+                                        .map_or(0.0, |segment| segment.seconds())
+                                };
+                                seconds(a).total_cmp(&seconds(b))
+                            })
+                            .copied()
+                            .unwrap_or(anchor)
+                    } else {
+                        anchor
+                    };
                     interviewer.identify(&Voice {
                         session: &session.id,
                         meeting: meeting.as_ref(),
-                        position: Position { nth, of },
+                        position: Position { nth: *nth, of },
                         attribution,
-                        number: &unknown[&cluster.id],
-                        speech_seconds: cluster.speech_seconds,
+                        number: &unknown[&anchor.id],
+                        speech_seconds: live.iter().map(|c| c.speech_seconds).sum::<f64>(),
                         queue: &rows,
                         snippets,
-                        clip: clip_for(&track, cluster),
-                        resembles: rank_enrolled(&cluster.embedding, speakers),
+                        clip: clip_for(&track, clip_member),
+                        resembles,
                         // The universe `resolve()` requires, and not the ranking above -- see
                         // `Voice::enrolled`. Owned borrows, like `resembles`, so the reborrow of
                         // the database ends with this block.
                         enrolled: speakers.enrolled_names(),
+                        fragment_groups,
+                        bundle_members,
                         // Six borrows and no work: what an answer would do is computed only if the
                         // answerer asks. Nothing is written by asking, so this is safe to hand out
-                        // even though it holds the database -- see `Voice::preview`.
+                        // even though it holds the database -- see `Voice::preview`. One preview
+                        // serves the whole bundle: every member's naming is refused identically
+                        // except at the veto, which the frame reads off the bundle preview rather
+                        // than this field.
                         preview: Preview::new(
                             &clusters.clusters,
                             &unknown,
                             speakers,
                             &assigned,
-                            cluster,
+                            anchor,
                             rules.enrolment,
                             None,
                             &committed[..],
@@ -433,7 +568,7 @@ pub(crate) fn enroll_session(
                         if raw.is_empty() {
                             // A name of nothing but spaces is the question going unanswered, the
                             // same way a blank typed answer is: counted, and nothing written.
-                            left_unanswered(std::iter::once(cluster), &shown, &baseline, report);
+                            left_unanswered(std::iter::once(anchor), &shown, &baseline, report);
                             continue;
                         }
                         if metadata.one_remote_speaker.as_deref() != Some(raw) {
@@ -457,12 +592,16 @@ pub(crate) fn enroll_session(
                         // up again on the next pass -- so both doors into this mode land the
                         // same state.
                         for c in order.iter() {
-                            if c.id != cluster.id
+                            if c.id != anchor.id
                                 && !committed.iter().any(|done| done.id == c.id)
-                                && !pending.iter().any(|&(_, queued)| queued.id == c.id)
-                                && !deferred.iter().any(|&(_, held)| held.id == c.id)
+                                && !pending.iter().any(|(_, queued)| {
+                                    queued.members().iter().any(|m| m.id == c.id)
+                                })
+                                && !deferred
+                                    .iter()
+                                    .any(|(_, held)| held.members().iter().any(|m| m.id == c.id))
                             {
-                                deferred.push((0, c));
+                                deferred.push((0, Question::Solo(c)));
                             }
                         }
                         Answer::Named {
@@ -502,29 +641,70 @@ pub(crate) fn enroll_session(
                 // write already happened per accepted name, and there is nothing between here and
                 // the end of the function, so nothing is skipped by going early.
                 Answer::Leave => {
-                    let rest = std::iter::once(cluster)
-                        .chain(pending[index + 1..].iter().map(|&(_, c)| c))
-                        .chain(deferred.iter().map(|&(_, c)| c));
+                    let rest = live
+                        .iter()
+                        .copied()
+                        .chain(
+                            pending[index + 1..]
+                                .iter()
+                                .flat_map(|(_, q)| q.members().iter().copied()),
+                        )
+                        .chain(
+                            deferred
+                                .iter()
+                                .flat_map(|(_, q)| q.members().iter().copied()),
+                        );
                     let left = left_unanswered(rest, &shown, &baseline, report);
                     about(notes, &session.id, SessionNote::Left { left })?;
                     return Ok(Outcome::Finished);
                 }
                 Answer::Skip => {
-                    left_unanswered(std::iter::once(cluster), &shown, &baseline, report);
+                    left_unanswered(live.iter().copied(), &shown, &baseline, report);
                     continue;
                 }
                 // Back into the queue with the number it already has, and counted as nothing:
                 // it has not been answered yet. The pass that finds nobody willing to answer is
                 // where these turn into skips -- see the fixed point below.
                 Answer::Later => {
-                    deferred.push((nth, cluster));
+                    deferred.push((*nth, question.clone()));
                     continue;
                 }
                 // One voice through the dry run and the fixed-order writes, exactly as before:
                 // no forcing, so a preview and a write see it identically. `continue` rather
                 // than falling through because every arm of this match now acts and moves on,
                 // and the body of the pass ends right here.
+                //
+                // On a bundled question the name lands on every member still open, walked with
+                // no veto authority: naming the bundle is not the user's act of staging these
+                // rows as one person, so the heard-at-once veto is honoured per member rather
+                // than overridden, exactly as [`Answer::FragmentGroup`] does. `anyway` is
+                // ignored there for the same reason a group never pays a third party's name.
                 Answer::Named { name, anyway } => {
+                    if live.len() > 1 {
+                        commit_group_walk(
+                            &live[..],
+                            name.trim(),
+                            false,
+                            &clusters.clusters,
+                            &unknown,
+                            speakers,
+                            &mut assigned,
+                            &mut transcript,
+                            &mut shown,
+                            &baseline,
+                            &mut committed,
+                            report,
+                            &mut vetoes_overridden,
+                            &mut asserted_voices,
+                            notes,
+                            session,
+                            paths,
+                            &rules,
+                            &metadata,
+                            assertion.as_deref(),
+                        )?;
+                        continue;
+                    }
                     commit_named(
                         &clusters.clusters,
                         &unknown,
@@ -543,7 +723,7 @@ pub(crate) fn enroll_session(
                         &rules,
                         &metadata,
                         assertion.as_deref(),
-                        cluster,
+                        anchor,
                         name,
                         anyway,
                         under_assertion,
@@ -572,7 +752,7 @@ pub(crate) fn enroll_session(
                         &rules,
                         &metadata,
                         assertion.as_deref(),
-                        cluster,
+                        anchor,
                         name,
                     )?;
                     continue;
@@ -592,73 +772,39 @@ pub(crate) fn enroll_session(
                     let members =
                         resolve_group_members(&clusters.clusters, &unknown, &group_name, &members);
                     match members {
-                        // The group is real: walk it in queue order, committing each member
-                        // through the same path a single naming uses. One context for the whole
-                        // walk rather than one per member, since nothing between members touches
-                        // the files the context borrows.
+                        // The group is real: walk it through the shared walk in queue order,
+                        // committing each member through the same path a single naming uses,
+                        // with the authority only a staged group carries.
                         Some(resolved) => {
                             // Veto authority iff the group names two or more voices: one member
                             // is a plain naming, and the veto refuses it exactly as today.
-                            let authority = resolved.len() >= 2;
-                            // The declared members committed so far, keyed to the group's name:
-                            // the forced tier each member's dry run honours, grown as members
-                            // land and shrunken back when one is refused -- the fold
-                            // `Preview::group` applies, mirrored here so the two agree.
-                            let mut forced: BTreeMap<u32, String> = BTreeMap::new();
-                            for member in &resolved {
-                                // Answered earlier in this run, by any door: counted then, not
-                                // committed again -- and not inserted into the forced set,
-                                // because the tier claims the voice reads the group's name, and
-                                // a voice committed under another name does not.
-                                if committed.iter().any(|done| done.id == member.id) {
-                                    continue;
-                                }
-                                if authority {
-                                    forced.insert(member.id, group_name.clone());
-                                }
-                                let fref: Option<&BTreeMap<u32, String>> =
-                                    if authority { Some(&forced) } else { None };
-                                let outcome = commit_named(
-                                    &clusters.clusters,
-                                    &unknown,
-                                    speakers,
-                                    &mut assigned,
-                                    &mut transcript,
-                                    &mut shown,
-                                    &baseline,
-                                    &mut committed,
-                                    report,
-                                    &mut vetoes_overridden,
-                                    &mut asserted_voices,
-                                    notes,
-                                    session,
-                                    paths,
-                                    &rules,
-                                    &metadata,
-                                    assertion.as_deref(),
-                                    member,
-                                    group_name.clone(),
-                                    false,
-                                    false,
-                                    fref,
-                                )?;
-                                // A refused member is not committed, so it stops being a
-                                // declared holder for the members after it -- the state the run
-                                // actually reaches, and the one the next member previews against.
-                                if authority && !matches!(outcome, CommitOutcome::Committed) {
-                                    forced.remove(&member.id);
-                                }
-                            }
+                            commit_group_walk(
+                                &resolved[..],
+                                &group_name,
+                                resolved.len() >= 2,
+                                &clusters.clusters,
+                                &unknown,
+                                speakers,
+                                &mut assigned,
+                                &mut transcript,
+                                &mut shown,
+                                &baseline,
+                                &mut committed,
+                                report,
+                                &mut vetoes_overridden,
+                                &mut asserted_voices,
+                                notes,
+                                session,
+                                paths,
+                                &rules,
+                                &metadata,
+                                assertion.as_deref(),
+                            )?;
                             // The voice the answer was given on, if the group did not name it:
                             // asked, went unanswered, counted the way every other unanswered
                             // voice is -- the group walked its members, not the anchor.
-                            if !resolved.iter().any(|m| m.id == cluster.id) {
-                                left_unanswered(
-                                    std::iter::once(cluster),
-                                    &shown,
-                                    &baseline,
-                                    report,
-                                );
+                            if !resolved.iter().any(|m| m.id == anchor.id) {
+                                left_unanswered(std::iter::once(anchor), &shown, &baseline, report);
                             }
                         }
                         // A group that cannot say who its members are -- a blank name, an empty
@@ -666,7 +812,57 @@ pub(crate) fn enroll_session(
                         // partially answered: the blank-name precedent reached with a different
                         // input, counted the way every other unanswered voice is.
                         None => {
-                            left_unanswered(std::iter::once(cluster), &shown, &baseline, report);
+                            left_unanswered(std::iter::once(anchor), &shown, &baseline, report);
+                        }
+                    }
+                    continue;
+                }
+                // The library-formed bundle, answered as one question. Walked without veto
+                // authority, for the reason the variant gives: the bundling proposed these
+                // fragments travel together, and honouring that must respect the veto per
+                // member rather than override it -- a fragment heard at once with somebody
+                // already holding the name stays unnamed while the rest of the bundle commits.
+                // Only formed under AboveTheFloor enrolment, which is the safety argument the
+                // variant states; enforced here rather than trusted, because a wrong bundle
+                // under `--force-reference` would poison nine references at once.
+                Answer::FragmentGroup { name, members } => {
+                    debug_assert!(
+                        rules.enrolment == Enrolment::AboveTheFloor,
+                        "a fragment bundle stores no references only under the default enrolment"
+                    );
+                    let group_name = name.trim().to_string();
+                    let members =
+                        resolve_group_members(&clusters.clusters, &unknown, &group_name, &members);
+                    match members {
+                        Some(resolved) => {
+                            commit_group_walk(
+                                &resolved[..],
+                                &group_name,
+                                false,
+                                &clusters.clusters,
+                                &unknown,
+                                speakers,
+                                &mut assigned,
+                                &mut transcript,
+                                &mut shown,
+                                &baseline,
+                                &mut committed,
+                                report,
+                                &mut vetoes_overridden,
+                                &mut asserted_voices,
+                                notes,
+                                session,
+                                paths,
+                                &rules,
+                                &metadata,
+                                assertion.as_deref(),
+                            )?;
+                            if !resolved.iter().any(|m| m.id == anchor.id) {
+                                left_unanswered(std::iter::once(anchor), &shown, &baseline, report);
+                            }
+                        }
+                        None => {
+                            left_unanswered(std::iter::once(anchor), &shown, &baseline, report);
                         }
                     }
                     continue;
@@ -698,7 +894,9 @@ pub(crate) fn enroll_session(
             // turned out to be, counted through the same rule every other unanswered voice goes
             // through so no two of them can disagree about which bucket a named voice is in.
             left_unanswered(
-                deferred.iter().map(|&(_, cluster)| cluster),
+                deferred
+                    .iter()
+                    .flat_map(|(_, question)| question.members().iter().copied()),
                 &shown,
                 &baseline,
                 report,
@@ -1138,6 +1336,162 @@ fn commit_denied<'d, 'm>(
     }
     *shown = now;
     Ok(())
+}
+
+/// The shared walk over a set of members named together with one name: each member through
+/// exactly the commit a single naming uses, in queue order, with the growing forced set the
+/// aggregate preview folds over -- so a preview and a write cannot disagree about sequence or
+/// cost.
+///
+/// `authority` is the one thing the callers decide differently. A staged [`Answer::Group`] of
+/// two or more carries it: the user chose those rows as one person, and a member heard at once
+/// with a holder of the name is named anyway and reported as overridden. A bundled question --
+/// [`Answer::Named`] on a multi-member question, or [`Answer::FragmentGroup`] -- does not: the
+/// bundling proposed the travel, and honouring it respects the veto per member rather than
+/// overriding it. Everything else in the walk is identical, which is why there is one walk.
+///
+/// One context for the whole walk rather than one per member, since nothing between members
+/// touches the files the context borrows; a refused member leaves the running state untouched,
+/// so the members after it commit against the state the run actually reaches.
+#[allow(clippy::too_many_arguments)]
+fn commit_group_walk<'d, 'm>(
+    resolved: &[&'d SpeakerCluster],
+    group_name: &str,
+    authority: bool,
+    clusters: &'d [SpeakerCluster],
+    unknown: &'d BTreeMap<u32, String>,
+    speakers: &'m mut EnrolledSpeakers,
+    assigned: &'m mut SpeakerNames,
+    transcript: &'m mut Transcript,
+    shown: &'m mut BTreeMap<u32, Attribution>,
+    baseline: &'d BTreeMap<u32, Attribution>,
+    committed: &'m mut Vec<&'d SpeakerCluster>,
+    report: &'m mut EnrollReport,
+    vetoes_overridden: &'m mut usize,
+    asserted_voices: &'m mut usize,
+    notes: &'m mut dyn Narrator,
+    session: &'d DiscoveredSession,
+    paths: &'d Paths,
+    rules: &'d EnrollRules<'d>,
+    metadata: &SessionMetadata,
+    assertion: Option<&str>,
+) -> Result<()> {
+    // Trimmed once here rather than in each member's dry run, so the forced map's key and the
+    // names committed agree on the same normalisation.
+    let group_name = group_name.trim();
+    // The declared members committed so far, keyed to the group's name: the forced tier each
+    // member's dry run honours, grown as members land and shrunken back when one is refused --
+    // the fold `Preview::group` applies, mirrored here so the two agree.
+    let mut forced: BTreeMap<u32, String> = BTreeMap::new();
+    for member in resolved {
+        // Answered earlier in this run, by any door: counted then, not committed again -- and
+        // not inserted into the forced set, because the tier claims the voice reads the group's
+        // name, and a voice committed under another name does not.
+        if committed.iter().any(|done| done.id == member.id) {
+            continue;
+        }
+        if authority {
+            forced.insert(member.id, group_name.to_string());
+        }
+        let fref: Option<&BTreeMap<u32, String>> = if authority { Some(&forced) } else { None };
+        let outcome = commit_named(
+            clusters,
+            unknown,
+            speakers,
+            assigned,
+            transcript,
+            shown,
+            baseline,
+            committed,
+            report,
+            vetoes_overridden,
+            asserted_voices,
+            notes,
+            session,
+            paths,
+            rules,
+            metadata,
+            assertion,
+            member,
+            group_name.to_string(),
+            false,
+            false,
+            fref,
+        )?;
+        // A refused member is not committed, so it stops being a declared holder for the
+        // members after it -- the state the run actually reaches, and the one the next member
+        // previews against.
+        if authority && !matches!(outcome, CommitOutcome::Committed) {
+            forced.remove(&member.id);
+        }
+    }
+    Ok(())
+}
+
+/// Ranks several voices against the database as one: a person appears once, scored at their
+/// nearest member, ties broken the way a single ranking breaks them.
+///
+/// The bundle half of what a prompt shows for a bundled question -- `resembles` behind the
+/// anchor's number, and the `best` entry every composite row reports -- and one computation
+/// rather than two because a pane and a prompt disagreeing about who the bundle most like is
+/// would be two answers to the same question.
+fn merge_rankings(rankings: Vec<Vec<Resemblance>>) -> Vec<Resemblance> {
+    // Per person, keep the nearest member's entry: `references` belongs to the person, not the
+    // member, so any member's copy carries the right count.
+    let mut best: BTreeMap<String, Resemblance> = BTreeMap::new();
+    for entry in rankings.into_iter().flatten() {
+        match best.get_mut(&entry.name) {
+            Some(held) if held.similarity >= entry.similarity => {}
+            _ => {
+                best.insert(entry.name.clone(), entry);
+            }
+        }
+    }
+    let mut merged: Vec<Resemblance> = best.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.similarity
+            .total_cmp(&a.similarity)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    merged
+}
+
+/// The bundles as a question sees them: every multi-member bundle, projected to what an
+/// interface can show across the seam.
+///
+/// Computed per question rather than frozen at build time, because `best` is ranked against
+/// the database as it stands now -- a person enrolled earlier in the run is somebody the
+/// bundle most like now -- while the membership and the totals stay as the queue was built, for
+/// the reason the module docs of [`crate::groups`] give: numbers must not move under the
+/// cursor mid-run.
+fn project_bundles(
+    bundles: &[Vec<u32>],
+    order: &[&SpeakerCluster],
+    unknown: &BTreeMap<u32, String>,
+    speakers: &EnrolledSpeakers,
+) -> Vec<FragmentGroup> {
+    bundles
+        .iter()
+        .filter(|members| members.len() > 1)
+        .map(|members| {
+            let cluster_of = |id: u32| order.iter().find(|c| c.id == id).unwrap();
+            FragmentGroup {
+                members: members.iter().map(|&id| unknown[&id].clone()).collect(),
+                speech_seconds: members
+                    .iter()
+                    .map(|&id| cluster_of(id).speech_seconds)
+                    .sum(),
+                best: merge_rankings(
+                    members
+                        .iter()
+                        .map(|&id| rank_enrolled(&cluster_of(id).embedding, speakers))
+                        .collect(),
+                )
+                .into_iter()
+                .next(),
+            }
+        })
+        .collect()
 }
 
 /// Resolves a group's "Unknown N" handles to the clusters they name, deduplicated and sorted

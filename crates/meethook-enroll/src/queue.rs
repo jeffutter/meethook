@@ -94,11 +94,13 @@ pub(crate) const PROMPT_FLOOR_SECONDS: f64 = 5.0;
 ///
 /// Two things it deliberately is not:
 ///
-/// - `of` counts the voices this run *offered for this session*, which is the number the
-///   session line already printed. It is not a run-wide total, because that would mean reading
-///   every session up front, and it does not include the voices held back under
-///   `PROMPT_FLOOR_SECONDS`, which are reported on their own clause and are not questions this
-///   run will ask.
+/// - `of` counts the *questions* this run offers for this session. A bundle of below-floor
+///   fragments asked about together is one question covering several voices, so in a run that
+///   groups them `of` can sit below the voice count the session line announced -- and in a run
+///   that does not group them the two agree, which is every run but the TUI's today. It is not
+///   a run-wide total, because that would mean reading every session up front, and it does not
+///   include the voices held back under `PROMPT_FLOOR_SECONDS`, which are reported on their own
+///   clause and are not questions this run will ask.
 /// - `nth` is the voice's place in that queue, not a tally of the questions actually asked. An
 ///   answer can name a voice further down the queue -- clustering splitting one person in two
 ///   -- and that voice is then passed over, so a number can be skipped: 1/4, 2/4, 4/4. The gap
@@ -331,6 +333,27 @@ pub enum Sessions {
     Every,
 }
 
+/// Whether a voice is settled against the database as it stands right now: it sits below the
+/// prompt floor and the transcript already says something about it -- a standing tentative
+/// guess or a standing denial. See the long comment at its first use in [`queue`] for what
+/// settledness is for and why it is a queue-side computation rather than an attribution
+/// change.
+///
+/// Read with `get` rather than the index the offer uses, because the bundling reaches it with
+/// maps built over subsets of the clusters, where a missing id reads as "nothing said about
+/// it" rather than panicking.
+pub(crate) fn is_settled(
+    cluster: &SpeakerCluster,
+    shown: &BTreeMap<u32, Attribution>,
+    denied: &BTreeSet<u32>,
+) -> bool {
+    cluster.speech_seconds < PROMPT_FLOOR_SECONDS
+        && (shown
+            .get(&cluster.id)
+            .is_some_and(|attribution| matches!(attribution, Attribution::Tentative { .. }))
+            || denied.contains(&cluster.id))
+}
+
 /// The voices one session's run will ask about, in first-appearance order, and the line
 /// saying so -- or `None` for a session with nothing to ask about, which has been reported
 /// and counted.
@@ -370,10 +393,11 @@ pub(crate) fn queue<'c>(
     // The floor check guards the denial arm: a stale-matched denial can resolve to an
     // above-floor cluster after re-clustering, and there it claims nothing -- no guess to
     // suppress, no question to hold back.
-    let settled = |c: &'c SpeakerCluster| {
-        c.speech_seconds < PROMPT_FLOOR_SECONDS
-            && (matches!(shown[&c.id], Attribution::Tentative { .. }) || denied.contains(&c.id))
-    };
+    //
+    // Shared with [`crate::groups`], whose pool is "the quiet tail this offer would still ask
+    // about": spelling the test twice would let the bundling drift from the queue the moment
+    // settledness gains a case.
+    let settled = |c: &'c SpeakerCluster| is_settled(c, shown, denied);
     // The one place "already named" is decided. Everything below -- the floor, the in-run
     // guard, the prompt -- treats a voice the same however it got into this list, which is
     // what lets `--all` and `--correct` compose without either knowing about the other.

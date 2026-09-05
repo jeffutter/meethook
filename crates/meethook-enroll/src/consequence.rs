@@ -441,11 +441,37 @@ impl<'a> Preview<'a> {
         if name.is_empty() || members.is_empty() {
             return None;
         }
+        let resolved = self.resolve_members(members)?;
+        // Veto authority iff the group names two or more voices: one member is a plain
+        // naming, and the veto refuses it exactly as today.
+        Some(self.fold(name, &resolved[..], resolved.len() >= 2))
+    }
 
-        // Resolution and deduplication against the session's own numbering: the handles are
-        // the values of `unknown`, built over every cluster in the session, so quiet members
-        // below the offer floor resolve alike. First-appearance order keeps the deduplication
-        // deterministic; the walk below re-sorts into queue order regardless.
+    /// What naming a library-formed bundle of below-floor fragments with one name would do:
+    /// [`group`](Self::group) without its veto authority.
+    ///
+    /// The authority is the staged group's act -- the user chose those rows as one person, and
+    /// two or more of them may override the heard-at-once veto on that claim. A bundle the
+    /// bundling proposed is not that act, so a member heard at once with somebody already
+    /// holding the name is refused here rather than overridden, and the rest of the fold still
+    /// applies. The write path makes the same choice, which is why both run over this one
+    /// fold rather than two computations that could drift.
+    pub fn fragments(&self, name: &str, members: &[&str]) -> Option<GroupConsequence> {
+        let name = name.trim();
+        if name.is_empty() || members.is_empty() {
+            return None;
+        }
+        let resolved = self.resolve_members(members)?;
+        Some(self.fold(name, &resolved[..], false))
+    }
+
+    /// Handles to clusters, deduplicated and re-sorted into queue order.
+    ///
+    /// Resolution and deduplication against the session's own numbering: the handles are the
+    /// values of `unknown`, built over every cluster in the session, so quiet members below
+    /// the offer floor resolve alike. First-appearance order keeps the deduplication
+    /// deterministic; the fold re-sorts into queue order regardless.
+    fn resolve_members(&self, members: &[&str]) -> Option<Vec<&SpeakerCluster>> {
         let mut ids: Vec<u32> = Vec::new();
         for handle in members {
             let id = self
@@ -466,11 +492,12 @@ impl<'a> Preview<'a> {
                 .total_cmp(&b.first_spoke_seconds)
                 .then(a.id.cmp(&b.id))
         });
+        Some(resolved)
+    }
 
-        // Veto authority iff the group names two or more voices: one member is a plain
-        // naming, and the veto refuses it exactly as today.
-        let authority = resolved.len() >= 2;
-
+    /// The fold itself: one clone pair per member, applied forward over the running state,
+    /// with the forced set grown as the walk commits, under `authority` only.
+    fn fold(&self, name: &str, resolved: &[&SpeakerCluster], authority: bool) -> GroupConsequence {
         // The fold: one clone pair per member, applied forward over the running state. A
         // refused member leaves the running state untouched, so the members after it are
         // previewed against the state the run will actually reach.
@@ -487,7 +514,7 @@ impl<'a> Preview<'a> {
             stale: Vec::new(),
         };
 
-        for member in &resolved {
+        for member in resolved.iter().copied() {
             // The members committed so far, by id and name: the previous forced set for the
             // veto count, and minus this member the seed of the current one.
             let mut previous_forced: BTreeMap<u32, String> = committed
@@ -584,7 +611,7 @@ impl<'a> Preview<'a> {
         // rather than re-derived from the members: the cap does the bounding, so the count
         // it holds is the answer.
         result.references_after = running_speakers.references(name);
-        Some(result)
+        result
     }
 }
 

@@ -10,6 +10,7 @@ use meethook_session::{SessionId, SourceTrack, SpeakerCluster, Transcript};
 use meethook_transcribe::{Attribution, Resemblance, TARGET_RATE};
 
 use crate::consequence::Preview;
+use crate::groups::FragmentGroup;
 use crate::interview::MeetingLabel;
 use crate::queue::{Position, Queued};
 use crate::{Error, Result};
@@ -225,6 +226,28 @@ pub struct Voice<'a> {
     /// - **An answerer that never asks pays nothing.** [`GivenName`] does not, and neither does
     ///   a line prompt that only reports outcomes after the fact.
     pub preview: Preview<'a>,
+
+    /// The bundles of below-floor fragments this run asks about together, if it groups them at
+    /// all.
+    ///
+    /// Empty for every run but one that asked for them -- a headless run answers per voice and
+    /// prints what it always printed -- and otherwise the full picture as the queue was built:
+    /// every multi-member bundle, not just the one the current question is about, because the
+    /// pane shows the whole queue rather than one row. Built once when the queue is built and
+    /// carried unmodified into every later question; [`bundle_members`](Self::bundle_members)
+    /// says which of these the *current* question is about, filtered to the members still open.
+    pub fragment_groups: Vec<FragmentGroup>,
+
+    /// The stable "Unknown N" handles the current question covers, in queue order -- or
+    /// `None` when the question is about one voice only, which is every question in a run that
+    /// does not group fragments.
+    ///
+    /// Carried across the seam rather than re-derived on the far side, because the interface
+    /// cannot see the clusters the bundle was built from: its rows carry attributions that move
+    /// as the run names voices, and membership worked out from them would drift from the
+    /// members the commit actually walks. This is the live set -- members already settled are
+    /// out -- so answering it commits exactly the walk the library will run over it.
+    pub bundle_members: Option<Vec<String>>,
 }
 
 /// How much somebody said, in the units a person would say it in.

@@ -84,6 +84,7 @@
 
 mod consequence;
 mod forget;
+mod groups;
 mod interview;
 mod meeting;
 mod narration;
@@ -95,6 +96,7 @@ mod session;
 
 pub use consequence::{Assertion, Consequence, Demotion, GroupConsequence, Preview, Refusal};
 pub use forget::{Confirm, Forgotten, Removal, Target, run_forget};
+pub use groups::{FragmentGroup, GROUP_DISTANCE};
 pub use interview::{Answer, GivenName, Interviewer, MeetingLabel};
 pub use meethook_session::Stored;
 pub use meeting::{Labelled, MeetingChoice, MeetingOffer, MeetingSource, Relabelling, run_meeting};

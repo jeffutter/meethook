@@ -314,6 +314,8 @@ impl Interviewer for Interface {
             snippets: &voice.snippets,
             resembles: &voice.resembles,
             enrolled: &voice.enrolled,
+            fragment_groups: &voice.fragment_groups,
+            bundle_members: voice.bundle_members.as_deref(),
             clip_is_empty: voice.clip.is_empty(),
         };
         // The interface deferring on its own: the user is steering toward another voice, so this
@@ -543,6 +545,12 @@ impl Costs for Preview<'_> {
     /// preview and a write cannot see the group differently.
     fn group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence> {
         Preview::group(self, name, members)
+    }
+
+    /// The bundle door, beside the group door for the reason it gives: the fan-out reports its
+    /// numbers off this same fold, so a preview and a write cannot see the bundle differently.
+    fn fragment_group_of(&self, name: &str, members: &[&str]) -> Option<GroupConsequence> {
+        Preview::fragments(self, name, members)
     }
 }
 

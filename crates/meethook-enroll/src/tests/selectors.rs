@@ -122,6 +122,8 @@ fn a_targeted_prompt_is_what_the_full_run_would_have_shown() {
         clip_samples,
         resembles,
         enrolled,
+        fragment_groups,
+        bundle_members,
     } = &aimed.seen[0];
     let queued = &queued.seen[1];
     assert_eq!(session, &queued.session);
@@ -138,6 +140,10 @@ fn a_targeted_prompt_is_what_the_full_run_would_have_shown() {
     assert_eq!(clip_samples, &queued.clip_samples);
     assert_eq!(resembles, &queued.resembles);
     assert_eq!(enrolled, &queued.enrolled);
+    // The seam carries the bundles across too, whatever this run did with them -- here none,
+    // because a targeted run is a single voice standing in for the queue.
+    assert_eq!(fragment_groups, &queued.fragment_groups);
+    assert_eq!(bundle_members, &queued.bundle_members);
     assert_eq!(
         (position.to_string(), queued.position.to_string()),
         ("1/1".to_string(), "2/2".to_string()),

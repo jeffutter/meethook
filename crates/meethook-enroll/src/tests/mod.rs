@@ -20,6 +20,7 @@ use meethook_transcribe::{
 use super::*;
 
 mod assertions;
+mod bundles;
 mod corrections;
 mod deferral;
 mod denials;
@@ -84,6 +85,12 @@ struct Shown {
     /// Every enrolled name the prompt was handed -- the universe [`resolve()`] requires,
     /// which is not the same list as `resembles`.
     enrolled: Vec<String>,
+    /// The bundles this session's quiet tail was built into, carried across the seam exactly
+    /// as a queue pane would receive them -- or none for a run that does not group fragments.
+    fragment_groups: Vec<FragmentGroup>,
+    /// The live members of the bundle this question is about, in queue order -- or `None`
+    /// when the question is about one voice.
+    bundle_members: Option<Vec<String>>,
 }
 
 impl Shown {
@@ -133,6 +140,9 @@ struct Scripted {
     /// countdown rather than a flag so that a test which gets the arithmetic wrong fails
     /// instead of hanging: once it reaches zero the session ends however the script reads.
     working_passes: Cell<usize>,
+    /// Whether this answerer wants below-floor fragments asked about as bundles. `false` by
+    /// default, which is every answerer but the full-screen frame's stand-in today.
+    accepts_fragment_groups: bool,
 }
 
 impl Scripted {
@@ -141,6 +151,16 @@ impl Scripted {
             answers: answers.into(),
             seen: Vec::new(),
             working_passes: Cell::new(0),
+            accepts_fragment_groups: false,
+        }
+    }
+
+    /// The frame's half of the bundling: this answerer asks for below-floor fragments to be
+    /// bundled into questions, which is what makes the run build any at all.
+    fn accepting_fragment_groups(self) -> Scripted {
+        Scripted {
+            accepts_fragment_groups: true,
+            ..self
         }
     }
 
@@ -195,8 +215,14 @@ impl Interviewer for Scripted {
             clip_samples: voice.clip.len(),
             resembles: voice.resembles.clone(),
             enrolled: voice.enrolled.iter().map(|n| n.to_string()).collect(),
+            fragment_groups: voice.fragment_groups.clone(),
+            bundle_members: voice.bundle_members.clone(),
         });
         self.answers.pop_front().unwrap_or(Answer::Skip)
+    }
+
+    fn accepts_fragment_groups(&self) -> bool {
+        self.accepts_fragment_groups
     }
 
     fn still_working(&self) -> bool {
