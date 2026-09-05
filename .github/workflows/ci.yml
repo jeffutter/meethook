@@ -26,6 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
+          key: ${{ hashFiles('flake.lock') }}
           workspaces: ". -> target"
       - name: Run tests
         run: nix develop -c cargo nextest run --all-features --workspace
@@ -51,6 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rustfmt-ubuntu-latest
+          key: ${{ hashFiles('flake.lock') }}
           workspaces: ". -> target"
       - name: Check formatting
         run: nix develop -c cargo fmt --all --check
@@ -73,6 +75,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy-${{ matrix.os }}
+          key: ${{ hashFiles('flake.lock') }}
           workspaces: ". -> target"
       - name: Clippy check
         run: nix develop -c cargo clippy --all-targets --all-features --workspace -- -D warnings
@@ -95,6 +98,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: docs-${{ matrix.os }}
+          key: ${{ hashFiles('flake.lock') }}
           workspaces: ". -> target"
       - name: Check documentation
         env:
@@ -119,6 +123,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: record
+          key: ${{ hashFiles('flake.lock') }}
           workspaces: "crates/meethook-record -> target"
       - name: fmt, clippy, test
         run: |
