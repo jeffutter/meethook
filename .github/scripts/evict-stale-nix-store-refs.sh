@@ -14,7 +14,11 @@
 # instead of tripping over a dangling reference.
 set -euo pipefail
 
-find target -type f \( -name CMakeCache.txt -o -name build.ninja \) 2>/dev/null | while IFS= read -r cache_file; do
+# Search from the repo root rather than a hardcoded `target`: the meethook-record job caches
+# crates/meethook-record/target instead, and `find` on a path that doesn't exist yet (e.g. a
+# first-ever run) would exit non-zero and, under `set -e`, kill this script before it does
+# anything.
+find . -type f \( -name CMakeCache.txt -o -name build.ninja \) 2>/dev/null | while IFS= read -r cache_file; do
   stale_path=""
   for store_path in $(grep -oE '/nix/store/[a-z0-9]{32}-[^"'"'"'[:space:]]*' "$cache_file" | sort -u); do
     if [[ ! -e "$store_path" ]]; then
