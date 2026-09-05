@@ -536,8 +536,9 @@ impl Lines<'_> {
                 } else {
                     // Reaching a settled tail lifts the floor (`--all`); correcting a named
                     // voice offers the named ones (`--correct`). A settled tail outranks the
-                    // correction hint because it is the reason the session has nothing left to
-                    // OFFER at all, and `--all` reaches the named voices too.
+                    // correction hint here, but `--all` alone does not actually resurface a
+                    // named voice -- `queue()` still excludes named candidates unless
+                    // `offer.named` (`--correct`) is set. See TASK-065.
                     let escape = if settled > 0 {
                         "meethook enroll --all"
                     } else {
