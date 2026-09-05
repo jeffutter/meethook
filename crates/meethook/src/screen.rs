@@ -360,6 +360,12 @@ impl Interviewer for Interface {
     fn still_working(&self) -> bool {
         self.state.still_working()
     }
+
+    /// The frame is the one answerer with a surface for a composite row, so it is the one that
+    /// asks the session loop to fold below-floor fragments into bundles.
+    fn accepts_fragment_groups(&self) -> bool {
+        true
+    }
 }
 
 impl Interface {

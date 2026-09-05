@@ -125,7 +125,12 @@ pub(crate) fn fragment_groups(
     // independent of pair order, and the position tiebreaks keep it total. Non-finite
     // distances sort last under `total_cmp` and never merge -- a NaN is not evidence of
     // likeness, whatever it sorts as.
-    let mut pairs: Vec<(f32, usize, usize)> = Vec::with_capacity(pool.len() * (pool.len() - 1) / 2);
+    //
+    // `saturating_sub` rather than `pool.len() - 1`: an empty pool -- no below-floor voices
+    // left to bundle, the ordinary case -- must not overflow computing a capacity for zero
+    // pairs.
+    let mut pairs: Vec<(f32, usize, usize)> =
+        Vec::with_capacity(pool.len() * pool.len().saturating_sub(1) / 2);
     for i in 0..pool.len() {
         for j in (i + 1)..pool.len() {
             let d = cosine_distance(&pool[i].embedding, &pool[j].embedding);
@@ -314,6 +319,17 @@ mod tests {
         let order = vec![&loud, &quiet];
         let groups = fragment_groups(&order, &BTreeMap::new(), &BTreeSet::new());
         assert_eq!(groups, vec![vec![2]]);
+    }
+
+    /// The ordinary run: nothing below the floor is left to bundle, so the pool is empty. This
+    /// is the shape of most sessions, not an edge case -- it must not panic computing a
+    /// capacity for zero pairs.
+    #[test]
+    fn an_empty_pool_produces_no_groups() {
+        let loud = fragment(1, 0.0, 30.0, &[]);
+        let order = vec![&loud];
+        let groups = fragment_groups(&order, &BTreeMap::new(), &BTreeSet::new());
+        assert_eq!(groups, Vec::<Vec<u32>>::new());
     }
 
     #[test]
