@@ -202,7 +202,7 @@ fn a_second_run_honors_the_denial_and_passes_the_session_over() {
     assert!(
         output.contains(
             "20260809-052600  passed over: nothing unresolved \
-             (1 named voice(s), 1 guessed or dismissed -- meethook enroll --all)"
+             (1 named voice(s), 1 guessed or dismissed -- meethook enroll --all --correct)"
         ),
         "{output}"
     );

@@ -418,14 +418,14 @@ fn a_session_whose_every_voice_is_already_settled_is_passed_over_counting_the_ta
     assert!(
         output.contains(
             "20260809-052600  passed over: nothing unresolved \
-             (1 named voice(s), 1 guessed or dismissed -- meethook enroll --all)"
+             (1 named voice(s), 1 guessed or dismissed -- meethook enroll --all --correct)"
         ),
         "{output}"
     );
     assert!(
         output.contains(
             "20260809-052700  passed over: nothing unresolved \
-             (1 named voice(s), 1 guessed or dismissed -- meethook enroll --all)"
+             (1 named voice(s), 1 guessed or dismissed -- meethook enroll --all --correct)"
         ),
         "{output}"
     );
@@ -433,6 +433,35 @@ fn a_session_whose_every_voice_is_already_settled_is_passed_over_counting_the_ta
     let markdown = std::fs::read_to_string(denied.transcript_md()).unwrap();
     assert!(!markdown.contains("Alice?"), "{markdown}");
     assert!(markdown.contains("Unknown 2"), "{markdown}");
+}
+
+/// A pass-over with both halves at once names both escapes: `--all` alone cannot resurface
+/// the named voice -- `queue()` still excludes it unless `offer.named` is set -- so the
+/// hint carries `--correct` beside it rather than letting the settled tail outrank it.
+#[test]
+fn a_pass_over_with_both_named_and_settled_voices_hints_at_both_flags() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+
+    // One strict match (named) and one guessable fragment (settled): the same shape the
+    // settled-tail test above holds, asserted here only on the escape it prints.
+    let session = make_session(&paths, "20260809-052600");
+    with_speech_seconds(&session, &[40.0, 1.5]);
+    with_embeddings(&session, &[nearly(0.0), nearly(54.0)]);
+    alice_enrolled(&paths);
+
+    let mut interviewer = Scripted::default();
+    let (report, output) = run(&paths, &[], &mut interviewer);
+
+    assert!(interviewer.seen.is_empty(), "{output}");
+    assert_eq!(report.passed_over, 1, "{output}");
+    assert!(
+        output.contains(
+            "20260809-052600  passed over: nothing unresolved \
+             (1 named voice(s), 1 guessed or dismissed -- meethook enroll --all --correct)"
+        ),
+        "{output}"
+    );
 }
 
 /// The mixed case: an open voice above the floor plus a settled tail. The run asks about

@@ -207,10 +207,12 @@ pub enum PassedOver {
         /// already speaks for (a standing tentative guess or a standing denial). It is the other
         /// half of the same honesty as `named` -- a run that passed over because every fragment
         /// was already guessed or dismissed has to say so, or "nothing unresolved" reads as
-        /// "your guesses went away" -- and it is what points the escape at `--all` instead of
-        /// `--correct`, since reaching those voices lifts the floor rather than offering the
-        /// named ones. Zero under every combination that predates the tail, which is what keeps
-        /// the older wordings byte-identical.
+        /// "your guesses went away" -- and it is what adds `--all` to the escape, since
+        /// reaching those voices lifts the floor rather than offering the named ones. With
+        /// both counts nonzero the hint names both flags, because `queue()` still excludes
+        /// named candidates unless `offer.named` (`--correct`) is set, so `--all` alone cannot
+        /// resurface a named voice. Zero under every combination that predates the tail, which
+        /// is what keeps the older wordings byte-identical.
         settled: usize,
     },
 }
@@ -535,14 +537,15 @@ impl Lines<'_> {
                     writeln!(out, "{session}  passed over: nothing unresolved")?;
                 } else {
                     // Reaching a settled tail lifts the floor (`--all`); correcting a named
-                    // voice offers the named ones (`--correct`). A settled tail outranks the
-                    // correction hint here, but `--all` alone does not actually resurface a
-                    // named voice -- `queue()` still excludes named candidates unless
-                    // `offer.named` (`--correct`) is set. See TASK-065.
-                    let escape = if settled > 0 {
-                        "meethook enroll --all"
-                    } else {
-                        "meethook enroll --correct"
+                    // voice offers the named ones (`--correct`). Neither flag reaches what
+                    // the other does -- `queue()` still excludes named candidates unless
+                    // `offer.named` (`--correct`) is set, so `--all` alone cannot resurface
+                    // a named voice -- so both counts nonzero gets both flags, and each
+                    // single count keeps the one-flag wording it always had.
+                    let escape = match (named > 0, settled > 0) {
+                        (true, true) => "meethook enroll --all --correct",
+                        (_, true) => "meethook enroll --all",
+                        _ => "meethook enroll --correct",
                     };
                     writeln!(
                         out,
