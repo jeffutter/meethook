@@ -48,8 +48,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: build-${{ matrix.job.os-name }}
-          key: ${{ hashFiles('flake.lock') }}
           workspaces: ". -> target"
+
+      - name: Evict stale native build caches
+        run: bash .github/scripts/evict-stale-nix-store-refs.sh
 
       - name: Cargo build
         run: |

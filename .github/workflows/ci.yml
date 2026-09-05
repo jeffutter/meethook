@@ -26,8 +26,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
-          key: ${{ hashFiles('flake.lock') }}
           workspaces: ". -> target"
+      - name: Evict stale native build caches
+        run: bash .github/scripts/evict-stale-nix-store-refs.sh
       - name: Run tests
         run: nix develop -c cargo nextest run --all-features --workspace
       - name: Run doctests
@@ -52,7 +53,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rustfmt-ubuntu-latest
-          key: ${{ hashFiles('flake.lock') }}
           workspaces: ". -> target"
       - name: Check formatting
         run: nix develop -c cargo fmt --all --check
@@ -75,8 +75,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy-${{ matrix.os }}
-          key: ${{ hashFiles('flake.lock') }}
           workspaces: ". -> target"
+      - name: Evict stale native build caches
+        run: bash .github/scripts/evict-stale-nix-store-refs.sh
       - name: Clippy check
         run: nix develop -c cargo clippy --all-targets --all-features --workspace -- -D warnings
 
@@ -98,8 +99,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: docs-${{ matrix.os }}
-          key: ${{ hashFiles('flake.lock') }}
           workspaces: ". -> target"
+      - name: Evict stale native build caches
+        run: bash .github/scripts/evict-stale-nix-store-refs.sh
       - name: Check documentation
         env:
           RUSTDOCFLAGS: -D warnings
@@ -123,8 +125,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: record
-          key: ${{ hashFiles('flake.lock') }}
           workspaces: "crates/meethook-record -> target"
+      - name: Evict stale native build caches
+        run: bash .github/scripts/evict-stale-nix-store-refs.sh
       - name: fmt, clippy, test
         run: |
           nix develop -c bash -c '
