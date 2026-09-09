@@ -762,7 +762,24 @@ fn parse_session_ids(raw: &[String]) -> Result<Vec<SessionId>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answerer, EnrollReport, Tty, answerer};
+    use meethook_enroll::Interviewer;
+
+    use super::{Answerer, Clips, EnrollReport, Terminal, Tty, answerer};
+
+    /// The other half of why grouping is a full-screen feature: the line prompt never asks to be
+    /// offered bundles, so the plain and headless prompts keep asking one question per voice and
+    /// their composed output cannot move by a byte. The frame opts in for its own
+    /// [`crate::screen`] test.
+    #[test]
+    fn a_run_without_a_composite_row_asks_one_voice_at_a_time() {
+        let prompt = Terminal {
+            clips: Clips::default(),
+        };
+        assert!(
+            !prompt.accepts_fragment_groups(),
+            "the line prompt has no row to stand in for a bundle"
+        );
+    }
 
     /// Every shape the two streams can be in, so a rule is asserted over all of them rather
     /// than at the one point a spot check happened to pick.

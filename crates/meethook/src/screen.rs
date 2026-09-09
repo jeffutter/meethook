@@ -690,7 +690,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use meethook_enroll::{Answer, Scan};
+    use meethook_enroll::{Answer, Interviewer, Scan};
     use meethook_session::Paths;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
@@ -983,6 +983,24 @@ mod tests {
             ..key(KeyCode::Enter, KeyModifiers::NONE)
         };
         assert_eq!(event(released), None);
+    }
+
+    /// The one line that makes fragment bundling reach a user at all: the session loop folds
+    /// below-floor fragments into a bundle only for an answerer that says it can show one, and
+    /// this frame is the only answerer with a composite row to show it in.
+    ///
+    /// Pinned here because nothing else was: `groups`, `render` and `state` were each built and
+    /// tested against bundles handed to them directly, so a frame that never asked for them left
+    /// every one of those tests green while no user ever saw a bundle. The plain prompt and the
+    /// headless surveyors keep the default `false` -- `a_run_without_a_composite_row_asks_one_voice_at_a_time`
+    /// pins that side -- which is why grouping changes no byte of their output.
+    #[test]
+    fn the_full_screen_frame_asks_to_be_offered_fragment_bundles() {
+        let frame = Interface::new(Shared::default(), Paths::new("/nowhere"));
+        assert!(
+            frame.accepts_fragment_groups(),
+            "the frame is the surface the composite row was built for"
+        );
     }
 
     /// AC #12's other half: what the frame drew is not all the narration did. Everything written
