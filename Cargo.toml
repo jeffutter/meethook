@@ -74,9 +74,11 @@ clap = { version = "4", features = ["derive", "env"] }
 ctrlc = { version = "3", features = ["termination"] }
 hound = "3.5"
 jiff = "0.2"
-# Only for `proc_pidpath`, the one libproc call meethook-record needs to name the
-# executable behind a capturing pid. Already in the tree transitively, so this adds no
-# crate to the build graph.
+# Two raw syscalls that no std or wrapper API covers the way this project wants them covered:
+# `proc_pidpath` in meethook-record, to name the executable behind a capturing pid, and the OFD
+# lock (`open` with `O_CLOEXEC`, `fcntl` `F_OFD_SETLK`) behind meethook-session's `record_lock`,
+# where going through a wrapper crate would mean trusting its choice of locking backend.
+# Already in the tree transitively, so this adds no crate to the build graph.
 libc = "0.2"
 mach2 = "0.6"
 # The template engine behind `transcript.md`. Templates are read from a path at runtime --

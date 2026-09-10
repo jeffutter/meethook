@@ -28,6 +28,11 @@ const EXCLUSIONS_JSON: &str = "exclusions.json";
 /// per-session: see [`Paths::transcript_template`].
 const TRANSCRIPT_TEMPLATE: &str = "transcript.md.jinja";
 
+/// The single-instance guard for `record`. Root-level, because there is one recording per root
+/// rather than one per session. Unlike its two neighbours above, meethook *does* write this one
+/// -- see [`Paths::record_lock`].
+const RECORD_LOCK: &str = "record.lock";
+
 /// The meethook data directory and everything directly under it.
 ///
 /// Construct one from the resolved root (`--root`, `$MEETHOOK_ROOT`, or `~/meethook`) and
@@ -82,6 +87,19 @@ impl Paths {
     /// exclusions; see the exclusions module for what a corrupt one does instead.
     pub fn exclusions_json(&self) -> PathBuf {
         self.root.join(EXCLUSIONS_JSON)
+    }
+
+    /// The file `record` holds an advisory lock on to keep a second `record` out of the root.
+    ///
+    /// Inverts the note on the two root files above: this one *is* written by meethook, and by
+    /// `record` alone. Its contents are the holder's own account of itself (pid, argv, start
+    /// time) for whoever loses next, and nothing decides anything from them -- whether the lock
+    /// is held is a kernel answer. It is created by
+    /// [`RecordLock::acquire`](crate::RecordLock::acquire), never rewritten by anything else,
+    /// and never deleted, so its presence says only that some `record` has run against this
+    /// root, not that one is running now.
+    pub fn record_lock(&self) -> PathBuf {
+        self.root.join(RECORD_LOCK)
     }
 
     pub fn session(&self, id: &SessionId) -> SessionPaths {

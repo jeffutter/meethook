@@ -11,6 +11,7 @@
 //! <root>/
 //!   speakers.json                 enrolled-speaker embedding DB
 //!   exclusions.json               apps excluded from the mic-activity trigger (user-authored)
+//!   record.lock                   held by a live `record`; keeps a second one out
 //!   transcript.md.jinja           optional template every transcript.md is rendered through
 //!   models/                       lazily fetched model weights
 //!   sessions/
@@ -33,6 +34,7 @@ mod exclusions;
 mod id;
 mod metadata;
 mod paths;
+mod record_lock;
 mod speaker_clusters;
 mod speaker_names;
 mod speakers;
@@ -58,6 +60,7 @@ pub use metadata::{
     SessionMetadata, TrackSync,
 };
 pub use paths::{Paths, SessionPaths};
+pub use record_lock::{Acquisition, Holder, RecordLock};
 pub use speaker_clusters::{
     MIN_REPRESENTATIVE_SECONDS, RepresentativeSegment, SPEAKER_CLUSTERS_SCHEMA_VERSION,
     SpeakerCluster, SpeakerClusters, unknown_labels,

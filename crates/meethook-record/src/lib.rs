@@ -163,8 +163,16 @@ impl Error {
 /// A configured, not-yet-running recorder.
 ///
 /// Construction demands an [`Authorized`] token, which only [`preflight()`] can produce.
-/// That is what keeps "permissions are checked before anything is written to disk" a
+/// That is what keeps "permissions are checked before any session data is written to disk" a
 /// property of the type system rather than a convention a later edit can quietly break.
+///
+/// *Session data* is the scope, deliberately: the caller takes `<root>/record.lock` (see
+/// [`meethook_session::RecordLock`]) before this, so a zero-byte file can exist under the root
+/// on a run that never got permission to record anything. What the invariant protects is a
+/// stray session directory or half-written audio appearing before the user granted anything,
+/// and a lock file is neither. Refusing before the permission prompt is worth that exception:
+/// a TCC prompt can sit out its two-minute timeout on a run that was already going to be
+/// refused, and would be a worse way to learn you were already recording.
 ///
 /// `start` -> [`RunningSession::finish`] may be called more than once on the same
 /// `Recorder`, and is: the CLI drives it in a loop, one session per detected call, for as

@@ -626,6 +626,10 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(entries, [paths.speakers_json().file_name().unwrap()]);
+        // Spelled out for the single-instance guard rather than left to the equality above:
+        // `record.lock` is the only other thing that lives loose in the root, and writing
+        // speaker references does not create it. `meethook record` is its sole creator.
+        assert!(!dir.path().join("record.lock").exists());
     }
 
     /// Writes a `speakers.json` by hand at whatever version, since the point of these tests is

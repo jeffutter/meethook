@@ -5,6 +5,12 @@
 //! created, checks both permissions in one pass, and reports every missing one at once --
 //! reporting them one at a time would make the user grant a permission, re-run, and get
 //! told about the next one.
+//!
+//! It is not, however, the first thing `record` does. The single-instance lock
+//! ([`meethook_session::RecordLock`]) is taken ahead of it, so that a run which was never going
+//! to record does not first spend the user's answer to a permission prompt. "Nothing reaches
+//! disk before the grants" therefore means no session directory and no audio, which is the
+//! hazard; a zero-byte lock file is not. See the note on [`crate::Recorder::new`].
 
 use std::fmt;
 use std::sync::mpsc;
