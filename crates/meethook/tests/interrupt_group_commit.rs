@@ -202,6 +202,9 @@ impl Driver {
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
+        // `std::process::Child` does not kill when it is dropped -- there is no `kill_on_drop`
+        // outside `tokio::process` -- so this child outlives a panicking test unless `Driver`
+        // itself reaps it. See the `Drop` below.
         let child = cmd.spawn().expect("spawning the built binary");
         Driver {
             child,
@@ -298,6 +301,36 @@ impl Driver {
     /// The last stretch of what the frame wrote, for a failure message.
     fn tail(&self) -> String {
         String::from_utf8_lossy(&self.out[self.out.len().saturating_sub(2000)..]).into_owned()
+    }
+}
+
+/// Kills and reaps the child on every path out of a `Driver`, including the ones that never
+/// reach `wait_exit`: the deadline panics inside the waits, the two panic sites in
+/// `interrupt_once`, and `complete_and_verify`'s no-frame branch, which falls straight through to
+/// the disk assertions and drops the driver with the child already gone but still unreaped.
+///
+/// This is load-bearing in a way most test cleanups are not. The child is `enroll` under a pty:
+/// once the frame is up it blocks reading stdin that the test may have stopped writing, and
+/// nextest runs each test in its own process, so a test failure leaves the child alive to be
+/// reparented by launchd -- where a `meethook enroll` asleep for days with PPID 1 was once found
+/// on the dev machine. `std::process::Child`'s own Drop does nothing about that, and the standard
+/// library has no `kill_on_drop` to ask for (that one is `tokio::process`'s), so owning the reap
+/// here is the whole guarantee. It covers unwinding, which is how libtest reports a failure; a
+/// test process killed outright still orphans its child, because macOS offers no parent-death
+/// signal to arm at spawn time.
+impl Drop for Driver {
+    fn drop(&mut self) {
+        // Once the child has been waited on, `try_wait` answers from the cached status without a
+        // syscall, so an already-reaped child is never signalled again -- its pid may by then
+        // belong to some other process. A failed `try_wait` is treated the same way: nothing
+        // this test can do about it is better than leaving the pid alone.
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        // The child is alive; SIGKILL does not wait on it draining the pty, and both errors are
+        // uninteresting -- a child that died between `try_wait` and `kill` is the outcome wanted.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
