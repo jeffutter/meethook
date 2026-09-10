@@ -39,7 +39,7 @@ cargo run -p meethook -- transcribe --help
 Darwin it roots its own workspace and its own gates run from inside its directory:
 
 ```sh
-cd crates/meethook-record && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo nextest run --workspace
+cd crates/meethook-record && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo nextest run --workspace && RUSTDOCFLAGS=-D\ warnings cargo doc --no-deps --document-private-items --workspace
 ```
 
 `lefthook.yml` encodes the exact gates and their order (fmt → clippy → test → doc → audit,

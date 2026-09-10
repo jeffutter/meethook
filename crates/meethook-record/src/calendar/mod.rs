@@ -59,7 +59,7 @@
 //! `eventsMatchingPredicate:` documents that it returns events in no guaranteed order, and
 //! the choice policy is pure arithmetic over start/end/all-day/declined -- so the split is
 //! what makes the policy testable on a machine with no calendar at all; it lives in
-//! [`select`].
+//! [`mod@select`].
 
 mod select;
 
@@ -84,7 +84,7 @@ use select::{Candidate, offerable, select};
 
 /// How much calendar to fetch on either side of the session start.
 ///
-/// Wider than [`select::NEAR_WINDOW`] on purpose, and it does not need to be exact: the predicate
+/// Wider than `select::NEAR_WINDOW` on purpose, and it does not need to be exact: the predicate
 /// returns events *overlapping* the range, so a two-hour meeting that began 50 minutes
 /// before the session must still be inside it to be found. Policy lives in [`select::select`], not
 /// in the query, so making this generous costs a few discarded candidates and nothing else.
@@ -123,7 +123,7 @@ pub fn meetings_around(at: Timestamp) -> Vec<Meeting> {
 /// Both halves of the question "what meeting does this session belong to", answered by one
 /// status check and one store query.
 ///
-/// [`meetings_for`] is the shared heart of [`meeting_at`] and [`meetings_around`], and the
+/// [`meetings_for`] is the shared heart of `meeting_at` and [`meetings_around`], and the
 /// answer the record interface asks mid-recording: the full-screen frame wants *both* halves
 /// at once -- the one the automatic rule would attach, to show with its fit, and everything
 /// worth offering, so a wrong guess can be corrected by hand without leaving the call. Two
@@ -132,12 +132,12 @@ pub fn meetings_around(at: Timestamp) -> Vec<Meeting> {
 ///
 /// Total, exactly as each half is and for the same reasons: a missing grant, an empty
 /// calendar, a raise and a panic all leave both fields empty. The `chosen` meeting carries
-/// the fit [`select`] decided; every `offered` meeting keeps
+/// the fit `select` decided; every `offered` meeting keeps
 /// [`meethook_session::MeetingFit::Unknown`], and `chosen` is always one of `offered` when it
 /// is present -- `select` and `offerable` filter the same candidates, so a meeting the rules
 /// would attach is always one a person may offer themselves.
 pub struct MeetingLookup {
-    /// Every meeting worth offering as a hand correction, in [`select::offerable`]'s stable
+    /// Every meeting worth offering as a hand correction, in `select::offerable`'s stable
     /// order.
     pub offered: Vec<Meeting>,
     /// The one the automatic rule would attach, with the fit that rule decided.
@@ -274,7 +274,7 @@ pub fn request_calendar_access() -> Option<NoCalendarAccess> {
 /// Whether the store is readable, given the status before asking and a way to ask.
 ///
 /// The whole policy, with no framework in reach -- the same split this module already makes
-/// between [`select`] and [`candidates_around`], and for the same reason: every rule below is
+/// between [`mod@select`] and [`candidates_around`], and for the same reason: every rule below is
 /// then decidable in `cargo test` on a machine with no calendar, no grant, and no prompt
 /// anywhere near it.
 ///
@@ -424,7 +424,7 @@ unsafe fn candidates_around(at: Timestamp) -> Vec<Candidate> {
 /// Converts one `EKEvent`, or drops it.
 ///
 /// A candidate whose dates will not convert is dropped rather than defaulted: an event with
-/// no usable interval cannot win any of [`select`]'s rules anyway, and inventing a timestamp
+/// no usable interval cannot win any of [`select()`]'s rules anyway, and inventing a timestamp
 /// for it could let it win one it should not.
 ///
 /// # Safety

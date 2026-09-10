@@ -75,12 +75,17 @@ pre-push:
       # the gates above never touch it. On macOS its full gate runs here, keeping the
       # push-time promise that every Rust in the repo passed its own checks. Lefthook has
       # no platform filter, so the guard lives in the script.
+      # The doc command mirrors the `doc` step above -- including RUSTDOCFLAGS spelled
+      # inline, since this one script holds several commands and lefthook's `env` applies
+      # per command rather than per line -- because the root workspace excludes this crate:
+      # without it, a broken intra-doc link here fails no gate at all.
       run: |
         [ "$(uname -s)" = "Darwin" ] || { echo "record-crate skipped (not macOS)"; exit 0; }
         cd crates/meethook-record &&
         cargo fmt --all --check &&
         cargo clippy --all-targets --workspace -- -D warnings &&
-        cargo nextest run --workspace
+        cargo nextest run --workspace &&
+        RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --workspace
     audit:
       priority: 6
       # Default DB location ($CARGO_HOME/advisory-db, fetched on each run) is deliberate.
