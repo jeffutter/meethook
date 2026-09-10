@@ -17,6 +17,25 @@
 //! - no edge at all across a mute/unmute toggle;
 //! - this process's own pid listed and marked excluded in the debug lines.
 //!
+//! The debug lines name every holder, because "a pid we cannot name" is what made a runaway
+//! recording undiagnosable: each one prints `exe=` (the executable behind the pid -- a bare
+//! binary reports no bundle id, so that is its only name), `devices=[...]` (the device(s) it
+//! holds *input* on, by name, id and UID), and `on-default=yes|no|unknown` against the default
+//! input device, which the summary line also names.
+//!
+//! Reading those three while something will not stop capturing:
+//!
+//! - a holder at `IsRunningInput=true` with `devices=[]` holds *no device at all*. It is still
+//!   counted as the meeting signal, and it is the first thing to suspect: `com.apple.CoreSpeech`
+//!   takes exactly that shape, appearing only while some other process holds input. A real
+//!   meeting app shows a non-empty list instead.
+//! - `devices=[]` and `devices=? (status=n)` are different claims -- the HAL answered "none"
+//!   versus the HAL would not answer -- so never read one as the other.
+//! - `on-default=no` is not an acquittal. BlackHole, Loopback and Wave Link devices are their own
+//!   ids, so an app capturing through an aggregate that *contains* the built-in mic reads `no`
+//!   anyway. The printed `uid=` is how you tell the two apart; this tool reports the association
+//!   rather than deciding on it.
+//!
 //! And, with the input device swapped while it runs -- System Settings > Sound > Input,
 //! unplugging a USB interface, AirPods going away:
 //!

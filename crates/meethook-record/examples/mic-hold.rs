@@ -21,6 +21,14 @@
 //! and meethook's own (shown as excluded). A third one is the hazard happening, and the
 //! session it opens will never end.
 //!
+//! Each holder line names itself now: `exe=` for the executable behind the pid, `devices=[...]`
+//! for the device(s) it holds input on, and `on-default=yes|no|unknown` against the default
+//! input device (named on the summary line). So this process's own line should read
+//! `devices=["..."#<id> uid=<UID>] on-default=yes` -- that is what a real capture looks like.
+//! A third pid at `IsRunningInput=true` with `devices=[]` is the hazard, and now named: it holds
+//! no device at all yet pins the predicate true, which is the shape a runaway session leaves
+//! behind. (`com.apple.CoreSpeech` does exactly this whenever someone else holds the mic.)
+//!
 //! It needs the microphone TCC grant and nothing else. On a machine with *no* audio devices
 //! at all -- which a sandbox can produce, and a real Mac cannot -- `AVAudioEngine`'s
 //! `inputNode` raises an Objective-C exception that aborts the process before any of this

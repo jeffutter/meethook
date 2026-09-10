@@ -150,8 +150,45 @@
 //! The system-level `ProcessObjectList` listener is kept -- that one demonstrably fires,
 //! including as a meeting app's process object appears -- and after the removal it simply
 //! wakes a recomputation instead of doing listener bookkeeping first.
+//!
+//! # Reading the debug log
+//!
+//! `MEETHOOK_ACTIVITY_DEBUG=1` prints one summary line per recomputation plus one line for each
+//! holder that is capturing (and one for our own process, capturing or not):
+//!
+//! ```text
+//! [activity] Install: someone_else_is_capturing=true IsRunningSomewhere=Some(true) default-input="MacBook Pro Microphone"#79 uid=BuiltInMicrophoneDevice
+//! [activity]   pid=662 com.apple.CoreSpeech IsRunningInput=true exe=/System/Library/PrivateFrameworks/CoreSpeech.framework/Versions/A/CoreSpeech devices=[] on-default=unknown
+//! [activity]   pid=9848 (no bundle id) IsRunningInput=true exe=/path/to/mic-hold devices=["MacBook Pro Microphone"#79 uid=BuiltInMicrophoneDevice] on-default=yes
+//! [activity]   pid=9851 (no bundle id) IsRunningInput=false exe=/path/to/mic-activity devices=[] on-default=unknown   <- meethook
+//! ```
+//!
+//! - `exe=` is the executable behind the pid (`proc_pidpath`, canonicalized) -- the only fact
+//!   that separates a second meethook or a driver helper from a bundled meeting app. A bare
+//!   binary reports an *empty* bundle id rather than none, so this is the only name such a
+//!   process has; `exe-unreadable` and `exe=<path> unresolved` are the two ways the path itself
+//!   fails, the latter still printing the raw path.
+//! - `devices=[...]` lists the device(s) that process holds *input* on, by name, id and UID.
+//!   Three states are kept distinct deliberately: a non-empty list, `devices=[]` (the HAL
+//!   answered "none") and `devices=? (status=n)` (the HAL refused). Measured: `com.apple.CoreSpeech`
+//!   reports `IsRunningInput=true` with `devices=[]`, and only while some other process holds
+//!   input -- a holder of *no* device, which the predicate counts today. That is the difference
+//!   between a suspect and a phantom, and why a failed read must not print as an empty list.
+//! - `on-default=yes|no|unknown` says whether that set contains the current default input device,
+//!   which the summary line names again so a pasted log is self-explanatory. `unknown` covers the
+//!   empty list, a refused read, and a machine with no default input device at all; an empty set
+//!   never reads as "not on the default".
+//!
+//! `on-default=no` is not an acquittal. Aggregate and virtual devices (BlackHole, Loopback, Wave
+//! Link) are their own `AudioObjectID`s, so a holder capturing through an aggregate that
+//! *contains* the built-in mic reads `no`; the printed `uid=` is how a human spots that. This
+//! module reports the association and does not act on it: requiring the default device would
+//! silently stop counting a meeting app that captured anywhere else, and deciding that is the job
+//! of the machine that actually has the problem.
 
+use std::collections::HashMap;
 use std::ffi::{OsString, c_void};
+use std::fmt;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
@@ -162,10 +199,12 @@ use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2_core_audio::{
     AudioObjectAddPropertyListenerBlock, AudioObjectGetPropertyData,
     AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectPropertySelector, AudioObjectRemovePropertyListenerBlock,
-    kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioHardwarePropertyDefaultInputDevice,
-    kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
+    AudioObjectPropertyScope, AudioObjectPropertySelector, AudioObjectRemovePropertyListenerBlock,
+    kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioDevicePropertyDeviceUID,
+    kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyProcessObjectList,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    kAudioProcessPropertyBundleID, kAudioProcessPropertyDevices,
     kAudioProcessPropertyIsRunningInput, kAudioProcessPropertyPID,
 };
 use objc2_core_foundation::{CFRetained, CFString};
@@ -553,39 +592,89 @@ impl State {
     /// The `IsRunningSomewhere` line is the load-bearing one: it is expected to stay
     /// `true` across a call ending while meethook records, which is exactly why it cannot
     /// be the predicate.
+    ///
+    /// Each holder line then names everything the classifier had to work with: the executable
+    /// behind the pid, the device(s) it holds input on, and whether that set includes the
+    /// default input device -- whose name the summary line repeats, so a captured log needs no
+    /// second tool. Those three are what TASK-066's reproduction was missing: the culprit shape
+    /// (a bare binary, a driver helper) reports no bundle id at all, so the old line rendered
+    /// it as `pid=NNNN  IsRunningInput=true` -- nothing but a number.
+    ///
+    /// Nothing here changes the verdict: the bearing comes from the same [`bearing`] the
+    /// predicate uses, and this prints rather than decides. In particular `on-default` is
+    /// reported and not acted on -- requiring it would silently stop counting a meeting app
+    /// that captured on a non-default device, and only the machine that has the problem gets to
+    /// make that call.
+    ///
+    /// Device labels are read once per pass and memoized, including the default device's: this
+    /// runs on every non-`Recheck` notification and `record` drives
+    /// [`MicActivityWatcher::recheck`] every couple of seconds, so an un-memoized read would
+    /// repeat the same cross-process calls several times a second for a device set of one or
+    /// two entries.
     fn log(&self, trigger: Trigger, active: bool) {
         let running_somewhere = self
             .device
             .as_ref()
             .and_then(|d| device_is_running_somewhere(d.object));
+        let default_device = default_input_device();
+        let mut labels: HashMap<AudioObjectID, String> = HashMap::new();
+        let default_label = default_device.map(|device| device_label(device, &mut labels));
         eprintln!(
             "[activity] {trigger:?}: someone_else_is_capturing={active} \
-             IsRunningSomewhere={running_somewhere:?}"
+             IsRunningSomewhere={running_somewhere:?} default-input={}",
+            default_label.unwrap_or_else(|| "none".to_owned()),
         );
         for process in object_list(
             kAudioObjectSystemObject as AudioObjectID,
             kAudioHardwarePropertyProcessObjectList,
         ) {
+            let running_input = process_is_running_input(process);
             let pid = process_pid(process);
             let ours = pid == Some(self.our_pid);
-            // The verdict comes from the same classifier the predicate uses, so the log
-            // cannot describe a rule the recorder is not actually applying.
-            let bearing = self.bearing_of(process);
-            if bearing == Bearing::Idle && !ours {
+            if !running_input && !ours {
                 continue;
             }
+            // The facts a shown holder is described by and judged on are read once, here.
+            // [`bearing_of`] is not reused: it throws the facts away, which is right for the
+            // predicate's hot path (a non-capturing process costs one read) and wrong for a log
+            // whose whole job is to print them.
+            let bundle_id = process_bundle_id(process);
+            let exe = pid.map_or(Exe::Unreadable, executable_of);
+            // The verdict comes from the same classifier the predicate uses, so the log
+            // cannot describe a rule the recorder is not actually applying -- including that
+            // a process which is not capturing is Idle whatever else it says about itself.
+            let bearing = if running_input {
+                bearing(
+                    pid,
+                    bundle_id.as_deref(),
+                    exe.canonical_path(),
+                    self.our_pid,
+                    self.our_exe.as_deref(),
+                    &self.exclusions,
+                )
+            } else {
+                Bearing::Idle
+            };
+            let (devices, on_default) =
+                devices_reported(process_input_devices(process), default_device, &mut labels);
+            let marker = match bearing {
+                Bearing::Excluded(why) => format!("   <- excluded: {why}"),
+                // Idle and ours: shown anyway, because "meethook is not capturing yet"
+                // is the baseline the later lines are read against.
+                _ if ours => "   <- meethook".to_owned(),
+                _ => String::new(),
+            };
             eprintln!(
-                "[activity]   pid={} {} IsRunningInput={}{}",
-                pid.map_or_else(|| "?".to_owned(), |p| p.to_string()),
-                process_bundle_id(process).unwrap_or_else(|| "(no bundle id)".to_owned()),
-                bearing != Bearing::Idle,
-                match bearing {
-                    Bearing::Excluded(why) => format!("   <- excluded: {why}"),
-                    // Idle and ours: shown anyway, because "meethook is not capturing yet"
-                    // is the baseline the later lines are read against.
-                    _ if ours => "   <- meethook".to_owned(),
-                    _ => String::new(),
-                },
+                "{}",
+                holder_line(
+                    pid,
+                    bundle_id.as_deref(),
+                    running_input,
+                    &exe,
+                    &devices,
+                    on_default,
+                    &marker,
+                )
             );
         }
     }
@@ -661,6 +750,154 @@ enum Bearing {
     Activity,
     /// Capturing, but it is us or on our behalf. Carries the reason, for the debug log.
     Excluded(&'static str),
+}
+
+/// The executable behind a pid, in the three states [`executable_of`] can land in.
+///
+/// [`bearing`] sees only the [`Exe::Resolved`] arm (through [`Exe::canonical_path`]) -- the
+/// predicate keeps comparing canonicalized paths and nothing else about it changes. The other
+/// two arms exist for the debug log, where "which kind of failure is this" is the question.
+#[derive(Debug, PartialEq)]
+enum Exe {
+    /// `proc_pidpath` answered and the path canonicalized.
+    Resolved(PathBuf),
+    /// `proc_pidpath` answered; the path did not canonicalize. Carries the raw path, because a
+    /// name we cannot compare is still a name.
+    Unresolved(PathBuf),
+    /// `proc_pidpath` refused: an exited process, another user's, or pid 0.
+    Unreadable,
+}
+
+impl Exe {
+    /// The canonicalized path [`bearing`] compares; `None` for both failure arms.
+    fn canonical_path(&self) -> Option<&Path> {
+        match self {
+            Exe::Resolved(path) => Some(path),
+            Exe::Unresolved(_) | Exe::Unreadable => None,
+        }
+    }
+}
+
+impl fmt::Display for Exe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Exe::Resolved(path) => write!(f, "exe={}", path.display()),
+            // Printed with its limitation rather than dropped: the raw path names the program,
+            // which is the thing a captured log is being read for.
+            Exe::Unresolved(path) => write!(f, "exe={} unresolved", path.display()),
+            Exe::Unreadable => f.write_str("exe-unreadable"),
+        }
+    }
+}
+
+/// What the read of one holder's input devices said, with all three outcomes kept apart.
+#[derive(Debug, PartialEq)]
+enum Devices {
+    /// Non-empty, each entry labelled by [`device_label`].
+    Read(Vec<String>),
+    /// The HAL answered, and the answer was "no input device": a holder of nothing.
+    Empty,
+    /// The HAL refused the property; the `OSStatus` is printed with it.
+    Unreadable(i32),
+}
+
+/// Turns a [`process_input_devices`] answer into what the log shows and what it means.
+///
+/// Kept together because the two halves read as one sentence -- a holder on no device is
+/// `devices=[] on-default=unknown`, never `on-default=no` -- and because the label cache is
+/// shared across every holder in one pass.
+fn devices_reported(
+    held: std::result::Result<Vec<AudioObjectID>, i32>,
+    default: Option<AudioObjectID>,
+    cache: &mut HashMap<AudioObjectID, String>,
+) -> (Devices, OnDefault) {
+    match held {
+        Err(status) => (Devices::Unreadable(status), OnDefault::Unknown),
+        Ok(ids) if ids.is_empty() => (Devices::Empty, OnDefault::Unknown),
+        Ok(ids) => {
+            let labels = ids.iter().map(|id| device_label(*id, cache)).collect();
+            (Devices::Read(labels), shares_default_device(default, &ids))
+        }
+    }
+}
+
+impl fmt::Display for Devices {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Devices::Read(labels) => write!(f, "devices=[{}]", labels.join(", ")),
+            Devices::Empty => f.write_str("devices=[]"),
+            Devices::Unreadable(status) => write!(f, "devices=? (status={status})"),
+        }
+    }
+}
+
+/// Whether a holder's input-device set contains the current default input device.
+///
+/// Three values, because "not on the default" and "we could not tell" lead a reader to opposite
+/// conclusions, and an empty set must never read as the former.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnDefault {
+    Yes,
+    No,
+    /// The holder holds no device, the read failed, or the machine has no default input device
+    /// at all (an unplugged-USB machine, which [`State::attach_device_listener`] treats as
+    /// normal).
+    Unknown,
+}
+
+impl fmt::Display for OnDefault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            OnDefault::Yes => "yes",
+            OnDefault::No => "no",
+            OnDefault::Unknown => "unknown",
+        })
+    }
+}
+
+/// Whether the devices a holder input on include the system's default input device.
+///
+/// Pure over ids for the same reason [`bearing`] is: this decides what a pasted log means, and
+/// the sandbox this is developed in has no audio device to ask.
+///
+/// Compared by exact `AudioObjectID`, which is why `no` is not an acquittal for a virtual or
+/// aggregate device: BlackHole, Loopback and Wave Link devices are their own ids, so a holder
+/// capturing through an aggregate that *contains* the built-in mic reads `no`. The printed `uid=`
+/// is how a human spots that case; reading sub-device lists to decide it automatically is
+/// deliberately left to whichever machine actually shows one.
+fn shares_default_device(default: Option<AudioObjectID>, held: &[AudioObjectID]) -> OnDefault {
+    match (default, held.is_empty()) {
+        (_, true) => OnDefault::Unknown,
+        (Some(device), false) if held.contains(&device) => OnDefault::Yes,
+        (Some(_), false) => OnDefault::No,
+        // A machine with no default input device cannot say anything about the set it would
+        // have compared to.
+        (None, false) => OnDefault::Unknown,
+    }
+}
+
+/// One holder line of the debug log, assembled apart from the reads it describes.
+///
+/// Pure so the shapes a human diagnoses from are testable with no CoreAudio device present,
+/// including the trailing marker: exclusion reasons are rendered against it, and a new field
+/// must not move it.
+///
+/// Field order keeps the pre-existing prefix bytes (`pid=`, bundle id, `IsRunningInput=`) in
+/// place so muscle memory and greps survive; the marker stays last.
+fn holder_line(
+    pid: Option<i32>,
+    bundle_id: Option<&str>,
+    running_input: bool,
+    exe: &Exe,
+    devices: &Devices,
+    on_default: OnDefault,
+    marker: &str,
+) -> String {
+    format!(
+        "[activity]   pid={} {} IsRunningInput={running_input} {exe} {devices} on-default={on_default}{marker}",
+        pid.map_or_else(|| "?".to_owned(), |p| p.to_string()),
+        bundle_id.unwrap_or("(no bundle id)"),
+    )
 }
 
 /// The exclusion rule, over facts already read from a capturing process object.
@@ -769,9 +1006,16 @@ fn remove_listener(listener: &Installed, queue: &DispatchQueue) {
 }
 
 fn address(selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+    address_scoped(selector, kAudioObjectPropertyScopeGlobal)
+}
+
+fn address_scoped(
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
-        mScope: kAudioObjectPropertyScopeGlobal,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementMain,
     }
 }
@@ -788,7 +1032,25 @@ unsafe fn property<T: Copy + Default>(
     object: AudioObjectID,
     selector: AudioObjectPropertySelector,
 ) -> Option<T> {
-    let address = address(selector);
+    // SAFETY: same requirements as [`property_scoped`], at the global scope.
+    unsafe { property_scoped(object, selector, kAudioObjectPropertyScopeGlobal) }
+}
+
+/// Reads a fixed-size property at an explicit scope.
+///
+/// The scope matters for more than device properties: `kAudioProcessPropertyDevices` is
+/// scope-selected, so reading it globally answers "no devices" even for a process holding the
+/// microphone (see [`process_input_devices`]).
+///
+/// # Safety
+///
+/// `T` must be the exact type CoreAudio returns for `selector` on `object` *at that scope*.
+unsafe fn property_scoped<T: Copy + Default>(
+    object: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+) -> Option<T> {
+    let address = address_scoped(selector, scope);
     let mut value = T::default();
     let mut size = size_of::<T>() as u32;
 
@@ -808,9 +1070,23 @@ unsafe fn property<T: Copy + Default>(
     (status == 0).then_some(value)
 }
 
-/// Reads an `AudioObjectID` array property, sized first so nothing is truncated.
+/// Reads an `AudioObjectID` array property at the global scope, or empty if it will not answer.
 fn object_list(object: AudioObjectID, selector: AudioObjectPropertySelector) -> Vec<AudioObjectID> {
-    let address = address(selector);
+    object_list_scoped(object, selector, kAudioObjectPropertyScopeGlobal).unwrap_or_default()
+}
+
+/// Reads an `AudioObjectID` array property at an explicit scope, sized first so nothing is
+/// truncated.
+///
+/// The `OSStatus` is kept rather than swallowed into an empty list because "the object has no
+/// such property" and "the object says the list is empty" are different facts, and the debug
+/// log has to tell them apart -- see [`process_input_devices`].
+fn object_list_scoped(
+    object: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+) -> std::result::Result<Vec<AudioObjectID>, i32> {
+    let address = address_scoped(selector, scope);
     let mut size: u32 = 0;
     // SAFETY: `address` and `size` are live locals; the qualifier is null.
     let status = unsafe {
@@ -823,12 +1099,14 @@ fn object_list(object: AudioObjectID, selector: AudioObjectPropertySelector) -> 
         )
     };
     if status != 0 {
-        return Vec::new();
+        return Err(status);
     }
 
     let mut ids = vec![0 as AudioObjectID; size as usize / size_of::<AudioObjectID>()];
     let Some(buffer) = NonNull::new(ids.as_mut_ptr()) else {
-        return Vec::new();
+        // An allocation that failed at zero-ish size is not a HAL answer; report it as one so
+        // the caller shows `?` rather than an empty list.
+        return Err(-1);
     };
     // SAFETY: `buffer` points at `size` bytes of owned, correctly typed storage.
     let status = unsafe {
@@ -842,12 +1120,97 @@ fn object_list(object: AudioObjectID, selector: AudioObjectPropertySelector) -> 
         )
     };
     if status != 0 {
-        return Vec::new();
+        return Err(status);
     }
 
     // The set can shrink between the two calls; trust the second answer.
     ids.truncate(size as usize / size_of::<AudioObjectID>());
-    ids
+    Ok(ids)
+}
+
+/// The devices a process object holds *input* on.
+///
+/// The scope is the whole point of this function. Apple documents `kAudioProcessPropertyDevices`
+/// as scope-selected (`AudioHardware.h:1958-1961`: "The scope will select the input or output
+/// device list"), measured here with `mic-hold` holding the microphone: the global scope answers
+/// `[]`, the input scope `[79 'MacBook Pro Microphone']`, the output scope
+/// `[72 'MacBook Pro Speakers']`. Reading it globally would print an empty list for every
+/// holder forever.
+///
+/// The three outcomes are kept distinct on purpose. `Ok(vec![])` is a real observed state --
+/// `com.apple.CoreSpeech` reports `IsRunningInput = 1` with an empty *input* device list, and
+/// only while some other process holds input -- i.e. a holder of no device at all, which the
+/// predicate counts today. That is a different fact from an `Err`, where the HAL has no such
+/// property or will not answer, and collapsing them would lose exactly the discrimination this
+/// output exists to provide.
+fn process_input_devices(process: AudioObjectID) -> std::result::Result<Vec<AudioObjectID>, i32> {
+    object_list_scoped(
+        process,
+        kAudioProcessPropertyDevices,
+        kAudioObjectPropertyScopeInput,
+    )
+}
+
+/// Reads a copy-accessor `CFStringRef` property, which `CFRetained` then owns.
+///
+/// # Safety
+///
+/// `selector` must return a single `CFStringRef` on `object` at `scope`.
+unsafe fn cfstring_property(
+    object: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+) -> Option<CFRetained<CFString>> {
+    // `Option<NonNull<_>>` is used as the destination because it is pointer-sized and its
+    // `Default` is null, which is exactly what a "no value written" outcome should read as.
+    // SAFETY: the qualifier is null and the destination is a live local, as in `property`.
+    let raw: Option<NonNull<CFString>> = unsafe { property_scoped(object, selector, scope)? };
+    // SAFETY: a copy accessor hands back a +1 reference, which `CFRetained` now owns.
+    Some(unsafe { CFRetained::from_raw(raw?) })
+}
+
+/// Reads a string device property, falling back across the scopes it plausibly lives at.
+///
+/// The three candidates are tried in order and the first non-empty answer wins; which one
+/// answered is never interesting downstream. On the planning machine the global scope answers
+/// for both name and UID, so the fallbacks are cheap insurance against a driver that files them
+/// under the device's direction instead -- they cost two extra refused reads only on a device
+/// whose label we would otherwise print as `?`. An empty answer counts as no answer for the same
+/// reason: a driver returning `""` for a name has told us nothing.
+fn device_string(device: AudioObjectID, selector: AudioObjectPropertySelector) -> Option<String> {
+    [
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyScopeInput,
+        kAudioObjectPropertyScopeOutput,
+    ]
+    .into_iter()
+    .find_map(|scope| {
+        // SAFETY: the selectors used at the one call site below return a single `CFStringRef`.
+        unsafe { cfstring_property(device, selector, scope) }
+            .map(|string| string.to_string())
+            .filter(|string| !string.trim().is_empty())
+    })
+}
+
+/// The device's label as `"NAME"#<id> uid=<UID>`, memoized for the duration of one log pass.
+///
+/// Each half falls back on its own (`"?#79 uid=BuiltInMicrophoneDevice", `uid=?`) instead of
+/// dropping the whole label: the numeric id alone is nearly worthless in a pasted log because it
+/// changes across boots, which is precisely why the stable UID rides beside it.
+fn device_label(id: AudioObjectID, cache: &mut HashMap<AudioObjectID, String>) -> String {
+    cache
+        .entry(id)
+        .or_insert_with(|| {
+            let name = device_string(id, kAudioObjectPropertyName);
+            let uid = device_string(id, kAudioDevicePropertyDeviceUID);
+            format!(
+                "{}#{id} uid={}",
+                name.as_deref()
+                    .map_or_else(|| "?".to_owned(), |n| format!("\"{n}\"")),
+                uid.as_deref().unwrap_or("?"),
+            )
+        })
+        .clone()
 }
 
 fn default_input_device() -> Option<AudioObjectID> {
@@ -883,17 +1246,30 @@ fn process_is_running_input(process: AudioObjectID) -> bool {
 /// Read by the predicate, not only by the log: it is how a helper capturing on our behalf
 /// is told apart from a meeting app.
 fn process_bundle_id(process: AudioObjectID) -> Option<String> {
-    // SAFETY: this selector returns a single `CFStringRef`. `Option<NonNull<_>>` is used
-    // as the destination because it is pointer-sized and its `Default` is null, which is
-    // exactly what a "no value written" outcome should read as.
-    let raw: Option<NonNull<CFString>> =
-        unsafe { property(process, kAudioProcessPropertyBundleID)? };
-    // SAFETY: the property is a "copy" accessor, so the returned string is owned by us.
-    let string = unsafe { CFRetained::from_raw(raw?) };
-    Some(string.to_string())
+    // SAFETY: this selector returns a single `CFStringRef` at the global scope.
+    let string = unsafe {
+        cfstring_property(
+            process,
+            kAudioProcessPropertyBundleID,
+            kAudioObjectPropertyScopeGlobal,
+        )?
+    };
+    // A bare binary reports an *empty* bundle id rather than none -- measured with `afplay`
+    // and with `mic-hold`, both of which come back `''` -- so without this the predicate's
+    // `is_some_and` checks saw `Some("")` and the log printed a blank where the name should
+    // be. Empty is not a fact about the process, so it normalizes to "not reported".
+    //
+    // The predicate is unaffected: the empty string is in neither `OUR_HELPER_BUNDLE_IDS` nor
+    // any plausible `exclusions.json`. One side effect is intended -- a hand-edited `""` entry
+    // in that file can no longer exclude *every* bare binary.
+    let id = string.to_string();
+    (!id.trim().is_empty()).then_some(id)
 }
 
 /// The executable behind a pid, canonicalized, or `None` for one that cannot be read.
+///
+/// This is the [`Exe::Resolved`] view only, because that is all [`bearing`] compares; use
+/// [`executable_of`] when the failure kind matters, as the debug log does.
 ///
 /// Not a CoreAudio property: the HAL reports a bundle id, and a plain binary has none,
 /// which is exactly why a second meethook is invisible to the bundle-id rule. The path
@@ -904,6 +1280,16 @@ fn process_bundle_id(process: AudioObjectID) -> Option<String> {
 /// another user, a path that no longer resolves. [`bearing`] treats that as "not known to
 /// be us", which is the direction its doc comment explains.
 fn process_executable(pid: i32) -> Option<PathBuf> {
+    match executable_of(pid) {
+        Exe::Resolved(path) => Some(path),
+        Exe::Unresolved(_) | Exe::Unreadable => None,
+    }
+}
+
+/// Reads the executable behind a pid, keeping which kind of failure it was.
+///
+/// The two failure arms are different things to say in a log: one still names the program.
+fn executable_of(pid: i32) -> Exe {
     let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: `buffer` is owned, writable storage of exactly the length passed alongside
     // it. `proc_pidpath` writes at most that many bytes and returns the length written.
@@ -915,10 +1301,19 @@ fn process_executable(pid: i32) -> Option<PathBuf> {
         )
     };
     if length <= 0 {
-        return None;
+        return Exe::Unreadable;
     }
     buffer.truncate(length as usize);
-    std::fs::canonicalize(PathBuf::from(OsString::from_vec(buffer))).ok()
+    let raw = PathBuf::from(OsString::from_vec(buffer));
+    match std::fs::canonicalize(&raw) {
+        Ok(path) => Exe::Resolved(path),
+        // Reached by unreadable path components -- a root-owned helper under a `0700`
+        // directory -- rather than by a deleted or rebuilt binary: unlinking or renaming a
+        // running executable's file gets the process `SIGKILL`ed on macOS, which was tried
+        // twice while planning this. So the name libproc already gave us is worth printing
+        // even though it cannot be compared to ours.
+        Err(_) => Exe::Unresolved(raw),
+    }
 }
 
 #[cfg(test)]
@@ -927,7 +1322,10 @@ mod tests {
 
     use meethook_session::AppExclusions;
 
-    use super::{Activity, Bearing, bearing, device_changed, edge, process_executable};
+    use super::{
+        Activity, Bearing, Devices, Exe, OnDefault, bearing, device_changed, edge, holder_line,
+        process_executable, shares_default_device,
+    };
 
     const OUR_PID: i32 = 500;
 
@@ -1263,5 +1661,128 @@ mod tests {
         assert!(device_changed(Some(1), None));
         // Repeat notifications with still no device are not further changes.
         assert!(!device_changed(None, None));
+    }
+
+    /// A holder line with everything except the field under test fixed, so the assertions read
+    /// as the difference they are about.
+    fn line_for(exe: Exe, devices: Devices, on_default: OnDefault) -> String {
+        holder_line(Some(41809), None, true, &exe, &devices, on_default, "")
+    }
+
+    const MIC: &str = "\"MacBook Pro Microphone\"#79 uid=BuiltInMicrophoneDevice";
+
+    #[test]
+    fn an_excluded_holder_line_names_everything_and_leaves_the_marker_last() {
+        // Pinned byte-for-byte, marker included: exclusion reasons are rendered as
+        // `<- excluded: {why}` and read off the end of the line, so a field inserted later must
+        // not push it around. This is the shape a captured log is diagnosed from.
+        let line = holder_line(
+            Some(997),
+            Some("com.apple.replayd"),
+            true,
+            &Exe::Resolved(PathBuf::from("/usr/libexec/replayd")),
+            &Devices::Read(vec![MIC.to_owned()]),
+            OnDefault::Yes,
+            "   <- excluded: captures on meethook's behalf",
+        );
+        let body = "[activity]   pid=997 com.apple.replayd IsRunningInput=true \
+                    exe=/usr/libexec/replayd devices=[\"MacBook Pro Microphone\"#79 \
+                    uid=BuiltInMicrophoneDevice] on-default=yes";
+        assert_eq!(
+            line,
+            format!("{body}   <- excluded: captures on meethook's behalf")
+        );
+    }
+
+    #[test]
+    fn a_bare_binary_holder_is_named_by_its_executable() {
+        // The shape TASK-066 could not diagnose: a plain binary reports no bundle id, so the
+        // old line was `pid=NNNN  IsRunningInput=true` -- a number and nothing else. `(no bundle
+        // id)` is still said, but it is never the whole answer now.
+        assert_eq!(
+            line_for(
+                Exe::Resolved(PathBuf::from("/tmp/mic-hold")),
+                Devices::Read(vec![MIC.to_owned()]),
+                OnDefault::Yes,
+            ),
+            "[activity]   pid=41809 (no bundle id) IsRunningInput=true exe=/tmp/mic-hold \
+             devices=[\"MacBook Pro Microphone\"#79 uid=BuiltInMicrophoneDevice] on-default=yes"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_executable_says_so_instead_of_blanking_the_name() {
+        assert!(
+            line_for(Exe::Unreadable, Devices::Empty, OnDefault::Unknown)
+                .contains(" exe-unreadable devices=[]")
+        );
+    }
+
+    #[test]
+    fn an_unresolved_executable_keeps_the_raw_path() {
+        // Reached by unreadable path components, not by a rebuilt binary (see `executable_of`).
+        // The name is worth printing even though it cannot be compared to ours, so it prints
+        // with its limitation stated rather than being replaced by nothing.
+        assert!(
+            line_for(
+                Exe::Unresolved(PathBuf::from("/usr/libexec/private/helper")),
+                Devices::Empty,
+                OnDefault::Unknown,
+            )
+            .contains(" exe=/usr/libexec/private/helper unresolved")
+        );
+    }
+
+    #[test]
+    fn an_empty_device_list_is_not_a_failed_read() {
+        // Both mean "we cannot say on-default", but they are opposite claims about the process:
+        // one holds no device at all (the observed `com.apple.CoreSpeech` shape), the other
+        // answered nothing at all. Collapsing them is what made the old output unusable.
+        let empty = line_for(
+            Exe::Resolved(PathBuf::from("/tmp/mic-hold")),
+            Devices::Empty,
+            OnDefault::Unknown,
+        );
+        let failed = line_for(
+            Exe::Resolved(PathBuf::from("/tmp/mic-hold")),
+            Devices::Unreadable(-4),
+            OnDefault::Unknown,
+        );
+        assert!(empty.ends_with("devices=[] on-default=unknown"), "{empty}");
+        assert!(
+            failed.ends_with("devices=? (status=-4) on-default=unknown"),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn the_default_device_flag_has_three_answers() {
+        assert_eq!(shares_default_device(Some(79), &[79]), OnDefault::Yes);
+        // A virtual or aggregate device is its own id, so this reads `no` even when it contains
+        // the built-in mic -- see the module docs on why that is reported, not resolved.
+        assert_eq!(shares_default_device(Some(79), &[120]), OnDefault::No);
+        // Holding input on nothing is not the same as holding it somewhere else.
+        assert_eq!(shares_default_device(Some(79), &[]), OnDefault::Unknown);
+        // Nor is anything else comparable on a machine whose last input device went away.
+        assert_eq!(shares_default_device(None, &[79]), OnDefault::Unknown);
+    }
+
+    #[test]
+    fn the_meethook_marker_line_keeps_its_shape() {
+        // "meethook is not capturing yet" is the baseline every later line is read against, so
+        // it keeps the same field order and the same trailing marker as the pre-existing line.
+        assert_eq!(
+            holder_line(
+                Some(500),
+                None,
+                false,
+                &Exe::Resolved(PathBuf::from("/usr/local/bin/meethook")),
+                &Devices::Empty,
+                OnDefault::Unknown,
+                "   <- meethook",
+            ),
+            "[activity]   pid=500 (no bundle id) IsRunningInput=false \
+             exe=/usr/local/bin/meethook devices=[] on-default=unknown   <- meethook"
+        );
     }
 }
