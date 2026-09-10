@@ -101,7 +101,48 @@ impl<M: Engine, S: Engine> Engines<M, S> {
             // So there is no double-settle to answer for, and no made-up summary to invent.
             unreachable!("settle consumes both engines, so it cannot run twice")
         };
-        (mic.settle(), speaker.settle())
+        let mic_stop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mic.settle()));
+        let mic_stop = match mic_stop {
+            Ok(stopped) => stopped,
+            Err(payload) => {
+                // `take` above emptied the slot, so the `Drop` that unwinding now runs finds
+                // nothing to abandon: this arm is the last thing standing between a mic whose
+                // stop faults and a speaker that keeps capturing into a file nobody will
+                // finalize. Nothing panics on this path today -- every framework call in
+                // [`MicCapture::settle`](crate::teardown::Engine::settle) already goes through
+                // [`crate::exception::catching`] -- so the guard exists for the edit that adds
+                // one.
+                //
+                // What it cannot do:
+                //
+                // - It holds only while panics *unwind*. `panic = "abort"` appears in neither
+                //   manifest; add it and this arm silently evaporates.
+                // - It never sees a genuine `NSException`. This crate depends on objc2 with
+                //   `features = ["exception"]` and not `catch-all`, so a raise travels foreign
+                //   unwind frames and aborts before any Rust frame runs. Routing framework
+                //   calls through [`crate::exception::catching`] is what keeps them from
+                //   becoming panics at all; enabling `catch-all` would turn raises into Rust
+                //   panics and make this arm load-bearing rather than latent.
+                //
+                // What the caught mic costs: unwind glue drops its `TrackWriter`, the sender
+                // disconnects, and the writer thread leaves its receive loop -- but still reaches
+                // the `finalize()` that closes the WAV, since that sits after the loop. Lost for
+                // good is whatever samples were still queued when the loop bailed, and any
+                // certainty the thread ran at all: nothing joins it here, because `join` lives in
+                // the `finish` this mic never reached. The promise is therefore "the speaker is
+                // always accounted for", never "both tracks survive".
+                //
+                // [`Engine::abandon`] rather than `settle`: it is bounded, silent, and returns
+                // before the stream delegate's error slot, whose reader expects on a poisoned
+                // lock. Settling here would inherit the one panic source reachable today from
+                // inside an unwind already carrying the mic's fault -- and a second panic during
+                // unwinding aborts. The payload stays boxed and is re-raised untouched, so the
+                // process dies with the mic's own message.
+                speaker.abandon();
+                std::panic::resume_unwind(payload);
+            }
+        };
+        (mic_stop, speaker.settle())
     }
 }
 
@@ -136,29 +177,38 @@ mod tests {
     /// Which method ran on which engine, in the order it ran.
     type Log = Rc<RefCell<Vec<String>>>;
 
+    /// How stopping this engine ends.
+    enum Outcome {
+        Ok,
+        Err,
+        Panic,
+    }
+
     struct Fake {
         name: &'static str,
         log: Log,
-        fails: bool,
+        outcome: Outcome,
     }
 
     impl Fake {
-        fn new(name: &'static str, log: &Log, fails: bool) -> Self {
+        fn new(name: &'static str, log: &Log, outcome: Outcome) -> Self {
             Fake {
                 name,
                 log: Rc::clone(log),
-                fails,
+                outcome,
             }
         }
     }
 
     impl Engine for Fake {
         fn settle(self) -> Result<TrackSummary> {
+            // Logged before the outcome is produced, so a test can tell "panicked on the way
+            // in" apart from "never reached at all".
             self.log.borrow_mut().push(format!("settle:{}", self.name));
-            if self.fails {
-                Err(Error::ScreenCaptureKit("fake".to_owned()))
-            } else {
-                Ok(summary())
+            match self.outcome {
+                Outcome::Ok => Ok(summary()),
+                Outcome::Err => Err(Error::ScreenCaptureKit("fake".to_owned())),
+                Outcome::Panic => panic!("fake {} stopped by force", self.name),
             }
         }
 
@@ -176,11 +226,11 @@ mod tests {
         }
     }
 
-    fn engines(mic_fails: bool, speaker_fails: bool) -> (Engines<Fake, Fake>, Log) {
+    fn engines(mic: Outcome, speaker: Outcome) -> (Engines<Fake, Fake>, Log) {
         let log: Log = Rc::new(RefCell::new(Vec::new()));
         let engines = Engines::new(
-            Fake::new("mic", &log, mic_fails),
-            Fake::new("speaker", &log, speaker_fails),
+            Fake::new("mic", &log, mic),
+            Fake::new("speaker", &log, speaker),
         );
         (engines, log)
     }
@@ -193,7 +243,7 @@ mod tests {
     /// nothing, and leave the microphone claimed by a process that had already left.
     #[test]
     fn a_session_dropped_without_finishing_abandons_both_engines() {
-        let (engines, log) = engines(false, false);
+        let (engines, log) = engines(Outcome::Ok, Outcome::Ok);
 
         drop(engines);
 
@@ -208,7 +258,7 @@ mod tests {
     /// then have nothing to do.
     #[test]
     fn finishing_first_leaves_the_drop_nothing_to_do() {
-        let (engines, log) = engines(false, false);
+        let (engines, log) = engines(Outcome::Ok, Outcome::Ok);
 
         let (mic_stop, speaker_stop) = engines.settle();
 
@@ -220,7 +270,7 @@ mod tests {
     /// failing must not cost the speaker its stop, nor its result.
     #[test]
     fn both_stops_are_issued_before_either_result_is_inspected() {
-        let (engines, log) = engines(true, false);
+        let (engines, log) = engines(Outcome::Err, Outcome::Ok);
 
         let (mic_stop, speaker_stop) = engines.settle();
 
@@ -239,7 +289,7 @@ mod tests {
     /// aborts -- and must not be retried into a second stop.
     #[test]
     fn an_engine_that_fails_to_stop_is_still_only_stopped_once() {
-        let (engines, log) = engines(true, true);
+        let (engines, log) = engines(Outcome::Err, Outcome::Err);
 
         drop(engines);
 
@@ -249,7 +299,7 @@ mod tests {
     /// Reading the mic mid-session -- rate, stall, frames -- must not disturb the rule.
     #[test]
     fn borrowing_the_mic_leaves_it_for_the_teardown() {
-        let (mut engines, log) = engines(false, false);
+        let (mut engines, log) = engines(Outcome::Ok, Outcome::Ok);
 
         assert!(engines.mic().is_some());
         assert!(engines.mic_mut().is_some());
@@ -257,5 +307,26 @@ mod tests {
 
         drop(engines);
         assert_eq!(taken(&log), ["abandon:mic", "abandon:speaker"]);
+    }
+
+    /// A mic whose stop panics must not buy the speaker its silence: `settle` has already
+    /// emptied the slot, so the `Drop` that unwinding runs finds nothing, and without the catch
+    /// inside [`Engines::settle`] the speaker's `SCStream` would keep capturing.
+    #[test]
+    fn a_mic_that_panics_while_settling_still_abandons_the_speaker() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let engines = Engines::new(
+            Fake::new("mic", &log, Outcome::Panic),
+            Fake::new("speaker", &log, Outcome::Ok),
+        );
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engines.settle()));
+
+        assert!(caught.is_err(), "the mic's panic still reaches the caller");
+        assert_eq!(
+            taken(&log),
+            ["settle:mic", "abandon:speaker"],
+            "the speaker is abandoned, not settled, and before the panic gets through"
+        );
     }
 }
