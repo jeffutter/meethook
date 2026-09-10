@@ -44,7 +44,7 @@ use state::EditingField;
 // caller rather than left to the module's broader `any(macos, test)` gate, or a Linux `cargo
 // clippy --all-targets` finds every item below dead.
 #[cfg(target_os = "macos")]
-use std::io::{self, Write};
+use std::io;
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
 #[cfg(target_os = "macos")]
@@ -66,7 +66,7 @@ use ratatui::crossterm::event::Event as CrosstermEvent;
 use ratatui::crossterm::event::{poll, read};
 
 #[cfg(target_os = "macos")]
-use crate::record::{Event, Note, Reporter};
+use crate::record::{Event, Narration, Note, Reporter};
 #[cfg(target_os = "macos")]
 use state::{Phase, State};
 
@@ -140,11 +140,20 @@ impl Reporter for Screen {
 /// once. The order is load-bearing: the frame stops first (nothing may draw over the
 /// restored screen), then the narration flushes to stdout in the order the run said it, then
 /// the stashed trouble is said on stderr.
+///
+/// Both streams are [`Narration`]s, which is what lets this happen *after* the run has already
+/// finalized the session: closing the terminal window hangs up stdout while the frame is still
+/// settling, and bytes nobody can read are not a reason to report a saved meeting as a failure,
+/// nor to panic on the way out. A stream that refused is therefore silent from then on and
+/// contributes no problem -- the complaint could only be said on the same dead terminal anyway.
+/// A frame that failed and a frame thread that panicked stay problems exactly as they were.
 #[cfg(target_os = "macos")]
 fn settle(
     stop: mpsc::Sender<()>,
     done: mpsc::Receiver<Result<State>>,
     handle: thread::JoinHandle<()>,
+    out: &mut Narration,
+    err: &mut Narration,
 ) -> Vec<String> {
     // Stop the frame, then wait for its verdict. The join comes after the verdict so a frame
     // that dies without reporting is reported by the receiver instead of swallowed by the
@@ -158,13 +167,10 @@ fn settle(
             // bottom.
             let narration = state.take_narration();
             if !narration.is_empty() {
-                print!("{narration}");
-                if io::stdout().flush().is_err() {
-                    problems.push("could not flush the record narration".to_string());
-                }
+                out.say(&narration);
             }
             for line in &state.trouble {
-                eprint!("{line}");
+                err.say(line);
             }
         }
         Ok(Err(e)) => problems.push(format!("the full-screen interface failed: {e:#}")),
@@ -186,7 +192,10 @@ pub(crate) fn close(mut screen: Screen) -> Result<()> {
     let stop = screen.stop.take().expect("a screen settles once");
     let done = screen.done.take().expect("a screen settles once");
     let handle = screen.handle.take().expect("a screen settles once");
-    let problems = settle(stop, done, handle);
+    // Built here rather than held by the screen: the teardown paths never coexist, so each one
+    // gets its own latch and a lost line on one stream says nothing about the other.
+    let (mut out, mut err) = (Narration::stdout(), Narration::stderr());
+    let problems = settle(stop, done, handle, &mut out, &mut err);
     anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
     Ok(())
 }
@@ -201,8 +210,9 @@ impl Drop for Screen {
         if let (Some(stop), Some(done), Some(handle)) =
             (self.stop.take(), self.done.take(), self.handle.take())
         {
-            for problem in settle(stop, done, handle) {
-                eprintln!("{problem}");
+            let (mut out, mut err) = (Narration::stdout(), Narration::stderr());
+            for problem in settle(stop, done, handle, &mut out, &mut err) {
+                err.say(&format!("{problem}\n"));
             }
         }
     }

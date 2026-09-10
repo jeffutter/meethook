@@ -18,6 +18,15 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "macos", test))]
 use std::fmt;
+// Only the narration sink names I/O: on Linux production builds `record_loop`'s presenters are
+// excluded by their `any(macos, test)` gates, and an import nothing names is a warning. The two
+// halves gate differently because naming the stream itself (`io::stdout()`) is something only the
+// macOS production paths do, while the trait that pushes bytes at it is named by the sink's own
+// `say`, which compiles for tests everywhere.
+#[cfg(target_os = "macos")]
+use std::io;
+#[cfg(any(target_os = "macos", test))]
+use std::io::Write;
 #[cfg(any(target_os = "macos", test))]
 use std::path::PathBuf;
 
@@ -507,6 +516,79 @@ pub(crate) fn giving_up_line(attempts: u32) -> String {
     format!("Giving up on this call after {attempts} attempts; still watching.\n")
 }
 
+/// One stream of narration, written to as though the terminal might already be gone.
+///
+/// Closing the terminal window does two things at once: the kernel hangs up the controlling
+/// terminal (which arrives as an interrupt, so the graceful path *is* taken) and the streams
+/// stop accepting bytes. Rust ignores `SIGPIPE`, so those writes come back as errors rather
+/// than killing the process, and `print!` answers an error by panicking -- which is how a run
+/// that was dutifully trying to save the meeting died in the middle of saying "Stopping...",
+/// having written no `session.json` and finalized nothing. A hung-up pty then answers every
+/// further write with `EIO` forever, not `BrokenPipe`, so retrying is pointless and the error
+/// kind is not something this type can usefully branch on.
+///
+/// So the failure is absorbed here rather than handed to callers: [`Narration::say`] reports
+/// nothing, and the first refusal latches the stream shut -- everything after it is discarded
+/// without another attempt at the descriptor. The owed work at stake is `Capture::finish`,
+/// which has *not* happened yet when the shutdown narration is printed, so any write error that
+/// aborts the loop costs the recording. That is also why one latch per stream rather than one
+/// global flag: a fault line that could not reach stderr must not silence the session report on
+/// stdout that follows it.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct Narration {
+    dest: Box<dyn Write>,
+    /// Set by the first refusal; from then on [`Narration::say`] discards silently.
+    dead: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Narration {
+    /// A narration stream over any writer, so a test can hand one a stream that refuses.
+    ///
+    /// Private to this module (its tests included): the rest of the crate gets the two named
+    /// streams below, which is the whole set a run may speak through.
+    fn to(dest: impl Write + 'static) -> Self {
+        Narration {
+            dest: Box::new(dest),
+            dead: false,
+        }
+    }
+
+    /// The stream the user reads: standard output, shared with any other print in the process
+    /// so the bytes stay in one order.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn stdout() -> Self {
+        Narration::to(io::stdout())
+    }
+
+    /// The stream the faults go to: standard error.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn stderr() -> Self {
+        Narration::to(io::stderr())
+    }
+
+    /// Say `text` if anyone is still listening, and never fail.
+    ///
+    /// Crate-visible rather than private to this module because the full-screen teardown says its
+    /// farewell after this module's run has already finished.
+    ///
+    /// Every error kind is swallowed -- a closed pipe, an `EIO`, a full disk all mean the same
+    /// thing here: nobody is receiving this, and the finalize matters more. Flushing is part of
+    /// the same promise: composed notes always end in a newline and std's stdout is
+    /// line-buffered, so the bytes would usually have left already, but a run whose stdout is a
+    /// pipe needs them out *now* rather than at an exit that may never come. Latching covers a
+    /// failed flush too, since a stream that cannot drain its buffer will not drain the next one
+    /// either.
+    pub(crate) fn say(&mut self, text: &str) {
+        if self.dead {
+            return;
+        }
+        if self.dest.write_all(text.as_bytes()).is_err() || self.dest.flush().is_err() {
+            self.dead = true;
+        }
+    }
+}
+
 /// Where a note goes.
 ///
 /// The seam the loop writes into instead of a stream: the plain implementation reproduces the
@@ -517,22 +599,46 @@ pub(crate) trait Reporter {
     fn note(&mut self, note: Note);
 }
 
-/// The line-based reporter: each note composed and printed to its own stream.
+/// The line-based reporter: each note composed and sent to its own stream.
 ///
-/// Printing the composed block with `print!` rather than `println!` is byte-identical -- the
-/// newline is in the block -- and it is what lets a multi-line note stay one write per note,
-/// in the same order the old `println!`s ran.
-#[cfg(target_os = "macos")]
-pub(crate) struct Plain;
+/// The composed block goes out as one write rather than as separate `println!`s -- byte-identical,
+/// since the newline is in the block -- which is what keeps a multi-line note one write per note,
+/// in the same order the old `println!`s ran. Both streams are [`Narration`]s, so a terminal that
+/// hangs up mid-run costs the user the rest of the narration and nothing else: the finalize that
+/// follows is exactly the work a panicking print used to skip.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct Plain {
+    out: Narration,
+    err: Narration,
+}
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
+impl Plain {
+    /// The reporter for a real run: narration on stdout, faults on stderr.
+    #[cfg(target_os = "macos")]
+    fn new() -> Self {
+        Plain::writing_to(io::stdout(), io::stderr())
+    }
+
+    /// The same reporter over two streams chosen by the caller, so a test can point it at ones
+    /// that refuse -- the way a hung-up terminal does -- and still watch the loop reach its
+    /// finalize.
+    fn writing_to(out: impl Write + 'static, err: impl Write + 'static) -> Self {
+        Plain {
+            out: Narration::to(out),
+            err: Narration::to(err),
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 impl Reporter for Plain {
     fn note(&mut self, note: Note) {
         let text = note.composed();
         if note.to_stderr() {
-            eprint!("{text}");
+            self.err.say(&text);
         } else {
-            print!("{text}");
+            self.out.say(&text);
         }
     }
 }
@@ -686,7 +792,7 @@ pub fn record(paths: &Paths, plain: bool) -> Result<()> {
     // with the ctrlc handler below, which remains the plain-mode path and the out-of-band
     // fallback. A single Receiver either way: cloning Senders does not split the stream.
     let mut sink = match presenter {
-        Presenter::Lines => Sink::Lines(Plain),
+        Presenter::Lines => Sink::Lines(Plain::new()),
         Presenter::Screen => {
             Sink::Screen(crate::record_screen::Screen::new(tx.clone(), paths.clone()))
         }
@@ -1154,8 +1260,9 @@ pub(crate) fn meeting_clause_line(label: &MeetingLabel) -> String {
 /// prove only what it does with them.
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1163,9 +1270,9 @@ mod tests {
     use meethook_session::{Meeting, MeetingFit, RosterEdit, SessionId};
 
     use super::{
-        Capture, DEVICE_CHANGED, Event, MIC_STALLED, Note, Offered, Outcome, Presenter, Timing,
-        await_end, meeting_clause_line, mic_line, presenter, record_loop, recorded_lines,
-        session_dir_line, session_id_line, speaker_line,
+        Capture, DEVICE_CHANGED, Event, MIC_STALLED, Narration, Note, Offered, Outcome, Plain,
+        Presenter, Reporter, Timing, WATCHING, await_end, meeting_clause_line, mic_line, presenter,
+        record_loop, recorded_lines, session_dir_line, session_id_line, speaker_line,
     };
 
     /// A reporter that records nothing.
@@ -1587,6 +1694,243 @@ mod tests {
         let mut capture = FakeCapture::default();
         run(&rx, &mut capture, &|| true, false);
 
+        assert_eq!(capture.calls, ["start", "finish"]);
+    }
+
+    /// What a [`ScriptedStream`] did about the bytes it was handed.
+    ///
+    /// Shared so a test can read it back after the stream itself has moved into a [`Narration`].
+    #[derive(Clone, Default)]
+    struct StreamLog {
+        /// The bytes the stream accepted, in order.
+        heard: Arc<Mutex<String>>,
+        /// How many writes it refused.
+        refusals: Arc<AtomicUsize>,
+    }
+
+    impl StreamLog {
+        fn heard(&self) -> String {
+            self.heard.lock().unwrap().clone()
+        }
+
+        fn refusals(&self) -> usize {
+            self.refusals.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A stream whose willingness to accept bytes is scripted like the rest of the doubles here.
+    ///
+    /// This is the hung-up terminal: the one that refuses forever, the one that refuses once and
+    /// then recovers (so the latch is visible from outside rather than assumed), and the healthy
+    /// one that must hear everything, since a latch that fired early would look exactly like a
+    /// passing suite.
+    struct ScriptedStream {
+        log: StreamLog,
+        /// Built per refusal, because [`io::Error`] is not `Clone` and a stream refuses more
+        /// than once.
+        error: fn() -> io::Error,
+        /// How many more writes to refuse before accepting again.
+        refusals_left: usize,
+        /// Whether the flush refuses even when the write is accepted.
+        flush_refuses: bool,
+    }
+
+    impl ScriptedStream {
+        /// Refuses the next `refusals` writes and then accepts and records, as `flush_refuses`
+        /// dictates for the flushes.
+        fn flaky(
+            error: fn() -> io::Error,
+            refusals: usize,
+            flush_refuses: bool,
+        ) -> (Self, StreamLog) {
+            let log = StreamLog::default();
+            (
+                ScriptedStream {
+                    log: log.clone(),
+                    error,
+                    refusals_left: refusals,
+                    flush_refuses,
+                },
+                log,
+            )
+        }
+
+        /// Refuses every write forever, the way a terminal whose master has closed does.
+        fn hung_up(error: fn() -> io::Error) -> (Self, StreamLog) {
+            Self::flaky(error, usize::MAX, false)
+        }
+
+        /// Accepts everything, for a test that must show the latch stayed asleep.
+        fn healthy() -> (Self, StreamLog) {
+            Self::flaky(
+                || io::Error::other("unused: this stream never refuses"),
+                0,
+                false,
+            )
+        }
+
+        /// Takes the bytes and then cannot drain them.
+        fn unflushable() -> (Self, StreamLog) {
+            Self::flaky(|| io::Error::from_raw_os_error(5), 0, true)
+        }
+    }
+
+    impl Write for ScriptedStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.refusals_left > 0 {
+                self.refusals_left -= 1;
+                self.log.refusals.fetch_add(1, Ordering::SeqCst);
+                return Err((self.error)());
+            }
+            self.log
+                .heard
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.flush_refuses {
+                self.log.refusals.fetch_add(1, Ordering::SeqCst);
+                return Err((self.error)());
+            }
+            Ok(())
+        }
+    }
+
+    /// What a closed pipe reports -- the shape a broken-pipe helper would recognise.
+    fn broken_pipe() -> io::Error {
+        io::Error::from(io::ErrorKind::BrokenPipe)
+    }
+
+    /// The error a hung-up pty actually answers with, which is *not* what a closed pipe gives.
+    fn input_output_error() -> io::Error {
+        io::Error::from_raw_os_error(5)
+    }
+
+    /// A broken pipe is swallowed rather than panicked on, and the stream goes quiet after it.
+    ///
+    /// The panic is the bug: `print!` raises it, it lands between the interrupt and the finalize,
+    /// and the meeting is lost. Silence costs the user a line they could no longer have read.
+    #[test]
+    fn a_broken_pipe_is_swallowed_and_latches_the_stream() {
+        let (stream, log) = ScriptedStream::hung_up(broken_pipe);
+        let mut narration = Narration::to(stream);
+
+        narration.say("Stopping...\n");
+        narration.say("Session 2026-09-10T10-00Z\n");
+
+        assert_eq!(log.refusals(), 1, "one attempt, then the latch holds");
+        assert_eq!(log.heard(), "");
+    }
+
+    /// The same for the error a closed terminal really returns, which no broken-pipe helper
+    /// would recognise: the kind is deliberately not asserted, because nothing here branches on
+    /// it -- every refusal means the same thing.
+    #[test]
+    fn an_input_output_error_is_swallowed_and_latches_the_stream() {
+        let (stream, log) = ScriptedStream::hung_up(input_output_error);
+        let mut narration = Narration::to(stream);
+
+        narration.say("Stopping...\n");
+        narration.say("Session 2026-09-10T10-00Z\n");
+
+        assert_eq!(log.refusals(), 1, "one attempt, then the latch holds");
+        assert_eq!(log.heard(), "");
+    }
+
+    /// Latching is a decision to stop trying, not a reaction to one transient failure: a stream
+    /// that recovers is still written to no further, which is why the trouble loop cannot hammer
+    /// a dead descriptor for the length of the teardown.
+    #[test]
+    fn a_stream_that_recovers_after_one_refusal_is_still_not_written_to_again() {
+        let (stream, log) = ScriptedStream::flaky(broken_pipe, 1, false);
+        let mut narration = Narration::to(stream);
+
+        narration.say("first\n");
+        narration.say("second\n");
+
+        assert_eq!(log.refusals(), 1);
+        assert_eq!(log.heard(), "", "the recovered stream hears nothing either");
+    }
+
+    /// Bytes that went in but never drained count as a failure: the buffer will not drain the
+    /// next note either, and the promise of this type is that its text reaches the terminal or
+    /// the latch closes, not that it sits in memory until an exit that may never come.
+    #[test]
+    fn a_stream_that_cannot_flush_latches_on_its_own() {
+        let (stream, log) = ScriptedStream::unflushable();
+        let mut narration = Narration::to(stream);
+
+        narration.say("first\n");
+        narration.say("second\n");
+
+        assert_eq!(log.refusals(), 1, "the failed flush alone is enough");
+    }
+
+    /// A stream that is merely fine hears every note in full.
+    ///
+    /// The other direction from the tests above: without this one, a latch that fired on the
+    /// first write of every run would keep the shutdown path safe and the user's terminal blank.
+    #[test]
+    fn a_stream_that_accepts_writes_hears_every_note() {
+        let (stream, log) = ScriptedStream::healthy();
+        let mut narration = Narration::to(stream);
+
+        narration.say("Watching the default microphone.\n");
+        narration.say("Stopping...\n");
+
+        assert_eq!(
+            log.heard(),
+            "Watching the default microphone.\nStopping...\n",
+            "byte for byte, in order"
+        );
+        assert_eq!(log.refusals(), 0, "nothing latched");
+    }
+
+    /// The two streams a plain run speaks through fail apart from each other.
+    ///
+    /// One global flag would be simpler and wrong: a diagnostic that could not reach stderr is
+    /// no reason to withhold the session report that follows it on stdout.
+    #[test]
+    fn a_stream_that_went_quiet_does_not_silence_the_other() {
+        let (out, out_log) = ScriptedStream::healthy();
+        let (err, err_log) = ScriptedStream::hung_up(input_output_error);
+        let mut plain = Plain::writing_to(out, err);
+
+        plain.note(Note::ActivityDebug("[activity] engine died".to_owned()));
+        plain.note(Note::Watching);
+        plain.note(Note::ActivityDebug("[activity] again".to_owned()));
+
+        assert_eq!(
+            err_log.refusals(),
+            1,
+            "both diagnostics were refused, one attempted"
+        );
+        assert_eq!(out_log.heard(), format!("{WATCHING}\n"));
+    }
+
+    /// The regression this whole guard exists for: narration goes nowhere, and the meeting is
+    /// still finalized.
+    ///
+    /// Driven with the production reporter rather than a silent double, because the fault lives
+    /// in that reporter: `Note::Stopping` is printed one statement before `Capture::finish`, so
+    /// a `print!` that panics there left the session with WAVs and nothing else -- no
+    /// `clips.json`, no `wav_align.json`, no `session.json`. The refusal counts are what make
+    /// this non-vacuous: the narration really was tried against a dead stream.
+    #[test]
+    fn a_terminal_that_stops_listening_does_not_skip_the_finalize() {
+        let (_tx, rx) = script(vec![(BLIP, Event::Started), (BLIP, Event::Interrupt)]);
+        let (out, out_log) = ScriptedStream::hung_up(input_output_error);
+        let (err, err_log) = ScriptedStream::hung_up(input_output_error);
+        let mut plain = Plain::writing_to(out, err);
+
+        let mut capture = FakeCapture::default();
+        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING, &mut plain);
+
+        assert!(out_log.refusals() > 0, "the shutdown was narrated anyway");
+        assert_eq!(err_log.refusals(), 0, "no fault note was owed");
         assert_eq!(capture.calls, ["start", "finish"]);
     }
 
