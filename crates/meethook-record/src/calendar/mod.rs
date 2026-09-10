@@ -65,7 +65,6 @@ mod select;
 
 use std::fmt;
 use std::fmt::Write as _;
-use std::io::Write as _;
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc;
 
@@ -79,6 +78,7 @@ use objc2_event_kit::{
 };
 use objc2_foundation::{NSDate, NSError};
 
+use crate::output::Output;
 use crate::preflight::PROMPT_TIMEOUT;
 use select::{Candidate, offerable, select};
 
@@ -305,10 +305,12 @@ fn ask() -> EKAuthorizationStatus {
     // The status is `NotDetermined`, so a dialog is about to appear over whatever the user is
     // looking at. This line lives here rather than in the CLI because this is the only code
     // that knows a prompt is coming; a caller-side check would duplicate the status read.
-    // Flushed before the call on the probe's precedent -- cheap insurance on a call family
-    // where one member terminates the process, even though this member does not.
-    println!("Asking macOS for calendar access, so sessions can be named after their meeting.");
-    let _ = std::io::stdout().flush();
+    // The write is flushed by `Output::line` before the call on the probe's precedent -- cheap
+    // insurance on a call family where one member terminates the process, even though this
+    // member does not -- and it survives a terminal that has already stopped listening.
+    Output::stdout().line(format_args!(
+        "Asking macOS for calendar access, so sessions can be named after their meeting."
+    ));
 
     let (tx, rx) = mpsc::channel::<(bool, Option<String>)>();
     // Two arguments, unlike `AVCaptureDevice`'s one-argument block: EventKit's completion
@@ -567,7 +569,7 @@ fn debugging() -> bool {
 /// grant, the candidate list and the rule that fired are all invisible in the result.
 fn debug(message: &str) {
     if debugging() {
-        eprintln!("[calendar] {message}");
+        Output::stderr().line(format_args!("[calendar] {message}"));
     }
 }
 

@@ -220,6 +220,7 @@ use objc2_core_foundation::{CFRetained, CFString};
 
 use meethook_session::{AppExclusions, Paths};
 
+use crate::output::Output;
 use crate::{Error, Result};
 
 /// What the microphone world did.
@@ -464,18 +465,22 @@ impl State {
         match self.attach_device_listener() {
             Ok(()) => {}
             Err(e @ Error::NoInputDevice) => {
-                eprintln!("Warning: {e}. Watching anyway; a device selected later is picked up.");
+                let mut err = Output::stderr();
+                err.line(format_args!(
+                    "Warning: {e}. Watching anyway; a device selected later is picked up."
+                ));
             }
             Err(e) => return Err(e),
         }
 
         self.active = self.someone_else_is_capturing();
         if self.debug {
-            eprintln!(
+            let mut err = Output::stderr();
+            err.line(format_args!(
                 "[activity] user exclusions: {} bundle ids, {} executables",
                 self.exclusions.bundle_ids.len(),
                 self.exclusions.executables.len(),
-            );
+            ));
             self.log(Trigger::Install, self.active);
         }
         Ok(self.active)
@@ -491,7 +496,10 @@ impl State {
             if let Err(e) = self.attach_device_listener()
                 && self.debug
             {
-                eprintln!("[activity] could not follow the default input device: {e}");
+                let mut err = Output::stderr();
+                err.line(format_args!(
+                    "[activity] could not follow the default input device: {e}"
+                ));
             }
         }
 
@@ -560,7 +568,10 @@ impl State {
             Trigger::DeviceRunning,
         )?);
         if self.debug {
-            eprintln!("[activity] IsRunningSomewhere listener attached to device {device}");
+            let mut err = Output::stderr();
+            err.line(format_args!(
+                "[activity] IsRunningSomewhere listener attached to device {device}"
+            ));
         }
         Ok(())
     }
@@ -628,11 +639,15 @@ impl State {
         let default_device = default_input_device();
         let mut labels: HashMap<AudioObjectID, String> = HashMap::new();
         let default_label = default_device.map(|device| device_label(device, &mut labels));
-        eprintln!(
+        // Constructed here rather than stored on `State`: `log` takes `&self` and runs on the
+        // watcher's serial queue, so a held writer would need interior mutability and `Send`
+        // gymnastics to buy nothing. See `crate::output` for why this cannot fail.
+        let mut err = Output::stderr();
+        err.line(format_args!(
             "[activity] {trigger:?}: someone_else_is_capturing={active} \
              IsRunningSomewhere={running_somewhere:?} default-input={}",
             default_label.unwrap_or_else(|| "none".to_owned()),
-        );
+        ));
         for process in object_list(
             kAudioObjectSystemObject as AudioObjectID,
             kAudioHardwarePropertyProcessObjectList,
@@ -673,7 +688,7 @@ impl State {
                 _ if ours => "   <- meethook".to_owned(),
                 _ => String::new(),
             };
-            eprintln!(
+            err.line(format_args!(
                 "{}",
                 holder_line(
                     pid,
@@ -684,7 +699,7 @@ impl State {
                     on_default,
                     &marker,
                 )
-            );
+            ));
         }
     }
 

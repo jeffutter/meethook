@@ -25,6 +25,7 @@ mod calendar;
 mod clock;
 mod exception;
 mod mic;
+mod output;
 mod preflight;
 mod speaker;
 mod teardown;
@@ -49,6 +50,7 @@ use std::time::Duration;
 use jiff::{Timestamp, Zoned};
 use meethook_session::{Meeting, Paths, RosterEdit, SessionId, SessionMetadata, SessionPaths};
 
+use crate::output::Output;
 use crate::teardown::Engine as _;
 
 /// The two live captures of a session, under the one-owner rule that stops them exactly once.
@@ -368,59 +370,96 @@ impl RunningSession {
         // run, the `Drop` that follows at the end of `finish` finds it empty.
         let (mic_stop, speaker_stop) = engines.settle();
 
+        // Both stops are taken before either result is read, so a mic that failed to settle
+        // still lets the speaker summary reach the diagnostics and the error below.
         let mic_summary = mic_stop?;
         let speaker_summary = speaker_stop?;
 
-        let mic_ticks = mic_summary.first_host_ticks().ok_or(Error::SilentTrack {
-            track: "mic",
-            dir: paths.dir().to_path_buf(),
-        })?;
-        let speaker_ticks = speaker_summary
-            .first_host_ticks()
-            .ok_or(Error::SilentTrack {
-                track: "speaker",
-                dir: paths.dir().to_path_buf(),
-            })?;
-
-        report_first_buffer_timing(&mic_summary, &speaker_summary);
-
-        // Asked here, after the silent-track checks, for two reasons. A session that is not
-        // going to be written should not wake the calendar daemon at all; and the question is
-        // asked against `start_time` rather than now, because the moment a recording began is
-        // what identifies the meeting it belongs to. The lookup cannot fail -- see
-        // `calendar` for why a missing grant, no match and a framework raise all arrive here
-        // as `None`, and why losing a recording over the calendar would be the wrong trade.
-        //
-        // Skipped altogether when a person picked the meeting while the session was live:
-        // the pick is the strongest evidence this tool holds, and asking the calendar anyway
-        // would cost a daemon wake for an answer that is discarded either way.
-        let mut metadata = SessionMetadata::new(
-            id.clone(),
-            start_time,
-            clock::track_sync(mic_ticks),
-            clock::track_sync(speaker_ticks),
-        );
-        if let Some(meeting) = hand {
-            metadata.label_by_hand(Some(meeting));
-        } else {
-            // Today's path, unchanged: the automatic rule decides, and `with_meeting`'s
-            // no-op guard on a hand-settled label keeps the two halves from ever disagreeing.
-            metadata = metadata.with_meeting(calendar::meeting_at(start_time));
-        }
-        // After the winner is resolved, before the write: one application point for both
-        // branches, matched by event id -- see the method doc for why the automatic path
-        // needs it just as much as the hand-pick path does.
-        metadata = metadata.apply_roster_edit(roster_edit);
-        metadata.write(&paths.session_json())?;
-
-        Ok(Recording {
+        finalize(
             id,
             paths,
-            metadata,
-            mic: mic_summary,
-            speaker: speaker_summary,
-        })
+            start_time,
+            mic_summary,
+            speaker_summary,
+            hand,
+            roster_edit,
+            &mut Output::stderr(),
+        )
     }
+}
+
+/// Decides whether this session is a usable recording, describes it, and writes its metadata.
+///
+/// Split out of [`RunningSession::finish`] so that "a diagnostic cannot skip the write" is
+/// testable rather than argued: `RunningSession` owns two live capture engines, which no test
+/// can build without a display, an input device and a grant. Everything left to do once the
+/// engines have settled is plain data, which is what lets a test drive the whole tail against
+/// a stream that refuses every byte -- the case that matters, because a print that panicked
+/// here landed *before* `session.json` existed and cost the recording. See
+/// [`crate::output`] for why these prints cannot fail.
+// Eight, because every one of them is something `session.json` records or something the
+// diagnostics print. Bundling them into a parameter struct would name the bundle, which is a
+// second vocabulary for facts the session already has names for.
+#[allow(clippy::too_many_arguments)]
+fn finalize(
+    id: SessionId,
+    paths: SessionPaths,
+    start_time: Timestamp,
+    mic_summary: TrackSummary,
+    speaker_summary: TrackSummary,
+    hand: Option<Meeting>,
+    roster_edit: Option<RosterEdit>,
+    out: &mut Output,
+) -> Result<Recording> {
+    let mic_ticks = mic_summary.first_host_ticks().ok_or(Error::SilentTrack {
+        track: "mic",
+        dir: paths.dir().to_path_buf(),
+    })?;
+    let speaker_ticks = speaker_summary
+        .first_host_ticks()
+        .ok_or(Error::SilentTrack {
+            track: "speaker",
+            dir: paths.dir().to_path_buf(),
+        })?;
+
+    report_first_buffer_timing(&mic_summary, &speaker_summary, out);
+
+    // Asked here, after the silent-track checks, for two reasons. A session that is not
+    // going to be written should not wake the calendar daemon at all; and the question is
+    // asked against `start_time` rather than now, because the moment a recording began is
+    // what identifies the meeting it belongs to. The lookup cannot fail -- see
+    // `calendar` for why a missing grant, no match and a framework raise all arrive here
+    // as `None`, and why losing a recording over the calendar would be the wrong trade.
+    //
+    // Skipped altogether when a person picked the meeting while the session was live:
+    // the pick is the strongest evidence this tool holds, and asking the calendar anyway
+    // would cost a daemon wake for an answer that is discarded either way.
+    let mut metadata = SessionMetadata::new(
+        id.clone(),
+        start_time,
+        clock::track_sync(mic_ticks),
+        clock::track_sync(speaker_ticks),
+    );
+    if let Some(meeting) = hand {
+        metadata.label_by_hand(Some(meeting));
+    } else {
+        // Today's path, unchanged: the automatic rule decides, and `with_meeting`'s
+        // no-op guard on a hand-settled label keeps the two halves from ever disagreeing.
+        metadata = metadata.with_meeting(calendar::meeting_at(start_time));
+    }
+    // After the winner is resolved, before the write: one application point for both
+    // branches, matched by event id -- see the method doc for why the automatic path
+    // needs it just as much as the hand-pick path does.
+    metadata = metadata.apply_roster_edit(roster_edit);
+    metadata.write(&paths.session_json())?;
+
+    Ok(Recording {
+        id,
+        paths,
+        metadata,
+        mic: mic_summary,
+        speaker: speaker_summary,
+    })
 }
 
 /// Prints how far each capture API's own timestamp sits from the moment its buffer was
@@ -449,34 +488,40 @@ impl RunningSession {
 /// line through the first timestamp at the track's nominal rate. A track whose timestamps
 /// disagree with its own sample count has lost or gained audio, which corrupts alignment
 /// however good the first timestamp was.
-fn report_first_buffer_timing(mic: &track::TrackSummary, speaker: &track::TrackSummary) {
+fn report_first_buffer_timing(
+    mic: &track::TrackSummary,
+    speaker: &track::TrackSummary,
+    out: &mut Output,
+) {
     if std::env::var_os("MEETHOOK_TIMING_DEBUG").is_none() {
         return;
     }
 
-    eprintln!("\n[timing] diagnostics (MEETHOOK_TIMING_DEBUG)");
+    out.line(format_args!(
+        "\n[timing] diagnostics (MEETHOOK_TIMING_DEBUG)"
+    ));
     for (label, summary) in [("mic", mic), ("speaker", speaker)] {
         let Some(b) = summary.first_buffer else {
-            eprintln!("  {label:<8} no buffers received");
+            out.line(format_args!("  {label:<8} no buffers received"));
             continue;
         };
         // Signed: a timestamp *after* delivery would be a distinct and much stranger bug
         // than one before it, and must not silently wrap through u64.
         let first_gap = clock::ticks_to_millis(b.delivered_ticks as i64 - b.host_ticks as i64);
         let buffer_ms = f64::from(b.frames) / f64::from(summary.sample_rate) * 1000.0;
-        eprintln!(
+        out.line(format_args!(
             "  {label:<8} buffer={} frames ({buffer_ms:.3} ms)   first gap={first_gap:+.3} ms \
              ({:.2} buffers)",
             b.frames,
             first_gap / buffer_ms,
-        );
+        ));
 
         let Some(t) = summary.timing.as_ref() else {
             continue;
         };
         let median = clock::ticks_to_millis(t.median_gap_ticks());
         let excess = first_gap - median;
-        eprintln!(
+        out.line(format_args!(
             "  {:<8} {} buffers   gap median={median:+.3} min={:+.3} max={:+.3} ms   \
              max drift={:+.3} ms",
             "",
@@ -484,8 +529,8 @@ fn report_first_buffer_timing(mic: &track::TrackSummary, speaker: &track::TrackS
             clock::ticks_to_millis(t.min_gap_ticks()),
             clock::ticks_to_millis(t.max_gap_ticks()),
             clock::ticks_to_millis(t.max_drift_ticks()),
-        );
-        eprintln!(
+        ));
+        out.line(format_args!(
             "  {:<8} first - median = {excess:+.3} ms ({:.2} buffers){}",
             "",
             excess / buffer_ms,
@@ -494,14 +539,14 @@ fn report_first_buffer_timing(mic: &track::TrackSummary, speaker: &track::TrackS
             } else {
                 ""
             },
-        );
+        ));
     }
 
     if let (Some(m), Some(s)) = (mic.first_buffer, speaker.first_buffer) {
         let stored = clock::ticks_to_millis(m.host_ticks as i64 - s.host_ticks as i64);
-        eprintln!(
+        out.line(format_args!(
             "  stored offset (mic - speaker)    {stored:+.3} ms   <- what session.json records"
-        );
+        ));
         // Deliberately no "corrected" offset is printed here. A first-vs-median excess is
         // tempting to subtract, but `max drift` above measures the first timestamp against
         // every later one in the same stream: when drift is ~0, the first timestamp is
@@ -513,7 +558,7 @@ fn report_first_buffer_timing(mic: &track::TrackSummary, speaker: &track::TrackS
     // Nor is any hardware latency printed. That probe existed and was removed: CoreAudio's
     // figures proved unusable for this purpose (see `speaker.rs`), and a number on screen
     // that nobody should subtract is worse than no number at all.
-    eprintln!();
+    out.line(format_args!(""));
 }
 
 /// A completed, on-disk session.
@@ -523,4 +568,171 @@ pub struct Recording {
     pub metadata: SessionMetadata,
     pub mic: TrackSummary,
     pub speaker: TrackSummary,
+}
+
+/// What this crate decides with no hardware: the tail of a session, after both engines have
+/// stopped and everything left to know is plain data.
+///
+/// What it therefore cannot decide is anything about the engines themselves -- whether a
+/// stream really stopped, whether a WAV header got finalized, whether the calendar daemon
+/// answers -- all of which need a display, an input device, or a grant, and none of which the
+/// finalize step can observe anyway: it works only from the summaries it was handed.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::Output;
+    use crate::output::scripted::{ScriptedStream, input_output_error};
+    use meethook_session::SessionId;
+
+    /// A track that received audio, so the silent-track gates let the finalize proceed.
+    ///
+    /// `timing` stays `None`: building a [`track::TimingProfile`] needs a real writer thread,
+    /// which is exactly the hardware this file's tests exist to avoid. The report's first two
+    /// lines per track -- and the stored-offset line -- still run.
+    fn live_track(host_ticks: u64) -> TrackSummary {
+        TrackSummary {
+            sample_rate: 48_000,
+            frames: 48_000,
+            first_buffer: Some(track::FirstBuffer {
+                host_ticks,
+                delivered_ticks: host_ticks + 48_000,
+                frames: 480,
+            }),
+            timing: None,
+        }
+    }
+
+    /// The meeting a person picked while the session was live.
+    ///
+    /// Passing one makes the automatic lookup skip `calendar::meeting_at` entirely, so these
+    /// tests touch no EventKit and behave identically on a machine that does have a grant.
+    fn hand_picked(start_time: Timestamp) -> Meeting {
+        Meeting::new(
+            "event-1".to_owned(),
+            "Weekly sync".to_owned(),
+            "Work".to_owned(),
+            start_time,
+            start_time
+                .checked_add(jiff::SignedDuration::from_secs(1800))
+                .unwrap(),
+        )
+    }
+
+    /// The regression this crate's whole `output` module exists for: the terminal stops
+    /// listening mid-teardown, every diagnostic is refused, and the session is still finalized.
+    ///
+    /// `MEETHOOK_TIMING_DEBUG` is set here so the gated report actually runs and is actually
+    /// refused -- without it the refusal count would be zero and the test would prove nothing.
+    /// The write is process-global, which is safe because nextest gives every test its own
+    /// process (under plain `cargo test` the threads would race on it).
+    #[test]
+    fn a_terminal_that_stops_listening_does_not_skip_the_write() {
+        // SAFETY: nextest runs this test alone in its own process, and nothing else in it has
+        // started a thread by this point.
+        unsafe { std::env::set_var("MEETHOOK_TIMING_DEBUG", "1") };
+
+        let dir = tempfile::tempdir().expect("a scratch session directory");
+        let paths = SessionPaths::new(dir.path());
+        let id = SessionId::parse("20260910-120000").expect("a well-formed id");
+        let start_time = "2026-09-10T12:00:00Z".parse().expect("a valid timestamp");
+        let (stream, log) = ScriptedStream::hung_up(input_output_error);
+        let mut out = Output::to(stream);
+
+        let recording = finalize(
+            id.clone(),
+            paths.clone(),
+            start_time,
+            live_track(1_000),
+            live_track(2_000),
+            Some(hand_picked(start_time)),
+            None,
+            &mut out,
+        );
+
+        let recording = recording.expect("a refused terminal must not cost the recording");
+        assert!(log.refusals() > 0, "the diagnostics really were refused");
+        let written = SessionMetadata::read(&paths.session_json())
+            .expect("session.json parses back as metadata");
+        assert_eq!(written.session_id, id);
+        assert_eq!(recording.metadata.session_id, id);
+        assert!(
+            recording.metadata.meeting.is_some(),
+            "the hand pick survived the path that could not print"
+        );
+    }
+
+    /// The same call with the diagnostics switched off: nothing is printed, and the write
+    /// still happens.
+    ///
+    /// The other half of the test above. With the latch never tripped (`refusals == 0`) it is
+    /// also the check that the healthy stream stayed healthy, since a stream that had gone dead
+    /// before the first line would look identical from the assertions that matter.
+    #[test]
+    fn a_quiet_run_writes_the_session_without_printing_anything() {
+        let dir = tempfile::tempdir().expect("a scratch session directory");
+        let paths = SessionPaths::new(dir.path());
+        let id = SessionId::parse("20260910-120001").expect("a well-formed id");
+        let start_time = "2026-09-10T12:00:01Z".parse().expect("a valid timestamp");
+        let (stream, log) = ScriptedStream::healthy();
+        let mut out = Output::to(stream);
+
+        let recording = finalize(
+            id.clone(),
+            paths.clone(),
+            start_time,
+            live_track(1_000),
+            live_track(2_000),
+            Some(hand_picked(start_time)),
+            None,
+            &mut out,
+        )
+        .expect("the ordinary finalize succeeds");
+
+        assert_eq!(log.heard(), "", "no diagnostic variable is set");
+        assert_eq!(log.refusals(), 0, "and nothing latched");
+        assert!(SessionPaths::new(dir.path()).session_json().is_file());
+        assert_eq!(recording.id, id);
+    }
+
+    /// A track that heard nothing is still refused *before* the write, whatever the terminal
+    /// will do with the report.
+    ///
+    /// Pinned because the finalize's order is load-bearing: the silent-track gate runs ahead of
+    /// the diagnostics, so a broken recording never gets a `session.json` claiming it completed.
+    #[test]
+    fn a_silent_track_is_refused_before_anything_is_printed() {
+        // SAFETY: as above -- one test per process under nextest.
+        unsafe { std::env::set_var("MEETHOOK_TIMING_DEBUG", "1") };
+
+        let dir = tempfile::tempdir().expect("a scratch session directory");
+        let paths = SessionPaths::new(dir.path());
+        let id = SessionId::parse("20260910-120002").expect("a well-formed id");
+        let start_time = "2026-09-10T12:00:02Z".parse().expect("a valid timestamp");
+        let (stream, log) = ScriptedStream::hung_up(input_output_error);
+        let mut out = Output::to(stream);
+
+        let silent = || TrackSummary {
+            sample_rate: 48_000,
+            frames: 0,
+            first_buffer: None,
+            timing: None,
+        };
+        let outcome = finalize(
+            id,
+            paths.clone(),
+            start_time,
+            silent(),
+            live_track(2_000),
+            Some(hand_picked(start_time)),
+            None,
+            &mut out,
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(Error::SilentTrack { track: "mic", .. })
+        ));
+        assert!(!paths.session_json().exists(), "nothing was written");
+        assert_eq!(log.refusals(), 0, "and nothing was printed first");
+    }
 }
