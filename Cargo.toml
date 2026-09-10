@@ -71,6 +71,12 @@ meethook-transcribe = { path = "crates/meethook-transcribe" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+# `termination` is what makes SIGTERM and SIGHUP reach the quit path at all; without it
+# ctrlc registers SIGINT only and a killed `record` dies mid-recording with the mic claimed.
+# Guarded by `sigterm_and_sighup_are_handled_so_a_kill_reaches_the_quit_path` in
+# crates/meethook/src/record.rs. crates/meethook-record doesn't even depend on ctrlc --
+# it roots its own workspace and is excluded from this one -- so this declaration is the
+# only thing deciding what the shipped binary links.
 ctrlc = { version = "3", features = ["termination"] }
 hound = "3.5"
 jiff = "0.2"

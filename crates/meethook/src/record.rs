@@ -3054,4 +3054,59 @@ mod tests {
         assert!(!text.contains("started as:"), "{text}");
         assert!(!text.contains("started "), "{text}");
     }
+
+    /// Without `features = ["termination"]` on the root workspace's ctrlc declaration
+    /// (`Cargo.toml` in this repo's root), `kill <pid>` -- or a hangup on the controlling
+    /// terminal -- kills `record` mid-recording with the mic still claimed: ctrlc then
+    /// registers SIGINT only, and SIGTERM/SIGHUP keep their default disposition, so the
+    /// quit path above never runs and nothing else in the suite notices. That single
+    /// Cargo.toml word is the whole mechanism, so this test reads the kernel's
+    /// dispositions back after installing a handler exactly the way `record` does.
+    ///
+    /// Feature resolution does not hide this anywhere: `crates/meethook-record` roots its
+    /// own workspace (it is excluded from this one) and does not depend on ctrlc at all, so
+    /// nothing there could shadow this declaration even if it wanted to -- `cargo tree -e
+    /// features -i ctrlc` shows the root's declaration as the only decider, which is why
+    /// the guard lives here rather than beside the handler's macOS-only call site.
+    ///
+    /// `set_handler` installs the sigaction handlers synchronously, before it returns --
+    /// `init_and_set_handler` calls `platform::init_os_handler` first and only spawns a
+    /// thread afterward, to wait on delivered signals -- so the dispositions below are
+    /// already set by the time this line returns. The poll below is defensive margin
+    /// against a future ctrlc version changing that ordering, not evidence of a race today.
+    /// nextest gives each test its own process -- ctrlc's one-handler-per-process rule costs
+    /// nothing here -- and ctrlc builds on Linux too, so the guard runs on both CI matrix
+    /// OSes without a microphone, a TCC grant, or a pty.
+    #[test]
+    fn sigterm_and_sighup_are_handled_so_a_kill_reaches_the_quit_path() {
+        ctrlc::set_handler(|| {}).expect("ctrlc refused to install its handler");
+
+        /// The process's current disposition for `sig`, read back without changing it
+        /// (a null `act` makes `sigaction` query-only).
+        fn disposition(sig: libc::c_int) -> usize {
+            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) };
+            assert_eq!(rc, 0, "querying the disposition of signal {sig} failed");
+            old.sa_sigaction
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        for (name, sig) in [("SIGTERM", libc::SIGTERM), ("SIGHUP", libc::SIGHUP)] {
+            loop {
+                let d = disposition(sig);
+                if d != libc::SIG_DFL && d != libc::SIG_IGN {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{name} is still {d:#x}: ctrlc installed no handler for it, which \
+                     means the shipped binary was linked without ctrlc's `termination` \
+                     feature (root Cargo.toml). A kill or hangup would then take the \
+                     default disposition -- instant death mid-recording, no finalize, \
+                     mic left claimed.",
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
 }
