@@ -33,3 +33,6 @@ scratch/**/*.tar
 scratch/**/*.tar.gz
 scratch/**/*.tgz
 scratch/**/*.zip
+
+# Same reasoning: archiving a task leaves its file behind, still working state.
+backlog/archive/

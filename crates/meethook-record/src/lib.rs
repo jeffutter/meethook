@@ -27,6 +27,7 @@ mod exception;
 mod mic;
 mod preflight;
 mod speaker;
+mod teardown;
 mod track;
 
 pub use activity::{Activity, MicActivityWatcher};
@@ -47,6 +48,14 @@ use std::time::Duration;
 
 use jiff::{Timestamp, Zoned};
 use meethook_session::{Meeting, Paths, RosterEdit, SessionId, SessionMetadata, SessionPaths};
+
+use crate::teardown::Engine as _;
+
+/// The two live captures of a session, under the one-owner rule that stops them exactly once.
+///
+/// Named here rather than spelled out at each field so the concrete pair stays in one place;
+/// the generic guard itself lives in `teardown`.
+type LiveEngines = teardown::Engines<mic::MicCapture, speaker::SpeakerCapture>;
 
 /// Everything capture can fail with.
 ///
@@ -199,7 +208,13 @@ impl Recorder {
                 Err(e) => {
                     // The speaker stream is already live; stop it so a failed start does not
                     // leave a capture running against a session nobody will finish.
-                    drop(speaker.stop());
+                    //
+                    // The settled stop, not `abandon`, even though nothing reads the result:
+                    // behaviour-preserving beats an unmeasured speedup here, and the bounded
+                    // wait is what proves the stream is really gone before the retry starts
+                    // another one. If TASK-067.01 measures that wait costing something, it
+                    // changes this line and carries the measurement.
+                    let _ = speaker.settle();
                     Err(e)
                 }
             }
@@ -217,19 +232,29 @@ impl Recorder {
             id,
             paths: session_paths,
             start_time: now.timestamp(),
-            mic,
-            speaker,
+            mic_sample_rate: mic.sample_rate(),
+            mic_channels: mic.channels(),
+            speaker_sample_rate: speaker.sample_rate(),
+            engines: LiveEngines::new(mic, speaker),
         })
     }
 }
 
 /// A session with both engines live.
+///
+/// The engines are held by the `LiveEngines` guard, which stops them if this session is ever
+/// dropped without being finished -- see `teardown`. Everything else the session reports after
+/// that point has to be answerable from plain fields, because a released engine has no honest
+/// answer left to give: the three numbers below are immutable facts about the session, whereas
+/// the engine handles are a resource that may already be gone.
 pub struct RunningSession {
     id: SessionId,
     paths: SessionPaths,
     start_time: Timestamp,
-    mic: mic::MicCapture,
-    speaker: speaker::SpeakerCapture,
+    mic_sample_rate: u32,
+    mic_channels: u32,
+    speaker_sample_rate: u32,
+    engines: LiveEngines,
 }
 
 impl RunningSession {
@@ -254,15 +279,15 @@ impl RunningSession {
     /// The input device's own rate, as reported. Printed at start so the user can see that
     /// the mic engine actually came up.
     pub fn mic_sample_rate(&self) -> u32 {
-        self.mic.sample_rate()
+        self.mic_sample_rate
     }
 
     pub fn mic_channels(&self) -> u32 {
-        self.mic.channels()
+        self.mic_channels
     }
 
     pub fn speaker_sample_rate(&self) -> u32 {
-        self.speaker.sample_rate()
+        self.speaker_sample_rate
     }
 
     /// Whether the microphone track has stopped receiving audio.
@@ -272,15 +297,21 @@ impl RunningSession {
     /// sample-rate reconfiguration, an exclusive grab, a stream-format change, a sleep the
     /// engine did not return from -- and needs no notification to do it. A microphone that
     /// has not delivered its first buffer yet is never stalled; that case is a failed start,
-    /// and [`RunningSession::finish`] already reports it as [`Error::SilentTrack`].
+    /// and [`RunningSession::finish`] already reports it as [`Error::SilentTrack`]. Answers
+    /// `false` once the engines have been released, for the same reason
+    /// [`RunningSession::mic_frames_delivered`] answers 0: every path that releases them ends
+    /// the session.
     pub fn mic_stalled(&mut self) -> bool {
-        self.mic.stalled(std::time::Instant::now())
+        self.engines
+            .mic_mut()
+            .is_some_and(|mic| mic.stalled(std::time::Instant::now()))
     }
 
     /// Frames the microphone tap has delivered so far. A diagnostic for the record loop's
-    /// debug output, not the length of `mic.wav`.
+    /// debug output, not the length of `mic.wav`. Answers 0 once the engines have been
+    /// released, which no caller can observe: both ways of stopping them end the session.
     pub fn mic_frames_delivered(&self) -> u64 {
-        self.mic.frames_delivered()
+        self.engines.mic().map_or(0, |mic| mic.frames_delivered())
     }
 
     /// Stops both engines, finalizes both WAV headers, and writes `session.json`.
@@ -319,14 +350,15 @@ impl RunningSession {
             id,
             paths,
             start_time,
-            mic,
-            speaker,
+            engines,
+            ..
         } = self;
 
         // Stop both before inspecting either result: returning early on a mic failure would
-        // leave the speaker WAV unfinalized, which is a worse outcome than a late error.
-        let mic_stop = mic.stop();
-        let speaker_stop = speaker.stop();
+        // leave the speaker WAV unfinalized, which is a worse outcome than a late error. The
+        // ordering lives in `teardown` because `Drop` uses the same slot -- and once this has
+        // run, the `Drop` that follows at the end of `finish` finds it empty.
+        let (mic_stop, speaker_stop) = engines.settle();
 
         let mic_summary = mic_stop?;
         let speaker_summary = speaker_stop?;

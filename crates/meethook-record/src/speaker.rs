@@ -200,12 +200,40 @@ impl SpeakerCapture {
     pub fn sample_rate(&self) -> u32 {
         SPEAKER_SAMPLE_RATE
     }
+}
 
+impl crate::teardown::Engine for SpeakerCapture {
     /// Stops the stream and finalizes the WAV.
     ///
     /// A stream that died mid-meeting is reported here rather than swallowed: without this,
     /// a dropped stream would produce a short file and a cheerful success message.
-    pub fn stop(self) -> Result<TrackSummary> {
+    fn settle(self) -> Result<TrackSummary> {
+        self.stop_capturing(true)
+    }
+
+    /// Stops the stream, finalizes the WAV, and reports nothing.
+    ///
+    /// The difference from [`Engine::settle`](crate::teardown::Engine::settle) is the wait and
+    /// everything the wait buys. The
+    /// completion handler is nullable, so this asks for none: the framework has nothing to
+    /// call and there is nothing to time out on. That also means a stop-time error -- including
+    /// `-3808`, the routine answer when a stream already died mid-meeting -- is never turned
+    /// into an `Error` nobody is left to print, and the delegate's error slot is never read,
+    /// because its reader panics on a poisoned lock and a panic during unwinding aborts.
+    fn abandon(self) {
+        let _ = self.stop_capturing(false);
+    }
+}
+
+impl SpeakerCapture {
+    /// The one teardown: stop the stream, detach the output, finalize the WAV.
+    ///
+    /// `waited` says whether to block on the completion handler, which decides both how long
+    /// this may take and whether anything is reported: `settle` waits because a stream that
+    /// died mid-meeting is worth saying so about, `abandon` because a hang while the process is
+    /// unwinding is worse than the capture it leaves behind. Both orders of business end at the
+    /// same finalized WAV.
+    fn stop_capturing(self, waited: bool) -> Result<TrackSummary> {
         let SpeakerCapture {
             stream,
             output,
@@ -219,19 +247,25 @@ impl SpeakerCapture {
             let _ = tx.send(error_message(error));
         });
         // Both teardown calls are caught and their raises discarded, the same reading
-        // `MicCapture::stop` takes: this is the finalize path, the audio is already on disk,
-        // and a stream whose display has gone is precisely what raises here. `stop_result`
+        // `MicCapture::settle` takes: this is the finalize path, the audio is already on disk,
+        // and a stream whose display has gone is precisely what raises here. `stop_report`
         // still carries a *returned* error, which is a stream that died mid-meeting and is
         // worth reporting; a raise on the way down is not.
         // SAFETY: as for `startCaptureWithCompletionHandler` above.
-        let stop_result = match crate::exception::catching("SCStream.stopCapture", || unsafe {
-            stream.stopCaptureWithCompletionHandler(Some(&handler))
-        }) {
-            Ok(()) => wait(&rx),
-            // Nothing will complete the handler, so waiting out the full timeout here would
-            // only delay the finalize by ten seconds to learn nothing.
-            Err(_) => Ok(None),
-        };
+        let stop_report: Result<Option<String>> =
+            match crate::exception::catching("SCStream.stopCapture", || unsafe {
+                if waited {
+                    stream.stopCaptureWithCompletionHandler(Some(&handler))
+                } else {
+                    stream.stopCaptureWithCompletionHandler(None)
+                }
+            }) {
+                Ok(()) if waited => wait(&rx),
+                // Nothing will complete the handler, so waiting out the full timeout here would
+                // only delay the finalize by ten seconds to learn nothing.
+                Ok(()) => Ok(None),
+                Err(_) => Ok(None),
+            };
 
         // Detach the output before dropping anything, so no queued callback can fire into a
         // writer that is about to be finalized.
@@ -246,10 +280,16 @@ impl SpeakerCapture {
         // Finalize before reporting any error: a half-written WAV helps nobody.
         let summary = writer.finish();
 
+        if !waited {
+            // Abandoning: nothing downstream may report or lock, and every branch below does
+            // one or the other.
+            return summary;
+        }
+
         if let Some(message) = delegate.take_error() {
             return Err(Error::ScreenCaptureKit(message));
         }
-        match stop_result {
+        match stop_report {
             Ok(None) => {}
             Ok(Some(message)) => return Err(Error::ScreenCaptureKit(message)),
             Err(e) => return Err(e),

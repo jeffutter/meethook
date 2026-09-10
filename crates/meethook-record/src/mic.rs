@@ -373,9 +373,11 @@ impl MicCapture {
     pub fn stalled(&mut self, now: Instant) -> bool {
         self.liveness.observe(&self.progress, now)
     }
+}
 
+impl crate::teardown::Engine for MicCapture {
     /// Stops the engine and finalizes the WAV.
-    pub fn stop(self) -> Result<TrackSummary> {
+    fn settle(self) -> Result<TrackSummary> {
         let MicCapture {
             engine,
             input,
@@ -400,6 +402,14 @@ impl MicCapture {
         });
 
         writer.finish()
+    }
+
+    /// The mic has no cheaper form of stopping than [`Engine::settle`](crate::teardown::Engine::settle):
+    /// `AVAudioEngine.stop` is synchronous and returns nothing (`AVAudioEngine.h:386`), so there
+    /// is no completion handler to skip. The only wait left is the writer join, which the drop
+    /// path *wants* -- it is what makes an orphan's WAV complete rather than checkpoint-short.
+    fn abandon(self) {
+        let _ = self.settle();
     }
 }
 
