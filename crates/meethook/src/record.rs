@@ -38,10 +38,19 @@ use anyhow::Context;
 use anyhow::Result;
 #[cfg(any(target_os = "macos", test))]
 use meethook_enroll::{MeetingLabel, MeetingOffer};
+// The single-instance guard is taken by `record` alone; `refusal` below names its holder in a
+// message and so compiles for tests everywhere, while the guard itself is only ever held by the
+// macOS command.
 #[cfg(target_os = "macos")]
+use anyhow::bail;
+#[cfg(any(target_os = "macos", test))]
+use meethook_session::Holder;
+#[cfg(any(target_os = "macos", test))]
 use meethook_session::Paths;
 #[cfg(any(target_os = "macos", test))]
 use meethook_session::SessionId;
+#[cfg(target_os = "macos")]
+use meethook_session::{Acquisition, RecordLock};
 #[cfg(any(target_os = "macos", test))]
 use meethook_session::{Attendee, Meeting, MeetingFit, RosterEdit};
 // The capture backend exists only where its Apple frameworks compile; the platform-neutral
@@ -780,6 +789,27 @@ pub fn record(paths: &Paths, plain: bool) -> Result<()> {
     // wait for the first line the run would print.
     let presenter = presenter(plain, Tty::current());
 
+    // The single-instance guard, taken before `preflight`. That ordering is the one place this
+    // function knowingly cuts across the property `Recorder::new` advertises -- see the scoping
+    // note there -- and it is worth the exception:
+    //
+    // - A TCC prompt can sit out its 120-second timeout (`preflight::PROMPT_TIMEOUT`) on a run
+    //   that was never going to record, and a refusal that arrives afterwards cost the user two
+    //   minutes and a dialog for nothing.
+    // - Refusing on a clean terminal beats refusing from inside the full-screen frame, or into
+    //   a pipe that has already swallowed the reason.
+    // - It is the only ordering under which a second instance can be tested at all without a
+    //   microphone and a granted TCC database behind it.
+    //
+    // What it costs is a zero-byte file under `<root>` before permissions were checked, which
+    // is not the thing that invariant protects: no session directory and no half-written audio
+    // reaches disk either way. Held for the rest of this function, which is the whole life of
+    // the process; releasing is dropping it.
+    let _record_lock = match RecordLock::acquire(paths)? {
+        Acquisition::Held(lock) => lock,
+        Acquisition::Taken(holder) => bail!("{}", refusal(paths, &holder)),
+    };
+
     let authorized = preflight()?;
     let recorder = Recorder::new(authorized)?;
 
@@ -1258,6 +1288,54 @@ pub(crate) fn meeting_clause_line(label: &MeetingLabel) -> String {
 /// automated test. What is *not* decidable here is whether the trigger fires at all against
 /// real hardware -- these tests feed the loop the edges a working watcher would produce, and
 /// prove only what it does with them.
+#[cfg(any(target_os = "macos", test))]
+/// Why a second `record` was refused, in the shape of every other startup refusal here.
+///
+/// Modelled on `MissingPermissions`'s wording (`meethook_record::preflight`): say what cannot
+/// start, then the facts that identify the thing standing in the way, then what to do about it.
+/// Returned as an error rather than printed here because the CLI's exit status comes from
+/// `main`'s `Result`, and a refusal that exited 0 would be indistinguishable from a recording
+/// that went fine to anything scripting this.
+///
+/// The last paragraph is the one that earns its length. Deleting `record.lock` *looks* like the
+/// fix -- it is a file with a name that says what it is for, sitting where other meethook state
+/// sits -- and deleting it does nothing whatever except strand the next `record` into thinking
+/// it is first in line while the original keeps recording. So the message says that out loud
+/// rather than leaving the user to discover it.
+fn refusal(paths: &Paths, holder: &Holder) -> String {
+    let mut message = String::new();
+    message
+        .push_str("meethook record cannot start: another recording holds this data directory.\n\n");
+    // Every detail the holder chose to publish gets its own line, and a gap means the line is
+    // absent rather than guessed at: a refusal that invented a pid would send the user to kill
+    // the wrong process.
+    match holder.pid {
+        Some(pid) => message.push_str(&format!(
+            "  {} is held by pid {pid}\n",
+            paths.record_lock().display()
+        )),
+        None => message.push_str(&format!(
+            "  {} is held by a live process whose pid is unknown\n",
+            paths.record_lock().display()
+        )),
+    }
+    if let Some(started) = &holder.started {
+        // To the second, and without the zone-name annotation jiff's default rendering appends:
+        // whoever reads this is deciding whether that is the run they forgot to quit, and six
+        // digits of microseconds plus `[America/Chicago]` is noise in that decision.
+        message.push_str(&format!(
+            "  started {}\n",
+            started.strftime("%Y-%m-%d %H:%M:%S %:z")
+        ));
+    }
+    if let Some(argv) = &holder.argv {
+        message.push_str(&format!("  started as: {argv}\n"));
+    }
+    message.push_str("\nQuitting that process releases the lock. Deleting record.lock does not:");
+    message.push_str("\nthe lock is held by the operating system, not by the file.");
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{self, Write};
@@ -1267,12 +1345,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::commands::Tty;
-    use meethook_session::{Meeting, MeetingFit, RosterEdit, SessionId};
+    use meethook_session::{Holder, Meeting, MeetingFit, Paths, RosterEdit, SessionId};
 
     use super::{
         Capture, DEVICE_CHANGED, Event, MIC_STALLED, Narration, Note, Offered, Outcome, Plain,
         Presenter, Reporter, Timing, WATCHING, await_end, meeting_clause_line, mic_line, presenter,
-        record_loop, recorded_lines, session_dir_line, session_id_line, speaker_line,
+        record_loop, recorded_lines, refusal, session_dir_line, session_id_line, speaker_line,
     };
 
     /// A reporter that records nothing.
@@ -2924,5 +3002,56 @@ mod tests {
     #[test]
     fn an_attached_run_without_plain_is_the_screen() {
         assert_eq!(presenter(false, ATTACHED), Presenter::Screen);
+    }
+
+    // --- refusing a second instance -------------------------------------------------------
+
+    /// The whole point of the refusal is that a user can act on it: which process to quit, and
+    /// where it came from.
+    #[test]
+    fn a_refusal_names_the_instance_it_lost_to() {
+        let holder = Holder {
+            pid: Some(4242),
+            argv: Some("/nix/store/abc-meethook-0.4.0/bin/meethook record".to_string()),
+            started: Some("2026-09-10T14:02:11+02:00[Europe/Berlin]".parse().unwrap()),
+        };
+        let text = refusal(&Paths::new("/Users/you/meethook"), &holder);
+
+        assert!(
+            text.starts_with("meethook record cannot start:"),
+            "the first line has to say what could not start, as every other startup refusal does: {text}"
+        );
+        assert!(
+            text.contains("/Users/you/meethook/record.lock is held by pid 4242"),
+            "{text}"
+        );
+        assert!(
+            text.contains("started 2026-09-10 14:02:11 +02:00"),
+            "{text}"
+        );
+        assert!(
+            text.contains("started as: /nix/store/abc-meethook-0.4.0/bin/meethook record"),
+            "{text}"
+        );
+        assert!(text.contains("Deleting record.lock does not"), "{text}");
+    }
+
+    /// A holder that published nothing still gets a refusal -- but one that says so, because a
+    /// made-up pid would send the user to kill a stranger's process.
+    #[test]
+    fn a_refusal_says_unknown_rather_than_guessing() {
+        let text = refusal(
+            &Paths::new("/tmp/meethook"),
+            &Holder {
+                pid: None,
+                argv: None,
+                started: None,
+            },
+        );
+
+        assert!(text.contains("whose pid is unknown"), "{text}");
+        assert!(!text.contains("pid 0"), "{text}");
+        assert!(!text.contains("started as:"), "{text}");
+        assert!(!text.contains("started "), "{text}");
     }
 }

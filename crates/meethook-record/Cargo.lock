@@ -237,6 +237,7 @@ version = "0.3.0"
 dependencies = [
  "hound",
  "jiff",
+ "libc",
  "minijinja",
  "serde",
  "serde_json",

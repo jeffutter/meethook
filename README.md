@@ -192,6 +192,8 @@ Everything meethook writes lives under one root (`~/meethook` by default, overri
 - `speakers.json` — enrolled voice references, shared across every session
 - `exclusions.json` — apps excluded from the mic-activity trigger (`record` only); user-
   authored, absent by default
+- `record.lock` — held by a live `meethook record` so a second one refuses to start; written by
+  `record`, never deleted, and its presence alone does not mean something is recording
 
 Nothing here is ever uploaded anywhere; recording, transcription, and enrollment all run
 entirely on-device.

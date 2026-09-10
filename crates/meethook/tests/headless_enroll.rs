@@ -134,6 +134,11 @@ fn fixture(root: &Path) {
 
 /// Every file under `root`, by path relative to it and by bytes: the whole state a run could
 /// have touched.
+///
+/// Whole-root means whole, which is worth knowing about `record`: `<root>/record.lock` would
+/// appear here for a run that took it, and would make every "this command wrote nothing"
+/// assertion below fail confusingly. Nothing here drives `record` -- only `record` creates that
+/// file, so each before/after pair sees it identically on both sides, or on neither.
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn walk(dir: &Path, base: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
         for entry in std::fs::read_dir(dir).unwrap() {

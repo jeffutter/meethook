@@ -13,6 +13,10 @@ license.workspace = true
 # hardcodes so a mono recording does not arrive in one ear.
 hound = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
+# For the OFD lock syscalls behind `record_lock`: `open` with `O_CLOEXEC` and `fcntl`
+# `F_OFD_SETLK`. Chosen over a wrapper crate so that the descriptor flags are stated in this
+# crate's code rather than trusted to a dependency's backend.
+libc = { workspace = true }
 minijinja = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

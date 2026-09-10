@@ -65,9 +65,18 @@
 //!
 //! Its known limit: two meethooks launched from *different* binaries -- `target/debug/meethook`
 //! under `cargo run` next to an installed copy -- have different executables and are not
-//! caught. That is the development-time shape rather than the user-facing one, and the
-//! general answer is a single-instance lock at startup, which would define the whole class
-//! away instead of filtering it.
+//! caught. That used to be dismissed as the development-time shape rather than the user-facing
+//! one, which turned out to be wrong: a Nix install changes
+//! `/nix/store/<hash>-meethook-<version>/bin/meethook` at every upgrade, so a recorder that
+//! survived one has always looked like somebody else's meeting to the next.
+//!
+//! That class is defined away one level up rather than filtered harder here: `record` takes
+//! `<root>/record.lock` before it ever gets this far, so a second instance cannot reach the
+//! predicate at all (see [`meethook_session::RecordLock`], and decision-006's reversal).
+//!
+//! This exclusion stays regardless. Binaries built before that guard exist keep running without
+//! ever taking the lock, and the recorder an upgrade left behind is precisely the process the
+//! predicate has to survive on its own.
 //!
 //! # User-excluded apps
 //!
