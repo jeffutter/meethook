@@ -103,6 +103,99 @@ no bundle id are matched by. Find an app's bundle id with `mdls -name kMDItemCFB
 /path/to/App.app`. The file is read once when `meethook record` starts, so restart `record`
 after editing it; with no file, or empty lists, nothing is excluded.
 
+#### Troubleshooting: the recording will not stop
+
+The orange microphone dot in the menu bar is a weak instrument. It lights when any input device
+is initialized — a virtual device included, audible sound not required — and it has been seen to
+stay lit some twenty seconds after the app that held the mic let go, Apple's own Voice Memos
+among them. Clicking Control Center names the app macOS blames, which makes the dot a good first
+look and a poor measurement. To find out whether meethook is recording, ask the lock:
+
+```sh
+ROOT="${MEETHOOK_ROOT:-$HOME/meethook}"
+lsof "$ROOT/record.lock"
+```
+
+That prints COMMAND and PID for whoever has the file open, and `record` keeps it open for exactly
+as long as it holds the lock; with nobody recording it prints nothing at all. The `ROOT=` line is
+not decoration: without it an unset `MEETHOOK_ROOT` leaves the path as a literal `/sessions/*`,
+and an empty data directory then looks like a healthy one. On a machine where `meethook record`
+has never run there is no `record.lock` yet, and `lsof` reports that rather than staying quiet.
+This beats `ps | grep meethook`, which answers "has meethook ever run here?" instead — tried
+here, it matched the shell doing the matching and a ten-day-old leftover `enroll`. With a pid in
+hand, say what it is:
+
+```sh
+ps -p <pid> -o pid,ppid,lstart,etime,args
+```
+
+A PPID of 1 means no terminal owns that process any more. Then check that it is still capturing
+rather than merely alive:
+
+```sh
+ls -l "$ROOT"/sessions/<id>/mic.wav
+sleep 5
+ls -l "$ROOT"/sessions/<id>/mic.wav
+```
+
+A size that grew is the proof. `du -sh "$ROOT"/sessions/*` sizes the damage instead — each track
+runs close to 690 MB an hour, so both together are close to 1.4 GB — and says nothing about
+liveness. `lsof "$ROOT"/sessions/<id>/mic.wav` asks the same question in one shot: it names the
+writer, and prints nothing once no process holds the file. Read sizes with `ls -l` or `wc -c <`;
+inside the dev shell GNU coreutils `stat` shadows BSD `stat`, where `-f` means "file system".
+
+Stop it with Ctrl-C in its terminal, or `kill -INT <pid>` from another shell. A plain `kill`
+(SIGTERM) and a closed terminal (SIGHUP) reach the same quit path and finalize the session too.
+What does not finalize is `kill -9`, an abort, or a crash. Deleting `record.lock` accomplishes
+nothing: the lock is held by the operating system, not by the file.
+
+What you get back depends on how it ended. An interrupted run writes `session.json` and
+transcribes normally. A panicked or unwound run leaves an orphan whose WAVs were finalized on the
+way out anyway, complete to the last sample. A `kill -9` leaves an orphan that is valid up to the
+last five-second checkpoint — the header stops there, so `afinfo` reports a duration up to five
+seconds shorter than what was recorded, and those last seconds sit on disk unread. Either orphan
+is skipped, never repaired:
+
+```text
+20260818-143027  skipped: no session.json (the recorder crashed mid-session)
+```
+
+`transcribe` prints that and exits 0; `enroll` passes the session over in the same words. The
+audio still plays on the Mac that recorded it, though a strict parser elsewhere may refuse the
+file until told to ignore the header length.
+
+To keep it from happening again, name whatever keeps the trigger true:
+
+```sh
+MEETHOOK_ACTIVITY_DEBUG=1 meethook record --plain 2>activity.log
+```
+
+Run this after stopping the runaway, not instead of it: `record` takes the lock before it checks
+permissions or prints anything, so while a runaway holds it this command refuses and not one
+`[activity]` line appears. It is `record`, so it needs the same permissions and starts capturing
+the moment something opens the mic. Its `[activity]` lines go to stderr — one summary per
+recomputation, then one per holder with its pid, bundle id, `exe=`, `devices=[...]` and
+`on-default=`. Browsers capture through helpers (`com.google.Chrome.helper`), any WebKit
+embedder reports `com.apple.WebKit.GPU`, and a plain binary reports `(no bundle id)` and is
+matched by its `exe=` path. `com.apple.CoreSpeech` beside `devices=[]` holds no device at all and
+is a bystander; `on-default=no` is not an acquittal, because aggregate and virtual devices are
+objects of their own that can contain the built-in microphone. Names worth excluding go in
+`exclusions.json` above, followed by a `record` restart. Two ways to see the same list without
+capturing anything: the probe in the source tree, which opens no device and needs no permission
+but does need the checkout,
+
+```sh
+cd crates/meethook-record && MEETHOOK_ACTIVITY_DEBUG=1 cargo run --example mic-activity -- 60
+```
+
+and `lsaudio`, a third-party tool that lists the processes holding audio devices and can kill
+them by pid.
+
+Why it happens comes down to what the trigger counts: a session stays open while *another*
+process has registered input IO, not while anyone is audible. An always-on dictation tool, an
+assistant daemon, or a virtual-device companion app can therefore hold a session open
+indefinitely, and nothing in the recording itself will end it.
+
 ### `meethook transcribe [SESSION_ID...]`
 
 Transcribes recorded sessions: an AEC pre-pass, voice-activity detection, diarization, speaker
@@ -179,6 +272,7 @@ session currently carries and the candidate meetings around it, numbered, and wr
 | --- | --- | --- |
 | `--root <PATH>` / `MEETHOOK_ROOT` | `~/meethook` | The meethook data directory (`sessions/`, `models/`, `speakers.json`) |
 | `--template <PATH>` / `MEETHOOK_TEMPLATE` | built-in | Jinja template every `transcript.md` is rendered through |
+| `MEETHOOK_ACTIVITY_DEBUG` | unset | Print which processes hold the microphone, and why `record` started or stayed running, to stderr |
 
 ### Data directory
 
