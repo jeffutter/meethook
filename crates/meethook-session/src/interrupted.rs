@@ -4,14 +4,22 @@
 //! standing `sessions` report all render from here, because three commands describing the same
 //! directory in three vocabularies is the defect this module exists to end -- and because a
 //! consumer that composes its own sentence about an unfinished session is free to invent a cause
-//! it cannot observe. **Consumers do not write this prose.** Call [`interrupted_brief`],
-//! [`interrupted_detail`] or [`recording_in_progress`]; if the sentence you need is not there,
-//! add it here so the next command gets it too.
+//! it cannot observe. **Consumers do not write this prose.** Call [`unfinished_now`] and print
+//! what it says; reach for [`interrupted_brief`], [`interrupted_detail`] or
+//! [`recording_in_progress`] directly only from inside this module's own chooser. If the sentence
+//! you need is not there, add it here so the next command gets it too.
+//!
+//! **Consumers do not branch on [`crate::LockState`] either.** Which of the two sentences is true
+//! depends on whether a recorder is live *now*, and that question has one answer per directory:
+//! [`unfinished_now`] asks the kernel and hands back the wording the answer licenses, so a
+//! command cannot print the interruption sentence without having earned it. A command that
+//! re-implements that branch is one forgotten probe away from lying about a call in progress.
 //!
 //! # The rules these sentences keep
 //!
-//! - **No cause, ever.** The retired wording said the recorder "crashed mid-session", which is a
-//!   story about what happened rather than a fact about the directory: the same bytes appear when
+//! - **No cause, ever.** The retired wording said the recorder had crashed partway through a
+//!   session, which is a story about what happened rather than a fact about the directory: the
+//!   same bytes appear when
 //!   a machine loses power, when a process is killed, and when a call is being captured at this
 //!   very second. Say what is on disk and what follows from it. Never *crashed*, *died*, *killed*
 //!   or *interrupted*, and never anything that sounds like the user's fault.
@@ -37,7 +45,61 @@
 //! The long form carries the tone a standing report needs -- an unfinished session is an expected
 //! shape, not a failure -- without using the word "error" to get there.
 
+use crate::paths::{Paths, SessionPaths};
+use crate::record_lock::RecordLock;
 use crate::wav::{TrackEvidence, TrackGap, Unfinished};
+
+/// What an unfinished directory means *right now*, which is the question its wording depends on.
+///
+/// A directory holding WAVs and no `session.json` is what a call in progress looks like as often
+/// as it is what an abandoned one left behind, and the two deserve different sentences. Carrying
+/// the tracks inside the variant that has them makes it impossible to render the stopped case
+/// without having asked, and impossible to render the live case with a measurement attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnfinishedNow {
+    /// A recorder holds the root, or the kernel could not be asked. Say nothing about stopping.
+    RecorderMayBeLive,
+    /// Nothing holds the root, so these tracks are all the evidence the directory left behind.
+    NoRecorderHoldsRoot(Unfinished),
+}
+
+/// Ask the kernel before reading the tracks: the answer decides which sentence is true.
+///
+/// Probed per unfinished directory rather than once per run, because the question is only worth
+/// asking where its answer changes a line -- an ordinary root answers `Free` from one `ENOENT`
+/// open ([`crate::RecordLock::probe`]) and pays nothing further. A recorder that starts mid-run
+/// therefore makes later lines hedge while earlier ones did not: toward saying less, which is the
+/// direction worth being wrong in. While a recorder *is* live, the `Held` answer reads the holder
+/// metadata and costs up to that read's timeout per directory, which a batch line can afford.
+pub fn unfinished_now(paths: &Paths, session: &SessionPaths) -> UnfinishedNow {
+    if RecordLock::probe(paths).recorder_may_be_live() {
+        UnfinishedNow::RecorderMayBeLive
+    } else {
+        UnfinishedNow::NoRecorderHoldsRoot(crate::wav::unfinished(session))
+    }
+}
+
+impl UnfinishedNow {
+    /// The one-line version: what a command prints while passing a session over.
+    pub fn brief(&self) -> String {
+        match self {
+            UnfinishedNow::RecorderMayBeLive => recording_in_progress(),
+            UnfinishedNow::NoRecorderHoldsRoot(tracks) => interrupted_brief(tracks),
+        }
+    }
+
+    /// The multi-line version: what a standing report prints, one entry per line.
+    ///
+    /// The live answer carries the hedge alone. A report that lists many unfinished directories
+    /// may prefer to say it once per run rather than once per directory -- that is the report's
+    /// call about its own shape, not something this function can decide from one directory.
+    pub fn detail(&self) -> Vec<String> {
+        match self {
+            UnfinishedNow::RecorderMayBeLive => vec![recording_in_progress()],
+            UnfinishedNow::NoRecorderHoldsRoot(tracks) => interrupted_detail(tracks),
+        }
+    }
+}
 
 /// The one-line version: what a command prints while passing a session over.
 ///
@@ -376,5 +438,86 @@ mod tests {
         let line = recording_in_progress();
         assert!(line.contains("may be"), "{line}");
         assert!(line.contains("session.json"), "{line}");
+    }
+
+    /// The guard against hedging forever: a root that has never recorded must still get the real
+    /// sentence, which it does because the probe reads absence as `Free` rather than as silence.
+    #[test]
+    fn a_root_with_no_lock_file_at_all_is_answered_as_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let session = paths.session(&crate::SessionId::parse("20260809-052500").unwrap());
+        std::fs::create_dir_all(session.dir()).unwrap();
+
+        assert_eq!(
+            unfinished_now(&paths, &session),
+            UnfinishedNow::NoRecorderHoldsRoot(Unfinished {
+                mic: TrackEvidence::Absent,
+                speaker: TrackEvidence::Absent,
+            })
+        );
+        assert!(!paths.record_lock().exists(), "asking writes nothing");
+    }
+
+    /// Liveness comes from the kernel, not from the file's existence: the same root flips back
+    /// and forth as the second descriptor is held and dropped.
+    #[test]
+    fn a_held_root_reads_as_live_and_a_released_one_reads_as_stopped_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let session = paths.session(&crate::SessionId::parse("20260809-052500").unwrap());
+        std::fs::create_dir_all(session.dir()).unwrap();
+
+        let lock = RecordLock::acquire(&paths).unwrap();
+        assert!(
+            matches!(lock, crate::Acquisition::Held(_)),
+            "a test that silently failed to hold the lock proves nothing"
+        );
+        assert_eq!(
+            unfinished_now(&paths, &session),
+            UnfinishedNow::RecorderMayBeLive
+        );
+
+        drop(lock);
+        assert!(matches!(
+            unfinished_now(&paths, &session),
+            UnfinishedNow::NoRecorderHoldsRoot(_)
+        ));
+    }
+
+    /// The live answer must not read like the stopped one in any particular: no leading `no
+    /// session.json`, and no claim about what a transcript can or cannot do.
+    #[test]
+    fn the_brief_under_a_live_recorder_says_neither_of_the_stopped_form_facts() {
+        let line = UnfinishedNow::RecorderMayBeLive.brief();
+        assert!(line.contains("may be"), "{line}");
+        assert!(!line.starts_with("no session.json"), "{line}");
+        assert!(!line.contains("no transcript is possible"), "{line}");
+        assert!(!line.contains('\n'), "the brief form is one line");
+    }
+
+    /// The chooser adds no vocabulary of its own: with nobody holding the root it is byte-for-byte
+    /// the renderer every other caller already reads.
+    #[test]
+    fn the_brief_when_nothing_holds_the_root_is_the_stopped_form_exactly() {
+        let tracks = Unfinished {
+            mic: TrackEvidence::CompleteAsDeclared,
+            speaker: TrackEvidence::BeyondDeclaration(TrackGap {
+                millis: 4_300,
+                bytes: 137_600,
+            }),
+        };
+        assert_eq!(
+            UnfinishedNow::NoRecorderHoldsRoot(tracks).brief(),
+            interrupted_brief(&tracks)
+        );
+        assert_eq!(
+            UnfinishedNow::NoRecorderHoldsRoot(tracks).detail(),
+            interrupted_detail(&tracks)
+        );
+        assert_eq!(
+            UnfinishedNow::RecorderMayBeLive.detail(),
+            vec![recording_in_progress()]
+        );
     }
 }

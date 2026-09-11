@@ -38,7 +38,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use meethook_session::{SessionId, Stored, TranscriptTime};
+use meethook_session::{SessionId, Stored, TranscriptTime, UnfinishedNow};
 
 use crate::{
     Consequence, MeetingLabel, REFERENCE_FLOOR_SECONDS, Refusal, Result, Selection, VoiceSelector,
@@ -193,8 +193,11 @@ pub enum SessionNote<'a> {
 
 /// Why a session was never asked about.
 pub enum PassedOver {
-    /// No `session.json`: the recorder crashed mid-session.
-    Orphaned,
+    /// No `session.json`, so there was nothing to read. Carries what the directory means *right
+    /// now* -- whether a recorder still holds the root -- because that decides which sentence is
+    /// true, and because `enroll` runs during a live call by design. The words themselves belong
+    /// to [`meethook_session::UnfinishedNow::brief`], shared with `transcribe`'s skip line.
+    Orphaned(UnfinishedNow),
 
     /// Recorded but not transcribed, so there are no voices to ask about yet.
     NotTranscribed,
@@ -510,10 +513,11 @@ impl Lines<'_> {
     fn session(&mut self, session: &SessionId, note: SessionNote<'_>) -> Result<()> {
         let out = &mut self.out;
         match note {
-            SessionNote::PassedOver(PassedOver::Orphaned) => writeln!(
-                out,
-                "{session}  passed over: no session.json (the recorder crashed mid-session)"
-            )?,
+            SessionNote::PassedOver(PassedOver::Orphaned(now)) => {
+                // Same body as `transcribe`'s skip line, from the same renderer: one event named
+                // one way across both commands, including the case where nothing stopped at all.
+                writeln!(out, "{session}  passed over: {}", now.brief())?
+            }
             SessionNote::PassedOver(PassedOver::NotTranscribed) => {
                 writeln!(out, "{session}  passed over: not transcribed yet")?
             }

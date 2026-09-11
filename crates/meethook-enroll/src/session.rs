@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use meethook_session::{
     AssignedName, Classification, DeniedName, DiscoveredSession, EnrolledSpeakers, Paths,
     SessionMetadata, SourceTrack, SpeakerCluster, SpeakerClusters, SpeakerNames, Transcript,
-    TranscriptContext, unknown_labels,
+    TranscriptContext, unfinished_now, unknown_labels,
 };
 use meethook_transcribe::{
     Attribution, Naming, Resemblance, attributions, heard_at_once, identify_clusters,
@@ -84,10 +84,16 @@ pub(crate) fn enroll_session(
 ) -> Result<Outcome> {
     match session.classification {
         Classification::Orphaned => {
+            // Asked here, at the one place that knows which directory this is and has the root to
+            // probe, rather than at print time: the narrator takes an id and a note, and liveness
+            // arriving through the note is what keeps a renderer from guessing.
             about(
                 notes,
                 &session.id,
-                SessionNote::PassedOver(PassedOver::Orphaned),
+                SessionNote::PassedOver(PassedOver::Orphaned(unfinished_now(
+                    paths,
+                    &session.paths,
+                ))),
             )?;
             report.passed_over += 1;
             return Ok(Outcome::Finished);

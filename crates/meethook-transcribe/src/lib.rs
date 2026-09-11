@@ -96,7 +96,7 @@ pub use voice_vectors::{GroupDistance, cosine_distance, group_distance};
 use meethook_session::{
     Classification, CleaningRecord, DiscoveredSession, EnrolledSpeakers, Paths, SessionId,
     SessionMetadata, SpeakerClusters, SpeakerNames, Transcript, TranscriptContext,
-    TranscriptTemplate, discover_sessions,
+    TranscriptTemplate, discover_sessions, unfinished_now,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -398,10 +398,14 @@ pub fn run_batch(
     for session in selected {
         match session.classification {
             Classification::Orphaned => {
+                // The body is enroll's pass-over body verbatim -- one event, named one way -- and
+                // it comes from a chooser that asked the kernel first, so a call being captured
+                // right now is never described as one that stopped.
                 writeln!(
                     out,
-                    "{}  skipped: no session.json (the recorder crashed mid-session)",
-                    session.id
+                    "{}  skipped: {}",
+                    session.id,
+                    unfinished_now(paths, &session.paths).brief()
                 )?;
                 report.skipped += 1;
             }
@@ -564,7 +568,9 @@ mod tests {
     use crate::timeline::tests::metadata;
     use hound::{SampleFormat, WavSpec, WavWriter};
     use jiff::Timestamp;
-    use meethook_session::{EnrolledSpeaker, SPEAKER_YOU, SessionPaths, SourceTrack, Turn};
+    use meethook_session::{
+        Acquisition, EnrolledSpeaker, RecordLock, SPEAKER_YOU, SessionPaths, SourceTrack, Turn,
+    };
 
     use super::*;
 
@@ -821,7 +827,7 @@ mod tests {
         }
     }
 
-    /// WAVs but no `session.json`: the recorder died mid-session.
+    /// WAVs but no `session.json`: the recorder stopped before it could close the session.
     fn make_orphan(paths: &Paths, id: &str) {
         let session_paths = paths.session(&SessionId::parse(id).unwrap());
         std::fs::create_dir_all(session_paths.dir()).unwrap();
@@ -1658,7 +1664,17 @@ mod tests {
 
         let (report, _, output) = run(&paths, &[], false);
 
-        assert!(output.contains("no session.json"), "{output}");
+        // The whole line, not a substring: an orphan here has a finalized mic track and no
+        // speaker track at all, which is the shape the renderer must describe per track rather
+        // than as one blended complaint.
+        assert_eq!(
+            output
+                .lines()
+                .find(|line| line.starts_with("20260809-052500"))
+                .unwrap(),
+            "20260809-052500  skipped: no session.json: no transcript is possible; the speaker \
+             track never reached disk"
+        );
         assert_eq!(report.skipped, 1);
         assert_eq!(report.transcribed, 1);
         // An orphan is a normal state, not a failure.
@@ -1674,6 +1690,47 @@ mod tests {
                 .transcript_json()
                 .exists(),
             "an orphan must never get a transcript built from unverifiable audio"
+        );
+    }
+
+    /// The same directory under a held root is a different fact, and gets different words: while
+    /// a recorder holds `record.lock`, a session directory with WAVs and no `session.json` may be
+    /// the call happening now. `enroll` is built to run during one, so this branch is not exotic.
+    /// A second descriptor in this process is a distinct holder as far as the kernel is concerned,
+    /// which is what lets the live case be driven with no hardware and no spawned process.
+    #[test]
+    fn an_unfinished_directory_under_a_held_lock_is_not_called_interrupted() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_orphan(&paths, "20260809-052500");
+        // Bound to a name: `let _ = acquire(..)` drops the guard immediately and would probe a
+        // free root, testing the wording it means to rule out.
+        let lock = RecordLock::acquire(&paths).unwrap();
+        assert!(
+            matches!(lock, Acquisition::Held(_)),
+            "a test that silently failed to hold the lock proves nothing"
+        );
+
+        let (report, opened, output) = run(&paths, &[], false);
+
+        assert!(
+            output.contains("a recorder holds this root right now"),
+            "{output}"
+        );
+        assert!(output.contains("may be"), "{output}");
+        assert!(
+            !output.contains("no transcript is possible"),
+            "the live answer says nothing about what a transcript can do: {output}"
+        );
+        // Only the words differ. It is still skipped, still counted, still no work and no model.
+        assert_eq!(report.skipped, 1, "{output}");
+        assert_eq!(report.failed, 0, "{output}");
+        assert_eq!(opened, 0, "a skipped orphan must not open any model");
+        assert!(
+            !SessionPaths::new(paths.sessions_dir().join("20260809-052500"))
+                .transcript_json()
+                .exists(),
+            "a hedge about liveness is not a licence to build a transcript"
         );
     }
 

@@ -157,7 +157,7 @@ seconds shorter than what was recorded, and those last seconds sit on disk unrea
 is skipped, never repaired:
 
 ```text
-20260818-143027  skipped: no session.json (the recorder crashed mid-session)
+20260818-143027  skipped: no session.json: no transcript is possible; the speaker track holds 4.3 s past the end its header declares
 ```
 
 `transcribe` prints that and exits 0; `enroll` passes the session over in the same words. The

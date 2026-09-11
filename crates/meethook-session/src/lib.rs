@@ -58,7 +58,9 @@ pub use cleaning::{
 pub use discovery::{Classification, DiscoveredSession, discover_sessions};
 pub use exclusions::{AppExclusions, EXCLUSIONS_SCHEMA_VERSION};
 pub use id::{SessionId, create_session_dir, discard_session_dir};
-pub use interrupted::{interrupted_brief, interrupted_detail, recording_in_progress};
+pub use interrupted::{
+    UnfinishedNow, interrupted_brief, interrupted_detail, recording_in_progress, unfinished_now,
+};
 pub use metadata::{
     Attendee, AttendeeStatus, Meeting, MeetingFit, RosterEdit, SESSION_SCHEMA_VERSION,
     SessionMetadata, TrackSync,

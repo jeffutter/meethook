@@ -39,7 +39,8 @@ fn one_runs_narration_reads_as_these_lines_in_this_order() {
 
     assert_eq!(
         output,
-        "20260809-052500  passed over: no session.json (the recorder crashed mid-session)\n\
+        "20260809-052500  passed over: no session.json: no transcript is possible; neither track \
+         reached disk\n\
          20260809-052600  1 voice(s) to review, 0 of them already named, 3 quieter voice(s) \
          not offered -- meethook enroll --all\n\
          20260809-052600  enrolled Alice\n\
@@ -67,6 +68,44 @@ fn one_runs_narration_reads_as_these_lines_in_this_order() {
             vetoes_overridden: 0,
         }
     );
+}
+
+/// The same bare directory while a recorder holds the root is not evidence that anything
+/// stopped -- `enroll` is built to run during a live call, and a session directory with WAVs and
+/// no `session.json` is what such a call looks like from the outside. Placed beside the run above
+/// so the pair reads as the two shapes of one event: identical behaviour, different words.
+#[test]
+fn a_held_root_makes_the_pass_over_line_hedge_instead_of_asserting_interruption() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let orphan = paths.session(&SessionId::parse("20260809-052500").unwrap());
+    std::fs::create_dir_all(orphan.dir()).unwrap();
+
+    // A second descriptor on `record.lock` in this process is a distinct holder as far as the
+    // kernel sees it, which is what makes the live case testable without a device or a child.
+    // Bound to a name: `let _ = ..` drops the guard immediately and probes a free root.
+    let lock = meethook_session::RecordLock::acquire(&paths).unwrap();
+    assert!(
+        matches!(lock, meethook_session::Acquisition::Held(_)),
+        "a test that silently failed to hold the lock proves nothing"
+    );
+
+    let mut interviewer = Scripted::default();
+    let (report, output) = run_asking(&paths, &[], CORRECT, &mut interviewer);
+
+    assert!(
+        output.contains("a recorder holds this root right now"),
+        "{output}"
+    );
+    assert!(output.contains("may be"), "{output}");
+    assert!(
+        !output.contains("no transcript is possible"),
+        "a call in progress is not reported as one that cannot be transcribed: {output}"
+    );
+    // Pass-over is not liveness-dependent: same count, nobody asked, nothing written.
+    assert_eq!(report.passed_over, 1, "{output}");
+    assert_eq!(report.failed, 0, "{output}");
+    assert!(interviewer.seen.is_empty(), "{:?}", interviewer.seen);
 }
 
 /// TASK-046.06.01 acceptance criterion #1: a prompt is handed the whole session, not only
