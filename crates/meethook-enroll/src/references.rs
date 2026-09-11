@@ -931,7 +931,7 @@ mod tests {
         let untranscribed = paths.session(&SessionId::parse("20260810-101500").unwrap());
         std::fs::create_dir_all(untranscribed.dir()).unwrap();
         std::fs::write(untranscribed.session_json(), b"{}").unwrap();
-        // The recorder died mid-session: not even a session.json.
+        // An orphaned directory: not even a session.json.
         let orphaned = paths.session(&SessionId::parse("20260811-090000").unwrap());
         std::fs::create_dir_all(orphaned.dir()).unwrap();
         enrolled(&[("Alice", voice(0))], &paths);

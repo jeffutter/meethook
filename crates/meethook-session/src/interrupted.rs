@@ -6,14 +6,22 @@
 //! consumer that composes its own sentence about an unfinished session is free to invent a cause
 //! it cannot observe. **Consumers do not write this prose.** Call [`unfinished_now`] and print
 //! what it says; reach for [`interrupted_brief`], [`interrupted_detail`] or
-//! [`recording_in_progress`] directly only from inside this module's own chooser. If the sentence
-//! you need is not there, add it here so the next command gets it too.
+//! [`recording_in_progress`] directly only from inside this module's own chooser. The one
+//! exception is [`RootNow::note`], which is the sanctioned way to print the hedge once above a
+//! list of directories -- reaching for [`recording_in_progress`] yourself is still an
+//! inside-this-module affair, because a caller that has the sentence but not the probe is a
+//! caller that can print it unhedged. If the sentence you need is not here, add it here so the
+//! next command gets it too.
 //!
 //! **Consumers do not branch on [`crate::LockState`] either.** Which of the two sentences is true
 //! depends on whether a recorder is live *now*, and that question has one answer per directory:
 //! [`unfinished_now`] asks the kernel and hands back the wording the answer licenses, so a
 //! command cannot print the interruption sentence without having earned it. A command that
 //! re-implements that branch is one forgotten probe away from lying about a call in progress.
+//! Two shapes ask the question, and both ask it here: a batch line passing one session over
+//! calls [`unfinished_now`], and a report that lists many directories calls [`RootNow::ask`] once
+//! and [`RootNow::detail_for`] per directory. Neither ever sees [`crate::LockState`]; neither
+//! chooses the wording.
 //!
 //! # The rules these sentences keep
 //!
@@ -71,12 +79,11 @@ pub enum UnfinishedNow {
 /// therefore makes later lines hedge while earlier ones did not: toward saying less, which is the
 /// direction worth being wrong in. While a recorder *is* live, the `Held` answer reads the holder
 /// metadata and costs up to that read's timeout per directory, which a batch line can afford.
+///
+/// A run that lists many directories asks [`RootNow::ask`] once instead and gets the same answer
+/// per directory from [`RootNow::unfinished_at`], which is what this delegates to.
 pub fn unfinished_now(paths: &Paths, session: &SessionPaths) -> UnfinishedNow {
-    if RecordLock::probe(paths).recorder_may_be_live() {
-        UnfinishedNow::RecorderMayBeLive
-    } else {
-        UnfinishedNow::NoRecorderHoldsRoot(crate::wav::unfinished(session))
-    }
+    RootNow::ask(paths).unfinished_at(session)
 }
 
 impl UnfinishedNow {
@@ -97,6 +104,78 @@ impl UnfinishedNow {
         match self {
             UnfinishedNow::RecorderMayBeLive => vec![recording_in_progress()],
             UnfinishedNow::NoRecorderHoldsRoot(tracks) => interrupted_detail(tracks),
+        }
+    }
+}
+
+/// What the kernel said about a whole root, asked once for a run that lists many directories.
+///
+/// [`unfinished_now`] asks per directory because a batch line pays nothing unless its own
+/// directory is unfinished. A standing report wants the opposite trade: one answer for every
+/// directory, and the hedge said once above them all rather than repeated under every row. This
+/// is that other shape, and it lives beside the first rather than in the report because the rule
+/// it enforces -- nobody asserts that something stopped without having asked -- is the module's,
+/// not one caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootNow {
+    /// A recorder holds the root, or the kernel could not be asked. Nothing below may say that a
+    /// directory was left behind.
+    RecorderMayBeLive,
+    /// Nothing holds the root, so every unfinished directory under it is evidence of a recording
+    /// that stopped.
+    NoRecorderHoldsRoot,
+}
+
+impl RootNow {
+    /// Ask the kernel once for the whole root.
+    ///
+    /// Carries the same asymmetry as [`crate::LockState::recorder_may_be_live`]: an answer we
+    /// could not get keeps the report from asserting anything stopped, so a root on a filesystem
+    /// that will not answer is reported as possibly-live rather than as settled.
+    pub fn ask(paths: &Paths) -> Self {
+        if RecordLock::probe(paths).recorder_may_be_live() {
+            RootNow::RecorderMayBeLive
+        } else {
+            RootNow::NoRecorderHoldsRoot
+        }
+    }
+
+    /// The line a report prints above its entries, or `None` when nothing needs hedging.
+    ///
+    /// A report that prints this must print [`RootNow::detail_for`] rather than
+    /// [`UnfinishedNow::detail`] underneath it, or the hedge arrives twice: once as the header and
+    /// once again as the only thing an unfinished row had to say.
+    pub fn note(self) -> Option<String> {
+        match self {
+            RootNow::RecorderMayBeLive => Some(recording_in_progress()),
+            RootNow::NoRecorderHoldsRoot => None,
+        }
+    }
+
+    /// The per-directory answer, given what was already asked of the kernel.
+    ///
+    /// Byte-identical to what [`unfinished_now`] returns for the same root and directory -- the
+    /// two entry points differ in how often they ask, never in what the answer means.
+    pub fn unfinished_at(self, session: &SessionPaths) -> UnfinishedNow {
+        match self {
+            RootNow::RecorderMayBeLive => UnfinishedNow::RecorderMayBeLive,
+            RootNow::NoRecorderHoldsRoot => {
+                UnfinishedNow::NoRecorderHoldsRoot(crate::wav::unfinished(session))
+            }
+        }
+    }
+
+    /// What this directory adds to a report that has already printed [`RootNow::note`].
+    ///
+    /// Empty while a recorder may be live: the note already said the only thing that is licensed
+    /// about such a directory, and repeating it under every id teaches a reader to skim past the
+    /// one sentence that has to be read. Stopped directories get [`interrupted_detail`] unchanged,
+    /// so the same facts reach the eye whichever way the probe answered -- only the certainty
+    /// moves.
+    pub fn detail_for(self, session: &SessionPaths) -> Vec<String> {
+        match self.unfinished_at(session) {
+            UnfinishedNow::RecorderMayBeLive => Vec::new(),
+            UnfinishedNow::NoRecorderHoldsRoot(tracks) => interrupted_detail(&tracks),
         }
     }
 }
@@ -519,5 +598,123 @@ mod tests {
             UnfinishedNow::RecorderMayBeLive.detail(),
             vec![recording_in_progress()]
         );
+    }
+
+    // --- the run-level shape, asked once for a whole root --------------------------------------
+
+    /// The report's own entry point must keep the guard against hedging forever: a root that has
+    /// never recorded gets the real block, not a note, because absence answers `Free`.
+    #[test]
+    fn a_root_with_no_lock_answers_the_report_as_stopped_and_offers_no_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let session = paths.session(&crate::SessionId::parse("20260809-052500").unwrap());
+        std::fs::create_dir_all(session.dir()).unwrap();
+
+        let now = RootNow::ask(&paths);
+        assert_eq!(now, RootNow::NoRecorderHoldsRoot);
+        assert_eq!(now.note(), None, "nothing to hedge, so nothing hedged");
+        assert_eq!(
+            now.detail_for(&session),
+            interrupted_detail(&Unfinished {
+                mic: TrackEvidence::Absent,
+                speaker: TrackEvidence::Absent,
+            }),
+            "the stopped answer is the renderer every other caller already reads"
+        );
+        assert!(!paths.record_lock().exists(), "asking writes nothing");
+    }
+
+    /// And the other direction, in the same test: holding the root turns the block into the note
+    /// and releasing it turns the note back into the block. A test that silently failed to hold
+    /// the lock would otherwise pass by never seeing the live case at all.
+    #[test]
+    fn a_held_root_gives_the_report_a_note_and_no_block_and_a_released_one_gives_them_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let session = paths.session(&crate::SessionId::parse("20260809-052500").unwrap());
+        std::fs::create_dir_all(session.dir()).unwrap();
+
+        let lock = RecordLock::acquire(&paths).unwrap();
+        assert!(
+            matches!(lock, crate::Acquisition::Held(_)),
+            "a test that silently failed to hold the lock proves nothing"
+        );
+        let live = RootNow::ask(&paths);
+        assert_eq!(live, RootNow::RecorderMayBeLive);
+        assert_eq!(live.note(), Some(recording_in_progress()));
+        assert!(
+            live.detail_for(&session).is_empty(),
+            "the note is said once, above the rows"
+        );
+
+        drop(lock);
+        let stopped = RootNow::ask(&paths);
+        assert_eq!(stopped, RootNow::NoRecorderHoldsRoot);
+        assert!(!stopped.detail_for(&session).is_empty());
+    }
+
+    /// The two entry points are one decision asked at two cadences. If they ever drift, the
+    /// standing report and the batch line start describing the same directory differently --
+    /// which is the defect this whole module exists to end.
+    #[test]
+    fn asking_once_per_run_and_once_per_directory_agree_on_every_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let session = paths.session(&crate::SessionId::parse("20260809-052500").unwrap());
+        std::fs::create_dir_all(session.dir()).unwrap();
+
+        for held in [false, true] {
+            let _lock = held.then(|| match RecordLock::acquire(&paths).unwrap() {
+                crate::Acquisition::Held(guard) => guard,
+                crate::Acquisition::Taken(holder) => {
+                    panic!("expected to hold the lock: {holder:?}")
+                }
+            });
+
+            let per_run = RootNow::ask(&paths).unfinished_at(&session);
+            let per_directory = unfinished_now(&paths, &session);
+            assert_eq!(per_run.brief(), per_directory.brief(), "held: {held}");
+            assert_eq!(per_run.detail(), per_directory.detail(), "held: {held}");
+        }
+    }
+
+    /// While a recorder may be live the report says one sentence and nothing else: no row adds a
+    /// track, a measurement, or an impossibility, whatever those tracks actually look like.
+    #[test]
+    fn under_a_live_recorder_no_track_state_earns_a_line_of_its_own() {
+        for evidence in [
+            TrackEvidence::Absent,
+            TrackEvidence::NotAWav,
+            TrackEvidence::Unreadable,
+            TrackEvidence::Unknown,
+            TrackEvidence::HeaderOnly,
+            TrackEvidence::CompleteAsDeclared,
+            TrackEvidence::ShortBy(TrackGap {
+                millis: 200,
+                bytes: 6_400,
+            }),
+            TrackEvidence::BeyondDeclaration(TrackGap {
+                millis: 100,
+                bytes: 3_200,
+            }),
+        ] {
+            assert!(
+                RootNow::RecorderMayBeLive
+                    .detail_for(&SessionPaths::new("sessions/20260809-052500"))
+                    .is_empty(),
+                "{evidence:?} still printed a line under a live recorder"
+            );
+        }
+
+        // And the note alone is what the forbidden-word table already governs, since it is the
+        // only prose the report prints in this state.
+        let note = RootNow::RecorderMayBeLive.note().unwrap();
+        for forbidden in ["crash", "died", "kill", "interrupt", "error", "fail"] {
+            assert!(
+                !note.to_lowercase().contains(forbidden),
+                "the note claims something it cannot know ({forbidden}): {note}"
+            );
+        }
     }
 }

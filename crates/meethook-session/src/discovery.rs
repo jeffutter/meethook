@@ -15,8 +15,8 @@ pub enum Classification {
     Transcribed,
     /// `session.json` present: recorded cleanly, ready to transcribe.
     Valid,
-    /// Neither marker: the recorder died mid-session. A normal, expected state -- never an
-    /// error. Callers skip these with a warning.
+    /// Neither marker: the recording was never finished. A normal, expected state -- never an
+    /// error. Callers skip these and say what the directory proves.
     Orphaned,
 }
 

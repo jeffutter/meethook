@@ -1,6 +1,6 @@
 //! The `meethook` CLI.
 //!
-//! One binary, five subcommands on macOS, four off it (`record` needs the Apple capture
+//! One binary, seven subcommands on macOS, six off it (`record` needs the Apple capture
 //! frameworks and does not exist elsewhere; see the target gate below). The spec describes
 //! `record` and `transcribe` as "two binaries" meaning they share no process, no IPC, and no
 //! state -- only the on-disk session contract. Subcommands preserve that: everything below
@@ -226,6 +226,24 @@ enum Command {
     /// also prints how many sessions it read and names any it could not.
     Speakers,
 
+    /// Report what every recorded session under --root became
+    ///
+    /// The standing answer to a question you can otherwise only ask by running a batch job over
+    /// everything: which recordings survived, and which never got a transcript. Every session
+    /// directory is printed with the state it is actually in -- transcribed, valid, or orphaned
+    /// -- and an orphaned one says which of its tracks reached disk, how far short of its own
+    /// declaration either stops when the header shows it, and why no transcript can be built from
+    /// it. An orphan is an expected shape, not a failure, and the report says so in those terms.
+    ///
+    /// While a recorder holds the root the report says that once at the top and refuses to call
+    /// any unfinished directory one that stopped, because a directory in that shape may be the
+    /// call happening now.
+    ///
+    /// Takes no options on purpose, like speakers: the report's whole claim is the scope it
+    /// scanned, so it names the directory it read and counts what it found there. Reads only;
+    /// writes nothing, and exits 0 whatever it finds.
+    Sessions,
+
     /// Remove a stored recording of somebody, or remove them entirely
     ///
     /// With --reference, drops the one recording that number addresses in meethook speakers;
@@ -420,6 +438,7 @@ fn main() -> Result<()> {
         ),
         Command::Enroll(args) => commands::enroll(&paths, &args, template),
         Command::Speakers => commands::speakers(&paths),
+        Command::Sessions => commands::sessions(&paths),
         Command::Forget {
             name,
             reference,

@@ -20,7 +20,7 @@ fn one_runs_narration_reads_as_these_lines_in_this_order() {
     let root = tempfile::tempdir().unwrap();
     let paths = Paths::new(root.path());
 
-    // The recorder died mid-session: nothing to read, and the first line of the run.
+    // An orphaned directory: nothing to read, and the first line of the run.
     let orphan = paths.session(&SessionId::parse("20260809-052500").unwrap());
     std::fs::create_dir_all(orphan.dir()).unwrap();
 

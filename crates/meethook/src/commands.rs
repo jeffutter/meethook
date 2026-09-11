@@ -1,6 +1,6 @@
 //! Subcommand bodies.
 //!
-//! All six are thin: the rules they enforce live in `meethook-record`,
+//! All seven are thin: the rules they enforce live in `meethook-record`,
 //! `meethook-transcribe` and `meethook-enroll`, where they can be tested without a terminal.
 //! What is left here is the terminal itself -- printing, prompting, and playing audio --
 //! which is exactly the part no test can decide.
@@ -15,7 +15,9 @@ use meethook_enroll::{
     VoiceSelector, incomplete, run_enroll, run_forget, run_meeting, run_speakers, speech,
 };
 use meethook_models::{ModelSpec, ensure_model};
-use meethook_session::{Paths, SessionId, TranscriptTemplate};
+use meethook_session::{
+    Classification, Paths, RootNow, SessionId, TranscriptTemplate, discover_sessions,
+};
 
 use crate::EnrollArgs;
 use crate::clips::Clips;
@@ -409,6 +411,96 @@ pub fn speakers(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+/// Prints every session directory under `--root` and what became of it. Read-only.
+pub fn sessions(paths: &Paths) -> Result<()> {
+    let mut out = io::stdout().lock();
+    sessions_report(&mut out, paths)
+}
+
+/// The report itself, off a writer so a test holds the whole block without a terminal behind it.
+///
+/// Every sentence below the header comes back from `meethook-session`: the classification from
+/// [`discover_sessions`], the loss figures from [`meethook_session::wav`], and the prose from
+/// [`RootNow`], which is also what asked the kernel whether anything is recording right now. What
+/// is left here is the census and the layout of a listing.
+fn sessions_report(out: &mut dyn Write, paths: &Paths) -> Result<()> {
+    // Propagated rather than swallowed, exactly as `speakers` refuses to report a scope it could
+    // not read: this command's whole claim is the directory it scanned, so a `sessions/` that
+    // cannot be opened at all -- not a directory, no permission -- has to leave a nonzero status
+    // rather than an empty-looking success. An absent `sessions/` is the opposite case and needs
+    // no handling here: discovery answers it with an empty list.
+    let found = discover_sessions(paths)?;
+
+    if found.is_empty() {
+        // Its own sentence rather than `0 session(s) ... 0 transcribed, 0 valid, 0 orphaned`,
+        // following the one `speakers` prints when nobody is enrolled: fact, path, and where to go
+        // next. An absent `sessions/` and an empty one reach here identically because they reach
+        // the command identically, so the report does not pretend to tell them apart.
+        writeln!(
+            out,
+            "no sessions under {} -- meethook record writes one",
+            paths.sessions_dir().display()
+        )?;
+        return Ok(());
+    }
+
+    let count = |kind: Classification| {
+        found
+            .iter()
+            .filter(|session| session.classification == kind)
+            .count()
+    };
+    let (transcribed, valid, orphaned) = (
+        count(Classification::Transcribed),
+        count(Classification::Valid),
+        count(Classification::Orphaned),
+    );
+
+    // The scope above the entries, as `speakers` puts it above its listing: every
+    // "names nothing"-shaped claim below has to be read against how much was scanned.
+    writeln!(
+        out,
+        "{} session(s) in {}: {transcribed} transcribed, {valid} valid, {orphaned} orphaned",
+        found.len(),
+        paths.sessions_dir().display(),
+    )?;
+
+    // Asked once for the run, not once per directory: the hedge is one sentence about the root,
+    // and repeating it under every unfinished id is the kind of repetition that trains a reader
+    // to stop reading it. Suppressed entirely when there is nothing it could apply to -- hedging
+    // about a live recorder above a root holding no unfinished directory is noise that dilutes the
+    // sentence for the run where it matters.
+    let now = RootNow::ask(paths);
+    if orphaned > 0
+        && let Some(note) = now.note()
+    {
+        writeln!(out, "{note}")?;
+    }
+    writeln!(out)?;
+
+    // Discovery's own order, which is ascending id and therefore chronological: neither re-sorted
+    // nor grouped by state, because a reader asking what became of their recordings is asking in
+    // the order they made them.
+    for session in &found {
+        writeln!(out, "{}  {}", session.id, session.classification)?;
+        if session.classification != Classification::Orphaned {
+            continue;
+        }
+        // The label still prints above while a recorder may be live -- it names only what is on
+        // disk, that neither marker is present, and the census has to account for every id -- but
+        // the block does not. The block is where `no transcript is possible` lives, and a
+        // directory that may be tonight's call has not earned that claim; `detail_for` returns
+        // nothing in that state, which is the module's rule rather than this loop's.
+        for line in now.detail_for(&session.paths) {
+            // Four spaces, so a terminal that wraps the prose leaves the continuation visibly
+            // attached to the id above it. One logical line per fact, unreflowed, so grep and awk
+            // still work on this output.
+            writeln!(out, "    {line}")?;
+        }
+    }
+    Ok(())
+}
+
 /// Removes one stored recording of somebody, or all of them, having first printed what that costs.
 ///
 /// Thin for the same reason `speakers` is: every line, including the one telling the user that
@@ -765,6 +857,227 @@ mod tests {
     use meethook_enroll::Interviewer;
 
     use super::{Answerer, Clips, EnrollReport, Terminal, Tty, answerer};
+
+    /// Builds a session directory holding exactly `files`, each written as a placeholder.
+    ///
+    /// A placeholder is honest here and only here: this report opens `session.json` and
+    /// `transcript.json` to test their presence and nothing else -- which is exactly what
+    /// `classify` does -- so no bytes behind those names are ever read.
+    fn placeholder_session(
+        paths: &meethook_session::Paths,
+        id: &str,
+        files: &[&str],
+    ) -> meethook_session::SessionPaths {
+        let session = paths.session(&meethook_session::SessionId::parse(id).unwrap());
+        std::fs::create_dir_all(session.dir()).unwrap();
+        for file in files {
+            std::fs::write(session.dir().join(file), b"placeholder").unwrap();
+        }
+        session
+    }
+
+    /// A real finalized WAV of `seconds` of silence, written through the public API.
+    ///
+    /// `write_clip` rather than `wav::create` because the latter takes a `hound::WavSpec` and
+    /// `hound` is not a dependency of this crate: one fixture is not worth adding one. Mono 16 kHz
+    /// float32 is 64 000 bytes of `data` a second, which is the arithmetic every caller below
+    /// truncates and appends by.
+    fn clip(path: &std::path::Path, seconds: f64) {
+        let samples = vec![0.0f32; (seconds * 16_000.0) as usize];
+        meethook_enroll::write_clip(path, &samples).unwrap();
+    }
+
+    /// The census, an orphan's whole block, and the two loss figures -- asserted rather than
+    /// incidental.
+    ///
+    /// The numbers come out of the fixtures' own bytes, not out of a constant: a 1.0 s clip is
+    /// 64 000 `data` bytes, so cutting 12 800 leaves the header declaring 0.2 s more than the file
+    /// holds, and adding 6 400 leaves 0.1 s past what it declares. Both are read back out of the
+    /// file's own `fmt ` chunk, which is the only place those seconds live.
+    #[test]
+    fn the_report_lists_every_session_and_says_what_each_one_became() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = meethook_session::Paths::new(root.path());
+        std::fs::create_dir_all(paths.sessions_dir()).unwrap();
+
+        // Truncated after finalize, which is how a header comes to declare more than the file
+        // holds, and appended to after finalize, which is the deterministic stand-in for what a
+        // kill actually leaves: audio past the last checkpoint the header knows about.
+        let truncated = placeholder_session(&paths, "20260809-052500", &[]);
+        clip(&truncated.mic_wav(), 1.0);
+        let mic = truncated.mic_wav();
+        let mic_len = std::fs::metadata(&mic).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&mic)
+            .unwrap()
+            .set_len(mic_len - 12_800)
+            .unwrap();
+        clip(&truncated.speaker_wav(), 1.0);
+        {
+            use std::io::Write;
+            let mut speaker = std::fs::OpenOptions::new()
+                .append(true)
+                .open(truncated.speaker_wav())
+                .unwrap();
+            speaker.write_all(&[0u8; 6_400]).unwrap();
+        }
+        // And the other shape of orphan: a directory where nothing reached disk at all.
+        placeholder_session(&paths, "20260809-052600", &[]);
+        placeholder_session(
+            &paths,
+            "20260809-052700",
+            &["session.json", "transcript.json"],
+        );
+        placeholder_session(&paths, "20260809-052800", &["session.json"]);
+
+        let mut out = Vec::new();
+        super::sessions_report(&mut out, &paths).unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        assert_eq!(
+            text,
+            format!(
+                concat!(
+                    "4 session(s) in {dir}: 1 transcribed, 1 valid, 2 orphaned\n",
+                    "\n",
+                    "20260809-052500  orphaned\n",
+                    "    no session.json: no transcript is possible.\n",
+                    "    That file held the single clock both tracks share, so neither can be \
+                     placed on a common timeline however much of either one plays.\n",
+                    "    The mic track declares 0.2 s more audio than the file holds, and that \
+                     part is not on disk.\n",
+                    "    The speaker track holds 0.1 s past the end its header declares; players \
+                     stop at the declaration, so that part does not play.\n",
+                    "    Nothing about this needs fixing: the audio that reached disk is kept as \
+                     recorded.\n",
+                    "20260809-052600  orphaned\n",
+                    "    no session.json: no transcript is possible.\n",
+                    "    That file held the single clock both tracks share, so neither can be \
+                     placed on a common timeline however much of either one plays.\n",
+                    "    The mic track never reached disk, so there is nothing to place on the \
+                     timeline.\n",
+                    "    The speaker track never reached disk, so there is nothing to place on the \
+                     timeline.\n",
+                    "    Nothing about this needs fixing: the audio that reached disk is kept as \
+                     recorded.\n",
+                    "20260809-052700  transcribed\n",
+                    "20260809-052800  valid\n",
+                ),
+                dir = paths.sessions_dir().display(),
+            )
+        );
+    }
+
+    /// An absent `sessions/` and an empty one are the same answer, because that is how they reach
+    /// the command. Exit 0 either way is the integration tests' claim; this one pins the line.
+    #[test]
+    fn a_root_with_no_sessions_names_the_directory_it_found_nothing_in() {
+        for have_sessions_dir in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = meethook_session::Paths::new(root.path());
+            if have_sessions_dir {
+                std::fs::create_dir_all(paths.sessions_dir()).unwrap();
+            }
+
+            let mut out = Vec::new();
+            super::sessions_report(&mut out, &paths).unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!(
+                    "no sessions under {} -- meethook record writes one\n",
+                    paths.sessions_dir().display()
+                ),
+                "sessions dir created: {have_sessions_dir}"
+            );
+        }
+    }
+
+    /// A live recorder changes the wording and nothing else: the hedge once, every id still
+    /// listed, and none of the claims an unfinished directory cannot support while it is being
+    /// written. Then the guard is dropped and the blocks come back, so the test cannot pass by
+    /// never having held the lock at all.
+    #[test]
+    fn a_live_recorder_is_said_once_and_no_directory_is_called_interrupted() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = meethook_session::Paths::new(root.path());
+        placeholder_session(&paths, "20260809-052500", &[]);
+        placeholder_session(&paths, "20260809-052600", &[]);
+
+        let guard = match meethook_session::RecordLock::acquire(&paths).unwrap() {
+            meethook_session::Acquisition::Held(guard) => guard,
+            meethook_session::Acquisition::Taken(holder) => {
+                panic!("expected to hold the lock: {holder:?}")
+            }
+        };
+
+        let mut out = Vec::new();
+        super::sessions_report(&mut out, &paths).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text.matches(meethook_session::recording_in_progress().as_str())
+                .count(),
+            1,
+            "the hedge is said once, above the rows:\n{text}"
+        );
+        assert!(text.contains("20260809-052500  orphaned"), "{text}");
+        assert!(text.contains("20260809-052600  orphaned"), "{text}");
+        assert!(!text.contains("no transcript is possible"), "{text}");
+        assert!(!text.contains("The mic track"), "{text}");
+        assert!(!text.contains("The speaker track"), "{text}");
+
+        drop(guard);
+        let mut out = Vec::new();
+        super::sessions_report(&mut out, &paths).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains(meethook_session::recording_in_progress().as_str()),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("no session.json: no transcript is possible.")
+                .count(),
+            2,
+            "{text}"
+        );
+    }
+
+    /// The note answers a question about the report's own content: with nothing here that could be
+    /// a call in progress, saying it anyway would spend the reader's attention on a sentence that
+    /// applies to nothing below it.
+    #[test]
+    fn a_live_recorder_says_nothing_when_no_directory_could_be_the_call() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = meethook_session::Paths::new(root.path());
+        placeholder_session(
+            &paths,
+            "20260809-052700",
+            &["session.json", "transcript.json"],
+        );
+        placeholder_session(&paths, "20260809-052800", &["session.json"]);
+
+        let guard = match meethook_session::RecordLock::acquire(&paths).unwrap() {
+            meethook_session::Acquisition::Held(guard) => guard,
+            meethook_session::Acquisition::Taken(holder) => {
+                panic!("expected to hold the lock: {holder:?}")
+            }
+        };
+
+        let mut out = Vec::new();
+        super::sessions_report(&mut out, &paths).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "2 session(s) in {}: 1 transcribed, 1 valid, 0 orphaned\n\n\
+                 20260809-052700  transcribed\n20260809-052800  valid\n",
+                paths.sessions_dir().display()
+            )
+        );
+        // Held across the whole run above: an early drop would make this pass by never having
+        // been live at all.
+        drop(guard);
+    }
 
     /// The other half of why grouping is a full-screen feature: the line prompt never asks to be
     /// offered bundles, so the plain and headless prompts keep asking one question per voice and

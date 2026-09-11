@@ -160,7 +160,8 @@ is skipped, never repaired:
 20260818-143027  skipped: no session.json: no transcript is possible; the speaker track holds 4.3 s past the end its header declares
 ```
 
-`transcribe` prints that and exits 0; `enroll` passes the session over in the same words. The
+`transcribe` prints that and exits 0; `enroll` passes the session over in the same words; `meethook
+sessions` lists every such directory at once, without running either. The
 audio still plays on the Mac that recorded it, though a strict parser elsewhere may refuse the
 file until told to ignore the header length.
 
@@ -241,6 +242,38 @@ non-terminal stdin/stdout falls back to plain automatically).
 Reports who is enrolled and which stored voice recording is naming them — useful before
 `forget`, since a person can hold several recordings that are otherwise indistinguishable.
 Takes no options; reads every transcribed session and writes nothing.
+
+### `meethook sessions`
+
+Reports what every session directory under the data directory became — the standing answer to
+"which of my recordings survived?", which you'd otherwise have to ask by running `transcribe` or
+`enroll` over everything. Each session is listed with the state it's actually in: `transcribed`,
+`valid` (recorded cleanly, not yet transcribed), or `orphaned`. An orphan says which of its two
+tracks reached disk, how far short of its own declaration either one stops when the header shows
+it — those seconds are on disk but no player will find them — and why no transcript can be built
+from it: `session.json`, the single clock both tracks share, was never written. An orphan is an
+expected shape, not a failure, and nothing here offers to repair one.
+
+```text
+4 session(s) in /Users/you/meethook/sessions: 1 transcribed, 1 valid, 2 orphaned
+
+20260809-052500  orphaned
+    no session.json: no transcript is possible.
+    That file held the single clock both tracks share, so neither can be placed on a common timeline however much of either one plays.
+    The mic track declares 0.2 s more audio than the file holds, and that part is not on disk.
+    The speaker track holds 0.1 s past the end its header declares; players stop at the declaration, so that part does not play.
+    Nothing about this needs fixing: the audio that reached disk is kept as recorded.
+20260809-052600  orphaned
+    …
+20260809-052700  transcribed
+20260809-052800  valid
+```
+
+While a `record` holds the root, the report says so once at the top and declines to say that any
+unfinished directory was left behind — one in that shape may be the call happening now. Takes
+no options, like `speakers`; reads only, writes nothing, and exits 0 whatever it finds, including
+an empty or missing `sessions/`. It works on Linux too, where `record` does not exist: that
+asymmetry is exactly why this is a command rather than something printed when recording starts.
 
 ### `meethook forget <NAME> [--reference N] [--yes]`
 

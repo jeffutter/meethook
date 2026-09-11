@@ -107,7 +107,7 @@ fn sessions_with_nothing_to_ask_about_are_passed_over_without_prompting() {
     std::fs::create_dir_all(untranscribed.dir()).unwrap();
     std::fs::write(untranscribed.session_json(), b"{}").unwrap();
 
-    // The recorder died mid-session.
+    // An orphaned directory: not even a session.json.
     let orphan = paths.session(&SessionId::parse("20260809-052800").unwrap());
     std::fs::create_dir_all(orphan.dir()).unwrap();
 
