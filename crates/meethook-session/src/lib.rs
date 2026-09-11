@@ -11,7 +11,9 @@
 //! <root>/
 //!   speakers.json                 enrolled-speaker embedding DB
 //!   exclusions.json               apps excluded from the mic-activity trigger (user-authored)
-//!   record.lock                   held by a live `record`; keeps a second one out
+//!   record.lock                   held by a live `record`; keeps a second one out.
+//!                                   Liveness is queryable without taking it -- see
+//!                                   [`RecordLock::probe`]
 //!   transcript.md.jinja           optional template every transcript.md is rendered through
 //!   models/                       lazily fetched model weights
 //!   sessions/
@@ -45,6 +47,7 @@ mod transcript_render;
 // because its surface is constructors: `wav::create` reads better than `create_wav`.
 // (A plain comment, not a doc comment: outer docs on a `mod` item resolve their intra-doc
 // links in *this* scope, which breaks the links in wav.rs's own module doc.)
+mod interrupted;
 pub mod wav;
 
 pub use atomic::{write_atomic, write_atomic_with};
@@ -55,12 +58,13 @@ pub use cleaning::{
 pub use discovery::{Classification, DiscoveredSession, discover_sessions};
 pub use exclusions::{AppExclusions, EXCLUSIONS_SCHEMA_VERSION};
 pub use id::{SessionId, create_session_dir, discard_session_dir};
+pub use interrupted::{interrupted_brief, interrupted_detail, recording_in_progress};
 pub use metadata::{
     Attendee, AttendeeStatus, Meeting, MeetingFit, RosterEdit, SESSION_SCHEMA_VERSION,
     SessionMetadata, TrackSync,
 };
 pub use paths::{Paths, SessionPaths};
-pub use record_lock::{Acquisition, Holder, RecordLock};
+pub use record_lock::{Acquisition, Holder, LockState, RecordLock};
 pub use speaker_clusters::{
     MIN_REPRESENTATIVE_SECONDS, RepresentativeSegment, SPEAKER_CLUSTERS_SCHEMA_VERSION,
     SpeakerCluster, SpeakerClusters, unknown_labels,

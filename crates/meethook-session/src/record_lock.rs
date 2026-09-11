@@ -45,6 +45,21 @@
 //! Because the winner writes microseconds after acquiring, a loser that finds the file empty
 //! waits briefly and then says plainly that the pid is unknown rather than guessing.
 //!
+//! # Asking whether a recorder is live without becoming one
+//!
+//! [`RecordLock::probe`] answers the same kernel question with an `F_OFD_GETLK` query over a
+//! descriptor opened *without* `O_CREAT`: no acquisition, no holder-message rewrite, no file
+//! created where none was. Liveness was always queryable this way -- the acquisition path already
+//! reads `EAGAIN` as "held" -- but nothing outside `record` had cause to ask until an unfinished
+//! session directory became something worth reporting, because such a directory also describes a
+//! call being captured at this very second.
+//!
+//! The query cannot name the holder: `fcntl(2)` on macOS reports `l_pid = -1` for an OFD lock
+//! (measured here on macOS 26.6.2, where `F_OFD_GETLK` says a write lock is held and returns no
+//! pid), so identity still comes from the holder's own line via [`read_holder`]. The xnu-private
+//! `F_OFD_GETLKPID` and `F_SETCONFINED` would answer it directly and are off-limits: portable
+//! code may not rely on them, and this module has to work on Linux too.
+//!
 //! # Advisory, and whose guard it is
 //!
 //! This is coordination, not enforcement: it stops a second `meethook record`, and does nothing
@@ -104,12 +119,45 @@ pub struct RecordLock {
 /// Every field is optional because the file is a message the holder chose to write about
 /// itself, not a record anybody verifies: a holder from an older build, a truncated write, or
 /// a hand-edited file all leave gaps, and a gap means *unknown*, never a guess.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Holder {
     pub pid: Option<u32>,
     /// The command line that started it, joined with spaces for display.
     pub argv: Option<String>,
     pub started: Option<Zoned>,
+}
+
+/// What a read-only question about the lock can come back with.
+///
+/// Three answers rather than two because "the kernel would not say" is not the same fact as
+/// "nobody holds it": an unreadable answer must never let a report claim that a call happening
+/// now was interrupted. [`LockState::recorder_may_be_live`] encodes that asymmetry in the type
+/// rather than leaving it to each caller to remember.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockState {
+    /// A live process holds the lock. The [`Holder`] is its self-description, which may be
+    /// partly empty: contents describe the holder, they never decide whether it is holding.
+    Held(Holder),
+    /// Nothing holds it. The file may well exist -- presence is not liveness, which is the whole
+    /// reason this probe exists alongside the file.
+    Free,
+    /// The kernel gave an answer that means nothing either way: the filesystem does not support
+    /// locking (`EINVAL`, which Apple also answers for an unlockable file), the remote-locking
+    /// protocol failed (`ENOLCK`, Linux's NFS/SMB spelling), or the open went wrong for a reason
+    /// other than absence. See the module's note on network-mounted roots.
+    Unknown,
+}
+
+impl LockState {
+    /// Whether a `record` may be capturing right now.
+    ///
+    /// True for [`LockState::Unknown`] on purpose. A caller about to tell a user their session
+    /// was interrupted and left audio on disk has to withhold that sentence while one might be
+    /// false, and "could not ask" is exactly such a case: the default falls toward saying
+    /// nothing rather than toward saying something wrong.
+    pub fn recorder_may_be_live(&self) -> bool {
+        !matches!(self, LockState::Free)
+    }
 }
 
 /// The outcome of [`RecordLock::acquire`].
@@ -161,6 +209,100 @@ impl RecordLock {
 
         Ok(Acquisition::Held(RecordLock { file }))
     }
+
+    /// Whether a `record` holds `<root>/record.lock` *right now*, asked of the kernel.
+    ///
+    /// Read-only in the strictest sense: the path is opened without `O_CREAT`, so probing a root
+    /// that has never recorded cannot leave a byte behind there, and nothing is ever written,
+    /// truncated or unlinked -- rewriting the holder message belongs to the holder alone
+    /// ([`crate::Paths::record_lock`]), and a probe that created the file would break the
+    /// assertion that non-`record` commands never touch it.
+    ///
+    /// This is what lets a report say "this directory holds WAVs and no `session.json`, so
+    /// something interrupted it" without lying about a recording that is happening this second:
+    /// `enroll`, `transcribe` and `speakers` are built to run alongside a live `record`, so an
+    /// unfinished directory legitimately means *being recorded* as often as it means *was
+    /// abandoned*. Liveness is also never inferred from the file's existence or contents, for
+    /// the reasons in the module doc -- a killed holder leaves the file standing.
+    ///
+    /// Not a member of the guard's lifecycle, just filed beside it: it neither takes nor releases
+    /// anything, and holding the returned answer proves nothing about who owns the lock.
+    pub fn probe(paths: &Paths) -> LockState {
+        probe_path(&paths.record_lock())
+    }
+}
+
+/// The kernel's answer about `path`, without acquiring, creating, or reading a verdict out of
+/// the file's contents.
+fn probe_path(path: &Path) -> LockState {
+    let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(c_path) => c_path,
+        // Not a path the OS could open either; "could not ask" is the honest answer.
+        Err(_) => return LockState::Unknown,
+    };
+
+    // `O_RDONLY | O_CLOEXEC` and deliberately no `O_CREAT`: see [`RecordLock::probe`]. The mode
+    // argument is ignored by the kernel without `O_CREAT`, and is passed as zero for that reason
+    // rather than as a permission this call has no intention of applying.
+    // SAFETY: `c_path` is a valid NUL-terminated C string kept alive by this binding for the
+    // duration of the call. `libc::open` returns a fresh descriptor or -1 with errno set, and
+    // the -1 branch below never reaches `from_raw_fd`, so exactly one `File` owns the fd.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC, 0) };
+    if fd < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            // No file, so nothing can be locked in it. This is the common answer for a root that
+            // has never recorded, not a failure to ask.
+            Some(libc::ENOENT) => LockState::Free,
+            _ => LockState::Unknown,
+        };
+    }
+    // SAFETY: `fd` was returned by `libc::open` above and is not otherwise owned.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+
+    let mut request = libc::flock {
+        l_type: libc::F_WRLCK as _,
+        l_whence: libc::SEEK_SET as _,
+        l_start: 0,
+        l_len: 0,
+        // Zeroed, because Linux answers `EINVAL` to a query whose `l_pid` is not. The lock we ask
+        // about is the same whole-file range [`try_ofd_write_lock`] takes.
+        l_pid: 0,
+    };
+
+    // `EINTR` is the one error worth retrying: it says the query was never attempted. The others
+    // -- `EINVAL` (no locking on this filesystem), `ENOLCK` (remote-locking failure), `EBADF`,
+    // `EFAULT` -- say nothing about who holds the name, so they become `Unknown` rather than
+    // collapsing into `Free`. `EAGAIN`/`EACCES` are deliberately absent: those answer `SETLK`,
+    // never `GETLK`, which reports a conflict by overwriting the struct instead.
+    for attempt in 0..2 {
+        // SAFETY: `request` is a live local that the kernel copies in and writes back; the
+        // variadic third argument is the `struct flock *` that `F_OFD_GETLK` is specified to take.
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &mut request) };
+        if rc == 0 {
+            // The kernel answered by rewriting the struct: `F_UNLCK` means no conflicting lock
+            // exists, anything else describes one. Compared through `as _` because `l_type` is a
+            // `c_short` on Apple and the constants are `c_int` on Linux gnu -- the same narrowing
+            // `try_ofd_write_lock` relies on, so no `cfg` is needed for either target.
+            //
+            // `l_pid` is not read: macOS answers -1 for an OFD lock (measured on macOS 26.6.2, and
+            // documented in `fcntl(2)`), so identity comes from the holder's own line instead.
+            return if request.l_type as libc::c_int == libc::F_UNLCK as libc::c_int {
+                LockState::Free
+            } else {
+                // Reusing the loser's reader means a holder that acquired a microsecond before
+                // this query can cost up to `METADATA_WINDOW` here. That is chosen, not inherited:
+                // a report that names the recording is worth a tenth of a second, and a second
+                // implementation of "what did the holder say about itself" is a second source of
+                // truth about it.
+                LockState::Held(read_holder(path))
+            };
+        }
+        if attempt == 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return LockState::Unknown;
+    }
+    LockState::Unknown
 }
 
 impl AsRawFd for RecordLock {
@@ -409,23 +551,15 @@ mod tests {
         let _again = held(dir.path());
     }
 
-    /// AC#2 of the guard: the kernel releases on `SIGKILL`, with no stale-file handling to
-    /// thank for it. The holder is a re-executed copy of this test binary, because the point of
-    /// the test is a process we cannot ask nicely.
-    #[test]
-    fn a_sigkilled_holder_releases_the_lock() {
-        const HELPER_ENV: &str = "MEETHOOK_RECORD_LOCK_HOLDER_HELPER";
-        if std::env::var_os(HELPER_ENV).is_some() {
-            // The helper branch: take the lock named by the parent and sit on it until killed.
-            let _lock = held(Path::new(&std::env::var(HELPER_ENV).unwrap()));
-            std::thread::sleep(Duration::from_secs(60));
-            return;
-        }
+    /// The environment a re-executed copy of this binary reads to become a lock holder that sits
+    /// on the lock until killed, holding the root named by its value.
+    const HOLDER_HELPER_ENV: &str = "MEETHOOK_RECORD_LOCK_HOLDER_HELPER";
 
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(dir.path());
-        let lock_path = paths.record_lock();
-
+    /// Spawns a holder in its own process and waits for proof it acquired.
+    ///
+    /// Proof, not sleep: the helper writes its metadata only *after* taking the lock, so the
+    /// arrival of its pid in the file means the kernel has granted it.
+    fn spawn_holder(root: &Path) -> std::process::Child {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("record_lock::tests::a_sigkilled_holder_releases_the_lock")
@@ -433,25 +567,27 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .env(HELPER_ENV, dir.path())
+            .env(HOLDER_HELPER_ENV, root)
             .spawn()
             .expect("spawning the holder helper");
 
-        // The metadata is written only after the lock is taken, so its arrival is proof the
-        // helper holds it -- no sleep-and-hope.
+        let path = Paths::new(root).record_lock();
         let deadline = Instant::now() + Duration::from_secs(30);
         let marker = format!("\"pid\":{}", child.id());
         loop {
-            let bytes = std::fs::read(&lock_path).unwrap_or_default();
+            let bytes = std::fs::read(&path).unwrap_or_default();
             if String::from_utf8_lossy(&bytes).contains(&marker) {
-                break;
+                return child;
             }
             if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
-                panic!("the helper never acquired {lock_path:?}");
+                panic!("the helper never acquired {path:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
 
+    /// Ends a helper spawned by [`spawn_holder`] by signal, never by asking it politely.
+    fn kill_holder(child: &mut std::process::Child) {
         // SAFETY: `pid` names this test's own child, still owned by `child` and not yet waited
         // on, so it is a live process this test is entitled to signal.
         let killed = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) } == 0;
@@ -462,9 +598,153 @@ mod tests {
             Some(libc::SIGKILL),
             "the helper has to die by the signal, not by exiting"
         );
+    }
+
+    /// AC#2 of the guard: the kernel releases on `SIGKILL`, with no stale-file handling to
+    /// thank for it. The holder is a re-executed copy of this test binary, because the point of
+    /// the test is a process we cannot ask nicely.
+    #[test]
+    fn a_sigkilled_holder_releases_the_lock() {
+        if std::env::var_os(HOLDER_HELPER_ENV).is_some() {
+            // The helper branch: take the lock named by the parent and sit on it until killed.
+            let _lock = held(Path::new(&std::env::var(HOLDER_HELPER_ENV).unwrap()));
+            std::thread::sleep(Duration::from_secs(60));
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = spawn_holder(dir.path());
+        kill_holder(&mut child);
 
         // No cleanup, no waiting, no removing the file: the lock died with the process.
         let _again = held(dir.path());
+    }
+
+    /// The read-only question, asked while another process holds the answer: the probe reports
+    /// it held, and touches nothing. It sees the *holder's own line* here rather than a pid,
+    /// because macOS answers `l_pid = -1` for an OFD lock -- which is why identity comes from the
+    /// file even though the verdict never does.
+    #[test]
+    fn a_probe_reports_another_process_holding_it_and_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let path = paths.record_lock();
+        let mut child = spawn_holder(dir.path());
+
+        let written = std::fs::read(&path).unwrap();
+        match RecordLock::probe(&paths) {
+            LockState::Held(holder) => {
+                assert_eq!(
+                    holder.pid,
+                    Some(child.id()),
+                    "the probe has to name the process that holds the lock"
+                );
+                assert!(holder.argv.is_some(), "and say how it was started");
+            }
+            other => panic!("expected the probe to report a live recorder, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            written,
+            "asking must not disturb the holder's message"
+        );
+
+        kill_holder(&mut child);
+    }
+
+    /// A second descriptor in this process is a different holder as far as the kernel is
+    /// concerned -- the same fact `a_second_acquire_against_a_held_root_refuses_and_names_the_holder`
+    /// exploits -- so liveness is testable without leaving the process at all.
+    #[test]
+    fn a_probe_reports_a_holder_in_this_very_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let _lock = held(dir.path());
+
+        let state = RecordLock::probe(&paths);
+        let LockState::Held(holder) = state else {
+            panic!("a held root must not read as free: {state:?}");
+        };
+        assert_eq!(holder.pid, Some(std::process::id()));
+    }
+
+    /// The whole reason a non-`record` command may ask: the answer costs nothing, including on a
+    /// root that has never recorded, where asking must not leave a trace. `speakers` asserts the
+    /// same absence from the outside; this pins it at the probe itself.
+    #[test]
+    fn probing_a_root_that_has_never_recorded_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("meethook");
+        std::fs::create_dir(&root).unwrap();
+        let paths = Paths::new(&root);
+
+        assert_eq!(RecordLock::probe(&paths), LockState::Free);
+        assert!(!paths.record_lock().exists(), "no file was created");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "and nothing else appeared in the root either"
+        );
+    }
+
+    /// Presence is not liveness: the file outlives every holder by design, and the probe says
+    /// `Free` anyway. Without this, `.02`/`.03` could not tell an abandoned directory from a
+    /// recording in progress.
+    #[test]
+    fn a_dropped_guard_stops_being_live_though_the_file_still_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let lock = held(dir.path());
+        assert!(
+            RecordLock::probe(&paths).recorder_may_be_live(),
+            "while the guard is up the probe must not read the root as free"
+        );
+
+        drop(lock);
+
+        assert!(
+            paths.record_lock().exists(),
+            "dropping closes, never unlinks"
+        );
+        assert_eq!(RecordLock::probe(&paths), LockState::Free);
+    }
+
+    /// The strongest available statement that neither existence nor contents decide anything: a
+    /// holder killed by signal leaves its file behind, intact, and the probe reads it as free.
+    #[test]
+    fn a_sigkilled_holder_is_reported_free_though_its_file_remains() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let mut child = spawn_holder(dir.path());
+
+        kill_holder(&mut child);
+
+        assert!(
+            paths.record_lock().is_file(),
+            "nothing cleans up after a holder"
+        );
+        assert_eq!(
+            RecordLock::probe(&paths),
+            LockState::Free,
+            "and the file's continued existence says nothing about a recorder"
+        );
+    }
+
+    /// The safety default, asserted directly because every caller leans on it: only a definite
+    /// `Free` permits saying a session was interrupted, and an answer the kernel refused to give
+    /// is not a definite anything.
+    #[test]
+    fn an_unknown_answer_leans_toward_a_recorder_being_live() {
+        assert!(
+            LockState::Held(Holder {
+                pid: None,
+                argv: None,
+                started: None
+            })
+            .recorder_may_be_live()
+        );
+        assert!(LockState::Unknown.recorder_may_be_live());
+        assert!(!LockState::Free.recorder_may_be_live());
     }
 
     /// The descriptor must not survive an `exec`, or a spawned player or a spawned `meethook`
