@@ -25,14 +25,15 @@
 //! three marks including the heard-at-once pair -- the composition .02's fake-costs tests and
 //! .01's scripted-library test each cover only in part.
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::Driver;
 use meethook_session::{
     Paths, RepresentativeSegment, SessionId, SessionMetadata, SourceTrack, SpeakerCluster,
     SpeakerClusters, TrackSync, Transcript, TranscriptContext, TranscriptTemplate, Turn,
@@ -123,216 +124,10 @@ fn turn(start: f64, cluster: u32, speaker: &str, text: &str) -> Turn {
 }
 
 // --- the pty seam --------------------------------------------------------------------------
-
-/// One open pty: the master the test reads and writes, the slave the child takes as its
-/// controlling terminal. The size is set before the spawn because the frame draws into
-/// whatever rectangle it is handed.
-fn open_pty() -> (std::fs::File, std::fs::File) {
-    // SAFETY: `master`/`slave`/`win` are valid stack locals passed by pointer to a well-formed
-    // libc call; `openpty` fills `master`/`slave` with fresh, valid fds on success (checked via
-    // `rc`), which `from_raw_fd` then takes ownership of.
-    //
-    // `&mut win` is required because macOS's `libc::openpty` declares `winp` as `*mut winsize`
-    // (unlike Linux's POSIX-matching `*const`), which clippy running on Linux CI can't see.
-    #[allow(clippy::unnecessary_mut_passed)]
-    unsafe {
-        let mut master: libc::c_int = -1;
-        let mut slave: libc::c_int = -1;
-        let mut name = [0u8; 256];
-        let mut win = libc::winsize {
-            ws_row: 30,
-            ws_col: 100,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        let rc = libc::openpty(
-            &mut master,
-            &mut slave,
-            name.as_mut_ptr().cast(),
-            std::ptr::null_mut(),
-            &mut win,
-        );
-        assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
-        (
-            std::fs::File::from_raw_fd(master),
-            std::fs::File::from_raw_fd(slave),
-        )
-    }
-}
-
-/// The built binary pointed at `root`, enrolled interactively through a pty.
-struct Driver {
-    child: Child,
-    master: std::fs::File,
-    /// Everything the child has written, kept so a failure can show what the frame saw.
-    out: Vec<u8>,
-    buf: [u8; 16384],
-}
-
-impl Driver {
-    fn spawn(root: &Path) -> Self {
-        let (master, slave) = open_pty();
-        let master = {
-            let fd = master.as_fd().as_raw_fd();
-            // SAFETY: `fd` is `master`'s own descriptor, kept alive by the borrow above, and
-            // `F_GETFL` takes no pointer argument -- a plain read of the fd's current flags.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            assert!(
-                flags >= 0,
-                "fcntl F_GETFL failed: {}",
-                std::io::Error::last_os_error()
-            );
-            // SAFETY: same fd as above; `flags` was just read from it, so OR-ing in
-            // `O_NONBLOCK` and writing it back changes no bit this call did not just observe.
-            let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-            assert_eq!(
-                rc,
-                0,
-                "fcntl F_SETFL failed: {}",
-                std::io::Error::last_os_error()
-            );
-            master
-        };
-
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_meethook"));
-        cmd.args(["--root"])
-            .arg(root)
-            .args(["enroll", SESSION])
-            .env("TERM", "xterm-256color")
-            .stdin(Stdio::from(slave.try_clone().unwrap()))
-            .stdout(Stdio::from(slave.try_clone().unwrap()))
-            .stderr(Stdio::from(slave));
-        // `std::process::Child` does not kill when it is dropped -- there is no `kill_on_drop`
-        // outside `tokio::process` -- so this child outlives a panicking test unless `Driver`
-        // itself reaps it. See the `Drop` below.
-        let child = cmd.spawn().expect("spawning the built binary");
-        Driver {
-            child,
-            master,
-            out: Vec::new(),
-            buf: [0; 16384],
-        }
-    }
-
-    /// Pulls whatever is readable into `out` without blocking.
-    fn pump(&mut self) {
-        loop {
-            let n = match self.master.read(&mut self.buf) {
-                Ok(n) => n,
-                Err(_) => return, // nothing yet, or the pty closed with the child gone
-            };
-            if n == 0 {
-                return;
-            }
-            self.out.extend_from_slice(&self.buf[..n]);
-        }
-    }
-
-    /// Blocks until either the frame has taken the terminal or the child has gone, whichever
-    /// comes first. Returns whether the frame won: a re-run pointed at a root the interrupt
-    /// left fully converged finds no question worth a frame and exits clean instead.
-    fn wait_for_frame_or_exit(&mut self, timeout: Duration) -> bool {
-        const ALT_SCREEN: &[u8] = b"\x1b[?1049h";
-        let seen = |out: &[u8]| out.windows(ALT_SCREEN.len()).any(|w| w == ALT_SCREEN);
-        let deadline = Instant::now() + timeout;
-        loop {
-            self.pump();
-            if seen(&self.out) {
-                return true;
-            }
-            match self.child.try_wait() {
-                Ok(Some(_)) => return false,
-                Ok(None) => {}
-                Err(e) => panic!("waiting on the child: {e}"),
-            }
-            if Instant::now() > deadline {
-                panic!(
-                    "neither frame nor exit within {timeout:?}; got {} bytes:\n{}",
-                    self.out.len(),
-                    String::from_utf8_lossy(&self.out)
-                );
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Feeds keystrokes with a settle between them: the pty queues raw-mode input, but the
-    /// frame redraws on a timer and each mark must land on its own row.
-    fn feed(&mut self, keys: &[&[u8]]) {
-        for key in keys {
-            self.master.write_all(key).unwrap();
-            self.pump();
-            std::thread::sleep(Duration::from_millis(150));
-        }
-    }
-
-    /// Writes bytes to the pty and nothing else -- for the keystroke that starts the commits,
-    /// where the very next instruction is to watch the disk, and a settle would let the whole
-    /// burst finish before the watcher starts.
-    fn write_now(&mut self, bytes: &[u8]) {
-        self.master.write_all(bytes).unwrap();
-    }
-
-    /// Blocks until the child is gone, keeping the pty drained so it never blocks on a full
-    /// buffer. Returns its exit status.
-    fn wait_exit(&mut self, timeout: Duration) -> ExitStatus {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    self.pump();
-                    return status;
-                }
-                Ok(None) => {
-                    self.pump();
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => panic!("waiting on the child: {e}"),
-            }
-        }
-        let _ = self.child.kill();
-        let status = self.child.wait().unwrap();
-        panic!(
-            "the run did not finish in {timeout:?}; status {status}; tail:\n{}",
-            String::from_utf8_lossy(&self.out[self.out.len().saturating_sub(2000)..])
-        );
-    }
-
-    /// The last stretch of what the frame wrote, for a failure message.
-    fn tail(&self) -> String {
-        String::from_utf8_lossy(&self.out[self.out.len().saturating_sub(2000)..]).into_owned()
-    }
-}
-
-/// Kills and reaps the child on every path out of a `Driver`, including the ones that never
-/// reach `wait_exit`: the deadline panics inside the waits, the two panic sites in
-/// `interrupt_once`, and `complete_and_verify`'s no-frame branch, which falls straight through to
-/// the disk assertions and drops the driver with the child already gone but still unreaped.
-///
-/// This is load-bearing in a way most test cleanups are not. The child is `enroll` under a pty:
-/// once the frame is up it blocks reading stdin that the test may have stopped writing, and
-/// nextest runs each test in its own process, so a test failure leaves the child alive to be
-/// reparented by launchd -- where a `meethook enroll` asleep for days with PPID 1 was once found
-/// on the dev machine. `std::process::Child`'s own Drop does nothing about that, and the standard
-/// library has no `kill_on_drop` to ask for (that one is `tokio::process`'s), so owning the reap
-/// here is the whole guarantee. It covers unwinding, which is how libtest reports a failure; a
-/// test process killed outright still orphans its child, because macOS offers no parent-death
-/// signal to arm at spawn time.
-impl Drop for Driver {
-    fn drop(&mut self) {
-        // Once the child has been waited on, `try_wait` answers from the cached status without a
-        // syscall, so an already-reaped child is never signalled again -- its pid may by then
-        // belong to some other process. A failed `try_wait` is treated the same way: nothing
-        // this test can do about it is better than leaving the pid alone.
-        if !matches!(self.child.try_wait(), Ok(None)) {
-            return;
-        }
-        // The child is alive; SIGKILL does not wait on it draining the pty, and both errors are
-        // uninteresting -- a child that died between `try_wait` and `kill` is the outcome wanted.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+//
+// The driver lives in `common`, shared rather than copied: it is unsafe libc terminal plumbing
+// whose `Drop` reap exists because of an orphaned `meethook enroll` once found asleep with
+// PPID 1 on the dev machine, and two copies of that history is not a price worth paying.
 
 // --- what the disk says --------------------------------------------------------------------
 
@@ -410,7 +205,7 @@ struct Missed;
 /// first member's database row is on disk. On success returns the members the walk reached in
 /// the database before it died.
 fn interrupt_once(root: &Path) -> Result<BTreeSet<u32>, Missed> {
-    let mut driver = Driver::spawn(root);
+    let mut driver = Driver::spawn(root, &["enroll", SESSION]);
     if !driver.wait_for_frame_or_exit(Duration::from_secs(15)) {
         // A fresh fixture always asks, so an early exit is a failure, not a miss.
         let status = driver.child.wait().unwrap();
@@ -526,7 +321,7 @@ fn an_interrupt_mid_group_commit_leaves_a_prefix_and_a_rerun_converges() {
 fn complete_and_verify(root: &Path, db: &BTreeSet<u32>) {
     // The corpse and the disk agree on what the walk reached.
     assert_eq!(&db_clusters(root), db);
-    let mut driver = Driver::spawn(root);
+    let mut driver = Driver::spawn(root, &["enroll", SESSION]);
     if driver.wait_for_frame_or_exit(Duration::from_secs(15)) {
         // The gesture is the group door again, over every row the queue offers -- including the
         // ones the interrupt already committed. The group's forced tier stands each member's
