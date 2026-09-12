@@ -56,8 +56,8 @@ pub enum Phase {
     Beginning,
     /// A session is open and delivering audio.
     Recording,
-    /// A session is ending: the call ended, the device moved, the mic stalled, or the user
-    /// interrupted.
+    /// A session is ending: the call ended, the device moved, the mic stalled, the user
+    /// interrupted, or the frame's key ended this session by hand.
     Finalizing,
 }
 
@@ -342,6 +342,19 @@ impl State {
     /// access it gets.
     pub fn take_narration(&mut self) -> String {
         std::mem::take(&mut self.narration)
+    }
+
+    /// Whether a live session exists for the frame's hand stop to end.
+    ///
+    /// The one question `s` asks the state machine, and the phase answers it alone: `Idle` has
+    /// nothing recording, `Beginning` has nothing recorded *yet* (the start is still being
+    /// retried), and `Finalizing` is already ending -- a second stop there would be a press
+    /// against audio the run is writing out right now. Only `Recording` has a session to end.
+    ///
+    /// A gate rather than a guard: the loop drops a stray `StopSession` in its idle wait too,
+    /// so this keeps the channel clean and the hint honest rather than preventing a fault.
+    pub fn can_stop_session(&self) -> bool {
+        self.phase == Phase::Recording
     }
 
     /// Opens the selector while a session is recording.
@@ -797,6 +810,39 @@ mod tests {
 
         s.apply(&Note::Watching);
         assert_eq!(s.phase, Phase::Idle);
+    }
+
+    /// The hand stop's gate follows the phase walk rather than a session field of its own: of
+    /// the four phases the frame can show, exactly one has a live session for `s` to end.
+    ///
+    /// Driven through the notes the loop produces, so the answer cannot come apart from what the
+    /// run actually says -- a predicate wired to `session.is_some()` would read true while the
+    /// audio is still being written out.
+    #[test]
+    fn a_hand_stop_is_offered_only_while_a_session_is_live() {
+        let mut s = State::default();
+        assert!(!s.can_stop_session(), "nothing is recording yet");
+
+        s.apply(&Note::AlreadyActive);
+        assert!(
+            !s.can_stop_session(),
+            "a start still being retried has recorded nothing to end"
+        );
+
+        s.apply(&started(1));
+        assert!(s.can_stop_session(), "a live session can be ended by hand");
+
+        s.apply(&Note::Stopping);
+        assert!(
+            !s.can_stop_session(),
+            "the session is already ending; a second stop would press against the finalize"
+        );
+
+        s.apply(&recorded(1, None));
+        assert!(
+            !s.can_stop_session(),
+            "back to watching, with nothing on the next call yet"
+        );
     }
 
     /// A device change or a stall finalizes the session and says why, in the composer's words.

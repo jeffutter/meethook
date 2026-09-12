@@ -124,9 +124,10 @@ impl Timing {
 ///
 /// One enum, one channel: a Ctrl-C during a recording has to be seen at the same instant
 /// as a microphone edge, and two separate waits cannot both be blocking. `pub(crate)` because
-/// the full-screen frame is a second producer of these -- it delivers its Ctrl-C and its
-/// calendar picks through a clone of this channel's sender; the event set itself stays private
-/// to this module, and every match site below owes a deliberate answer per variant.
+/// the full-screen frame is a second producer of these -- it delivers its Ctrl-C, its hand stop,
+/// and its calendar picks and roster edits through a clone of this channel's sender; the event set
+/// itself stays private to this module, and every match site below owes a deliberate answer per
+/// variant.
 pub(crate) enum Event {
     Started,
     Stopped,
@@ -135,6 +136,15 @@ pub(crate) enum Event {
     /// a deliberate answer for.
     InputDeviceChanged,
     Interrupt,
+    /// End the session that is recording right now and keep the run watching for the next
+    /// call. Only the full-screen frame produces it, from its `s` key.
+    ///
+    /// Its own variant rather than a reuse of [`Event::Stopped`]: that route goes through
+    /// [`await_end`], where a microphone edge that resumes inside the grace period vetoes the
+    /// stop and the session lives on -- the exact outcome this key exists to escape. A hand
+    /// stop is not an observation about the microphone but a decision about the session, so it
+    /// never enters the wait that a microphone observation can cancel.
+    StopSession,
     /// The user confirmed one of the calendar offers the frame was showing, addressed by the
     /// event's own identifier rather than its title: titles repeat across calendars, and the
     /// identifier is what `finish` writes. The first payload-carrying variant -- kept a
@@ -927,6 +937,10 @@ fn record_loop(
                 Ok(Event::MeetingPicked(_)) => continue,
                 // No session is live to attach an edit to either; the same answer.
                 Ok(Event::RosterEdited(_)) => continue,
+                // Nothing is recording, so there is nothing here to end -- and above all a
+                // stray press must not fall into the arm below, which would have quitting be
+                // what a mispress costs.
+                Ok(Event::StopSession) => continue,
                 Ok(Event::Interrupt) | Err(_) => break,
             }
         }
@@ -1034,6 +1048,11 @@ fn record_loop(
                 // finalize it and open a new session on the new device.
                 Ok(Event::InputDeviceChanged) => break Recording::DeviceChanged,
                 Ok(Event::Interrupt) => break Recording::Interrupted,
+                // The hand stop, and the whole mechanism of it: an immediate break to the one
+                // finalize point, never the grace wait. Someone looking at the frame has
+                // decided this call is over, which outranks whatever the microphone could still
+                // be reporting -- the runaway case is precisely a process that keeps reporting.
+                Ok(Event::StopSession) => break Recording::StoppedByUser,
                 // The safety net, and the only reason this wait has a timeout at all. A
                 // release edge can be lost outright -- the recomputation behind a
                 // notification reads a world that can move under it -- and once the machine
@@ -1072,7 +1091,9 @@ fn record_loop(
         match outcome {
             Recording::DeviceChanged => sink.note(Note::DeviceChanged),
             Recording::MicStalled => sink.note(Note::MicStalled),
-            Recording::Ended | Recording::Interrupted => sink.note(Note::Stopping),
+            Recording::Ended | Recording::Interrupted | Recording::StoppedByUser => {
+                sink.note(Note::Stopping)
+            }
         }
 
         if let Err(e) = capture.finish(sink, hand.take(), roster_edit.take()) {
@@ -1083,7 +1104,11 @@ fn record_loop(
 
         match outcome {
             Recording::Interrupted => break,
-            Recording::Ended => sink.note(Note::Watching),
+            // A hand stop lands where a call that ended on its own lands: back to watching.
+            // Not the device-change arm's `recheck()`-and-reopen -- the counted process is
+            // usually still holding the microphone in the case this key exists for, so opening
+            // a session again at once would make the key look like it did nothing.
+            Recording::Ended | Recording::StoppedByUser => sink.note(Note::Watching),
             // The level, recomputed from the world, is what keeps a swap that coincides with
             // the call ending from opening a session for a call that is already over. When it
             // is still up, `already_active` is exactly the "record without waiting for a start
@@ -1113,7 +1138,7 @@ fn record_loop(
 ///
 #[cfg(any(target_os = "macos", test))]
 /// An enum rather than the `interrupted` boolean it replaced, so that the one finalize point
-/// after the loop stays the only one: three ways out of a recording, three answers to "what
+/// after the loop stays the only one: five ways out of a recording, three answers to "what
 /// happens after `finish`", and a single place where the audio is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Recording {
@@ -1121,6 +1146,10 @@ enum Recording {
     Ended,
     /// Ctrl-C, or every sender gone: finalize and exit.
     Interrupted,
+    /// The frame's key ended this session while the run keeps watching: finalize and go back to
+    /// watching, like `Ended` -- but decided by a person at the frame rather than by the
+    /// microphone having looked idle long enough.
+    StoppedByUser,
     /// The default input device moved out from under the engine: finalize, and open a new
     /// session on the new device if the call is still up.
     DeviceChanged,
@@ -1191,6 +1220,10 @@ fn begin(
             Ok(Event::MeetingPicked(_)) => {}
             // No session exists yet to attach an edit to either; the same answer.
             Ok(Event::RosterEdited(_)) => {}
+            // And no session exists yet to end, so the same answer again: keep retrying.
+            // Abandoning here would throw away a call the user may still want recorded, on the
+            // strength of a keypress made a moment before the session the user meant came up.
+            Ok(Event::StopSession) => {}
             Err(RecvTimeoutError::Timeout) => {
                 // The stop edge can be missed outright, so the level is recomputed from the
                 // world here rather than inferred from the absence of a message. It has to
@@ -1253,6 +1286,12 @@ fn await_end(rx: &Receiver<Event>, grace: Duration) -> Outcome {
             // within seconds and the pane closes with it, so no further edit could arrive
             // anyway -- waiting out the remainder keeps the grace honest.
             Ok(Event::RosterEdited(_)) => {}
+            // Already ending, and seconds from the finalize either way. Shortening the wait
+            // here would make the grace period a second owner of the session lifecycle for a
+            // saving nobody can notice; waiting it out keeps one answer for "when is this
+            // session over". The hand stop that matters -- the one taken while the session is
+            // live -- never gets here.
+            Ok(Event::StopSession) => {}
             Err(RecvTimeoutError::Timeout) => return Outcome::CallEnded,
             // Every sender is gone, so nothing can resume this session. Finalizing is the
             // only outcome that does not lose the audio already captured.
@@ -1591,6 +1630,21 @@ mod tests {
         );
     }
 
+    /// Nor does a hand stop. Once the session is in the grace wait it is ending either way,
+    /// and letting the frame's key resolve the wait early would make the grace period a second
+    /// owner of "when is this session over" for a saving nobody can see.
+    #[test]
+    fn a_hand_stop_inside_the_grace_period_waits_it_out() {
+        let (_tx, rx) = feed(GRACE / 6, Event::StopSession);
+
+        let started = Instant::now();
+        assert_eq!(await_end(&rx, GRACE), Outcome::CallEnded);
+        assert!(
+            started.elapsed() >= GRACE,
+            "the hand stop cut the wait short"
+        );
+    }
+
     /// Losing every sender cannot leave a live recording waiting forever.
     #[test]
     fn a_disconnected_channel_ends_the_call() {
@@ -1773,6 +1827,125 @@ mod tests {
         run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "finish"]);
+    }
+
+    /// The hand stop: `s` in the frame ends the session that is recording, finalizes it through
+    /// the same single point a natural ending uses, and leaves the run watching.
+    ///
+    /// *When* it finalized is the load-bearing assertion. A stop that had been routed through
+    /// [`await_end`] -- reusing the microphone's own stop edge, which is the tempting shortcut --
+    /// would also produce `["start", "finish"]`, just not until the grace had elapsed. Landing
+    /// inside the grace is what says the press broke the recording wait directly.
+    #[test]
+    fn a_hand_stop_finalizes_the_session_and_returns_to_watching() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::StopSession),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        let started = Instant::now();
+        run(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        let finished = capture
+            .finished_at
+            .expect("the session was never finalized")
+            .duration_since(started);
+        assert!(
+            finished < LOOP_TIMING.grace,
+            "the hand stop sat in the grace period and finalized after {finished:?}"
+        );
+    }
+
+    /// The reason the hand stop is its own event rather than [`Event::Stopped`]: the grace
+    /// period can veto a stop, because a microphone edge that resumes inside it means the call
+    /// never ended. A person who pressed the key has already made that judgement, so an edge
+    /// arriving a moment later must not rescue the session.
+    ///
+    /// The counterpoint to `a_blip_inside_the_grace_period_does_not_split_the_session`, which
+    /// scripts the identical `Stopped`-then-`Started` pair and is owed the opposite answer: there
+    /// the pair is one call with a mute in it, here it is a call that was ended by hand and a new
+    /// one that opened afterwards. Two sessions is therefore the only correct call log, and a
+    /// veto would leave one.
+    #[test]
+    fn a_hand_stop_is_not_vetoed_by_activity_that_resumes() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::StopSession),
+            (BLIP, Event::Started),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        run(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(
+            capture.calls,
+            ["start", "finish", "start", "finish"],
+            "the resumed edge vetoed the hand stop"
+        );
+    }
+
+    /// Two presses, two finalized sessions, and the watcher still watching between them: the
+    /// shape of the runaway case this key exists for, where the trigger stays pinned true and
+    /// each hand stop opens the way onto the next call rather than quitting the run.
+    #[test]
+    fn two_hand_stops_produce_two_sessions() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::StopSession),
+            (SETTLE, Event::Started),
+            (BLIP, Event::StopSession),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        run(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish", "start", "finish"]);
+    }
+
+    /// Pressing the key with nothing recording costs nothing. An empty call log alone cannot
+    /// tell "ignored" from "the recorder exited", and the second of those is what falling into
+    /// the idle wait's interrupt arm would make a mispress.
+    #[test]
+    fn a_hand_stop_while_idle_opens_nothing() {
+        let (_tx, rx) = script(vec![(BLIP, Event::StopSession), (SETTLE, Event::Interrupt)]);
+
+        let mut capture = FakeCapture::default();
+        let started = Instant::now();
+        run(&rx, &mut capture, &|| true, false);
+
+        assert!(capture.calls.is_empty(), "{:?}", capture.calls);
+        assert!(
+            started.elapsed() >= SETTLE,
+            "the loop returned on the hand stop, not on the interrupt"
+        );
+    }
+
+    /// During a start retry there is no session yet to end, so the press is dropped and the
+    /// retry continues. Abandoning the attempt instead would throw away a call the user may
+    /// still want recorded because the key was pressed a moment too early.
+    #[test]
+    fn a_hand_stop_during_a_start_retry_keeps_retrying() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            // Queued immediately, so it is waiting when the first failed start reaches the
+            // retry wait; a delay near `retry` would race the timeout instead.
+            (Duration::ZERO, Event::StopSession),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            failing_starts: 1,
+            ..FakeCapture::default()
+        };
+        run(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "start", "finish"]);
     }
 
     /// What a [`ScriptedStream`] did about the bytes it was handed.

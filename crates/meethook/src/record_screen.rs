@@ -15,9 +15,10 @@
 //! the cloned sender the run's ctrlc handler uses in plain mode: the main loop finalizes the
 //! session exactly as it would have. The frame is now a second producer of events in kind,
 //! not just in that one case: a hand pick of a calendar offer rides the same cloned sender
-//! as an [`Event::MeetingPicked`], and a committed roster correction as an
-//! [`Event::RosterEdited`], each decided at the same single reader as a mic edge. What keeps
-//! the contract intact is that the payloads are values the run resolves against the lists it
+//! as an [`Event::MeetingPicked`], a committed roster correction as an [`Event::RosterEdited`],
+//! and its `s` key -- the one event that changes which session is live rather than describing it
+//! -- as an [`Event::StopSession`], each decided at the same single reader as a mic edge. What
+//! keeps the contract intact is that the payloads are values the run resolves against the lists it
 //! handed over -- never a meeting -- and that every match site in the loop owes a deliberate
 //! answer per variant.
 //!
@@ -100,8 +101,10 @@ pub(crate) struct Screen {
 impl Screen {
     /// Spawns the frame thread.
     ///
-    /// `tx` is the clone the frame uses to deliver Ctrl-C as an [`Event::Interrupt`]; the
-    /// original sender stays with the run's ctrlc handler, which remains the plain-mode path.
+    /// `tx` is the clone the frame uses to deliver its own events -- Ctrl-C as
+    /// [`Event::Interrupt`], its `s` key as [`Event::StopSession`], and the calendar pick or
+    /// roster correction it commits; the original sender stays with the run's ctrlc handler,
+    /// which remains the plain-mode path.
     pub(crate) fn new(tx: mpsc::Sender<Event>, paths: Paths) -> Self {
         let (notes_tx, notes_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
@@ -348,6 +351,16 @@ fn run(
                                     }
                                 }
                                 Action::CancelField => state.cancel_edit(),
+                                Action::StopSession => {
+                                    // Only a live session can be ended; the run decides what
+                                    // that means and says so. A stray press with nothing
+                                    // recording is dropped by the loop's idle arm as well, so
+                                    // the frame gate saves the channel an event rather than
+                                    // preventing a fault.
+                                    if state.can_stop_session() {
+                                        let _ = tx.send(Event::StopSession);
+                                    }
+                                }
                                 // The stop never reaches this arm: the interrupt arm
                                 // above decides Ctrl-C before the selector commands get
                                 // a look at the key.
@@ -400,13 +413,20 @@ fn run(
 
 /// What a keypress means to the frame.
 ///
-/// The stop is the base TUI's only binding; the rest is TASK-056.01's meeting selector, and
-/// they grow this table rather than the loop that reads it.
+/// Two of these leave the frame: leaving the run (`Interrupt`) and ending the session that is
+/// recording while the run keeps watching (`StopSession`). The rest is TASK-056.01's meeting
+/// selector and its roster correction, and they grow this table rather than the loop that reads
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     /// Stop the run and exit: the main loop finalizes the session exactly as a plain-mode
     /// Ctrl-C would have.
     Interrupt,
+    /// End the session that is recording right now and keep the run watching for the next call:
+    /// crosses as an [`Event::StopSession`]. Deliberately not `Interrupt`, which leaves the run
+    /// -- "end this recording" and "quit" are two different questions, and every peer studied
+    /// for TASK-066 keeps them on two different keys.
+    StopSession,
     /// Open the meeting selector: the numbered offers replace the notice region while it is
     /// open. Allowed even with an empty list -- that is the degraded view, and the frame says
     /// nothing is offered rather than hiding the key.
@@ -510,6 +530,14 @@ fn event(key: KeyEvent, ctx: KeyContext) -> Option<Action> {
         (KeyCode::Esc, KeyContext::RosterEditing(_)) => Some(Action::CancelField),
         (KeyCode::Esc, KeyContext::Selector) => Some(Action::CloseSelector),
         (KeyCode::Esc, KeyContext::Roster) => Some(Action::CloseRoster),
+        // The hand stop: bound in every context where a live session is on screen, and
+        // deliberately NOT in the editing one, where printables belong to the field being
+        // corrected -- typing a name must never end a call. Uppercase stays unbound, like the
+        // pane letters, and Ctrl-S is refused by the control block above rather than silently
+        // meaning something nobody advertised.
+        (KeyCode::Char('s'), KeyContext::Base | KeyContext::Selector | KeyContext::Roster) => {
+            Some(Action::StopSession)
+        }
         // The roster pane's toggle: bound wherever the pane might be opened or closed, and a
         // no-op in the state machine when there is no attachment to open it on.
         (KeyCode::Char('r'), KeyContext::Base) => Some(Action::OpenRoster),
@@ -625,6 +653,23 @@ mod tests {
         assert_eq!(roster(KeyCode::Char('n')), Some(Action::EditName));
         assert_eq!(roster(KeyCode::Char('e')), Some(Action::EditEmail));
 
+        // The hand stop is bound wherever a live session is the thing on screen -- including
+        // from inside either pane, because ending the call outranks whichever list is open.
+        assert_eq!(base(KeyCode::Char('s')), Some(Action::StopSession));
+        assert_eq!(selector(KeyCode::Char('s')), Some(Action::StopSession));
+        assert_eq!(roster(KeyCode::Char('s')), Some(Action::StopSession));
+        // Uppercase stays unbound like the other pane letters, and Ctrl-S stays unbound with
+        // them: control bytes mean leaving the run or nothing, never something subtler.
+        assert_eq!(base(KeyCode::Char('S')), None, "`S` is not the hand stop");
+        assert_eq!(
+            event(
+                press(KeyCode::Char('s'), KeyEventKind::Press, true),
+                KeyContext::Base
+            ),
+            None,
+            "Ctrl-S is not the hand stop"
+        );
+
         // Releases of the navigation and pane keys do nothing, in any context.
         for code in [KeyCode::Enter, KeyCode::Up, KeyCode::Down, KeyCode::Esc] {
             for ctx in [KeyContext::Base, KeyContext::Selector, KeyContext::Roster] {
@@ -634,6 +679,13 @@ mod tests {
                     "a release of {code:?} does nothing in {ctx:?}"
                 );
             }
+        }
+        for ctx in [KeyContext::Base, KeyContext::Selector, KeyContext::Roster] {
+            assert_eq!(
+                event(press(KeyCode::Char('s'), KeyEventKind::Release, false), ctx),
+                None,
+                "a release of `s` does nothing in {ctx:?}"
+            );
         }
 
         // Unbound keys are ignored outside their context, and a control-modified navigation
@@ -657,10 +709,16 @@ mod tests {
         );
     }
 
-    /// Printables feed ONLY the editing context: the enroll search-input partitioning, scoped
-    /// to a context instead of permanent. In every other context a printable stays unbound,
-    /// so roster input can never drive the selector or a background action; and inside the
-    /// editing context a control character is refused rather than buffered.
+    /// Printables feed the editing context and, with one named exception, go nowhere else: the
+    /// enroll search-input partitioning, scoped to a context instead of permanent. In every other
+    /// context a printable stays unbound, so roster input can never drive the selector or a
+    /// background action; and inside the editing context a control character is refused rather
+    /// than buffered.
+    ///
+    /// The exception is `s`, TASK-066.07's hand stop -- the only printable bound outside the
+    /// field, bound because record's frame has its printables free where enroll's spends them on
+    /// its filter. Bound or not, the editing context wins: typing a name that contains an `s` must
+    /// insert the letter, never end the call.
     #[test]
     fn printables_feed_only_the_editing_context() {
         for ctx in [KeyContext::Base, KeyContext::Selector, KeyContext::Roster] {
@@ -679,6 +737,12 @@ mod tests {
                     "{c:?} feeds the {field:?} field"
                 );
             }
+            // The one printable bound outside the field is still just a letter inside it.
+            assert_eq!(
+                event(press(KeyCode::Char('s'), KeyEventKind::Press, false), ctx),
+                Some(Action::Type('s')),
+                "`s` feeds the {field:?} field rather than ending the session"
+            );
             assert_eq!(
                 event(press(KeyCode::Backspace, KeyEventKind::Press, false), ctx),
                 Some(Action::DeleteChar)

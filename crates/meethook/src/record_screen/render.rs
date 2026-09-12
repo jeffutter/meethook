@@ -188,32 +188,52 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
     }
 
     body_lines.push(Line::from(Span::raw(" ")));
-    // Contextual bindings: the base stop always, and the meeting keys only while a session is
-    // recording -- a key that cannot work in the current context is not advertised, and
-    // Enter's wording follows what it would do now.
-    let mut hint = vec![
+    // Two key rows rather than one wrapped paragraph. Every binding cannot fit one line at the
+    // 80-column floor once the hand stop joins it: the widest combination -- the exit keys, the
+    // hand stop and the roster pane's five bindings -- measures 101 columns, and a folded hint
+    // splits a binding from its key. The roster pane already folded by one column before this key
+    // existed (81); adding `s` pushed the open selector (88) and a base frame with a roster
+    // attached (84) past it too. So the keys that act on the run take the first row and the keys
+    // that act on whichever pane is on screen take a row of their own, which holds every frame to
+    // 51 columns on either row.
+    //
+    // What each row advertises is unchanged from the single line: the run's stop always, the
+    // meeting keys only while a session is recording -- a key that cannot work in the current
+    // context is not advertised -- and the hand stop answers both halves of that rule, since it
+    // needs a live session to end and needs its printable letter free. Enter's wording still
+    // follows what it would do now.
+    let mut run_keys = vec![
         Span::raw("Ctrl-C / Ctrl-D").bold(),
         Span::raw("  stop and exit").dim(),
     ];
+    let mut pane_keys: Vec<Span<'static>> = Vec::new();
     if state.phase == Phase::Recording {
+        if state.editing.is_none() {
+            run_keys.push(Span::raw("  s").bold());
+            run_keys.push(Span::raw(" end this session").dim());
+        }
         if state.roster_open {
             if state.editing.is_some() {
-                hint.push(Span::raw("  type  enter save  esc cancel").dim());
+                pane_keys.push(Span::raw("  type  enter save  esc cancel").dim());
             } else {
-                hint.push(Span::raw("  up/down move  x remove  n name  e email  esc back").dim());
+                pane_keys
+                    .push(Span::raw("  up/down move  x remove  n name  e email  esc back").dim());
             }
         } else if state.selector_open {
-            hint.push(Span::raw("  up/down move  enter choose  esc back").dim());
+            pane_keys.push(Span::raw("  up/down move  enter choose  esc back").dim());
         } else {
             // The roster key is advertised only while a roster is attached: with no meeting
             // there is nothing to open, and a key that cannot work is not offered.
             if state.roster.is_some() {
-                hint.push(Span::raw("  r roster").dim());
+                pane_keys.push(Span::raw("  r roster").dim());
             }
-            hint.push(Span::raw("  enter choose a meeting").dim());
+            pane_keys.push(Span::raw("  enter choose a meeting").dim());
         }
     }
-    body_lines.push(Line::from(hint));
+    body_lines.push(Line::from(run_keys));
+    if !pane_keys.is_empty() {
+        body_lines.push(Line::from(pane_keys));
+    }
 
     if trouble_height > 0 {
         let [main, trouble] = Layout::default()
@@ -432,8 +452,10 @@ mod tests {
         assert!(painted.contains("stop and exit"), "{painted}");
         assert!(painted.contains("sessions"), "{painted}");
         // No session is recording, so the meeting keys are not advertised: a key that cannot
-        // work in the current context is not offered.
+        // work in the current context is not offered. The hand stop goes the same way -- there is
+        // no live session for it to end.
         assert!(!painted.contains("choose a meeting"), "{painted}");
+        assert!(!painted.contains("end this session"), "{painted}");
     }
 
     /// A recording frame shows the live session the way the plain run announced it: id,
@@ -467,6 +489,90 @@ mod tests {
         let painted = painted(80, 24, &state, None).join("\n");
         assert!(painted.contains("finalizing"), "{painted}");
         assert!(painted.contains(STOPPING), "{painted}");
+    }
+
+    /// The hand stop is advertised exactly where it works: in every recording context whose
+    /// printable letters are free -- the base, the open selector and the open roster pane --
+    /// and nowhere else. A press against a field under correction has to type a letter, not end
+    /// a call, so the key withdraws there; and with no session live there is nothing to end.
+    ///
+    /// Both assertions are the width measurement rather than a style preference: a hint that
+    /// folds at the 80-column floor separates a binding from its key, so `s` would sit above the
+    /// words that say what it does. The hand stop must stay on the row with the exit keys, and the
+    /// pane row must keep its own phrase whole -- together those hold only because the two rows
+    /// exist. On the single row the frame used before TASK-066.07 the widest case measured 101
+    /// columns and orphaned `esc back` from the roster pane's bindings.
+    #[test]
+    fn the_stop_key_is_advertised_only_where_it_works() {
+        let standup = meeting_of("EVENT-A", "Standup", MeetingFit::Started);
+        let offered = || Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&standup)],
+            guess: Some(MeetingLabel::from(&standup)),
+        };
+
+        let advertised_in = [
+            // The widest base a run reaches: a live session with a roster attached, so `r
+            // roster` joins the hint alongside `enter choose a meeting`.
+            ("a recording frame", {
+                let mut s = State::default();
+                s.apply(&started(30));
+                s.apply(&offered());
+                s.apply(&secret_roster());
+                s
+            }),
+            ("the open selector", {
+                let mut s = State::default();
+                s.apply(&started(30));
+                s.apply(&offered());
+                s.open_selector();
+                s
+            }),
+            ("the open roster pane", roster_state()),
+        ];
+        for (name, state) in advertised_in {
+            let rows = painted(80, 24, &state, None);
+            let hint = rows
+                .iter()
+                .find(|row| row.contains("Ctrl-C"))
+                .expect("every frame advertises how to leave it");
+            assert!(
+                hint.contains("s end this session"),
+                "`s` is not advertised on the same row as the exit keys in {name}: {rows:?}"
+            );
+            // The other row, held whole by the same width limit: whichever pane is open, its
+            // closing phrase arrives on one row rather than folded across the floor.
+            let pane_hint = rows.join("\n");
+            assert!(
+                pane_hint.contains("enter choose a meeting") || pane_hint.contains("esc back"),
+                "the pane bindings folded across rows in {name}: {rows:?}"
+            );
+        }
+
+        let withdrawn_in = [
+            ("a field under correction", {
+                let mut s = roster_state();
+                s.begin_edit(EditingField::Name);
+                s
+            }),
+            ("a finalizing session", {
+                let mut s = State::default();
+                s.apply(&started(31));
+                s.apply(&Note::Stopping);
+                s
+            }),
+            ("an idle run", {
+                let mut s = State::default();
+                s.apply(&Note::Watching);
+                s
+            }),
+        ];
+        for (name, state) in withdrawn_in {
+            let painted = painted(80, 24, &state, None).join("\n");
+            assert!(
+                !painted.contains("end this session"),
+                "`s` is advertised in {name}, where it cannot work: {painted}"
+            );
+        }
     }
 
     /// Trouble gets its pane only when there is some, and then it says what was stashed.

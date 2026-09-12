@@ -82,7 +82,11 @@ sessions if you pass session ids (the directory name each one is recorded under,
 ### `meethook record`
 
 *macOS only.* Watches the default microphone and records each call as a session — your mic and
-the system/speaker audio as two independent tracks — until interrupted (Ctrl-C).
+the system/speaker audio as two independent tracks. Two ways out, because "end this call" and
+"stop the recorder" are different questions: in the full-screen UI `s` ends the session that is
+recording, finalizes it, and goes back to watching for the next call, while Ctrl-C or Ctrl-D
+stops and exits. Run with `--plain`, which prints one line per event and reads no keys, Ctrl-C is
+the only stop.
 
 It starts a session whenever *another* app opens the microphone, so an app that does that
 without it being a meeting — a dictation tool, say — can be named as one that never counts,
@@ -144,10 +148,12 @@ liveness. `lsof "$ROOT"/sessions/<id>/mic.wav` asks the same question in one sho
 writer, and prints nothing once no process holds the file. Read sizes with `ls -l` or `wc -c <`;
 inside the dev shell GNU coreutils `stat` shadows BSD `stat`, where `-f` means "file system".
 
-Stop it with Ctrl-C in its terminal, or `kill -INT <pid>` from another shell. A plain `kill`
-(SIGTERM) and a closed terminal (SIGHUP) reach the same quit path and finalize the session too.
-What does not finalize is `kill -9`, an abort, or a crash. Deleting `record.lock` accomplishes
-nothing: the lock is held by the operating system, not by the file.
+With the full-screen UI on that terminal, `s` ends just that session: the audio is finalized and
+the recorder stays up, watching for the next call. To stop the whole run instead, use Ctrl-C in its
+terminal, or `kill -INT <pid>` from another shell. A plain `kill` (SIGTERM) and a closed terminal
+(SIGHUP) reach the same quit path and finalize the session too. What does not finalize is
+`kill -9`, an abort, or a crash. Deleting `record.lock` accomplishes nothing: the lock is held by
+the operating system, not by the file.
 
 What you get back depends on how it ended. An interrupted run writes `session.json` and
 transcribes normally. A panicked or unwound run leaves an orphan whose WAVs were finalized on the
@@ -195,7 +201,9 @@ them by pid.
 Why it happens comes down to what the trigger counts: a session stays open while *another*
 process has registered input IO, not while anyone is audible. An always-on dictation tool, an
 assistant daemon, or a virtual-device companion app can therefore hold a session open
-indefinitely, and nothing in the recording itself will end it.
+indefinitely, and nothing in the recording itself will end it. Ending one is something you do:
+`s` in the full-screen UI closes that session and leaves the watcher watching, and a signal to the
+run finalizes and quits.
 
 ### `meethook transcribe [SESSION_ID...]`
 
