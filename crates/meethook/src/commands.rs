@@ -23,8 +23,8 @@ use crate::EnrollArgs;
 use crate::clips::Clips;
 use crate::screen::{Interface, Shared};
 use meethook_transcribe::{
-    Attribution, EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, SILERO_VAD_MODEL,
-    WHISPER_MODEL, WhisperEngine, run_batch,
+    Attribution, CPU_ENV_VAR, EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL,
+    SILERO_VAD_MODEL, WHISPER_MODEL, WhisperEngine, run_batch,
 };
 
 /// Transcribes recorded sessions.
@@ -72,7 +72,7 @@ pub fn transcribe(
                 // Only reachable via MEETHOOK_CPU, so this confirms an explicit choice rather
                 // than reporting a surprise -- and says out loud what that choice costs.
                 eprintln!(
-                    "Note: MEETHOOK_CPU is set; speech recognition is running on the CPU and \
+                    "Note: {CPU_ENV_VAR} is set; speech recognition is running on the CPU and \
                      will be much slower."
                 );
             }

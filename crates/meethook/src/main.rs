@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use meethook_session::{Paths, TranscriptTime};
-use meethook_transcribe::mixdown;
+use meethook_transcribe::{CPU_ENV_VAR, mixdown};
 
 /// Parses a pan width, refusing one outside the range rather than clamping it.
 ///
@@ -107,6 +107,37 @@ struct Cli {
     command: Command,
 }
 
+/// The `ENVIRONMENT:` block that closes `meethook transcribe --help`.
+///
+/// `MEETHOOK_CPU` has no flag, and clap renders `[env: ...]` only beside one -- upstream
+/// closed the request to render an env-only variable (`clap-rs/clap#6039`, wontfix) -- so an
+/// env-only knob reaches help as text or not at all. It goes here rather than into the variant's
+/// doc comment because clap splits a doc comment into `about` and `long_about`, which leaves `-h`
+/// showing nothing; `after_help` on the subcommand is the one placement that covers `-h`,
+/// `--help` and `help transcribe` alike. Raw epilogues print verbatim and are never reflowed, so
+/// the wrapping below is the wrapping a user gets, kept inside 80 columns for the terminals that
+/// would otherwise break it mid-sentence.
+///
+/// The name comes from [`CPU_ENV_VAR`] rather than restating it, so this cannot advertise a
+/// variable nothing reads even momentarily: a rename in `meethook-transcribe` changes the help and
+/// the read site together. The padding keeps the description in one column whatever the name costs.
+fn cpu_env_help() -> String {
+    format!(
+        "\
+ENVIRONMENT:
+
+  {CPU_ENV_VAR:<12}  Run speech recognition on the CPU rather than Metal, many
+                times slower for the same transcript. It is the way forward
+                when a run stops with `no usable Metal device` -- usually a
+                sandbox, CI, an SSH session with no window server, or a VM
+                without GPU passthrough hiding the GPU this machine has. Any
+                non-empty value counts, 0 included; an empty one is the same
+                as leaving it unset. Only speech recognition moves, so
+                diarization keeps whatever CoreML decided. Off macOS the CPU
+                is already the only path, so setting it changes nothing there."
+    )
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Record meetings until interrupted
@@ -141,7 +172,7 @@ enum Command {
     // as an unexpected argument `-0` -- and `--target-lufs -16` needs it simply to work, since a
     // loudness target is negative every time anyone types one. Safe because session ids never
     // begin with a hyphen, so nothing positional can be swallowed by it.
-    #[command(allow_negative_numbers = true)]
+    #[command(allow_negative_numbers = true, after_help = cpu_env_help())]
     Transcribe {
         /// Session ids to transcribe; omit to consider all discovered sessions
         #[arg(value_name = "SESSION_ID")]
@@ -609,6 +640,18 @@ mod tests {
             let message = refused(&["meethook", "transcribe", "--pan", value]);
             assert!(message.contains(value), "{value} not named in: {message}");
         }
+    }
+
+    #[test]
+    fn transcribe_refuses_a_cpu_flag_because_the_knob_stays_env_only() {
+        // Naming the variable in help is deliberately not the same as giving it a flag: a flag
+        // reads as a per-run choice, while this is a standing answer to an environment that hides
+        // the GPU (see the module doc of `meethook_transcribe::gpu`). Pinned as a refusal so the
+        // decision cannot be reversed by someone adding `--cpu` beside it later -- clap's own env
+        // binding could not even express the shipped rule, where any non-empty value including `0`
+        // opts in.
+        let message = refused(&["meethook", "transcribe", "--cpu"]);
+        assert!(message.contains("unexpected argument"), "{message}");
     }
 
     /// What `meethook meeting` would do, given these arguments: the session, and the two flags

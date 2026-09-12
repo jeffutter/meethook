@@ -42,6 +42,15 @@ use std::sync::OnceLock;
 #[cfg(target_os = "macos")]
 use objc2_metal::MTLCreateSystemDefaultDevice;
 
+/// The variable that gives up the GPU, named once because four places quote it.
+///
+/// This crate reads it and prints it in [`NoMetalDevice`], the CLI prints it in the startup note
+/// that confirms the choice (`crates/meethook/src/commands.rs`), and `meethook transcribe --help`
+/// advertises it. A rename that reaches only some of them leaves the help advertising a variable
+/// nothing reads and the refusal pointing at a knob that does nothing -- which is worse than the
+/// dead end this variable exists to avoid.
+pub const CPU_ENV_VAR: &str = "MEETHOOK_CPU";
+
 /// No usable Metal device, and the GPU is the only path compiled in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoMetalDevice(());
@@ -72,7 +81,7 @@ impl fmt::Display for NoMetalDevice {
         writeln!(f)?;
         write!(
             f,
-            "Set MEETHOOK_CPU=1 to transcribe on the CPU instead. It produces the same \
+            "Set {CPU_ENV_VAR}=1 to transcribe on the CPU instead. It produces the same \
              transcript, many times slower."
         )
     }
@@ -127,7 +136,7 @@ fn metal_device_available() -> bool {
 
 /// Whether the user asked to transcribe on the CPU.
 fn cpu_requested() -> bool {
-    opted_in(std::env::var_os("MEETHOOK_CPU").as_deref())
+    opted_in(std::env::var_os(CPU_ENV_VAR).as_deref())
 }
 
 /// Split from the read purely so it can be tested. `std::env::set_var` races every other

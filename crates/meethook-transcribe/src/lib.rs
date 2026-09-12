@@ -58,7 +58,7 @@ pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
 pub use attribution::{Attribution, Naming, attributions, resolve_denials};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
 pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
-pub use gpu::NoMetalDevice;
+pub use gpu::{CPU_ENV_VAR, NoMetalDevice};
 pub use identify::{
     IDENTIFY_DISTANCE, Identification, Resemblance, TENTATIVE_DISTANCE, TENTATIVE_FLOOR_SECONDS,
     TentativePair, heard_at_once, identify_clusters, rank_enrolled, tentative_identifications,
