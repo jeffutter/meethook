@@ -23,6 +23,13 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use meethook_session::{Paths, TranscriptTime};
 use meethook_transcribe::{CPU_ENV_VAR, mixdown};
+// The two debug variables the capture path reads live in the crate that reads them, and that
+// crate exists only where its Apple frameworks compile. The help blocks below are gated the same
+// way: off macOS neither the constants nor a line advertising a variable that cannot print
+// anything there is compiled in (`LINUX.md` already says the calendar var "has nothing to print
+// here", and `record` itself is absent).
+#[cfg(target_os = "macos")]
+use meethook_record::{ACTIVITY_DEBUG_ENV_VAR, CALENDAR_DEBUG_ENV_VAR};
 
 /// Parses a pan width, refusing one outside the range rather than clamping it.
 ///
@@ -138,6 +145,82 @@ ENVIRONMENT:
     )
 }
 
+/// The sentence both record-side `ENVIRONMENT:` entries end with.
+///
+/// Stated once because both variables share the rule and a block that phrased it twice
+/// differently would read as two rules. It is deliberately not the sentence above: these enable
+/// on *presence*, so an empty value turns them on, which is the opposite of [`CPU_ENV_VAR`] --
+/// `var_os(..).is_some()` at every read site (`meethook_record::MicActivityWatcher::start`,
+/// `crates/meethook/src/record.rs`, the calendar module's `debugging`). A reader who has seen
+/// `transcribe`'s block is exactly the reader who would assume the house rule, so the contrast
+/// gets named rather than left to inference. README's Global options rows say the same thing in
+/// table register.
+#[cfg(target_os = "macos")]
+fn presence_rule() -> String {
+    format!(
+        "      Presence turns it on, whatever it holds -- an empty value prints as
+      surely as `=1`, the opposite of {CPU_ENV_VAR}, whose empty value means
+      unset."
+    )
+}
+
+/// One `ENVIRONMENT:` entry: the name on its own line, the explanation indented under it.
+///
+/// Not the column layout `cpu_env_help` uses: these names are twenty-three characters wide, so
+/// aligning a description beside them leaves barely half a line of prose per row. The heading
+/// form also survives a rename without rewrapping anything.
+#[cfg(target_os = "macos")]
+fn activity_debug_entry() -> String {
+    format!(
+        "  {ACTIVITY_DEBUG_ENV_VAR}
+      Print which processes hold the default microphone, and why this run
+      started or stayed running: one `[activity]` summary per recomputation,
+      then one line per holder with its pid, bundle id and executable. All of
+      it goes to stderr, so `2>activity.log` keeps the diagnostics away from
+      the status lines.
+{}",
+        presence_rule()
+    )
+}
+
+/// The calendar entry, built once because two commands honour the variable and clap propagates
+/// nothing but `version`, so two placements have to come from one builder or they drift.
+#[cfg(target_os = "macos")]
+fn calendar_debug_entry() -> String {
+    format!(
+        "  {CALENDAR_DEBUG_ENV_VAR}
+      Print each calendar lookup to stderr: whether access was granted, the
+      candidates considered and which one matched, counting attendees without
+      naming them. Set it when a session gets the wrong meeting attached, or
+      none at all.
+{}",
+        presence_rule()
+    )
+}
+
+/// The `ENVIRONMENT:` block that closes `meethook record --help`: both variables the capture path
+/// reads, since `record` is the command that honours each of them.
+///
+/// `MEETHOOK_TIMING_DEBUG` is deliberately absent. Its output exists only at the end of a real
+/// recording, nobody has read it off a real Mac yet (TASK-075), and help that described figures no
+/// one has reproduced is worse than silence about them.
+#[cfg(target_os = "macos")]
+fn record_env_help() -> String {
+    format!(
+        "ENVIRONMENT:\n\n{}\n\n{}",
+        activity_debug_entry(),
+        calendar_debug_entry()
+    )
+}
+
+/// The same calendar entry on the other command that honours it. `meeting` exists off macOS but
+/// consults no calendar there, so the attribute carries the platform gate rather than the help
+/// text carrying a clause about a platform where the block itself is gone.
+#[cfg(target_os = "macos")]
+fn meeting_env_help() -> String {
+    format!("ENVIRONMENT:\n\n{}", calendar_debug_entry())
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Record meetings until interrupted
@@ -153,6 +236,7 @@ enum Command {
     /// macOS only: the capture backend is built from Apple frameworks that do not compile
     /// anywhere else, so the subcommand is absent rather than stubbed on other platforms.
     #[cfg(target_os = "macos")]
+    #[command(after_help = record_env_help())]
     Record {
         /// Record line by line, never opening the full-screen interface
         ///
@@ -311,6 +395,7 @@ enum Command {
     /// session was not recorded during a meeting at all and needs no calendar access. Either
     /// way the label is marked as one a human chose, so nothing guesses over it afterwards,
     /// and the session's transcript.md is brought in line in the same run.
+    #[cfg_attr(target_os = "macos", command(after_help = meeting_env_help()))]
     Meeting {
         /// The session to relabel, exactly as its directory is named
         #[arg(value_name = "SESSION_ID")]

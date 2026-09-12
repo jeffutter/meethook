@@ -269,6 +269,19 @@ pub struct MicHolder {
     pub not_counted_because: Option<String>,
 }
 
+/// The variable that turns on the `[activity]` diagnostics, named once because three places
+/// quote it.
+///
+/// This crate reads it ([`MicActivityWatcher::start`]), the CLI reads it again to gate its own
+/// half of the diagnostics (`crates/meethook/src/record.rs`), and `meethook record --help`
+/// advertises it. A rename that reaches only some of them leaves the help advertising a variable
+/// nothing reads -- worse than the mystery this variable exists to solve.
+///
+/// Enabling is presence, not value: every read site asks `var_os(..).is_some()`, so an empty
+/// value turns the diagnostics *on*. That is the opposite of `MEETHOOK_CPU`, where an empty value
+/// means unset, so the help text states the rule per variable rather than assuming a house rule.
+pub const ACTIVITY_DEBUG_ENV_VAR: &str = "MEETHOOK_ACTIVITY_DEBUG";
+
 /// A live set of CoreAudio property listeners reporting microphone activity.
 ///
 /// Dropping it removes every listener. Keep it alive for as long as the edges matter.
@@ -330,7 +343,7 @@ impl MicActivityWatcher {
                     .ok()
                     .and_then(|path| std::fs::canonicalize(path).ok()),
                 exclusions,
-                debug: std::env::var_os("MEETHOOK_ACTIVITY_DEBUG").is_some(),
+                debug: std::env::var_os(ACTIVITY_DEBUG_ENV_VAR).is_some(),
                 active: false,
                 system: Vec::new(),
                 device: None,

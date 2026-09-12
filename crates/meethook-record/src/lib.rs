@@ -31,15 +31,19 @@ mod speaker;
 mod teardown;
 mod track;
 
-pub use activity::{Activity, MicActivityWatcher, MicHolder};
+pub use activity::{ACTIVITY_DEBUG_ENV_VAR, Activity, MicActivityWatcher, MicHolder};
 // `calendar` stays private: only the request and the values it reports cross the boundary,
 // so no caller can learn an EventKit selector or a status enum from this crate.
 // `meetings_around` and `meetings_for` cross it as plain `Vec<Meeting>`s for the same reason:
 // `meethook meeting` needs the events around a session to offer as a correction, and the
 // record interface needs the same answer plus the automatic pick while a session is live --
 // neither learns that EventKit exists.
+// The two names a person sets to see what these modules decided cross it too, and nothing else:
+// the CLI interpolates them into `record --help` and `meeting --help`, so the help cannot
+// advertise a variable nothing reads (see the doc of each constant).
 pub use calendar::{
-    MeetingLookup, NoCalendarAccess, meetings_around, meetings_for, request_calendar_access,
+    CALENDAR_DEBUG_ENV_VAR, MeetingLookup, NoCalendarAccess, meetings_around, meetings_for,
+    request_calendar_access,
 };
 pub use preflight::{Authorized, MissingPermissions, preflight};
 pub use track::TrackSummary;

@@ -57,7 +57,8 @@ use meethook_session::{Attendee, Meeting, MeetingFit, RosterEdit};
 // sequencing in `record_loop` below stays ungated and keeps testing without it.
 #[cfg(target_os = "macos")]
 use meethook_record::{
-    Activity, MicActivityWatcher, Recorder, RunningSession, meetings_for, preflight,
+    ACTIVITY_DEBUG_ENV_VAR, Activity, MicActivityWatcher, Recorder, RunningSession, meetings_for,
+    preflight,
 };
 
 #[cfg(any(target_os = "macos", test))]
@@ -823,7 +824,7 @@ pub fn record(paths: &Paths, plain: bool) -> Result<()> {
     let authorized = preflight()?;
     let recorder = Recorder::new(authorized)?;
 
-    let debug = std::env::var_os("MEETHOOK_ACTIVITY_DEBUG").is_some();
+    let debug = std::env::var_os(ACTIVITY_DEBUG_ENV_VAR).is_some();
 
     let (tx, rx) = mpsc::channel::<Event>();
 

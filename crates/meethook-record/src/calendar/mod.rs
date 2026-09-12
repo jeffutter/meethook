@@ -559,8 +559,16 @@ fn timestamp(date: &NSDate) -> Option<Timestamp> {
         .and_then(|since_epoch| Timestamp::from_duration(since_epoch).ok())
 }
 
+/// The variable that turns on the `[calendar]` diagnostics, named once because three places
+/// quote it: this module reads it, and `meethook record --help` and `meethook meeting --help`
+/// both advertise it.
+///
+/// Enabling is presence, not value (`debugging` below): an empty value turns the diagnostics on,
+/// which is the opposite of `MEETHOOK_CPU`, where an empty value means unset.
+pub const CALENDAR_DEBUG_ENV_VAR: &str = "MEETHOOK_CALENDAR_DEBUG";
+
 fn debugging() -> bool {
-    std::env::var_os("MEETHOOK_CALENDAR_DEBUG").is_some()
+    std::env::var_os(CALENDAR_DEBUG_ENV_VAR).is_some()
 }
 
 /// Prints one diagnostic line, gated behind `MEETHOOK_CALENDAR_DEBUG`.

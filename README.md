@@ -319,9 +319,9 @@ session currently carries and the candidate meetings around it, numbered, and wr
 | --- | --- | --- |
 | `--root <PATH>` / `MEETHOOK_ROOT` | `~/meethook` | The meethook data directory (`sessions/`, `models/`, `speakers.json`) |
 | `--template <PATH>` / `MEETHOOK_TEMPLATE` | built-in | Jinja template every `transcript.md` is rendered through |
-| `MEETHOOK_ACTIVITY_DEBUG` | unset | Print which processes hold the microphone, and why `record` started or stayed running, to stderr |
+| `MEETHOOK_ACTIVITY_DEBUG` | unset | Print which processes hold the microphone, and why `record` started or stayed running, to stderr. Setting it at all counts, an empty value included |
 | `MEETHOOK_CPU` | unset | Run speech recognition on the CPU rather than Metal, many times slower for the same transcript. Any non-empty value counts, `0` included |
-| `MEETHOOK_CALENDAR_DEBUG` | unset | Print each calendar lookup to stderr: the access status, the candidates found, and which one matched, counting attendees without naming them |
+| `MEETHOOK_CALENDAR_DEBUG` | unset | Print each calendar lookup to stderr: the access status, the candidates found, and which one matched, counting attendees without naming them. Honoured by `record` and `meeting`, on macOS only. Setting it at all counts, an empty value included |
 
 ### Data directory
 
