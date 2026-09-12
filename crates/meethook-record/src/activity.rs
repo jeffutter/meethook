@@ -165,6 +165,9 @@
 //! `MEETHOOK_ACTIVITY_DEBUG=1` prints one summary line per recomputation plus one line for each
 //! holder that is capturing (and one for our own process, capturing or not):
 //!
+//! The same facts are readable without the env var through [`MicActivityWatcher::holders`],
+//! which reports each holder's identity tail byte-for-byte as it is printed here.
+//!
 //! ```text
 //! [activity] Install: someone_else_is_capturing=true IsRunningSomewhere=Some(true) default-input="MacBook Pro Microphone"#79 uid=BuiltInMicrophoneDevice
 //! [activity]   pid=662 com.apple.CoreSpeech IsRunningInput=true exe=/System/Library/PrivateFrameworks/CoreSpeech.framework/Versions/A/CoreSpeech devices=[] on-default=unknown
@@ -245,6 +248,25 @@ pub enum Activity {
     /// another, and when the last input device disappears entirely -- an unplugged USB
     /// interface, which is the case a live capture most needs to hear about.
     InputDeviceChanged,
+}
+
+/// One process the activity trigger saw holding the input device.
+///
+/// Produced by [`MicActivityWatcher::holders`]. Plain fields with no `Display` impl: the
+/// caller composes whatever sentence it puts on screen, and the wording of that notice is not
+/// this module's decision to make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicHolder {
+    /// Marker-free identity tail: byte-identical to what the `[activity]` line prints after
+    /// its tag. The trailing marker is deliberately absent here -- see
+    /// [`MicHolder::not_counted_because`] for the one fact it carried that a caller needs.
+    pub identity: String,
+    /// Why the trigger does *not* count this holder as the meeting signal, in the same words
+    /// the debug log prints after `<- excluded: `. `None` means the trigger counts it.
+    ///
+    /// A non-empty `Vec` whose rows are all `Some` is therefore a meaningful state: holders
+    /// exist, and every one of them is excluded.
+    pub not_counted_because: Option<String>,
 }
 
 /// A live set of CoreAudio property listeners reporting microphone activity.
@@ -345,6 +367,57 @@ impl MicActivityWatcher {
         let mut state = self.lock();
         state.notified(Trigger::Recheck);
         state.active
+    }
+
+    /// Who the trigger says is holding the input device right now, and who of them it counts.
+    ///
+    /// The names come from the same walk the debug log makes, and the identity text is
+    /// byte-identical to its lines, so a support thread can be diagnosed from either without
+    /// asking anyone to re-run with `MEETHOOK_ACTIVITY_DEBUG=1`. That flag remains a *printing*
+    /// decision and never gates this method.
+    ///
+    /// # What the answer claims
+    ///
+    /// It names who the *trigger* counts (or would count, but for an exclusion), not who owns
+    /// the device. Apple warns that audio IO may be in progress with no active input or output
+    /// stream, so a process can hold the microphone and correctly appear nowhere in this list.
+    /// An empty `Vec` is honestly reported as "the trigger named no capturing process other
+    /// than this recording"; a caller must not word it as "nothing is using the microphone".
+    ///
+    /// Emptiness stays truthful because what is left out is left out by rule rather than by
+    /// accident: our own process is withheld (the caller asking is us), as is the idle baseline
+    /// row. Those two are still printed by the debug log, which shows the whole walk. The
+    /// distinguishable other case is a non-empty vec whose rows all carry
+    /// [`MicHolder::not_counted_because`] -- somebody is capturing, and every holder seen is
+    /// excluded from the predicate.
+    ///
+    /// # Cost and cadence
+    ///
+    /// This is a full walk of the system's audio process objects: unlike [`Self::recheck`],
+    /// whose predicate stops at the first capturing process, it describes every one of them,
+    /// reading five properties per *capturing* process (typically one to three) plus memoized
+    /// device labels. So it costs at most a re-check that answers `false`, and more than one
+    /// that short-circuits to `true`.
+    ///
+    /// Ask at a coarse cadence accordingly -- once when a notice becomes due, and again on the
+    /// order of minutes. External evidence that this is not paranoia: Mac Note Taker measured
+    /// 9+ callbacks/sec during a Meet join and livelocked a SwiftUI app at 100% CPU doing
+    /// exactly this walk per callback. The walk's duration is also how long a listener waits to
+    /// deliver an edge, since both want the same lock.
+    ///
+    /// # Locking
+    ///
+    /// Takes the same lock [`Self::recheck`] takes, and is poison-tolerant in the same way.
+    /// **Never call this from inside the `on_change` callback** documented on
+    /// [`Self::start`]: that callback already runs under this lock, `std::sync::Mutex` is not
+    /// reentrant, and the call self-deadlocks.
+    pub fn holders(&self) -> Vec<MicHolder> {
+        self.lock()
+            .gather()
+            .rows
+            .into_iter()
+            .filter_map(|row| row.mic_holder())
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -636,18 +709,42 @@ impl State {
             .device
             .as_ref()
             .and_then(|d| device_is_running_somewhere(d.object));
-        let default_device = default_input_device();
-        let mut labels: HashMap<AudioObjectID, String> = HashMap::new();
-        let default_label = default_device.map(|device| device_label(device, &mut labels));
+        let walk = self.gather();
         // Constructed here rather than stored on `State`: `log` takes `&self` and runs on the
         // watcher's serial queue, so a held writer would need interior mutability and `Send`
         // gymnastics to buy nothing. See `crate::output` for why this cannot fail.
         let mut err = Output::stderr();
+        // The walk now happens *before* the summary line is printed, since the summary needs the
+        // default device label the walk gathers for its own rows. Under the debug flag that only
+        // reorders stderr; it changes no content.
         err.line(format_args!(
             "[activity] {trigger:?}: someone_else_is_capturing={active} \
              IsRunningSomewhere={running_somewhere:?} default-input={}",
-            default_label.unwrap_or_else(|| "none".to_owned()),
+            walk.default_input.as_deref().unwrap_or("none"),
         ));
+        for row in &walk.rows {
+            err.line(format_args!("{}", render_row(&row.identity, &row.marker())));
+        }
+    }
+
+    /// Walks every process object once and keeps everything both consumers report.
+    ///
+    /// There is exactly one such walk in this crate: [`State::log`] prints these rows and
+    /// [`MicActivityWatcher::holders`] filters them, so the debug log and a live display of the
+    /// same facts cannot drift apart.
+    ///
+    /// The reads are ordered as [`State::log`] ordered them: the cheap facts first, and the
+    /// bundle id and executable fetched only for a process worth describing. [`State::bearing_of`]
+    /// is not reused -- it throws those facts away, which is right for the predicate's hot path
+    /// (a non-capturing process costs one read) and wrong for a walk whose whole job is to
+    /// describe them. The device-label cache and the default-device read stay inside this pass so
+    /// the summary line and the rows share them; a second cache would repeat the cross-process
+    /// reads the memo above exists to prevent.
+    fn gather(&self) -> Walk {
+        let default_device = default_input_device();
+        let mut labels: HashMap<AudioObjectID, String> = HashMap::new();
+        let default_input = default_device.map(|device| device_label(device, &mut labels));
+        let mut rows = Vec::new();
         for process in object_list(
             kAudioObjectSystemObject as AudioObjectID,
             kAudioHardwarePropertyProcessObjectList,
@@ -658,15 +755,11 @@ impl State {
             if !running_input && !ours {
                 continue;
             }
-            // The facts a shown holder is described by and judged on are read once, here.
-            // [`bearing_of`] is not reused: it throws the facts away, which is right for the
-            // predicate's hot path (a non-capturing process costs one read) and wrong for a log
-            // whose whole job is to print them.
             let bundle_id = process_bundle_id(process);
             let exe = pid.map_or(Exe::Unreadable, executable_of);
-            // The verdict comes from the same classifier the predicate uses, so the log
-            // cannot describe a rule the recorder is not actually applying -- including that
-            // a process which is not capturing is Idle whatever else it says about itself.
+            // The verdict comes from the same classifier the predicate uses, so neither consumer
+            // can describe a rule the recorder is not actually applying -- including that a
+            // process which is not capturing is Idle whatever else it says about itself.
             let bearing = if running_input {
                 bearing(
                     pid,
@@ -681,25 +774,22 @@ impl State {
             };
             let (devices, on_default) =
                 devices_reported(process_input_devices(process), default_device, &mut labels);
-            let marker = match bearing {
-                Bearing::Excluded(why) => format!("   <- excluded: {why}"),
-                // Idle and ours: shown anyway, because "meethook is not capturing yet"
-                // is the baseline the later lines are read against.
-                _ if ours => "   <- meethook".to_owned(),
-                _ => String::new(),
-            };
-            err.line(format_args!(
-                "{}",
-                holder_line(
+            rows.push(Row {
+                identity: holder_identity(
                     pid,
                     bundle_id.as_deref(),
                     running_input,
                     &exe,
                     &devices,
                     on_default,
-                    &marker,
-                )
-            ));
+                ),
+                bearing,
+                ours,
+            });
+        }
+        Walk {
+            default_input,
+            rows,
         }
     }
 
@@ -774,6 +864,80 @@ enum Bearing {
     Activity,
     /// Capturing, but it is us or on our behalf. Carries the reason, for the debug log.
     Excluded(&'static str),
+}
+
+/// One process the debug walk described, holding everything both consumers need and reading
+/// nothing further from the device.
+///
+/// Both of its derivations are pure functions of data the walk already gathered, which is what
+/// makes them decidable with no audio device and no TCC grant -- the discipline established for
+/// this module by TASK-066.01.
+struct Row {
+    /// The identity tail, as the debug log prints it and as [`MicHolder`] reports it.
+    identity: String,
+    /// The predicate's verdict on this process, kept because the marker and the exclusion reason
+    /// are both read off it.
+    bearing: Bearing,
+    /// Whether this row is our own process. Not derivable from `bearing`, which reports our
+    /// capturing pid as `Bearing::Excluded("meethook")` -- the same arm a user-excluded app lands
+    /// in. Withholding ourselves is therefore a fact of its own.
+    ours: bool,
+}
+
+impl Row {
+    /// The trailing marker for the debug log, in the three shapes it has always had.
+    ///
+    /// Our own *capturing* row reads `<- excluded: meethook` while the idle baseline row reads
+    /// `<- meethook`, because the exclusion arm is matched first. That asymmetry is pinned rather
+    /// than smoothed over: captured logs in circulation already have this shape.
+    fn marker(&self) -> String {
+        match self.bearing {
+            Bearing::Excluded(why) => format!("   <- excluded: {why}"),
+            // Idle and ours: shown anyway, because "meethook is not capturing yet"
+            // is the baseline the later lines are read against.
+            _ if self.ours => "   <- meethook".to_owned(),
+            _ => String::new(),
+        }
+    }
+
+    /// The same row as the public snapshot, or `None` when it says nothing a caller asking
+    /// "who is keeping this alive" can act on.
+    ///
+    /// Our own row is withheld: the recording asking the question is not the thing holding the
+    /// mic open, and naming it would say otherwise. So is any non-capturing row, which today can
+    /// only be our own idle baseline (`gather` skips processes that are neither capturing nor
+    /// ours) but is refused on principle rather than by coincidence -- reporting an idle process
+    /// as a holder would be the one way this list could lie.
+    ///
+    /// Withholding both by rule is what makes an empty `Vec` an honest sentence; see
+    /// [`MicActivityWatcher::holders`].
+    fn mic_holder(&self) -> Option<MicHolder> {
+        if self.ours {
+            return None;
+        }
+        match self.bearing {
+            Bearing::Activity => Some(MicHolder {
+                identity: self.identity.clone(),
+                not_counted_because: None,
+            }),
+            Bearing::Excluded(why) => Some(MicHolder {
+                identity: self.identity.clone(),
+                not_counted_because: Some(why.to_owned()),
+            }),
+            Bearing::Idle => None,
+        }
+    }
+}
+
+/// One pass of [`State::gather`].
+struct Walk {
+    /// The current default input device, labelled as the summary line prints it, and shared with
+    /// the rows' `on-default` comparison so one walk reads it once.
+    default_input: Option<String>,
+    /// Every process the walk described, including the rows `MicActivityWatcher::holders`
+    /// withholds. Incomplete only where the HAL refuses the process list, which is indistinguishable
+    /// here from nobody capturing -- see the method docs for what emptiness may claim.
+    rows: Vec<Row>,
 }
 
 /// The executable behind a pid, in the three states [`executable_of`] can land in.
@@ -908,6 +1072,14 @@ fn shares_default_device(default: Option<AudioObjectID>, held: &[AudioObjectID])
 ///
 /// Field order keeps the pre-existing prefix bytes (`pid=`, bundle id, `IsRunningInput=`) in
 /// place so muscle memory and greps survive; the marker stays last.
+///
+/// Test-only, because the walk that feeds both consumers holds their shared [`holder_identity`]
+/// rather than the six separate facts: production prints with [`render_row`], so nothing outside
+/// `mod tests` has all seven in hand any more. This stays the whole-line entry point the
+/// byte-pinned assertions run through -- they are what prove the debug log and
+/// [`MicActivityWatcher::holders`] still render one shape, and asserting here rather than against
+/// a duplicated format string is what keeps them honest.
+#[cfg(test)]
 fn holder_line(
     pid: Option<i32>,
     bundle_id: Option<&str>,
@@ -917,11 +1089,35 @@ fn holder_line(
     on_default: OnDefault,
     marker: &str,
 ) -> String {
+    render_row(
+        &holder_identity(pid, bundle_id, running_input, exe, devices, on_default),
+        marker,
+    )
+}
+
+/// Everything a holder line says after its `[activity]   ` tag.
+///
+/// Split out from the test-only `holder_line` because two consumers want exactly this part: the
+/// debug log, which tags and prints it, and [`MicActivityWatcher::holders`], which reports it
+/// verbatim so a live notice and a captured log cannot disagree about who a process is.
+fn holder_identity(
+    pid: Option<i32>,
+    bundle_id: Option<&str>,
+    running_input: bool,
+    exe: &Exe,
+    devices: &Devices,
+    on_default: OnDefault,
+) -> String {
     format!(
-        "[activity]   pid={} {} IsRunningInput={running_input} {exe} {devices} on-default={on_default}{marker}",
+        "pid={} {} IsRunningInput={running_input} {exe} {devices} on-default={on_default}",
         pid.map_or_else(|| "?".to_owned(), |p| p.to_string()),
         bundle_id.unwrap_or("(no bundle id)"),
     )
+}
+
+/// The one place the debug log's holder-line tag is spelled.
+fn render_row(identity: &str, marker: &str) -> String {
+    format!("[activity]   {identity}{marker}")
 }
 
 /// The exclusion rule, over facts already read from a capturing process object.
@@ -1347,8 +1543,8 @@ mod tests {
     use meethook_session::AppExclusions;
 
     use super::{
-        Activity, Bearing, Devices, Exe, OnDefault, bearing, device_changed, edge, holder_line,
-        process_executable, shares_default_device,
+        Activity, Bearing, Devices, Exe, OnDefault, Row, bearing, device_changed, edge,
+        holder_identity, holder_line, process_executable, shares_default_device,
     };
 
     const OUR_PID: i32 = 500;
@@ -1807,6 +2003,180 @@ mod tests {
             ),
             "[activity]   pid=500 (no bundle id) IsRunningInput=false \
              exe=/usr/local/bin/meethook devices=[] on-default=unknown   <- meethook"
+        );
+    }
+
+    /// The exclusion reason the ScreenCapturekit helper is given, spelled once so the debug-log
+    /// marker and the public snapshot provably carry the same string rather than two look-alikes.
+    const REPLAYD_REASON: &str = "captures on meethook's behalf";
+
+    /// A row with the facts `gather` would have attached to it, so the two derivations below are
+    /// decided without a device -- the same discipline as [`bearing`] itself.
+    fn row(identity: &str, bearing: Bearing, ours: bool) -> Row {
+        Row {
+            identity: identity.to_owned(),
+            bearing,
+            ours,
+        }
+    }
+
+    #[test]
+    fn the_identity_is_the_log_line_with_its_tag_removed() {
+        // The reason for the split: a live notice quotes this text and the debug log prints it, so
+        // they have to be the same bytes. Pinned against the shapes the module docs advertise --
+        // counted with a bundle id, a bare binary, both executable failures, and the three
+        // device/on-default states kept apart.
+        let exe = Exe::Resolved(PathBuf::from("/tmp/mic-hold"));
+        let devices = Devices::Read(vec![MIC.to_owned()]);
+        assert_eq!(
+            holder_identity(
+                Some(9848),
+                Some("com.microsoft.teams2.modulehost"),
+                true,
+                &exe,
+                &devices,
+                OnDefault::Yes,
+            ),
+            "pid=9848 com.microsoft.teams2.modulehost IsRunningInput=true exe=/tmp/mic-hold \
+             devices=[\"MacBook Pro Microphone\"#79 uid=BuiltInMicrophoneDevice] on-default=yes"
+        );
+        assert_eq!(
+            holder_identity(Some(9848), None, true, &exe, &Devices::Empty, OnDefault::No),
+            "pid=9848 (no bundle id) IsRunningInput=true exe=/tmp/mic-hold devices=[] \
+             on-default=no"
+        );
+        // An unreadable pid and a refused device read together: every unknown said as such rather
+        // than rendered as a value.
+        assert_eq!(
+            holder_identity(
+                None,
+                None,
+                true,
+                &Exe::Unreadable,
+                &Devices::Unreadable(-4),
+                OnDefault::Unknown,
+            ),
+            "pid=? (no bundle id) IsRunningInput=true exe-unreadable \
+             devices=? (status=-4) on-default=unknown"
+        );
+        assert_eq!(
+            holder_identity(
+                Some(1),
+                None,
+                false,
+                &Exe::Unresolved(PathBuf::from("/usr/libexec/private/helper")),
+                &Devices::Empty,
+                OnDefault::Unknown,
+            ),
+            "pid=1 (no bundle id) IsRunningInput=false \
+             exe=/usr/libexec/private/helper unresolved devices=[] on-default=unknown"
+        );
+        // The same claim from the other side: with no marker, the printed line is exactly the tag
+        // concatenated with this identity.
+        let identity = holder_identity(Some(41809), None, true, &exe, &devices, OnDefault::Yes);
+        assert_eq!(
+            holder_line(Some(41809), None, true, &exe, &devices, OnDefault::Yes, ""),
+            format!("[activity]   {identity}"),
+        );
+    }
+
+    #[test]
+    fn a_row_renders_the_three_markers_it_always_rendered() {
+        // Byte-for-byte what `log` built inline before the split, quirks included: our own
+        // *capturing* row is excluded by name, because the exclusion arm is matched before the
+        // `ours` arm. Captured logs in circulation already have this shape, so it is pinned rather
+        // than smoothed over.
+        assert_eq!(
+            row(
+                "pid=997 com.apple.replayd",
+                Bearing::Excluded(REPLAYD_REASON),
+                false
+            )
+            .marker(),
+            format!("   <- excluded: {REPLAYD_REASON}"),
+        );
+        assert_eq!(
+            row(
+                "pid=500 (no bundle id)",
+                Bearing::Excluded("meethook"),
+                true
+            )
+            .marker(),
+            "   <- excluded: meethook",
+        );
+        assert_eq!(
+            row("pid=500 (no bundle id)", Bearing::Idle, true).marker(),
+            "   <- meethook"
+        );
+        // A counted holder carries no marker at all, which is what leaves the marker last in the
+        // byte-pinned lines above.
+        assert_eq!(
+            row(
+                "pid=26975 com.microsoft.teams2.modulehost",
+                Bearing::Activity,
+                false
+            )
+            .marker(),
+            "",
+        );
+    }
+
+    #[test]
+    fn the_snapshot_names_holders_and_withholds_our_own_rows_by_rule() {
+        // Somebody else capturing is reported as counted, with no reason attached.
+        let counted = row(
+            "pid=26975 com.microsoft.teams2.modulehost",
+            Bearing::Activity,
+            false,
+        );
+        let holder = counted.mic_holder().expect("a counted holder is a holder");
+        assert_eq!(holder.identity, counted.identity);
+        assert_eq!(holder.not_counted_because, None);
+
+        // A user-excluded app comes back with its reason rather than being dropped, so a caller
+        // can say "somebody has the mic, and here is why we do not count them" instead of the
+        // emptier-sounding nothing.
+        let excluded = row(
+            "pid=711 com.example.dictation",
+            Bearing::Excluded("user-excluded bundle id"),
+            false,
+        );
+        assert_eq!(
+            excluded.mic_holder().map(|h| h.not_counted_because),
+            Some(Some("user-excluded bundle id".to_owned())),
+        );
+
+        // The ScreenCapturekit helper, judged by the real classifier rather than by a hand-built
+        // `Bearing`, so the reason in the snapshot is provably the one the predicate applies --
+        // and the one the marker test above prints.
+        let replayd = bearing(
+            Some(997),
+            Some("com.apple.replayd"),
+            Some(Path::new("/usr/libexec/replayd")),
+            OUR_PID,
+            Some(our_exe()),
+            no_exclusions(),
+        );
+        assert_eq!(
+            row("pid=997 com.apple.replayd", replayd, false)
+                .mic_holder()
+                .map(|h| h.not_counted_because),
+            Some(Some(REPLAYD_REASON.to_owned())),
+        );
+
+        // Our own rows are withheld whichever way we are capturing: the recording asking who holds
+        // the mic is not the answer to its own question. That leaves an empty vec able to mean
+        // "the trigger named no capturing process other than this recording" truthfully.
+        assert_eq!(
+            row("pid=500", Bearing::Excluded("meethook"), true).mic_holder(),
+            None
+        );
+        assert_eq!(row("pid=500", Bearing::Idle, true).mic_holder(), None);
+        // And so is any non-capturing process, which today only ever describes us (`gather` skips
+        // the rest) but is refused on principle: an idle process is not a holder.
+        assert_eq!(
+            row("pid=300 com.apple.SomethingIdle", Bearing::Idle, false).mic_holder(),
+            None
         );
     }
 }

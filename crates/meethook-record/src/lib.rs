@@ -31,7 +31,7 @@ mod speaker;
 mod teardown;
 mod track;
 
-pub use activity::{Activity, MicActivityWatcher};
+pub use activity::{Activity, MicActivityWatcher, MicHolder};
 // `calendar` stays private: only the request and the values it reports cross the boundary,
 // so no caller can learn an EventKit selector or a status enum from this crate.
 // `meetings_around` and `meetings_for` cross it as plain `Vec<Meeting>`s for the same reason:
