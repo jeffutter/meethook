@@ -11,9 +11,12 @@ come along:
 - **Calendar-backed halves of `meeting`** are macOS-only too. On Linux
   `meeting <id>` lists no candidates and points at `--clear`, which never consults
   the calendar and works everywhere.
+  For the same reason, `MEETHOOK_CALENDAR_DEBUG` has nothing to print here.
 - **Accelerators** (Metal/CoreML) are macOS-only by construction; off macOS the
   pipeline reports `accelerated = false` and runs on CPU. That is expected, not a
-  failure.
+  failure. `MEETHOOK_CPU`, documented in README's Global options, is
+  therefore a no-op here: it exists to give up Metal deliberately, and off
+  macOS there is nothing to give up and no confirming note to print either.
 - **Enroll clip playback** falls back from `afplay` to the first of
   `paplay`, `aplay`, `ffplay`, `mpv` found on `PATH`; with none of them present,
   enrollment degrades to text snippets instead of failing.

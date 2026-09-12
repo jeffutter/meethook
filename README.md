@@ -224,6 +224,12 @@ discovered session that doesn't already have a transcript is considered.
 arithmetic admits, rather than silently clamped, so a mistyped value is reported instead of
 quietly reinterpreted.
 
+A process that cannot reach the GPU stops rather than quietly degrading: `transcribe` reports
+`no usable Metal device` and exits nonzero. Set `MEETHOOK_CPU` to any non-empty value (`0`
+counts, an empty value does not) to choose the CPU deliberately, which `transcribe` confirms
+once at startup with a `Note:` line on stderr. The switch covers speech recognition only;
+diarization keeps whatever CoreML decided, and off macOS there is nothing to opt out of.
+
 ### `meethook enroll [SESSION_ID...]`
 
 Names speakers that transcription couldn't identify. With no session ids, every session with
@@ -314,6 +320,8 @@ session currently carries and the candidate meetings around it, numbered, and wr
 | `--root <PATH>` / `MEETHOOK_ROOT` | `~/meethook` | The meethook data directory (`sessions/`, `models/`, `speakers.json`) |
 | `--template <PATH>` / `MEETHOOK_TEMPLATE` | built-in | Jinja template every `transcript.md` is rendered through |
 | `MEETHOOK_ACTIVITY_DEBUG` | unset | Print which processes hold the microphone, and why `record` started or stayed running, to stderr |
+| `MEETHOOK_CPU` | unset | Run speech recognition on the CPU rather than Metal, many times slower for the same transcript. Any non-empty value counts, `0` included |
+| `MEETHOOK_CALENDAR_DEBUG` | unset | Print each calendar lookup to stderr: the access status, the candidates found, and which one matched, counting attendees without naming them |
 
 ### Data directory
 

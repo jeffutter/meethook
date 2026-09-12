@@ -49,9 +49,10 @@ develop` entry. `cargo audit` needs real network/fs access and is expected to fa
 sandboxed agent run — use `LEFTHOOK_EXCLUDE=audit lefthook run pre-push` there.
 
 Useful runtime env vars: `MEETHOOK_ROOT` (data dir, default `~/meethook`; `--root` overrides
-it), `MEETHOOK_TEMPLATE` (transcript template override), `MEETHOOK_CPU=1` (opt out of
-GPU/CoreML acceleration — see `meethook-transcribe::gpu`, which otherwise hard-fails rather
-than silently falling back).
+it), `MEETHOOK_TEMPLATE` (transcript template override), `MEETHOOK_CPU` set to any non-empty
+value (`0` included; run Whisper on the CPU instead of Metal, leaving CoreML diarization
+alone -- see `meethook-transcribe::gpu`, which otherwise hard-fails rather than silently
+falling back).
 
 See `LINUX.md` for what does and doesn't work off macOS (no `record`, no calendar
 correction, no accelerators, clip playback falls back through `paplay`/`aplay`/`ffplay`/`mpv`).
