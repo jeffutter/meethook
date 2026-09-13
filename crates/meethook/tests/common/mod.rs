@@ -21,6 +21,17 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+/// The pty geometry every frame is drawn into: wide enough that neither key row wraps, tall
+/// enough for header, status, key hints and footer with room to spare.
+///
+/// A test that reconstructs the screen has to agree with the child about this rectangle, so it is
+/// stated once here instead of as a private constant in each test file. Even so, a grid model has
+/// to grow to fit what the frame actually addresses -- requested geometry and delivered geometry
+/// have been observed to disagree on real hardware, which `open_pty`'s second sizing exists to
+/// make rare rather than impossible.
+pub(crate) const PTY_ROWS: u16 = 30;
+pub(crate) const PTY_COLS: u16 = 100;
+
 /// One open pty: the master the test reads and writes, the slave the child takes as its
 /// controlling terminal. The size is set before the spawn because the frame draws into
 /// whatever rectangle it is handed.
@@ -37,8 +48,8 @@ pub(crate) fn open_pty() -> (std::fs::File, std::fs::File) {
         let mut slave: libc::c_int = -1;
         let mut name = [0u8; 256];
         let mut win = libc::winsize {
-            ws_row: 30,
-            ws_col: 100,
+            ws_row: PTY_ROWS,
+            ws_col: PTY_COLS,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
@@ -50,10 +61,29 @@ pub(crate) fn open_pty() -> (std::fs::File, std::fs::File) {
             &mut win,
         );
         assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
-        (
-            std::fs::File::from_raw_fd(master),
-            std::fs::File::from_raw_fd(slave),
-        )
+        let master = std::fs::File::from_raw_fd(master);
+        let slave = std::fs::File::from_raw_fd(slave);
+        // Ask twice, because the first ask has been observed not to hold. On a granted Mac the
+        // frame addressed its footer at row 71 while `win` said thirty, which is what a
+        // reconstructed grid looks like when the geometry underneath it changed after creation --
+        // a cloned pty inheriting the window it was cloned from is the usual way that happens, and
+        // nothing here can rule it out from the parent side. Setting the size on the descriptor
+        // afterwards is the form that measurably sticks; a test still must not assume it did, so
+        // `Screen` grows on demand regardless.
+        //
+        // `slave` is a valid open pty descriptor owned by the binding above, and `&mut win` points
+        // at a live `winsize`; TIOCSWINSZ takes exactly these two arguments. Same outer `unsafe`
+        // block as the `openpty` call, so no nested block of its own.
+        let rc = libc::ioctl(slave.as_fd().as_raw_fd(), libc::TIOCSWINSZ, &mut win);
+        assert_eq!(
+            rc,
+            0,
+            "could not size the pty {}x{}: {}",
+            PTY_ROWS,
+            PTY_COLS,
+            std::io::Error::last_os_error()
+        );
+        (master, slave)
     }
 }
 
@@ -98,6 +128,20 @@ impl Driver {
             .arg(root)
             .args(args)
             .env("TERM", "xterm-256color")
+            // The three diagnostic switches print through the record crate's `Output`, which
+            // writes stderr -- and stderr is wired to the same pty slave as the frame's stdout.
+            // A test that reconstructs the screen from those bytes would therefore parse
+            // `[activity] ...` lines as if the frame had painted them. Scrubbing them costs a
+            // debugging avenue inside the test only; the manual recipe in the live-proof ticket
+            // runs the same binary with the variable set, which is where reading the walker's
+            // decisions actually belongs.
+            //
+            // Spelled as literals rather than reused from `meethook_record::{ACTIVITY_DEBUG_ENV_VAR,
+            // CALENDAR_DEBUG_ENV_VAR}`: this module compiles on every platform, and the record
+            // crate is a macOS-only dependency of the CLI crate.
+            .env_remove("MEETHOOK_ACTIVITY_DEBUG")
+            .env_remove("MEETHOOK_CALENDAR_DEBUG")
+            .env_remove("MEETHOOK_TIMING_DEBUG")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));

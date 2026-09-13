@@ -48,6 +48,23 @@ before assuming what "the gates" check. `lefthook install` runs automatically on
 develop` entry. `cargo audit` needs real network/fs access and is expected to fail in a
 sandboxed agent run — use `LEFTHOOK_EXCLUDE=audit lefthook run pre-push` there.
 
+The third thing a Mac developer sees here, next to the record-crate notice, is the *live*
+record proof: `crates/meethook/tests/live_record_hand_stop.rs` drives the built binary through a
+real pty and ends a real session with `s`. It is `#[ignore]`d by default because it can only run
+where a terminal app holds both TCC grants (Microphone, Screen & System Audio Recording) and some
+other process is genuinely capturing through the default input device - the recorder triggers on
+*which processes are capturing*, never on loudness, so nothing shorter will do. On macOS:
+
+```sh
+cargo build --manifest-path crates/meethook-record/Cargo.toml --example mic-hold   # the stand-in capturing process
+cargo nextest run -p meethook --run-ignored only -E 'binary(live_record_hand_stop)' --nocapture
+```
+
+`MEETHOOK_LIVE_PROOF=1 git push` turns that pair into a blocking pre-push gate instead of a
+printed notice; see the two `live-proof*` commands in `lefthook.yml` for why it cannot simply join
+the automatic suite (CI's macOS runner has no such grant, and editing its system TCC database is
+not on the table).
+
 Useful runtime env vars: `MEETHOOK_ROOT` (data dir, default `~/meethook`; `--root` overrides
 it), `MEETHOOK_TEMPLATE` (transcript template override), `MEETHOOK_CPU` set to any non-empty
 value (`0` included; run Whisper on the CPU instead of Metal, leaving CoreML diarization

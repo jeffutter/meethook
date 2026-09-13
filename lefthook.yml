@@ -99,3 +99,39 @@ pre-push:
       # other four gates asks for that explicitly: LEFTHOOK_EXCLUDE=audit lefthook run
       # pre-push.
       run: cargo audit
+    live-proof-notice:
+      priority: 7
+      # The hand-stop live proof (crates/meethook/tests/live_record_hand_stop.rs) cannot live in
+      # the automatic gate above. It needs a real process capturing through the default input
+      # device -- the recorder triggers on *which processes are capturing*, so no scripted capture
+      # and no acoustic trick can stand in -- and it needs the launching terminal app to hold both
+      # TCC grants, since macOS charges the grant to the responsible process that children inherit.
+      # GitHub's macos-15 runner has neither, and this repo will not hack around that by editing
+      # the system TCC database. So the case is `#[ignore]`d and the push gate only says how to run
+      # it.
+      #
+      # `skip: - run:` is a condition for skipping, measured on lefthook 2.1.10 in both polarities.
+      # The `uname` guard is not decorative: `os: [darwin]` does not filter ad-hoc `lefthook run`
+      # invocations (an `os: [linux]` command was measured running on this Mac).
+      skip:
+        - run: test "${MEETHOOK_LIVE_PROOF:-0}" = "1"
+      run: |
+        [ "$(uname -s)" = "Darwin" ] || exit 0
+        echo "live proof skipped: it needs a granted terminal and a microphone another process is capturing through."
+        echo "  Run it with: MEETHOOK_LIVE_PROOF=1 git push   (or directly:"
+        echo "    cargo build --manifest-path crates/meethook-record/Cargo.toml --example mic-hold"
+        echo "    cargo nextest run -p meethook --run-ignored only -E 'binary(live_record_hand_stop)' --nocapture)"
+    live-proof:
+      priority: 7
+      # The same job as a blocking gate, for the one shell that can satisfy it: a person pushing
+      # from a terminal that holds the Microphone and Screen & System Audio Recording grants. The
+      # switch is read from the pushing shell through `${MEETHOOK_LIVE_PROOF:-0}` rather than
+      # supplied by lefthook's `env:`, because `env:` *provides* a value to the command instead of
+      # reading one -- measured: a job with `env: MEETHOOK_LIVE_PROOF: 1` saw it set even with the
+      # variable absent outside, which would make the gate fire on every push from anyone.
+      skip:
+        - run: test "${MEETHOOK_LIVE_PROOF:-0}" != "1"
+      run: |
+        [ "$(uname -s)" = "Darwin" ] || exit 0
+        cargo build --manifest-path crates/meethook-record/Cargo.toml --example mic-hold &&
+        cargo nextest run -p meethook --run-ignored only -E "binary(live_record_hand_stop)" --nocapture
