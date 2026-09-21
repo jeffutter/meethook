@@ -394,8 +394,9 @@ impl Interface {
         let mut line: Option<usize> = None;
 
         loop {
-            // A clip that will not play is only knowable here, once the child has been reaped, so
-            // the report lands an iteration after the key that started it rather than at the spawn.
+            // Whether the clip played at all is only knowable here, once the child has been
+            // reaped, so the report lands an iteration after the key that started it rather than
+            // at the spawn.
             let playing = match clips.poll() {
                 Ok(playing) => playing,
                 Err(e) => {

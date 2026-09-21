@@ -827,7 +827,7 @@ mod tests {
         }
     }
 
-    /// WAVs but no `session.json`: the recorder stopped before it could close the session.
+    /// WAVs but no `session.json`: the shape an unfinished session directory has on disk.
     fn make_orphan(paths: &Paths, id: &str) {
         let session_paths = paths.session(&SessionId::parse(id).unwrap());
         std::fs::create_dir_all(session_paths.dir()).unwrap();

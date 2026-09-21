@@ -356,7 +356,8 @@ enum Command {
     ///
     /// Takes no options on purpose, like speakers: the report's whole claim is the scope it
     /// scanned, so it names the directory it read and counts what it found there. Reads only;
-    /// writes nothing, and exits 0 whatever it finds.
+    /// writes nothing; a missing or empty `sessions/` is reported rather than treated as an
+    /// error, and a path it cannot scan at all is the one thing that exits nonzero.
     Sessions,
 
     /// Remove a stored recording of somebody, or remove them entirely

@@ -947,8 +947,8 @@ mod tests {
                      placed on a common timeline however much of either one plays.\n",
                     "    The mic track declares 0.2 s more audio than the file holds, and that \
                      part is not on disk.\n",
-                    "    The speaker track holds 0.1 s past the end its header declares; players \
-                     stop at the declaration, so that part does not play.\n",
+                    "    The speaker track holds 0.1 s past the end its header declares; a player \
+                     that trusts that number stops there, so that part does not play.\n",
                     "    Nothing about this needs fixing: the audio that reached disk is kept as \
                      recorded.\n",
                     "20260809-052600  orphaned\n",

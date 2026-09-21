@@ -86,8 +86,8 @@ use std::path::PathBuf;
 
 /// Everything that can go wrong while working with the on-disk contract.
 ///
-/// Note what is *not* in here: an orphaned session (WAVs but no `session.json`, i.e. a
-/// crash mid-recording) is a normal, expected classification, never an error.
+/// Note what is *not* in here: an orphaned session (WAVs but no `session.json`) is a normal,
+/// expected classification, never an error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("malformed session id {0:?}: expected YYYYMMDD-HHMMSS with an optional -N suffix")]

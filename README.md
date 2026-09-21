@@ -158,8 +158,10 @@ the operating system, not by the file.
 What you get back depends on how it ended. An interrupted run writes `session.json` and
 transcribes normally. A panicked or unwound run leaves an orphan whose WAVs were finalized on the
 way out anyway, complete to the last sample. A `kill -9` leaves an orphan that is valid up to the
-last five-second checkpoint — the header stops there, so `afinfo` reports a duration up to five
-seconds shorter than what was recorded, and those last seconds sit on disk unread. Either orphan
+last five-second checkpoint - the header stops there, so `afinfo` reports a duration up to five
+seconds shorter than what was recorded, and those last seconds are undeclared. Die before that
+first checkpoint and the header declares nothing at all: `afinfo` then calls such a file zero
+seconds long although the audio is on disk (ffmpeg reads it whole, see below). Either orphan
 is skipped, never repaired:
 
 ```text
@@ -167,9 +169,12 @@ is skipped, never repaired:
 ```
 
 `transcribe` prints that and exits 0; `enroll` passes the session over in the same words; `meethook
-sessions` lists every such directory at once, without running either. The
-audio still plays on the Mac that recorded it, though a strict parser elsewhere may refuse the
-file until told to ignore the header length.
+sessions` lists every such directory at once, without running either. The part the header declares
+plays everywhere. What lies past it plays depending on the reader: ffmpeg reads past a zero
+declaration by default and prints `Ignoring maximum wav data size`, `-ignore_length` is needed only
+for a header that declares a short nonzero length, and a header declaring `0xFFFFFFFF` says "unknown
+length" - which CoreAudio honours by playing to the end. Nothing here repairs a header to make any
+of that moot.
 
 To keep it from happening again, name whatever keeps the trigger true:
 
@@ -264,7 +269,8 @@ Reports what every session directory under the data directory became — the sta
 `enroll` over everything. Each session is listed with the state it's actually in: `transcribed`,
 `valid` (recorded cleanly, not yet transcribed), or `orphaned`. An orphan says which of its two
 tracks reached disk, how far short of its own declaration either one stops when the header shows
-it — those seconds are on disk but no player will find them — and why no transcript can be built
+it - those seconds are on disk but undeclared, so whether a listener reaches them depends on the
+reader - and why no transcript can be built
 from it: `session.json`, the single clock both tracks share, was never written. An orphan is an
 expected shape, not a failure, and nothing here offers to repair one.
 
@@ -275,7 +281,7 @@ expected shape, not a failure, and nothing here offers to repair one.
     no session.json: no transcript is possible.
     That file held the single clock both tracks share, so neither can be placed on a common timeline however much of either one plays.
     The mic track declares 0.2 s more audio than the file holds, and that part is not on disk.
-    The speaker track holds 0.1 s past the end its header declares; players stop at the declaration, so that part does not play.
+    The speaker track holds 0.1 s past the end its header declares; a player that trusts that number stops there, so that part does not play.
     Nothing about this needs fixing: the audio that reached disk is kept as recorded.
 20260809-052600  orphaned
     …
@@ -285,8 +291,9 @@ expected shape, not a failure, and nothing here offers to repair one.
 
 While a `record` holds the root, the report says so once at the top and declines to say that any
 unfinished directory was left behind — one in that shape may be the call happening now. Takes
-no options, like `speakers`; reads only, writes nothing, and exits 0 whatever it finds, including
-an empty or missing `sessions/`. It works on Linux too, where `record` does not exist: that
+no options, like `speakers`; reads only, writes nothing, and reports a missing or empty `sessions/`
+rather than treating it as an error — the one thing that exits nonzero is a `sessions/` it cannot
+scan at all. It works on Linux too, where `record` does not exist: that
 asymmetry is exactly why this is a command rather than something printed when recording starts.
 
 ### `meethook forget <NAME> [--reference N] [--yes]`

@@ -311,9 +311,9 @@ pub enum TrackEvidence {
     /// missing, or there is no `data ` chunk to weigh. Deliberately not folded into any of the
     /// measurements: guessing a number is worse than reporting none.
     Unknown,
-    /// Valid header declaring zero bytes and holding zero bytes. Hound's initial header declares
-    /// nothing, so this is a recorder that died before its first checkpoint with no audio yet
-    /// buffered to disk either.
+    /// Valid header declaring zero bytes and holding zero bytes: a header that declares nothing,
+    /// with nothing written onto it. Hound's initial header declares zero, and finalizing a writer
+    /// that never received a sample produces the identical bytes, so no event is named here.
     HeaderOnly,
     /// Real bytes and declared bytes agree exactly, and more than zero. Note this says the file
     /// agrees with *itself*, which is all a header can be asked; whether it agrees with the
@@ -323,10 +323,19 @@ pub enum TrackEvidence {
     /// Never our own death -- see [`track`]'s note on hound's write order -- so this is
     /// truncation by copy, by a truncate, or by a writer that is not us.
     ShortBy(TrackGap),
-    /// The file holds more than the header counts: audio on disk that players will not find,
-    /// because every mainstream reader stops at the declaration. This is the signature of a
-    /// recorder that was killed -- the header froze at its last checkpoint while the audio kept
-    /// going to the last byte the OS took.
+    /// The file holds more than the header counts: audio on disk past what the header declares.
+    /// What the bytes prove is about the writer, not about anybody's player -- the header stopped
+    /// being updated while bytes kept landing, and neither another `flush` after the last one nor
+    /// `finalize`/`Drop` ever ran.
+    ///
+    /// How much of it a listener reaches depends on which reader they use, and the readers were
+    /// measured rather than assumed (doc-008 §3): CoreAudio stops at a short *nonzero*
+    /// declaration, calls a declared-zero file zero seconds long, and honours the `0xFFFFFFFF`
+    /// "unknown length" sentinel by reading to EOF; libavformat treats 0 and `0xFFFFFFFF` as
+    /// unknown and reads to EOF unaided, honouring a short nonzero declaration unless told
+    /// `-ignore_length`; hound's reader divides the declared length by the sample size and trusts
+    /// whatever number it finds. So this hands over bytes and milliseconds instead of a promise
+    /// about playback, which is also what the report prints.
     BeyondDeclaration(TrackGap),
 }
 
@@ -357,7 +366,9 @@ const HEADER_WINDOW: u64 = 64 * 1024;
 /// The verdict is the `data` chunk's declared length against the bytes that follow it, and
 /// nothing else. The `RIFF` size is deliberately not consulted: it lies in the same breath as
 /// `data` does, and the audio is what `data` counts, so weighing both would be averaging two
-/// claims rather than checking one against reality.
+/// claims rather than checking one against reality. (No reader is obliged to agree with that
+/// choice: a short `RIFF` size caps what CoreAudio reads once `data` declares something, though
+/// libavformat ignores it -- doc-008 §3.)
 ///
 /// The direction of disagreement means something, because hound's mechanics make one direction
 /// impossible for us: its header is *born* declaring zero `data` bytes, the two size fields are
@@ -500,8 +511,9 @@ fn evidence(window: &[u8], file_len: u64) -> TrackEvidence {
         return TrackEvidence::Unknown;
     };
 
-    // Everything past the chunk header counts as audio, to EOF: that is what a player will
-    // reach, which is the quantity a user cares about even when a trailer chunk sits after it.
+    // Everything from the chunk header to EOF is audio the recorder captured, which is the
+    // quantity a user cares about even when a trailer chunk sits after it. Whether a given reader
+    // reaches all of it is a question about that reader, not about these bytes (doc-008 §3).
     let held = file_len.saturating_sub(audio_at);
     let gap = |bytes: u64| TrackGap {
         bytes,
@@ -823,9 +835,10 @@ mod tests {
         assert_eq!(track(&path), TrackEvidence::CompleteAsDeclared);
     }
 
-    /// The killed-recorder shape, and the reason the two directions of disagreement are two
-    /// states: the checkpoint froze at `before`, the audio kept going, and everything past the
-    /// declaration is on disk but invisible to a player.
+    /// The shape a run that never got a second checkpoint leaves, and the reason the two
+    /// directions of disagreement are two states: the checkpoint froze at `before`, the audio kept
+    /// going, and everything past the declaration is bytes a reader that trusts the declaration
+    /// never reaches.
     #[test]
     fn a_checkpointed_track_killed_midway_holds_more_than_it_declares() {
         let dir = tempfile::tempdir().unwrap();
@@ -855,9 +868,11 @@ mod tests {
         assert_eq!(track(&path), TrackEvidence::BeyondDeclaration(expected));
     }
 
-    /// A kill inside the first checkpoint interval: seconds of real audio, and a header that
-    /// declares none of it. `afinfo` calls this file zero seconds long, which is why this state
-    /// may not be folded into either "complete" or "empty".
+    /// A stop inside the first checkpoint interval: seconds of real audio, and a header that
+    /// declares none of it. `afinfo` calls this file zero seconds long while `ffprobe` reports the
+    /// full five seconds for the same bytes, which is why this state may not be folded into either
+    /// "complete" or "empty": merged away, the audio is lost for every reader that would have
+    /// found it.
     #[test]
     fn a_track_killed_before_its_first_checkpoint_declares_nothing_and_holds_audio() {
         let dir = tempfile::tempdir().unwrap();

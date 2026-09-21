@@ -148,8 +148,8 @@ session directory.** That contract is the thing to understand before touching an
   `Consequence`, `Forget`'s cost report) that runs the same logic as the real write over a
   copy, so a preview and a write can't drift apart. Prefer extending that shared path over
   adding a second computation for `--dry-run`/`--list`/report output.
-- An orphaned session (WAVs with no `session.json` — a crash mid-recording) is a normal,
-  expected classification throughout the codebase, never an error.
+- An orphaned session (WAVs with no `session.json`) is a normal, expected classification
+  throughout the codebase, never an error.
 - Numeric CLI options that come from measured/settled constants (mixdown pan, LUFS target,
   boost cap, bitrate) are range-refused at the parser edge rather than clamped — clamping a
   user-typed value silently changes what they asked for.

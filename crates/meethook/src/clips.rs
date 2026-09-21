@@ -201,8 +201,8 @@ impl Clips {
     ///
     /// `Ok(None)` covers both "nothing is playing" and "it has just finished cleanly", which are
     /// the same thing to a caller: there is no position to show. `Err` is a player that exited
-    /// non-zero -- a clip that will not play is only knowable here, once the child is reaped --
-    /// and in that case playback has already been torn down.
+    /// non-zero -- whether the clip played at all is only knowable here, once the child is reaped
+    /// -- and in that case playback has already been torn down.
     pub(crate) fn poll(&mut self) -> Result<Option<Progress>> {
         let Some(playing) = self.playing.as_mut() else {
             return Ok(None);

@@ -36,10 +36,13 @@
 //! - **No promised interval.** The recorder rewrites its header every few seconds, and that
 //!   number stays in the recorder: quoting it here would give it a second home *and* would be
 //!   false for a track whose header still declares zero, where seconds of real audio sit on disk
-//!   that no player will find at all. Report the measured gap instead -- [`crate::wav::track`]
-//!   hands it over in bytes and milliseconds -- and say that players stop at the declaration.
+//!   undeclared. Report the measured gap instead -- [`crate::wav::track`] hands it over in bytes
+//!   and milliseconds. Where a sentence must speak of playback at all, condition it on the reader
+//!   trusting that declaration, and never assert what players do in general: measured readers
+//!   disagree (doc-008 §3), so a population claim here is one reader away from being false.
 //! - **Three magnitudes stay distinct:** audio kept *and playable*, audio kept *but undeclared*
-//!   (quantified, and named as unplayable), and audio that *never reached disk* at all. The last
+//!   (quantified, and named as undeclared rather than as unplayable -- how much of it a listener
+//!   reaches depends on the reader), and audio that *never reached disk* at all. The last
 //!   one is unknowable in degree, so it gets no number and no reason -- only which track is
 //!   missing. A dead input device leaves exactly one track on disk, and saying "both tracks" then
 //!   is the same class of untruth as saying "crashed".
@@ -298,8 +301,8 @@ fn track_says(name: &str, evidence: TrackEvidence) -> (String, String) {
                 human_audio(gap)
             ),
             format!(
-                "holds {} past the end its header declares; players stop at the declaration, so \
-                 that part does not play",
+                "holds {} past the end its header declares; a player that trusts that number \
+                 stops there, so that part does not play",
                 human_audio(gap)
             ),
         ),
@@ -423,8 +426,8 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "The speaker track holds 5.0 s past the end its header declares; players stop at the \
-             declaration, so that part does not play."
+            "The speaker track holds 5.0 s past the end its header declares; a player that trusts \
+             that number stops there, so that part does not play."
         );
         assert!(lines[4].contains("kept"), "{}", lines[4]);
     }
