@@ -560,11 +560,63 @@ fn opus_tags() -> Vec<u8> {
     tags
 }
 
+/// The Ogg/Opus round-trip, shared with the crate-root tests.
+///
+/// [`decode`]'s pre-skip and granule trimming is the load-bearing part -- RFC 7845 §4 asks a
+/// player for two clamped subtractions, and a second copy written beside a different test would
+/// get one of them subtly wrong while still passing whatever that test cared about.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use ropus::{DecodeMode, Decoder};
+
+    use super::*;
+
+    /// Every 48 kHz sample the file claims, decoded, with the pre-skip already dropped --
+    /// i.e. what a player would put on the wire.
+    ///
+    /// Reads the Ogg back with the same crate that wrote it and the packets back with ropus's
+    /// own decoder. That is not an independent check of the container, and it is not meant to
+    /// be: what it pins is that the granule arithmetic, the pre-skip and the frame padding
+    /// agree with each other, which is where the bugs in this module live.
+    pub(crate) fn decode(path: &Path) -> (u16, u8, Vec<f32>) {
+        let file = std::fs::File::open(path).unwrap();
+        let mut reader = ogg::PacketReader::new(std::io::BufReader::new(file));
+
+        let head = reader.read_packet_expected().unwrap();
+        assert_eq!(&head.data[..8], b"OpusHead");
+        let channels = head.data[9];
+        let pre_skip = u16::from_le_bytes([head.data[10], head.data[11]]);
+
+        let tags = reader.read_packet_expected().unwrap();
+        assert_eq!(&tags.data[..8], b"OpusTags");
+
+        let mut decoder = Decoder::new(48_000, Channels::Stereo).unwrap();
+        let mut audio = Vec::new();
+        let mut last_granule = 0;
+        while let Some(packet) = reader.read_packet().unwrap() {
+            // 120 ms at 48 kHz, stereo: the largest frame any Opus packet can decode to.
+            let mut frame = vec![0.0; 5760 * CHANNELS];
+            let decoded = decoder
+                .decode_float(&packet.data, &mut frame, DecodeMode::Normal)
+                .unwrap();
+            audio.extend_from_slice(&frame[..decoded * CHANNELS]);
+            last_granule = packet.absgp_page();
+        }
+
+        // Pre-skip off the front, and everything past the granule the last page claims off the
+        // back: exactly the trimming RFC 7845 §4 asks a player to do. Both bounds are clamped
+        // so the headers-only file trims to nothing rather than panicking.
+        let skip = (usize::from(pre_skip) * CHANNELS).min(audio.len());
+        let end = (last_granule as usize * CHANNELS).clamp(skip, audio.len());
+        (pre_skip, channels, audio[skip..end].to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use ropus::{DecodeMode, Decoder};
     use tempfile::tempdir;
 
+    use super::fixtures::decode;
     use super::*;
     use crate::TARGET_RATE;
     use crate::loudness::fixtures::bursts;
@@ -601,46 +653,6 @@ mod tests {
             offset_s,
             pan: 0.0,
         }
-    }
-
-    /// Every 48 kHz sample the file claims, decoded, with the pre-skip already dropped --
-    /// i.e. what a player would put on the wire.
-    ///
-    /// Reads the Ogg back with the same crate that wrote it and the packets back with ropus's
-    /// own decoder. That is not an independent check of the container, and it is not meant to
-    /// be: what it pins is that the granule arithmetic, the pre-skip and the frame padding
-    /// agree with each other, which is where the bugs in this module live.
-    fn decode(path: &Path) -> (u16, u8, Vec<f32>) {
-        let file = std::fs::File::open(path).unwrap();
-        let mut reader = ogg::PacketReader::new(std::io::BufReader::new(file));
-
-        let head = reader.read_packet_expected().unwrap();
-        assert_eq!(&head.data[..8], b"OpusHead");
-        let channels = head.data[9];
-        let pre_skip = u16::from_le_bytes([head.data[10], head.data[11]]);
-
-        let tags = reader.read_packet_expected().unwrap();
-        assert_eq!(&tags.data[..8], b"OpusTags");
-
-        let mut decoder = Decoder::new(48_000, Channels::Stereo).unwrap();
-        let mut audio = Vec::new();
-        let mut last_granule = 0;
-        while let Some(packet) = reader.read_packet().unwrap() {
-            // 120 ms at 48 kHz, stereo: the largest frame any Opus packet can decode to.
-            let mut frame = vec![0.0; 5760 * CHANNELS];
-            let decoded = decoder
-                .decode_float(&packet.data, &mut frame, DecodeMode::Normal)
-                .unwrap();
-            audio.extend_from_slice(&frame[..decoded * CHANNELS]);
-            last_granule = packet.absgp_page();
-        }
-
-        // Pre-skip off the front, and everything past the granule the last page claims off the
-        // back: exactly the trimming RFC 7845 §4 asks a player to do. Both bounds are clamped
-        // so the headers-only file trims to nothing rather than panicking.
-        let skip = (usize::from(pre_skip) * CHANNELS).min(audio.len());
-        let end = (last_granule as usize * CHANNELS).clamp(skip, audio.len());
-        (pre_skip, channels, audio[skip..end].to_vec())
     }
 
     #[test]

@@ -834,6 +834,93 @@ mod tests {
         write_silence(&session_paths.mic_wav(), 0.25);
     }
 
+    // The shape of the mixed-rate session below, spelled out once so the fixture and the test
+    // that reads it cannot disagree about what was written.
+
+    /// Seconds of audio on each of the two tracks.
+    const MIXED_SECONDS: f32 = 4.0;
+    /// What a macOS call actually puts on disk: the microphone at whatever rate the call
+    /// negotiated, the system tap at the 48 kHz ScreenCaptureKit pins it to.
+    const MIXED_MIC_RATE: u32 = 24_000;
+    const MIXED_SPEAKER_RATE: u32 = 48_000;
+    /// When the tone begins, *relative to each track's own first sample* -- identical on both
+    /// sides on purpose, so "the same instant arrives at the same index" is an assertion rather
+    /// than a coincidence.
+    const MIXED_TONE_START_S: f32 = 1.0;
+    /// Two tones far enough apart to tell which track a buffer came from, far below the 8 kHz
+    /// Nyquist of the 16 kHz target, far above `align`'s 80 Hz floor, and low enough to survive
+    /// Opus at 32 kbps -- the same reasons the mixdown tests reach for 300 and 900.
+    const MIXED_MIC_TONE_HZ: f32 = 300.0;
+    const MIXED_SPEAKER_TONE_HZ: f32 = 900.0;
+    const MIXED_TONE_AMPLITUDE: f32 = 0.4;
+    /// The mic's first sample lands 0.6 s after the speaker's: 14_400_000 ticks at the Apple
+    /// timebase `timeline::tests::metadata` reports (125/3 ns per tick) is exactly 0.6 s.
+    const MIXED_MIC_LAG_TICKS: u64 = 14_400_000;
+
+    /// A session whose two tracks were captured at *different* rates: the microphone at 24 kHz
+    /// against the system tap at 48 kHz, which is what a real macOS call produces -- the input
+    /// device runs at whatever rate the call negotiated while ScreenCaptureKit stays at 48 kHz
+    /// (`meethook-record`'s `mic.rs` reads the device rate, `speaker.rs` pins 48).
+    /// Byte-for-byte the two files grow at different speeds for the same seconds, which is why
+    /// nothing may assume one rate for both.
+    ///
+    /// Each track is digital silence until its own `MIXED_TONE_START_S`, then a continuous sine,
+    /// at a different frequency per side so a buffer can be traced back to the track it came
+    /// from after everything downstream of reading the file.
+    ///
+    /// The tracks go through [`audio::fixtures::write_wav`], which is bare `hound` and therefore
+    /// carries hound's default front-left mono channel mask where production writes through
+    /// `meethook_session::wav::create`. Nothing on the read path consults the mask. Do *not*
+    /// "fix" this by routing through [`audio::write_track_16k_mono`] instead: that stamps a
+    /// 16 kHz header on both files and voids the entire fixture.
+    fn make_mixed_rate_session(paths: &Paths, id: &str, mic_lag_ticks: u64) -> DiscoveredSession {
+        let id = SessionId::parse(id).unwrap();
+        let session_paths = paths.session(&id);
+        std::fs::create_dir_all(session_paths.dir()).unwrap();
+
+        // Built here rather than by asking `audio::fixtures::tone` for more parameters: that
+        // fixture is a continuous tone and has four callers that want exactly that.
+        let gated_tone = |rate: u32, hz: f32| -> Vec<f32> {
+            let start = (rate as f32 * MIXED_TONE_START_S) as usize;
+            let tau = std::f32::consts::TAU;
+            (0..(rate as f32 * MIXED_SECONDS) as usize)
+                .map(|index| {
+                    if index < start {
+                        0.0
+                    } else {
+                        // Phase measured from the gate, so the sine opens at zero crossing and
+                        // the onset is not preceded by a discontinuity to ring the resampler.
+                        let t = (index - start) as f32 / rate as f32;
+                        (t * hz * tau).sin() * MIXED_TONE_AMPLITUDE
+                    }
+                })
+                .collect()
+        };
+
+        audio::fixtures::write_wav(
+            &session_paths.mic_wav(),
+            MIXED_MIC_RATE,
+            &gated_tone(MIXED_MIC_RATE, MIXED_MIC_TONE_HZ),
+        );
+        audio::fixtures::write_wav(
+            &session_paths.speaker_wav(),
+            MIXED_SPEAKER_RATE,
+            &gated_tone(MIXED_SPEAKER_RATE, MIXED_SPEAKER_TONE_HZ),
+        );
+
+        // A tick magnitude large enough that an accidental f64 round-trip would lose bits.
+        let base = 900_000_000_000u64;
+        metadata(&id, base + mic_lag_ticks, base)
+            .write(&session_paths.session_json())
+            .unwrap();
+
+        DiscoveredSession {
+            id,
+            paths: session_paths,
+            classification: Classification::Valid,
+        }
+    }
+
     /// Runs a batch against a single set of fake engines, reporting how many times they were
     /// opened so "no work means no model" can be asserted.
     fn run(paths: &Paths, ids: &[&str], force: bool) -> (BatchReport, usize, String) {
@@ -1404,6 +1491,279 @@ mod tests {
             compressed * 10 < mic,
             "meeting.opus is {compressed} bytes against mic.wav's {mic}; \
              it holds both tracks and should still be far smaller than either"
+        );
+    }
+
+    /// A 24 kHz microphone track against a 48 kHz system-audio track survives resampling to
+    /// 16 kHz at the right length, pitch, tempo and relative offset, and mixes down correctly.
+    ///
+    /// This is the shape of *every real macOS call*, not an edge case: the input device runs at
+    /// whatever rate the call negotiated (24 kHz was observed on hardware) while
+    /// ScreenCaptureKit's system-audio tap stays at 48 kHz, so the two WAVs in one session grow
+    /// at different byte rates for the same seconds. Nothing on the read path may assume one
+    /// rate for both, and every other fixture in this workspace writes its tracks at the same
+    /// rate -- so making the two rates here match would void the test outright. TASK-078.
+    #[test]
+    fn a_24khz_mic_track_against_a_48khz_speaker_track_arrives_at_16khz_aligned_and_panned() {
+        use crate::audio::fixtures::{first_onset, projection};
+        use crate::mixdown::PAN_POSITION;
+        use crate::mixdown::fixtures::decode;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_mixed_rate_session(&paths, "20260809-052600", MIXED_MIC_LAG_TICKS);
+
+        // Both tracks are heard from 1.0 s to 3.8 s in their own time, which is where the tone
+        // is, so the transcript's timestamps become a statement about the tick-derived 0.6 s.
+        let mut asr = FakeAsr::saying(
+            vec![segment(1.0, 3.8, "from the mic")],
+            vec![segment(1.0, 3.8, "from the call")],
+        );
+        let mut diarizer = FakeDiarizer {
+            diarization: Diarization {
+                clusters: vec![cluster(0, 2.8, 1.0)],
+                turns: vec![SpeakerTurn {
+                    start_s: 1.0,
+                    end_s: 3.8,
+                    cluster: 0,
+                }],
+            },
+            heard: Vec::new(),
+        };
+        let mut progress = Vec::new();
+        let transcript = transcribe_session(
+            &session,
+            &mut asr,
+            &mut diarizer,
+            &nobody_enrolled(),
+            mixdown::Settings::default(),
+            &mut progress,
+        )
+        .unwrap();
+
+        // 1. The pre-pass must not have touched the microphone. Four-second tracks cannot
+        // supply the three spaced 3 s windows `align` wants, so nothing was cancelled and the
+        // buffer ASR saw is the raw track. If this ever reports `Cancelled`, stop and report:
+        // the fixture has become alignable, and every tone assertion below it needs rethinking.
+        let record = CleaningRecord::read_if_present(&session.paths)
+            .unwrap()
+            .expect("cleaning.json must exist after a transcribe run");
+        assert!(
+            matches!(
+                record.outcome,
+                meethook_session::Cleaning::PassedThrough {
+                    reason: meethook_session::PassThrough::Unalignable(_),
+                }
+            ),
+            "four-second tracks cannot align, so the mic must reach the recognizer untouched; \
+             got {:?}",
+            record.outcome
+        );
+        let raw_mic = audio::read_track_16k_mono(&session.paths.mic_wav()).unwrap();
+        assert_eq!(
+            asr.heard[0], raw_mic,
+            "with nothing cancellable, the recognizer must see the raw mic track verbatim"
+        );
+
+        // 2. Length: four seconds of either track is four seconds at 16 kHz. A rate confusion
+        // in either direction gives 32_000 or 128_000, not something nearby.
+        assert_eq!(asr.heard.len(), 2, "one call per track, mic first");
+        let expected_frames = (MIXED_SECONDS * TARGET_RATE as f32) as usize;
+        assert_eq!(
+            (asr.heard[0].len(), asr.heard[1].len()),
+            (expected_frames, expected_frames),
+            "96_000 frames at 24 kHz and 192_000 at 48 kHz are both exactly 4 s at 16 kHz"
+        );
+        assert_eq!(
+            diarizer.heard.len(),
+            1,
+            "only the speaker track is diarized"
+        );
+        assert_eq!(
+            diarizer.heard[0], asr.heard[1],
+            "the diarizer and the recognizer must be handed the same speaker buffer"
+        );
+
+        // 3. Pitch, steady state only (skip the gate at 1.0 s and the resampler's settling).
+        // Measured against the real code: 0.4000 at the tone's own frequency and 0.0000 at both
+        // aliases from either source rate, so these bounds carry ~18x slack on the pass and ~20x
+        // on the reject -- while a 2x rate error lands the tone exactly on the reject bound.
+        let (from, to) = (19_200usize, 60_800usize);
+        for (buffer, hz, which) in [
+            (&asr.heard[0], MIXED_MIC_TONE_HZ, "mic"),
+            (&asr.heard[1], MIXED_SPEAKER_TONE_HZ, "speaker"),
+        ] {
+            let measured = projection(buffer, TARGET_RATE, hz, from, to);
+            assert!(
+                measured > MIXED_TONE_AMPLITUDE * 0.875,
+                "{which} lost its {hz} Hz tone: measured {measured}, expected ~{MIXED_TONE_AMPLITUDE}"
+            );
+            for alias in [hz / 2.0, hz * 2.0] {
+                let leaked = projection(buffer, TARGET_RATE, alias, from, to);
+                assert!(
+                    leaked < 0.02,
+                    "{which} carries {alias} Hz, which it was never written with: measured {leaked}"
+                );
+            }
+        }
+
+        // 4. Onset. Each tone gates on at 1.0 s in its *own* file, so both must arrive at the
+        // same 16 kHz index -- which is only true because `Resample` drains rubato's
+        // `output_delay()` per track. Measured deviation: one sample from either source rate, so
+        // the 16-sample (1 ms) margin below buys 16x. The clause comparing the two onsets to
+        // each other is the actual cross-rate claim: treat one track as though it had been
+        // recorded at the other's rate and it is false by hundreds of samples.
+        let onsets: Vec<usize> = asr
+            .heard
+            .iter()
+            .map(|buffer| {
+                first_onset(buffer, MIXED_TONE_AMPLITUDE / 10.0).expect("a tone must start")
+            })
+            .collect();
+        for (buffer_index, onset) in onsets.iter().enumerate() {
+            let which = if buffer_index == 0 { "mic" } else { "speaker" };
+            assert!(
+                (*onset as isize - TARGET_RATE as isize).unsigned_abs() <= 16,
+                "{which}'s tone arrived at sample {onset} instead of {} +- 16",
+                TARGET_RATE
+            );
+        }
+        assert!(
+            onsets[0].abs_diff(onsets[1]) <= 16,
+            "the two source rates mapped the same instant to different positions: mic at {}, \
+             speaker at {}",
+            onsets[0],
+            onsets[1]
+        );
+
+        // 5. The same 0.6 s of host ticks, showing up in the transcript as text -- computed from
+        // `session.json`, not from either track's sample count.
+        assert_eq!(transcript.turns.len(), 2);
+        assert!(
+            (transcript.turns[0].start - 1.0).abs() < 1e-5,
+            "the speaker track starts at zero on the session timeline: {:?}",
+            transcript.turns[0]
+        );
+        assert_eq!(transcript.turns[0].source_track, SourceTrack::Speaker);
+        assert!(
+            (transcript.turns[1].start - 1.6).abs() < 1e-5,
+            "the mic's 1.0 s segment rides the 0.6 s tick offset to 1.6 s: {:?}",
+            transcript.turns[1]
+        );
+        assert_eq!(transcript.turns[1].source_track, SourceTrack::Mic);
+
+        // 6. `meeting.opus`, from the mixer's view: two already-resampled tracks, so everything
+        // above has to show through the codec too.
+        let (_pre_skip, channels, stereo) = decode(&session.paths.meeting_opus());
+        assert_eq!(channels, 2);
+        let mixed = stereo.len() / 2;
+        // Derived from the recorded ticks rather than restating them: the mixer lays the two
+        // tracks down `mic_offset_seconds` apart, so the file must run to the later track's end.
+        let mic_lag_s = mic_minus_speaker_seconds(&session.load_metadata().unwrap()).unwrap();
+        let expected_mixed = ((f64::from(MIXED_SECONDS) + mic_lag_s) * 48_000.0) as usize;
+        assert!(
+            mixed.abs_diff(expected_mixed) <= 960,
+            "the mix runs to the longer of the two offsets-plus-lengths: {mixed} frames per \
+             channel against {expected_mixed} expected (one 20 ms packet of tolerance)"
+        );
+        let left: Vec<f32> = stereo.iter().step_by(2).copied().collect();
+        let right: Vec<f32> = stereo.iter().skip(1).step_by(2).copied().collect();
+
+        // Constant-power pan, derived from the same constant the mixer used: a source at `pan`
+        // gets gains (cos theta, sin theta) with theta = (pan + 1) * pi/4, so the left/right
+        // magnitude ratio for a tone is cot(theta). Measured through Opus at 32 kbps: 1.6236
+        // against 1.6320 near-left and 0.6172 against 0.6128 near-right -- well under a percent,
+        // and comparing one tone across channels cancels the per-source loudness gain, which is
+        // why this is the only amplitude-shaped claim made here.
+        // Constant-power pan, derived from the same constant the mixer used: a source at `pan`
+        // gets gains (cos theta, sin theta) with theta = (pan + 1) * pi/4, so its left-to-right
+        // magnitude ratio is cot(theta). Measured through Opus at 32 kbps over this window:
+        // 1.6118 against the 1.6319 ideal for the near-left tone and 0.6251 against 0.6128 for
+        // the near-right one -- 1.2% and 2.0%, against the 10% bound below. Comparing one tone
+        // across channels cancels the per-source loudness gain, which is why this is the only
+        // amplitude-shaped claim made here.
+        //
+        // The window matters: it has to sit where *both* tones are sounding. Widen it back to
+        // cover the speaker's gate and the codec's own leakage from the loud 900 Hz tone raises
+        // the quiet channel's reading during the seconds before the mic's tone starts, and the
+        // ratio for 300 Hz drifts to 1.457 -- still directionally right, but a third of the
+        // margin gone for a reason that has nothing to do with the pan.
+        let pan_ratio = |pan: f32| {
+            let theta = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+            theta.cos() / theta.sin()
+        };
+        let (tone_from, tone_to) = ((2.0 * 48_000.0) as usize, (3.0 * 48_000.0) as usize);
+        for (hz, pan, which) in [
+            (MIXED_MIC_TONE_HZ, -PAN_POSITION, "mic"),
+            (MIXED_SPEAKER_TONE_HZ, PAN_POSITION, "speaker"),
+        ] {
+            let near_channel = if pan < 0.0 { "left" } else { "right" };
+            let on_left = projection(&left, 48_000, hz, tone_from, tone_to);
+            let on_right = projection(&right, 48_000, hz, tone_from, tone_to);
+            let measured = on_left / on_right;
+            let ideal = pan_ratio(pan);
+            assert!(
+                (measured / ideal - 1.0).abs() < 0.1,
+                "the {which}'s {hz} Hz tone sits {measured}:1 left-to-right against the \
+                 constant-power {ideal}:1 that puts it in the {near_channel} channel"
+            );
+        }
+
+        // And the offsets themselves, in the mix: the mic's tone starts 0.6 s later than the
+        // speaker's, because that is what the recorded ticks say. Drop the tick offset entirely
+        // and the mic's tone walks back to 1.0 s, an order of magnitude past this bound.
+        // Measured: 0.000009 and 0.000000 in the two silent windows, 0.204 and 0.192 once each
+        // tone is sounding. So the reject bound carries ~2000x while the pass bound carries
+        // ~2x -- which is fine, because "is the tone there at all" is a presence check, not a
+        // measurement; the measurement of the offset is the reject side. All of these are
+        // post-codec numbers: hand the same two buffers to `mix_with` without the encoder and
+        // the pan ratio comes back 1.631852, six digits of the constant-power ideal.
+        let (mic_before_from, mic_before_to) =
+            ((0.2 * 48_000.0) as usize, (1.5 * 48_000.0) as usize);
+        let (mic_after_from, mic_after_to) = ((1.7 * 48_000.0) as usize, (3.8 * 48_000.0) as usize);
+        assert!(
+            projection(
+                &left,
+                48_000,
+                MIXED_MIC_TONE_HZ,
+                mic_before_from,
+                mic_before_to
+            ) < 0.02,
+            "the mic's tone is audible before its 0.6 s offset has elapsed"
+        );
+        assert!(
+            projection(
+                &left,
+                48_000,
+                MIXED_MIC_TONE_HZ,
+                mic_after_from,
+                mic_after_to
+            ) > 0.1,
+            "the mic's tone is missing once its offset has elapsed"
+        );
+        let (speaker_before_from, speaker_before_to) =
+            ((0.2 * 48_000.0) as usize, (0.9 * 48_000.0) as usize);
+        let (speaker_after_from, speaker_after_to) =
+            ((1.1 * 48_000.0) as usize, (3.8 * 48_000.0) as usize);
+        assert!(
+            projection(
+                &right,
+                48_000,
+                MIXED_SPEAKER_TONE_HZ,
+                speaker_before_from,
+                speaker_before_to
+            ) < 0.02,
+            "the speaker's tone is audible before its own 1.0 s gate"
+        );
+        assert!(
+            projection(
+                &right,
+                48_000,
+                MIXED_SPEAKER_TONE_HZ,
+                speaker_after_from,
+                speaker_after_to
+            ) > 0.1,
+            "the speaker's tone is missing after its own gate"
         );
     }
 

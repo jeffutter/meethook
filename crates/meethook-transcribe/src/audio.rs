@@ -266,13 +266,23 @@ impl Resample {
     }
 }
 
+/// Synthetic tracks, plus the two measurements needed to read them back.
+///
+/// Here rather than inside one test module because [`crate::mixdown`] and the crate-root tests
+/// need the same shapes, and two copies of a fixture this load-bearing would drift -- the same
+/// reason [`crate::loudness::fixtures`] exists. What the mixed-rate session fixture in
+/// [`crate::tests`] depends on is precisely that *each* track states its own rate, so the writer
+/// that takes a rate per call has to be shared rather than reimplemented beside whichever test
+/// asked for it first.
 #[cfg(test)]
-mod tests {
-    use hound::{WavSpec, WavWriter};
+pub(crate) mod fixtures {
+    use hound::{SampleFormat, WavSpec, WavWriter};
 
-    use super::*;
-
-    fn write_wav(path: &Path, rate: u32, samples: &[f32]) {
+    /// A mono 32-bit float WAV at `rate`, written from `samples`.
+    ///
+    /// Note the header says `rate`, not anything the caller's audio was made at: that
+    /// discrepancy is the whole content of a rate-mismatch fixture.
+    pub(crate) fn write_wav(path: &std::path::Path, rate: u32, samples: &[f32]) {
         write_wav_spec(
             path,
             WavSpec {
@@ -285,7 +295,8 @@ mod tests {
         );
     }
 
-    fn write_wav_spec(path: &Path, spec: WavSpec, samples: &[f32]) {
+    /// A WAV with an arbitrary header, for the tests that are about the header itself.
+    pub(crate) fn write_wav_spec(path: &std::path::Path, spec: WavSpec, samples: &[f32]) {
         let mut writer = WavWriter::create(path, spec).unwrap();
         for sample in samples {
             match spec.sample_format {
@@ -296,12 +307,52 @@ mod tests {
         writer.finalize().unwrap();
     }
 
-    fn tone(rate: u32, seconds: f32, hz: f32) -> Vec<f32> {
+    /// `seconds` of a continuous sine at `hz`, amplitude 0.5.
+    pub(crate) fn tone(rate: u32, seconds: f32, hz: f32) -> Vec<f32> {
         let n = (rate as f32 * seconds) as usize;
         (0..n)
             .map(|i| (i as f32 / rate as f32 * hz * std::f32::consts::TAU).sin() * 0.5)
             .collect()
     }
+
+    /// Quadrature projection magnitude of `hz` over `from..to`: the correlation of the buffer
+    /// with a cosine and a sine at that frequency, normalised so a pure tone of amplitude `a`
+    /// measures `a` and anything else measures ~0. Exact for a known frequency, insensitive to
+    /// unknown phase, and unaffected by the codec's phase distortion - which is why it is used
+    /// instead of an FFT.
+    ///
+    /// Accumulated in `f64`: the windows here run to tens of thousands of samples, and summing
+    /// their products in `f32` costs a rounding error comparable to the reject bound callers
+    /// assert against.
+    pub(crate) fn projection(samples: &[f32], rate: u32, hz: f32, from: usize, to: usize) -> f32 {
+        use std::f64::consts::TAU;
+
+        let (mut cos_sum, mut sin_sum) = (0.0f64, 0.0f64);
+        for (index, sample) in samples[from..to].iter().enumerate() {
+            // Absolute index, so the window's position in the track is part of the geometry
+            // rather than something each caller has to keep straight. Projection magnitude
+            // does not depend on it; reproducibility across a refactor does.
+            let phase = f64::from((index + from) as u32) * f64::from(hz) / f64::from(rate) * TAU;
+            cos_sum += f64::from(*sample) * phase.cos();
+            sin_sum += f64::from(*sample) * phase.sin();
+        }
+        // A pure tone of amplitude `a` puts `a * n / 2` into each quadrature, so twice the
+        // per-sample mean of the pair's magnitude reads back as `a`.
+        ((cos_sum * cos_sum + sin_sum * sin_sum).sqrt() * 2.0 / (to - from) as f64) as f32
+    }
+
+    /// Index of the first sample whose magnitude reaches `threshold`, or `None`.
+    pub(crate) fn first_onset(samples: &[f32], threshold: f32) -> Option<usize> {
+        samples.iter().position(|sample| sample.abs() >= threshold)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hound::WavSpec;
+
+    use super::fixtures::*;
+    use super::*;
 
     #[test]
     fn a_16k_track_passes_through_untouched() {
