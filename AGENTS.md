@@ -8,10 +8,12 @@ when working with code in this repository.
 `meethook` is a local-first macOS/Linux meeting recorder and transcriber: it records both
 sides of a call to independent WAV tracks, diarizes and transcribes them, matches speakers
 against an enrolled-voice database, and renders a `transcript.md`. The design record for
-*why* lives in `backlog/decisions/decision-001` through `decision-012` — read the relevant
-one before making an architectural change in that area (ASR, diarization, speaker matching,
-reference lifecycle, echo cancellation, calendar fit, transcript rendering, mixdown,
-interactive enroll UI).
+*why* lives in the numbered files in `backlog/decisions/` - read the relevant one, including
+its `## Consequences` section, before making an architectural change in that area (ASR,
+diarization, speaker matching, reference lifecycle, echo cancellation, calendar fit,
+transcript rendering, mixdown, interactive enroll UI, tentative identification). A changed
+mind amends the decision that owns the territory rather than spawning a new number, so the
+highest number is not the last word on anything.
 
 ## Commands
 
