@@ -5,7 +5,7 @@ title: >-
   TASK-067.05.01
 type: other
 created_date: '2026-09-11 14:21'
-updated_date: '2026-09-11 14:45'
+updated_date: '2026-09-21 17:15'
 ---
 
 Research for TASK-067.05.01 (per-track forensics over an unfinished session directory, one home
@@ -90,24 +90,65 @@ All line numbers below are the vendored crate (`~/.cargo/registry/src/*/hound-3.
 ## 3. What readers actually do with a lying header (measured here, macOS 26.6.2)
 
 Synthetic files with hound's exact header shape (48 kHz mono float32, `WAVE_FORMAT_EXTENSIBLE`,
-`cbSize` 22, mask `0x4`), rebuilt with python; re-run with `python3` writing
-`b"RIFF" + u32(len(body)+declared-8) + b"WAVE" + b"fmt "…` plus N zero bytes, then `afinfo F.wav`
-and `afconvert -f WAVE -d LEF32 F.wav out.wav`:
+`cbSize` 22, mask `0x4`, 68-byte header), written by python as
+`b"RIFF" + u32(len(body)+payload-8) + b"WAVE" + b"fmt " + u32(40) + <extensible body> + b"data" +
+u32(declared)` followed by `960 000` zero bytes (5 s of payload on disk in every row but the last).
 
-| file | declared `data` | bytes present | `afinfo` duration | `afconvert` output |
-|---|---|---|---|---|
-| declared short | 4 s (768 000 B) | 5 s (960 000 B) | **3.999979 s** | 4 s — the extra second is dropped |
-| declared zero | 0 | 5 s (960 000 B) | **0.000000 s** | 4 KB file, i.e. nothing |
-| declared long | 10 s | 5 s | **5.000000 s** | 5 s (clamped to file size) |
-| header only | 0 | 0 | 0 s | — |
+Provenance for the whole table: measured 2026-09-21 on macOS 26.6.2 arm64. Apple tools are
+`/usr/bin/afinfo` and `/usr/bin/afconvert`; ffmpeg is `ffprobe version 7.1.5` / `ffmpeg version
+7.1.5` from `nix build --no-link --print-out-paths 'nixpkgs#ffmpeg_7'`; hound is the vendored 3.5.1
+this repo pins, driven by a throwaway reader that counts the samples it actually returns. Per file:
 
-Read that middle row against §1: because hound's initial declarations are zero and the first
+```sh
+afinfo F.wav
+afconvert -f WAVE -d LEF32@48000 F.wav out.wav && afinfo out.wav   # and `wc -c out.wav`
+ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 F.wav
+ffmpeg -hide_banner -i F.wav -y copy.wav                            # read the stderr and the output length
+```
+
+| declared `data` | bytes present | `afinfo` | `afconvert` -> LEF32 | `ffprobe` duration | `ffmpeg -i F.wav out.wav` |
+|---|---|---|---|---|---|
+| 960 000 B (5 s) | 5 s | 4.999958 s (959 992 B, 239 998 pkts) | 964 088 B, 4.999958 s | 5.000000 | 5.000000 s, no warning |
+| 768 000 B (4 s) | 5 s | 4.000000 s | 772 096 B, 4.000000 s | 4.000000 | 4.000000 s, no warning |
+| **0** | 5 s | **0.000000 s** | **4 096 B, nothing** | **5.000000** | **5.000000 s** |
+| **0xFFFFFFFF** | 5 s | **4.999958 s** | 964 088 B, 4.999958 s | **5.000000** | **5.000000 s** |
+| 1 920 000 B (10 s) | 5 s | 4.999958 s | 964 088 B, 4.999958 s | 5.000000 | 5.000000 s (clamped) |
+| 0 | 0 | 0.000000 s | 4 096 B, nothing | `N/A` | no frames decoded |
+
+The rows where the declaration is 0 or `0xFFFFFFFF` print `[wav @ 0x…] Ignoring maximum wav data
+size, file may be invalid` at ffmpeg's default verbosity; the 0, `0xFFFFFFFF` and over-long rows
+also print `Estimating duration from bitrate, this may be inaccurate`. `-ignore_length 1` does not
+change any of those four, and changes only the short-nonzero row: `ffmpeg -ignore_length 1 -i` on
+the 4 s declaration writes a 5.000000 s output where the same command without the option writes
+4.000000 s (`ffprobe -ignore_length 1 -count_packets` corroborates: 59 packets versus 47). Note
+that `ffprobe -show_entries format=duration` still reports 4.000000 *with* the option set - that
+field comes from the header, so verify an `ignore_length` effect on packet count or output length,
+not on it.
+
+Two things earlier drafts of this section got wrong, both corrected by the table above.
+
+- **CoreAudio honours the `0xFFFFFFFF` sentinel.** It is not a corruption shape but a deliberate
+  third thing an author writes to mean "unknown length", and CoreAudio and libavformat both honour
+  it by reading to EOF. Treat it as a value a writer may legitimately emit, not one to avoid.
+- **The RIFF size is not ignored by everyone.** Varying the size at offset 4 changed nothing for
+  libavformat (every short-RIFF variant still reported 5 s, or 4 s for the 4 s declaration), but it
+  caps CoreAudio exactly once the `data` declaration is nonzero: with the RIFF size declaring 500
+  000 bytes, `afinfo` reported 2.603875 s, and declaring 100 bytes it reported 0.000229 s - for the
+  fully-declared, the 4 s-declared and the sentinel-shaped file alike. A declared-zero file reads as
+  zero seconds whatever the RIFF size says. So `wav.rs`'s refusal to consult the RIFF size is a
+  choice about which quantity to report (bytes the recorder captured), not a claim that readers
+  ignore that field.
+
+Read the declared-zero row against §1: because hound's initial declarations are zero and the first
 checkpoint is at 5 s, **a recorder killed inside its first five seconds leaves seconds of real
 audio that CoreAudio reports as a zero-second file.** "Your audio survived to within about five
-seconds" would then be doing nothing for the user, and "may not play" would be too soft — for that
-state the truth is *nothing plays until someone repairs it*, while the bytes are still there. The
-forensic states should therefore keep "declared shorter than the file" distinct from "declared
-zero", and neither should be folded into "empty".
+seconds" would then be doing nothing for the user. What that state does *not* do is sit unhearable:
+libavformat reads those bytes to EOF unasked and prints the discrepancy while doing it. So the
+argument for keeping the states apart is not "nothing plays until somebody repairs it" - it is that
+what the user hears depends on which reader they happen to use, and a report that folds
+"declared zero" into "empty" loses seconds of real audio for every reader that would have found
+them. Keep "declared shorter than the file" distinct from "declared zero", and neither folded into
+"empty".
 
 Cross-reader prior art for the same shapes:
 
@@ -116,21 +157,29 @@ Cross-reader prior art for the same shapes:
   which wasn't closed properly. Fixing it.` and takes the real byte count (`src/wav.c`, condition
   `chunk_size == 0 && RIFFsize == 8 && psf->filelength > 44`). Both precedents report an observed
   discrepancy instead of inventing a cause — exactly the tone this ticket family wants.
-- **FFmpeg** will *not* read the hidden tail by default; it ships an explicit opt-in instead:
-  `ignore_length` — "Ignore the size of the `data` chunk and keep reading until the end of the file
-  if set. May be useful to read broken or partial files where the header was not properly updated,
-  but will misinterpret files with non-audio chunks after the `data` chunk. Default is disabled"
-  (`doc/demuxers.texi`, <https://github.com/FFmpeg/FFmpeg/blob/d998016f/doc/demuxers.texi>). So
-  "it will not play" is the default behaviour of the two biggest readers, and recovering it is a
-  deliberate act — consistent with decision-001's refusal to reopen finalized files and with the
-  parent plan's "name the gap, don't silently close it".
+- **libavformat (`ffmpeg`/`ffprobe`) treats 0 and `0xFFFFFFFF` as unknown and reads to EOF with no
+  option set**, printing `Ignoring maximum wav data size, file may be invalid` while doing so; it
+  honours a short *nonzero* declaration unless told otherwise. `ignore_length` is therefore the
+  opt-in for the third case only — a nonzero-but-short declaration — not the general key to the
+  hidden tail: "Ignore the size of the `data` chunk and keep reading until the end of the file if
+  set. May be useful to read broken or partial files where the header was not properly updated, but
+  will misinterpret files with non-audio chunks after the `data` chunk. Default is disabled"
+  (`doc/demuxers.texi`, <https://github.com/FFmpeg/FFmpeg/blob/d998016f/doc/demuxers.texi>). An
+  earlier draft of this bullet asserted the opposite — that FFmpeg will not read the hidden tail by
+  default — and that claim is what licensed the shipped report sentence "players stop at the
+  declaration", which is false for a killed recorder's most common early death. See
+  <https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/wavdec.c> for the code path.
 - **hound's own reader trusts the declaration** (`num_samples = data_len / bytes_per_sample`,
   `read.rs:598-616`) and refuses a file whose declared length isn't a whole multiple of sample size
-  or channel count (`:607-617`). Since checkpoints and finalization only ever write whole-sample
-  sizes, that mostly matters if a `write()` landed partially at a block boundary — a case where the
-  strict reader rejects the *whole* file while lenient ones play part of it. Worth one sentence in
-  the long-form message: how much of the kept audio plays depends on the player, which is another
-  reason not to promise playback.
+  or channel count (`:607-617`). Measured against the six shapes above: full → 240 000 samples, 4 s
+  declaration → 192 000, declared zero → 0, over-long declaration → 240 000 then `Failed to read
+  enough bytes.` at EOF, and the `0xFFFFFFFF` declaration → the file is refused outright (`Ill-formed
+  WAVE file: data chunk length is not a multiple of sample size`). Since checkpoints and finalization
+  only ever write whole-sample sizes, the refusal mostly matters if a `write()` landed partially at a
+  block boundary — a case where the strict reader rejects the *whole* file while lenient ones play
+  part of it. Which is the point worth carrying into the phrasing: how much of the kept audio a
+  listener reaches depends on the reader, so report the measurement and condition any talk of
+  playback on it rather than promising either way.
 
 ## 4. The liveness probe: what the two kernels actually promise
 
@@ -203,7 +252,8 @@ updated", and OBS's answer being a container that survives abortion plus a *manu
 covered in the parent plan's corrections). Three consequences for the phrase library:
 
 - Distinguish three magnitudes that today's single sentence conflates: audio **kept and playable**,
-  audio **kept but undeclared** (present, invisible to players — quantifiable in bytes and ms), and
+  audio **kept but undeclared** (present, undeclared — quantifiable in bytes and ms, and reachable or
+  not depending on the reader, §3), and
   audio **never written** (unknowable, because the clock died with the recorder — say nothing about
   it beyond that).
 - Say what a transcript lacks concretely enough to be believed: `session.json` held the one clock
