@@ -5,7 +5,7 @@ title: >-
   TASK-067.05.01
 type: other
 created_date: '2026-09-11 14:21'
-updated_date: '2026-09-21 17:15'
+updated_date: '2026-09-22 06:05'
 ---
 
 Research for TASK-067.05.01 (per-track forensics over an unfinished session directory, one home
@@ -200,15 +200,59 @@ from the kernel.
   iff this is a confined fd" (<https://github.com/apple/darwin-xnu/blob/master/bsd/kern/kern_lockf.c>)
   — the owner is a file description, not a process. Do **not** reach for `F_OFD_GETLKPID` (94) /
   `F_SETCONFINED` (95): those exist only under `PRIVATE` in xnu's own header and are not public API.
-- **Availability.** Values 90/91/92 are exposed in the SDK under `__DARWIN_C_LEVEL >=
-  __DARWIN_C_FULL` (`…/MacOSX.sdk/usr/include/sys/fcntl.h:308-314`) and `libc` exports them for
-  apple targets (`libc-0.2.189/src/unix/bsd/apple/mod.rs:2442-2444`); Linux uses 36/37/38, gated
-  since Linux 3.15 and glibc-exposed. How far back the *runtime* support goes on macOS is
-  unresolved *(verify)* — which makes the `EINVAL` path load-bearing: Apple lists `EINVAL` for
-  `F_OFD_GETLK` when "the data to which arg points is not valid, or `fildes` refers to a file that
-  does not support locking". Map `EINVAL` (and `ENOLCK`, which Linux documents as including "a
-  remote locking protocol failed", i.e. the NFS/SMB caveat already in `record_lock.rs:63-70`) to
-  *unknown*, never to *free*.
+- **Availability.** Closed by TASK-067.05.07 (full evidence in
+  `doc-013 - Prior-art-macOS-runtime-floor-for-OFD-locks-for-TASK-067.05.07.md`). There are two
+  floors, eight years apart, and conflating them is why the question looked unanswerable.
+  - **Apple's own manual dates our dependency to Linux.** `fcntl(2)` gained a HISTORY paragraph at
+    macOS 14 reading "Open file description locks first appeared in Linux 3.15"
+    (`xnu-10002.81.5/bsd/man/man2/fcntl.2`, `.Sh HISTORY` at :1037, the sentence at :1043; still
+    verbatim at `xnu-12377.121.6`, and live on the keith mirror cited above). At `xnu-8792.81.2`
+    (macOS 13) that same section is the 4.2BSD line alone. First-party text pointing at Linux for a
+    command Apple's kernel had answered since 2015 is the reason nobody found a macOS number: the
+    documentation said Linux, so nobody looked for an Apple release.
+  - **Kernel/runtime floor: OS X 10.11 El Capitan (Darwin 15).** Bisected on Apple's own OSS tags at
+    <https://github.com/apple-oss-distributions/xnu/tags>: `xnu-2782.40.9` (10.10.5) has zero `F_OFD`
+    hits in `bsd/sys/fcntl.h` *and* zero in `bsd/kern/kern_descrip.c`; `xnu-3247.10.11` (the 10.11
+    seed) defines 90/91/92/93 under `#ifdef PRIVATE` (`bsd/sys/fcntl.h:353-358`) with 14 `F_OFD` hits
+    in `bsd/kern/kern_descrip.c` and 7 in `bsd/kern/kern_lockf.c`; `xnu-3248.60.10` (10.11 GM) is the
+    same. The dispatch lives in `kern_descrip.c` - there is no `bsd/kern/kern_fcntl.c` in these
+    trees, so anyone re-running this bisect should not go looking there.
+  - **Public-header and documentation floor: macOS 14 Sonoma (Darwin 23, `xnu-10002`).** There
+    `bsd/sys/fcntl.h:386-391` moves 90/91/92/93 out of `PRIVATE` into
+    `#if __DARWIN_C_LEVEL >= __DARWIN_C_FULL`, while 94/95/96 (`F_OFD_GETLKPID`, `F_SETCONFINED`,
+    `F_GETCONFINED`) stay `PRIVATE` at :394 - never public in any release, which is the firmer basis
+    for the "do not reach for `F_OFD_GETLKPID`" above. The count of `F_OFD` in `bsd/man/man2/fcntl.2`
+    is 0 / 0 / 0 / 0 / 16 across `xnu-3248` / `4903` / `6153` / `8792` / `10002`, so the man-page text
+    this section leans on, `l_pid = -1` included, is itself a macOS 14 artifact. Values 90/91/92 are
+    exposed in today's SDK under `__DARWIN_C_FULL` (`…/MacOSX.sdk/usr/include/sys/fcntl.h:309-313`)
+    and `libc` exports them for apple targets
+    (`libc-0.2.189/src/unix/bsd/apple/mod.rs:2442-2444`); Linux uses 36/37/38, gated since Linux 3.15
+    and glibc-exposed.
+  - **There is no SDK route to the runtime floor.** `API_AVAILABLE` / `__AVAILABILITY` occurs 0 times
+    in `usr/include/sys/fcntl.h` of every SDK on this machine (15, 15.4, 26, 26.5), and Apple's
+    `fcntl(2)` carries no per-command availability. This was only ever answerable by reading xnu
+    source, which is what made it cost eight years instead of one grep.
+  - **What an errno can and cannot mean.** An earlier draft treated Apple's `EINVAL` wording as
+    load-bearing for the *version* question, because the runtime floor was then unknown; with the
+    floor established, that reading is superseded - `EINVAL` is a *filesystem* signal. Apple documents
+    it for `F_OFD_GETLK` when "the data to which arg points is not valid, or `fildes` refers to a file
+    that does not support locking" (`xnu-10002.81.5/bsd/man/man2/fcntl.2:892`), and never
+    acknowledges the third case glibc names ("the operating system kernel doesn't support open file
+    description locks"), so `EINVAL` can never be read as "this macOS is too old". Map `EINVAL` (and
+    `ENOLCK`, which Linux documents as including "a remote locking protocol failed", i.e. the NFS/SMB
+    caveat already in `record_lock.rs:63-70`) to *unknown*, never to *free* - which is right for the
+    reason Apple does state.
+  - Read from kernel source rather than run on hardware, so marked per the rule at the top of this
+    document: pre-10.11, cmd 90 falls through to the ioctl-ish default arm of `kern_fcntl` and yields
+    an error (`EINVAL`, occasionally `ENOTTY` from a filesystem's ioctl fallback), never a lock
+    (`xnu-2782.40.9/bsd/kern/kern_descrip.c`); and from its first drop `kern_lockf.c` says "OFD
+    byte-range locks currently do NOT support deadlock detection"
+    (`xnu-3248.60.10/bsd/kern/kern_lockf.c:525-526`), mirrored in the man page from macOS 14 on
+    (`xnu-10002.81.5/bsd/man/man2/fcntl.2:617`). Neither matters to locking one file whole, but the
+    second is the substantive difference the documentation never leads with. Nobody ran a 10.10 box,
+    and nobody searched Apple's release notes or Security Update PDFs for OFD mentions - that search
+    stays unattempted *(verify)*, though given that the public man page begins at macOS 14 it is
+    unlikely to beat 10.11.
 - **Linux details that shape the call.** From the split man pages
   (<https://man7.org/linux/man-pages/man2/F_OFD_GETLK.2const.html>, same content as
   `fcntl_locking(2)`):
@@ -277,9 +321,14 @@ covered in the parent plan's corrections). Three consequences for the phrase lib
 3. Decide whether the probe returns the holder's self-description (reusing `read_holder`) or only a
    boolean; returning it costs nothing and saves `.02`/`.03` each reaching for the path themselves —
    but it risks becoming a second home for holder formatting.
-4. Confirm *(verify)* minimum macOS runtime with working `F_OFD_*`; if it is newer than meethook's
-   floor, the `EINVAL → unknown` mapping becomes the whole story on old systems and deserves a line
-   in `LINUX.md`-adjacent docs.
+4. Settled by TASK-067.05.07: the minimum macOS runtime with working `F_OFD_*` is OS X 10.11
+   (Darwin 15), bisected on Apple's OSS xnu tags, with the public-header and man-page floor at
+   macOS 14 - both written up in the "Availability." bullet in §4 and evidenced in doc-013. It is
+   *older* than meethook's own de facto floor (ScreenCaptureKit needs macOS 12.3+, the mic-activity
+   trigger needs 14.4+, and the release binary's load command declares `minos 14.0`), so nothing that
+   can run `record` lacks the lock, and `EINVAL → unknown` is not the story of old systems. It is the
+   story of the filesystem: the network-mount case, whose user-facing sentences belong to README's
+   `record.lock` entry and to `LINUX.md` (TASK-067.05.07.02).
 5. Measure, for the record (TASK-067.07 territory): kill the real `record` at t = 0.5 s / 4 s / 6 s
    / 20 s and log the four (declared, actual) pairs, to turn "≈5 s" from arithmetic into a measured
    distribution — including the declared-zero case from §3, which the ticket's table does not have.
