@@ -281,9 +281,14 @@ impl<'a> Iterator for Chunks<'a> {
     }
 }
 
-/// How far a track's bytes and its own declaration disagree.
+/// A quantity of audio in one track, counted in bytes and in the milliseconds those bytes are
+/// worth at the file's own rate.
+///
+/// Deliberately not named after disagreement: which audio a span points at -- the part that is
+/// missing, the part no header declared, or the part the file simply holds -- is the business of
+/// the [`TrackEvidence`] variant that carries it, not of the number itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TrackGap {
+pub struct TrackSpan {
     pub bytes: u64,
     pub millis: u64,
 }
@@ -322,7 +327,7 @@ pub enum TrackEvidence {
     /// The header counts more than the file holds: audio that was declared and is now gone.
     /// Never our own death -- see [`track`]'s note on hound's write order -- so this is
     /// truncation by copy, by a truncate, or by a writer that is not us.
-    ShortBy(TrackGap),
+    ShortBy(TrackSpan),
     /// The file holds more than the header counts: audio on disk past what the header declares.
     /// What the bytes prove is about the writer, not about anybody's player -- the header stopped
     /// being updated while bytes kept landing, and neither another `flush` after the last one nor
@@ -336,7 +341,7 @@ pub enum TrackEvidence {
     /// `-ignore_length`; hound's reader divides the declared length by the sample size and trusts
     /// whatever number it finds. So this hands over bytes and milliseconds instead of a promise
     /// about playback, which is also what the report prints.
-    BeyondDeclaration(TrackGap),
+    BeyondDeclaration(TrackSpan),
 }
 
 /// What an unfinished session directory proves, one entry per track.
@@ -515,7 +520,7 @@ fn evidence(window: &[u8], file_len: u64) -> TrackEvidence {
     // quantity a user cares about even when a trailer chunk sits after it. Whether a given reader
     // reaches all of it is a question about that reader, not about these bytes (doc-008 §3).
     let held = file_len.saturating_sub(audio_at);
-    let gap = |bytes: u64| TrackGap {
+    let gap = |bytes: u64| TrackSpan {
         bytes,
         millis: fmt.millis(bytes),
     };
@@ -860,7 +865,7 @@ mod tests {
             "audio written after the checkpoint has to have reached the disk: {held} vs {declared}"
         );
 
-        let expected = TrackGap {
+        let expected = TrackSpan {
             bytes: held - declared,
             millis: (held - declared) * 1_000 / (48_000 * 4),
         };
@@ -923,7 +928,7 @@ mod tests {
 
         assert_eq!(
             track(&path),
-            TrackEvidence::ShortBy(TrackGap {
+            TrackEvidence::ShortBy(TrackSpan {
                 bytes: 1_600,
                 // 16 kHz mono float32: 64 000 bytes a second, so 1 600 bytes is a quarter-second.
                 millis: 25,
@@ -1060,7 +1065,7 @@ mod tests {
         drop(file);
 
         let held = 4 * 1_024 * 1_024 * 1_024;
-        let expected = TrackGap {
+        let expected = TrackSpan {
             bytes: held - 16,
             millis: (held - 16) * 1_000 / (48_000 * 4),
         };

@@ -58,7 +58,7 @@
 
 use crate::paths::{Paths, SessionPaths};
 use crate::record_lock::RecordLock;
-use crate::wav::{TrackEvidence, TrackGap, Unfinished};
+use crate::wav::{TrackEvidence, TrackSpan, Unfinished};
 
 /// What an unfinished directory means *right now*, which is the question its wording depends on.
 ///
@@ -313,12 +313,12 @@ fn track_says(name: &str, evidence: TrackEvidence) -> (String, String) {
     )
 }
 
-/// A gap rendered for a person: decimal seconds under a minute, `h:mm:ss` beyond.
+/// A span of audio rendered for a person: decimal seconds under a minute, `h:mm:ss` beyond.
 ///
-/// Takes the whole [`TrackGap`] rather than a millisecond count so a caller cannot print one
+/// Takes the whole [`TrackSpan`] rather than a millisecond count so a caller cannot print one
 /// half of a measurement without the other. Deliberately not [`crate::TranscriptTime`], which
 /// parses positions inside a transcript and has nothing to do with durations.
-fn human_audio(gap: TrackGap) -> String {
+fn human_audio(gap: TrackSpan) -> String {
     if gap.millis < 60_000 {
         let tenths = gap.millis / 100;
         return format!("{}.{:01} s", tenths / 10, tenths % 10);
@@ -340,8 +340,8 @@ mod tests {
         Unfinished { mic, speaker }
     }
 
-    fn gap(millis: u64, bytes: u64) -> TrackGap {
-        TrackGap { millis, bytes }
+    fn gap(millis: u64, bytes: u64) -> TrackSpan {
+        TrackSpan { millis, bytes }
     }
 
     /// The substring two assertions outside this crate already pin, plus the shape the rest of
@@ -584,7 +584,7 @@ mod tests {
     fn the_brief_when_nothing_holds_the_root_is_the_stopped_form_exactly() {
         let tracks = Unfinished {
             mic: TrackEvidence::CompleteAsDeclared,
-            speaker: TrackEvidence::BeyondDeclaration(TrackGap {
+            speaker: TrackEvidence::BeyondDeclaration(TrackSpan {
                 millis: 4_300,
                 bytes: 137_600,
             }),
@@ -693,11 +693,11 @@ mod tests {
             TrackEvidence::Unknown,
             TrackEvidence::HeaderOnly,
             TrackEvidence::CompleteAsDeclared,
-            TrackEvidence::ShortBy(TrackGap {
+            TrackEvidence::ShortBy(TrackSpan {
                 millis: 200,
                 bytes: 6_400,
             }),
-            TrackEvidence::BeyondDeclaration(TrackGap {
+            TrackEvidence::BeyondDeclaration(TrackSpan {
                 millis: 100,
                 bytes: 3_200,
             }),

@@ -321,7 +321,7 @@ fn the_four_shapes_are_all_there_to_be_read() {
     let empty = unfinished(&paths.session(&SessionId::parse(ORPHANS[1]).unwrap()));
     assert_eq!(
         short.mic,
-        TrackEvidence::ShortBy(meethook_session::wav::TrackGap {
+        TrackEvidence::ShortBy(meethook_session::wav::TrackSpan {
             bytes: 12_800,
             millis: 200,
         }),
@@ -352,7 +352,7 @@ fn the_four_shapes_are_all_there_to_be_read() {
 ///
 /// Scanned rather than parsed: the tests only ever need the one figure a track line carries, and
 /// pulling it out of the printed string is what keeps the comparison about what the user reads
-/// instead of about `TrackGap`'s rounding, which is the renderer's own decision.
+/// instead of about `TrackSpan`'s rounding, which is the renderer's own decision.
 fn seconds_figure(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
     let mut start = None;
