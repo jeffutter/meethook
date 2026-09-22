@@ -23,6 +23,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::placeholder_session;
 use meethook_session::{Acquisition, Paths, RecordLock};
 
 /// How long a refused `record` is given to refuse.
@@ -185,6 +188,25 @@ fn a_second_record_names_the_instance_that_already_holds_the_root() {
     );
 }
 
+/// A root with two sessions in it: one transcribed, one valid. Both are placeholders, which is all
+/// either classification looks at.
+///
+/// The differential needs directories rather than an empty root because `sessions` answers "no
+/// sessions under ..." and returns before it ever asks the kernel who holds the root -- so pointed
+/// at a bare tempdir it would prove nothing about the one command whose entire job is that question.
+/// Two shapes rather than four because this test compares roots against each other, not against a
+/// sentence; the forensic shapes belong to `three_surfaces_one_directory.rs`.
+fn two_sessions(root: &Path) {
+    let paths = Paths::new(root);
+    std::fs::create_dir_all(paths.sessions_dir()).unwrap();
+    placeholder_session(
+        &paths,
+        "20260101-000000",
+        &["session.json", "transcript.json"],
+    );
+    placeholder_session(&paths, "20260101-000100", &["session.json"]);
+}
+
 /// AC#3: the guard is `record`'s alone. Every sibling command sees the same thing whether or not
 /// a recording holds the root, which is what lets `enroll` bring a stale transcript up to date
 /// while the next call is being captured.
@@ -196,7 +218,12 @@ fn a_live_recording_does_not_disturb_any_other_command() {
     // reach the network or a human: a session id that matches nothing sends `transcribe` to
     // "not found" rather than to the gigabytes of model weights a real session would need, and
     // `meeting --clear` is the half of that command that asks macOS for nothing at all.
+    //
+    // `sessions` is the one entry that queries the lock rather than merely refusing to take it, so
+    // it is the differential's only proof that the query is read-only in every sense: same lines,
+    // same exit, and nothing in stderr about who holds it.
     const COMMANDS: &[&[&str]] = &[
+        &["sessions"],
         &["speakers"],
         &["enroll", "--list"],
         &["forget", "Nobody", "--yes"],
@@ -207,6 +234,14 @@ fn a_live_recording_does_not_disturb_any_other_command() {
     for args in COMMANDS {
         let quiet = tempfile::tempdir().unwrap();
         let busy = tempfile::tempdir().unwrap();
+        // Deliberately orphan-free. A directory with no `session.json` is the one shape where a
+        // live recorder legitimately changes what these commands say -- the per-directory
+        // forensics are replaced by the once-per-run hedge, because such a directory may be the
+        // call happening now. That documented difference is not what this differential is for; it
+        // belongs to `sessions_report.rs`'s
+        // `a_recorder_holding_the_root_elsewhere_is_said_once_and_nothing_is_called_interrupted`.
+        two_sessions(quiet.path());
+        two_sessions(busy.path());
         let _lock = hold_lock(busy.path());
 
         let without = run_to_completion(quiet.path(), args);
