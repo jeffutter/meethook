@@ -1053,6 +1053,11 @@ fn tracks(found: &DiscoveredSession) -> (TrackEvidence, TrackEvidence) {
 /// shape of a writer that has not finalized yet) and may disagree with itself in the other
 /// direction; what it must not be is absent, not-a-WAV, unreadable, or a header that has never had
 /// a sample written under it.
+///
+/// `NoDeclaredLength` is deliberately absent from that list for the same reason `BeyondDeclaration`
+/// is: a file in that state holds audio, which is precisely what this predicate asks. Nothing the
+/// recorder writes can produce it either -- `track.rs` checkpoints a real length -- so listing it
+/// here would assert something untrue about a file to guard against a shape that cannot occur.
 fn capturing(evidence: TrackEvidence) -> bool {
     !matches!(
         evidence,

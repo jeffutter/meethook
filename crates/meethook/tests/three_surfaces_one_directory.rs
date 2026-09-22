@@ -257,7 +257,13 @@ fn what_each_surface_prints_is_what_the_renderers_say_about_those_exact_files() 
                 // A measurement in one form is the same measurement in the other, and a track the
                 // detail finds fault with is a track the brief had to mention.
                 match evidence {
-                    TrackEvidence::ShortBy(_) | TrackEvidence::BeyondDeclaration(_) => {
+                    // The three states that print a figure. `NoDeclaredLength` belongs here even
+                    // though no fixture makes one yet -- the relation is stated once here so the
+                    // compiler keeps finding drift when TASK-067.05.09 puts that state in front of
+                    // a surface.
+                    TrackEvidence::ShortBy(_)
+                    | TrackEvidence::BeyondDeclaration(_)
+                    | TrackEvidence::NoDeclaredLength(_) => {
                         // Compare the printed figure rather than recomputing it: the renderer's
                         // rounding is its own business, and what must not drift is the number a
                         // user sees in the two places.

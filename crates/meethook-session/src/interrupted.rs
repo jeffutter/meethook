@@ -295,6 +295,16 @@ fn track_says(name: &str, evidence: TrackEvidence) -> (String, String) {
                 human_audio(gap)
             ),
         ),
+        // One figure, both forms. It says what the file holds and that no length was declared --
+        // nothing about whether a listener reaches all of it (readers were measured disagreeing,
+        // doc-008 §3), and nothing about an end to go past, since this header declared none.
+        TrackEvidence::NoDeclaredLength(held) => (
+            format!("holds {} with no length declared", human_audio(held)),
+            format!(
+                "holds {} of audio, and its header declares no length for it",
+                human_audio(held)
+            ),
+        ),
         TrackEvidence::BeyondDeclaration(gap) => (
             format!(
                 "holds {} past the end its header declares",
@@ -404,6 +414,37 @@ mod tests {
         );
     }
 
+    /// A track whose header declines to declare a length: both forms say what the file holds, and
+    /// neither repeats the sentinel back as a duration. Pinned byte-for-byte because the brief
+    /// clause reaches the one-line surface through a `matches!` that *excludes* only
+    /// `CompleteAsDeclared` -- a new state lands there silently, so its exact wording is asserted
+    /// rather than trusted to fall out right.
+    #[test]
+    fn a_track_that_declares_no_length_reports_what_it_holds_in_both_forms() {
+        let tracks = both(
+            TrackEvidence::CompleteAsDeclared,
+            TrackEvidence::NoDeclaredLength(gap(1_000, 64_000)),
+        );
+        assert_eq!(
+            interrupted_brief(&tracks),
+            "no session.json: no transcript is possible; the speaker track holds 1.0 s with no \
+             length declared"
+        );
+        let lines = interrupted_detail(&tracks);
+        assert_eq!(
+            lines[3],
+            "The speaker track holds 1.0 s of audio, and its header declares no length for it."
+        );
+        // The sentinel weighed as a measurement produced this class of sentence; it must not come
+        // back through the renderer either.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("more audio than the file holds")),
+            "{lines:?}"
+        );
+    }
+
     /// The long form leads with the reason a transcript is impossible -- the shared clock, which
     /// a user verifies by looking for the file -- and ends on what happens to the audio.
     #[test]
@@ -444,6 +485,7 @@ mod tests {
             TrackEvidence::Unknown,
             TrackEvidence::HeaderOnly,
             TrackEvidence::CompleteAsDeclared,
+            TrackEvidence::NoDeclaredLength(gap(4_800, 76_800)),
             TrackEvidence::ShortBy(gap(4_800, 76_800)),
             TrackEvidence::BeyondDeclaration(gap(4_800, 76_800)),
         ] {
@@ -452,7 +494,10 @@ mod tests {
             assert!(long.starts_with("The mic track "), "{long}");
             // Whatever number the brief form prints, the detail prints the same one: a report
             // shows both, and two different measurements of one file is the defect here.
-            if let TrackEvidence::ShortBy(gap) | TrackEvidence::BeyondDeclaration(gap) = evidence {
+            if let TrackEvidence::ShortBy(gap)
+            | TrackEvidence::BeyondDeclaration(gap)
+            | TrackEvidence::NoDeclaredLength(gap) = evidence
+            {
                 let measured = human_audio(gap);
                 assert!(
                     short.contains(&measured) && long.contains(&measured),
@@ -473,6 +518,7 @@ mod tests {
             TrackEvidence::Unknown,
             TrackEvidence::HeaderOnly,
             TrackEvidence::CompleteAsDeclared,
+            TrackEvidence::NoDeclaredLength(gap(1_000, 64_000)),
             TrackEvidence::ShortBy(gap(1_500, 24_000)),
             TrackEvidence::BeyondDeclaration(gap(7_200, 115_200)),
         ];
@@ -693,6 +739,10 @@ mod tests {
             TrackEvidence::Unknown,
             TrackEvidence::HeaderOnly,
             TrackEvidence::CompleteAsDeclared,
+            TrackEvidence::NoDeclaredLength(TrackSpan {
+                millis: 1_000,
+                bytes: 64_000,
+            }),
             TrackEvidence::ShortBy(TrackSpan {
                 millis: 200,
                 bytes: 6_400,

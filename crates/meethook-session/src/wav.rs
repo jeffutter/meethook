@@ -316,10 +316,34 @@ pub enum TrackEvidence {
     /// missing, or there is no `data ` chunk to weigh. Deliberately not folded into any of the
     /// measurements: guessing a number is worse than reporting none.
     Unknown,
-    /// Valid header declaring zero bytes and holding zero bytes: a header that declares nothing,
-    /// with nothing written onto it. Hound's initial header declares zero, and finalizing a writer
-    /// that never received a sample produces the identical bytes, so no event is named here.
+    /// A header that declares no length at all, with nothing written onto it: no event is named
+    /// here. Two kinds of "no length" land together -- `data` declaring zero bytes, which is how
+    /// hound's header is born and what finalizing a writer that never received a sample produces,
+    /// and the `0xFFFFFFFF` "unknown length" sentinel over an empty body, which describes the same
+    /// nothing whatever kind of blank the header was handed ([`TrackEvidence::NoDeclaredLength`]
+    /// is the state for a sentinel that *does* sit on audio).
     HeaderOnly,
+
+    /// The `data` chunk declares `0xFFFFFFFF`, which is not a length. Hound documents the value as
+    /// a stand-alone header for an "infinite or unknown size" file (`into_header_for_infinite_file`,
+    /// hound 3.5.1 `lib.rs`), notes such files are produced for instance by FFmpeg, and its own
+    /// reader refuses them outright; CoreAudio and libavformat read to EOF instead (doc-008 §3).
+    /// So the sentinel is a convention about what the header declines to say, not a quantity, and
+    /// this hands over the audio the file *holds* and says nothing about how much of it any given
+    /// listener reaches -- the same reason [`TrackEvidence::BeyondDeclaration`] carries bytes rather
+    /// than a promise about playback.
+    ///
+    /// Weighing the sentinel instead of recognising it is what once reported "18:38:27 more audio
+    /// than the file holds" for a one-second file that `afinfo` plays whole, which is a confident
+    /// claim about audio the user still has -- the exact class of sentence this module exists not
+    /// to write.
+    ///
+    /// Nothing here is RF64: an `RF64`/`BW64` container legitimately fills these same fields with
+    /// placeholders and is refused by the `RIFF` magic check at the top of `evidence`, so it stays
+    /// [`TrackEvidence::NotAWav`] and cannot reach this state. Reading RF64 is separate work. A
+    /// plain `RIFF` file whose *`RIFF`* size also carries the sentinel does reach it, and correctly
+    /// -- that field is never consulted (see [`track`]).
+    NoDeclaredLength(TrackSpan),
     /// Real bytes and declared bytes agree exactly, and more than zero. Note this says the file
     /// agrees with *itself*, which is all a header can be asked; whether it agrees with the
     /// meeting is a different question, and the one `session.json` used to answer.
@@ -520,19 +544,31 @@ fn evidence(window: &[u8], file_len: u64) -> TrackEvidence {
     // quantity a user cares about even when a trailer chunk sits after it. Whether a given reader
     // reaches all of it is a question about that reader, not about these bytes (doc-008 §3).
     let held = file_len.saturating_sub(audio_at);
-    let gap = |bytes: u64| TrackSpan {
+    let span = |bytes: u64| TrackSpan {
         bytes,
         millis: fmt.millis(bytes),
     };
+
+    // The sentinel is recognised before any arithmetic, because it is not a number to weigh: 4 GiB
+    // of declaration versus a one-second file would otherwise land in `ShortBy` and print hours of
+    // audio as gone. A sentinel over an empty body shares `HeaderOnly` with a declared-zero one --
+    // a file with no audio in it is the same fact whichever kind of "no length" its header used.
+    if declared == u64::from(u32::MAX) {
+        return if held == 0 {
+            TrackEvidence::HeaderOnly
+        } else {
+            TrackEvidence::NoDeclaredLength(span(held))
+        };
+    }
 
     if declared == 0 && held == 0 {
         TrackEvidence::HeaderOnly
     } else if declared == held {
         TrackEvidence::CompleteAsDeclared
     } else if declared > held {
-        TrackEvidence::ShortBy(gap(declared - held))
+        TrackEvidence::ShortBy(span(declared - held))
     } else {
-        TrackEvidence::BeyondDeclaration(gap(held - declared))
+        TrackEvidence::BeyondDeclaration(span(held - declared))
     }
 }
 
@@ -1070,6 +1106,109 @@ mod tests {
             millis: (held - 16) * 1_000 / (48_000 * 4),
         };
         assert_eq!(track(&path), TrackEvidence::BeyondDeclaration(expected));
+    }
+
+    /// The `0xFFFFFFFF` "unknown length" declaration is a refusal to say, not a quantity: the
+    /// verdict hands back the audio the file holds instead of weighing four gigabytes against it.
+    /// A foreign file can arrive this way -- hound itself writes it via
+    /// `into_header_for_infinite_file`, and FFmpeg leaves it behind when a write is aborted -- so
+    /// the shape is plausible rather than exotic.
+    #[test]
+    fn a_declaration_of_unknown_length_reports_what_the_file_holds() {
+        // 44.1 kHz mono at two bytes a sample: 50 000 bytes is 566 ms at 88 200 bytes a second,
+        // deliberately not a round number, so a millisecond count that came from anywhere else
+        // would show.
+        let audio = vec![0u8; 50_000];
+        let wav = riff_with(&[
+            chunk_bytes(b"fmt ", 16, &fmt_body(44_100, 2)),
+            chunk_bytes(b"data", u32::MAX, &audio),
+        ]);
+
+        assert_eq!(
+            evidence(&wav, u64::try_from(wav.len()).unwrap()),
+            TrackEvidence::NoDeclaredLength(TrackSpan {
+                bytes: 50_000,
+                millis: 566,
+            }),
+            "the sentinel must never reach the comparison that produced the old 18h38m claim"
+        );
+    }
+
+    /// A sentinel over an empty body shares `HeaderOnly` with a declared-zero one. Ruled here
+    /// because the alternative was a `ShortBy` of four gigabytes for a file holding no audio --
+    /// which is the same lie, only louder.
+    #[test]
+    fn a_declaration_of_unknown_length_over_no_audio_is_the_same_empty_header() {
+        let wav = riff_with(&[
+            chunk_bytes(b"fmt ", 16, &fmt_body(48_000, 4)),
+            chunk_bytes(b"data", u32::MAX, b""),
+        ]);
+
+        assert_eq!(
+            evidence(&wav, u64::try_from(wav.len()).unwrap()),
+            TrackEvidence::HeaderOnly
+        );
+    }
+
+    /// The exact bytes from the report that started this: a 40-byte extensible `fmt `, `data`
+    /// declaring `0xFFFFFFFF`, and one second of float32 at 16 kHz. The unit helpers above build a
+    /// 16-byte `PCMWAVEFORMAT`; this pins the wider form a stranger actually hands us, read through
+    /// the same path a report uses.
+    #[test]
+    fn a_real_world_track_that_declares_no_length_is_measured_by_what_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mic.wav");
+
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&WAVE_FORMAT_EXTENSIBLE.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // nChannels
+        fmt.extend_from_slice(&16_000u32.to_le_bytes()); // nSamplesPerSec
+        fmt.extend_from_slice(&64_000u32.to_le_bytes()); // nAvgBytesPerSec
+        fmt.extend_from_slice(&4u16.to_le_bytes()); // nBlockAlign
+        fmt.extend_from_slice(&32u16.to_le_bytes()); // wBitsPerSample
+        fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        fmt.extend_from_slice(&32u16.to_le_bytes()); // wValidBitsPerSample
+        fmt.extend_from_slice(&MONO_CHANNEL_MASK.to_le_bytes());
+        fmt.extend_from_slice(&SUBTYPE_IEEE_FLOAT);
+
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(&chunk_bytes(b"fmt ", 40, &fmt));
+        wav.extend_from_slice(&chunk_bytes(b"data", u32::MAX, &vec![0u8; 64_000]));
+        std::fs::write(&path, &wav).unwrap();
+        assert_eq!(
+            wav.len(),
+            68 + 64_000,
+            "the shape the report was written against"
+        );
+
+        assert_eq!(
+            track(&path),
+            TrackEvidence::NoDeclaredLength(TrackSpan {
+                bytes: 64_000,
+                millis: 1_000,
+            })
+        );
+    }
+
+    /// The line drawn under RF64: a `RF64`/`BW64` container uses these same placeholder sizes for
+    /// real, and stays out of the new state because it is refused as a WAV before the walk starts.
+    /// Reading RF64 is separate work; this pins that this change did not quietly begin it.
+    #[test]
+    fn an_rf64_file_still_fails_the_magic_check_rather_than_reading_the_sentinel() {
+        let audio = vec![0u8; 4_000];
+        let mut wav = riff_with(&[
+            chunk_bytes(b"fmt ", 16, &fmt_body(48_000, 4)),
+            chunk_bytes(b"data", u32::MAX, &audio),
+        ]);
+        wav[0..4].copy_from_slice(b"RF64");
+
+        assert_eq!(
+            evidence(&wav, u64::try_from(wav.len()).unwrap()),
+            TrackEvidence::NotAWav
+        );
     }
 
     /// One track and not the other is ordinary: a dead input device abandons one engine and
