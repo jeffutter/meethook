@@ -295,6 +295,9 @@ no options, like `speakers`; reads only, writes nothing, and reports a missing o
 rather than treating it as an error — the one thing that exits nonzero is a `sessions/` it cannot
 scan at all. It works on Linux too, where `record` does not exist: that
 asymmetry is exactly why this is a command rather than something printed when recording starts.
+The same line at the top is also what you get when the filesystem under the root will not
+answer the lock query at all, a network-mounted root being how you reach that, and printing it
+rather than naming a directory interrupted is the safer error.
 
 ### `meethook forget <NAME> [--reference N] [--yes]`
 
@@ -343,7 +346,11 @@ Everything meethook writes lives under one root (`~/meethook` by default, overri
 - `exclusions.json` — apps excluded from the mic-activity trigger (`record` only); user-
   authored, absent by default
 - `record.lock` — held by a live `meethook record` so a second one refuses to start; written by
-  `record`, never deleted, and its presence alone does not mean something is recording
+  `record`, never deleted, and its presence alone does not mean something is recording. Whether
+  one is held is the kernel's own answer, not a reading of the file, and every macOS that can
+  run this tool had that lock long before anything else it needs; where the answer goes silent,
+  or the lock refuses outright, is a network-mounted root - there the guard holds against local
+  processes only, so a second machine can start a second recorder
 
 Nothing here is ever uploaded anywhere; recording, transcription, and enrollment all run
 entirely on-device.

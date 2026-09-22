@@ -7,7 +7,10 @@ come along:
 - **`record`** exists only on macOS. The `meethook-record` crate is pure Apple
   frameworks (ScreenCaptureKit, EventKit, ...) and lives in its own standalone
   workspace; the binary pulls it in through a target-gated dependency, so on Linux
-  the subcommand simply does not exist.
+  the subcommand simply does not exist, `record.lock` is never written here, and
+  `meethook sessions` -- which still asks the kernel about that lock -- hedges the
+  way the report does on macOS when the filesystem will not answer it, Linux
+  spelling that refusal `ENOLCK` where macOS spells it `EINVAL`.
 - **Calendar-backed halves of `meeting`** are macOS-only too. On Linux
   `meeting <id>` lists no candidates and points at `--clear`, which never consults
   the calendar and works everywhere.
