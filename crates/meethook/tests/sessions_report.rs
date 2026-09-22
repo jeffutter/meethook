@@ -8,11 +8,14 @@
 //! the liveness probe -- which reaches the kernel, not a value passed in -- agrees with a recorder
 //! running in another process.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use meethook_session::{Acquisition, Paths, RecordLock, SessionId, recording_in_progress};
+use common::mixed_root;
+use meethook_session::{Acquisition, Paths, RecordLock, recording_in_progress};
 
 /// Every file under `root`, by path relative to it and by bytes: the whole state a run could have
 /// touched.
@@ -39,60 +42,6 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut out = BTreeMap::new();
     walk(root, root, &mut out);
     out
-}
-
-/// A session directory holding exactly `files`, each written as a placeholder.
-///
-/// Honest here because the report tests those two names for presence and never opens them, which
-/// is how `classify` decides what a directory is.
-fn placeholder_session(paths: &Paths, id: &str, files: &[&str]) {
-    let session = paths.session(&SessionId::parse(id).unwrap());
-    std::fs::create_dir_all(session.dir()).unwrap();
-    for file in files {
-        std::fs::write(session.dir().join(file), b"placeholder").unwrap();
-    }
-}
-
-/// A finalized WAV of `seconds` of silence: mono 16 kHz float32, so 64 000 bytes of `data` a
-/// second. Truncating one afterwards is what makes a header declare more than the file holds.
-fn clip(path: &Path, seconds: f64) {
-    let samples = vec![0.0f32; (seconds * 16_000.0) as usize];
-    meethook_enroll::write_clip(path, &samples).unwrap();
-}
-
-/// The same four directories as the unit golden, built the same way: an orphan whose mic stops
-/// 0.2 s short of what its header declares and whose speaker track runs 0.1 s past it, an orphan
-/// with nothing in it, one transcribed and one valid.
-fn mixed_root(root: &Path) -> Paths {
-    let paths = Paths::new(root);
-    std::fs::create_dir_all(paths.sessions_dir()).unwrap();
-    placeholder_session(
-        &paths,
-        "20260809-052700",
-        &["session.json", "transcript.json"],
-    );
-    placeholder_session(&paths, "20260809-052800", &["session.json"]);
-    placeholder_session(&paths, "20260809-052600", &[]);
-    let orphaned = paths.session(&SessionId::parse("20260809-052500").unwrap());
-    std::fs::create_dir_all(orphaned.dir()).unwrap();
-    clip(&orphaned.mic_wav(), 1.0);
-    let mic = orphaned.mic_wav();
-    let len = std::fs::metadata(&mic).unwrap().len();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&mic)
-        .unwrap()
-        .set_len(len - 12_800)
-        .unwrap();
-    use std::io::Write;
-    clip(&orphaned.speaker_wav(), 1.0);
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(orphaned.speaker_wav())
-        .unwrap()
-        .write_all(&[0u8; 6_400])
-        .unwrap();
-    paths
 }
 
 /// The built binary, pointed at this root and given the one subcommand this file exercises.

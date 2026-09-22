@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 // every test target compiles its own copy of this module and uses a
-// subset of it; the parts one binary ignores are not dead code.
+// subset of it -- the pty driver in some, the session fixture in others,
+// usually not all of either; the parts one binary ignores are not dead code.
 
-//! Driving the built binary through a real pty.
+//! The two ways a test drives the built binary: through a real pty, and over a synthetic root.
 //!
 //! The interactive frames only draw when their stdout is a terminal, so a test that wants to
 //! watch one -- or type into it, or kill it mid-keystroke -- cannot settle for the piped stdio
@@ -14,12 +15,20 @@
 //! A child spawned here is owned by the `Driver`, which kills and reaps it on every path out of
 //! the test -- including the panicking ones. That reap is load-bearing rather than tidy: see the
 //! comment on the `Drop` impl, which records the sleeping orphan it exists to prevent.
+//!
+//! The other half builds what that binary is pointed at: a root holding a known mix of session
+//! shapes, assembled from honest WAV forensics so a truncated header is a real truncated header.
+//! Anything that runs a whole-root command -- `sessions`, `transcribe <id>`, `enroll --list` --
+//! against more than one shape at a time should start here rather than lay the same four
+//! directories down again.
 
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+use meethook_session::{Paths, SessionId};
 
 /// The pty geometry every frame is drawn into: wide enough that neither key row wraps, tall
 /// enough for header, status, key hints and footer with room to spare.
@@ -245,6 +254,65 @@ impl Driver {
     pub(crate) fn tail(&self) -> String {
         String::from_utf8_lossy(&self.out[self.out.len().saturating_sub(2000)..]).into_owned()
     }
+}
+
+/// A session directory holding exactly `files`, each written as a placeholder.
+///
+/// Honest here because the report tests those two names for presence and never opens them, which
+/// is how `classify` decides what a directory is.
+pub(crate) fn placeholder_session(
+    paths: &Paths,
+    id: &str,
+    files: &[&str],
+) -> meethook_session::SessionPaths {
+    let session = paths.session(&SessionId::parse(id).unwrap());
+    std::fs::create_dir_all(session.dir()).unwrap();
+    for file in files {
+        std::fs::write(session.dir().join(file), b"placeholder").unwrap();
+    }
+    session
+}
+
+/// A finalized WAV of `seconds` of silence: mono 16 kHz float32, so 64 000 bytes of `data` a
+/// second. Truncating one afterwards is what makes a header declare more than the file holds.
+pub(crate) fn clip(path: &Path, seconds: f64) {
+    let samples = vec![0.0f32; (seconds * 16_000.0) as usize];
+    meethook_enroll::write_clip(path, &samples).unwrap();
+}
+
+/// The same four directories as the unit golden, built the same way: an orphan whose mic stops
+/// 0.2 s short of what its header declares and whose speaker track runs 0.1 s past it, an orphan
+/// with nothing in it, one transcribed and one valid.
+pub(crate) fn mixed_root(root: &Path) -> Paths {
+    let paths = Paths::new(root);
+    std::fs::create_dir_all(paths.sessions_dir()).unwrap();
+    placeholder_session(
+        &paths,
+        "20260809-052700",
+        &["session.json", "transcript.json"],
+    );
+    placeholder_session(&paths, "20260809-052800", &["session.json"]);
+    placeholder_session(&paths, "20260809-052600", &[]);
+    let orphaned = paths.session(&SessionId::parse("20260809-052500").unwrap());
+    std::fs::create_dir_all(orphaned.dir()).unwrap();
+    clip(&orphaned.mic_wav(), 1.0);
+    let mic = orphaned.mic_wav();
+    let len = std::fs::metadata(&mic).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&mic)
+        .unwrap()
+        .set_len(len - 12_800)
+        .unwrap();
+    use std::io::Write;
+    clip(&orphaned.speaker_wav(), 1.0);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(orphaned.speaker_wav())
+        .unwrap()
+        .write_all(&[0u8; 6_400])
+        .unwrap();
+    paths
 }
 
 /// Kills and reaps the child on every path out of a `Driver`, including the ones that never
