@@ -91,8 +91,8 @@ single-instance locking of one file, but it is the one substantive difference th
 
 Version↔name mapping cross-checks (second-party, needed because Apple does not publish a
 Darwin↔product table with xnu branch strings):
-- macOS 15.0 = Darwin 24.0.0 = `xnu-11215.1.10~2` — <https://en.wikipedia.org/wiki/MacOS_Sequoia>
-- macOS 14.0 = Darwin 23.0.0 = `root:xnu-10002.1.13~1` (from a real `uname -a`) —
+- macOS 15.0 = Darwin 24.0.0 = `xnu-11215.1.10~2` - <https://en.wikipedia.org/wiki/MacOS_Sequoia>
+- macOS 14.0 = Darwin 23.0.0 = `root:xnu-10002.1.13~1` (from a real `uname -a`) -
   <http://www.3rz.de/howto/apple-silicon-macos-unix-kernel-system-versions.txt>, corroborated by
   <https://github.com/calmsacibis995/xnu-history>
 
