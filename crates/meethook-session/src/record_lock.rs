@@ -78,6 +78,21 @@
 //! about as hard as locking them. The position is therefore to state it and do neither: with
 //! `<root>` on a network share, this guard holds against processes on the local machine and may
 //! not hold across machines.
+//!
+//! What that costs differs by path, deliberately. [`RecordLock::probe`] maps `EINVAL` -- Apple's
+//! documented wording for "a file that does not support locking" -- and `ENOLCK`, Linux's spelling
+//! of the same condition on NFS/SMB, to [`LockState::Unknown`], which behaves like `Held`: a report
+//! over such a root keeps printing its once-per-run hedge and never calls a session interrupted,
+//! without ever saying why. [`RecordLock::acquire`] treats the same errnos as hard errors, so
+//! `record` refuses to start with an errno rather than a sentence. Falling toward silence on the
+//! read side is the shipped decision rather than an oversight -- asserting that a call in progress
+//! was interrupted is the one claim a wrong answer cannot be allowed to produce -- and the write
+//! side keeps failing loudly because a guard lost without anyone noticing is what this module
+//! exists to end. Neither errno is ever a version signal -- Apple documents `EINVAL` only as "a
+//! file that does not support locking" and never acknowledges the "kernel doesn't support OFD
+//! locks" case glibc names, so nothing here needs to know which macOS it is on (doc-008 section 4).
+//! User-facing wording lives in README and `LINUX.md` (TASK-067.05.07.02), so no second explanation
+//! belongs here.
 
 use std::ffi::CString;
 use std::io::Read;
@@ -184,7 +199,12 @@ impl RecordLock {
     /// Anything other than success or a genuine "already held" answer is an error rather than a
     /// silent pass. Losing the guard without noticing is the failure mode this module exists to
     /// fix, so an unexpected errno names the path and the OS reason and lets the run fail
-    /// loudly -- including on an OS too old to have OFD locks at all.
+    /// loudly. That is not expected to mean "this OS is too old": the kernel has answered cmds
+    /// 90/91/92 since OS X 10.11 and Apple made them public API in macOS 14 (doc-008 section 4),
+    /// while this binary declares `minos 14.0` in its own load command and the recorder's trigger
+    /// needs macOS 14.4+ (`meethook-record/src/activity.rs`). The unexpected errno is therefore a
+    /// filesystem talking -- see the network-mount note above -- which is also why it stays loud
+    /// rather than becoming another flavour of `Unknown`.
     pub fn acquire(paths: &Paths) -> Result<Acquisition> {
         let path = paths.record_lock();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
