@@ -21,13 +21,20 @@
 //! Anything that runs a whole-root command -- `sessions`, `transcribe <id>`, `enroll --list` --
 //! against more than one shape at a time should start here rather than lay the same four
 //! directories down again.
+//!
+//! There are two mothers because there are two audiences. [`mixed_root`] reproduces the four shapes
+//! a user is told about, and README quotes its output byte for byte; [`forensic_root`] holds the
+//! foreign-file shapes nobody advertises. They stay separate on purpose -- see the doc comment on
+//! [`forensic_root`] for the four goldens that would churn if the rows were merged back together.
 
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use meethook_session::wav::TrackEvidence;
 use meethook_session::{Paths, SessionId};
 
 /// The pty geometry every frame is drawn into: wide enough that neither key row wraps, tall
@@ -313,6 +320,232 @@ pub(crate) fn mixed_root(root: &Path) -> Paths {
         .write_all(&[0u8; 6_400])
         .unwrap();
     paths
+}
+
+/// Whether this process reads any file whatever its mode bits say.
+///
+/// The single copy of this guard for the CLI crate's integration targets. A `chmod 0000` file is
+/// not a test fixture under root -- the open succeeds and the state under test simply never
+/// happens -- so a test that builds one has to say which expectation it is holding, rather than
+/// quietly asserting nothing. `meethook-session`'s own unit test for the same state
+/// (`wav.rs`'s `a_file_that_cannot_be_read_is_reported_rather_than_skipped`) guards the same way,
+/// but inside that crate's `#[cfg(test)] mod tests`, which compiles into its own unit-test binary
+/// and cannot be imported from here; this is the one copy this crate shares rather than one per
+/// target.
+pub(crate) fn root_reads_anything() -> bool {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    (unsafe { libc::geteuid() }) == 0
+}
+
+/// One directory of [`forensic_root`]: the shape it was laid down to make, and the reading a
+/// correct reader owes it.
+///
+/// The expected evidence is written next to the construction rather than derived from it, so the
+/// assertion that a surface really printed this state is not a tautology about the builder.
+pub(crate) struct ForensicRow {
+    pub(crate) id: &'static str,
+    /// What the directory is a picture of, named in the failure message when it stops being that.
+    pub(crate) meaning: &'static str,
+    pub(crate) mic: TrackEvidence,
+    /// Every row's speaker track is a plain whole clip: one fault per directory keeps the brief to
+    /// a single clause, which is what makes "the brief named the track the detail reported" a sharp
+    /// assertion instead of one an unrelated clause could satisfy.
+    pub(crate) speaker: TrackEvidence,
+}
+
+/// A root of seven orphaned sessions, each holding exactly one of the track states that
+/// [`mixed_root`] does not reach: `HeaderOnly`, `NotAWav`, `Unreadable` twice, `Unknown` twice and
+/// `NoDeclaredLength`.
+///
+/// These are the shapes a foreign file produces -- a copied-then-truncated track, an image renamed
+/// `.wav`, a file nobody may read, a header whose chunk walk ran off the read window -- and so the
+/// states a support request actually arrives with. Each has had a unit test inside `wav.rs` and a
+/// rendering assertion inside `interrupted.rs` since it was added; what none of them had was ever
+/// reaching a surface a person reads, which is what the callers of this mother exist to prove.
+///
+/// A second mother rather than more rows on [`mixed_root`], for the same reason
+/// `readme_quotes_the_renderers.rs` keeps its fifth shape local: `mixed_root`'s output is pinned
+/// byte for byte in four places -- the listing in `sessions_report.rs`, the census and the
+/// classification table in `three_surfaces_one_directory.rs`, and README's sample block -- and an
+/// exotic row would churn all four while advertising in the documentation a state nobody should
+/// have to meet. Nothing here touches any of them: the ids are fresh, and the four pinned
+/// classifications are unchanged.
+pub(crate) fn forensic_root(root: &Path) -> (Paths, Vec<ForensicRow>) {
+    let paths = Paths::new(root);
+    std::fs::create_dir_all(paths.sessions_dir()).unwrap();
+    let whole = TrackEvidence::CompleteAsDeclared;
+    let mut rows = Vec::new();
+
+    // A header declaring zero `data` bytes and nothing written onto it. Not reachable by dropping a
+    // writer on the floor: through the public create path that leaves a *zero-byte* file, which is
+    // `NotAWav`. Writing a real clip with no samples is the route that produces the declared-zero
+    // header, which is also what finalizing a writer that never received a sample would leave.
+    let session = orphan_session(&paths, "20260101-000001");
+    clip(&session.mic_wav(), 0.0);
+    clip(&session.speaker_wav(), 1.0);
+    rows.push(ForensicRow {
+        id: "20260101-000001",
+        meaning: "a header that was born declaring nothing and never got a sample",
+        mic: TrackEvidence::HeaderOnly,
+        speaker: whole,
+    });
+
+    // An honest PNG renamed `.wav` -- the shape of the support request, not a random blob.
+    let session = orphan_session(&paths, "20260101-100002");
+    std::fs::write(
+        session.mic_wav(),
+        [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+    )
+    .unwrap();
+    clip(&session.speaker_wav(), 1.0);
+    rows.push(ForensicRow {
+        id: "20260101-100002",
+        meaning: "an image that was renamed .wav",
+        mic: TrackEvidence::NotAWav,
+        speaker: whole,
+    });
+
+    // A real clip nobody may read. Under root the mode bits mean nothing, so the row's declared
+    // expectation follows the same guard that gates the chmod -- a row that silently stopped
+    // asserting its state is the unfalsifiable branch this whole ticket is about. The mode is left
+    // set: deleting a file is a privilege of its directory, which `TempDir` owns outright, so
+    // cleanup stays boring and every surface in the calling test still meets the state.
+    let session = orphan_session(&paths, "20260101-200003");
+    clip(&session.mic_wav(), 1.0);
+    let unreadable_by_mode = !root_reads_anything();
+    if unreadable_by_mode {
+        std::fs::set_permissions(session.mic_wav(), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+    }
+    clip(&session.speaker_wav(), 1.0);
+    rows.push(ForensicRow {
+        id: "20260101-200003",
+        meaning: if unreadable_by_mode {
+            "a track the user cannot read"
+        } else {
+            "a track the user cannot read -- skipped: running as root, so mode 0000 still opens"
+        },
+        mic: if unreadable_by_mode {
+            TrackEvidence::Unreadable
+        } else {
+            TrackEvidence::CompleteAsDeclared
+        },
+        speaker: whole,
+    });
+
+    // The same state with no permission bits anywhere in it: `File::open` on a directory succeeds
+    // on macOS and the read afterwards answers EISDIR. This is why the row above being skipped
+    // under root does not cost the suite its proof that a surface prints the sentence.
+    let session = orphan_session(&paths, "20260101-300004");
+    std::fs::create_dir(session.mic_wav()).unwrap();
+    clip(&session.speaker_wav(), 1.0);
+    rows.push(ForensicRow {
+        id: "20260101-300004",
+        meaning: "a directory wearing the name of a track",
+        mic: TrackEvidence::Unreadable,
+        speaker: whole,
+    });
+
+    // A prologue, a parsed `fmt `, and then the file ends before any `data` chunk is even named:
+    // the walk found no audio to weigh. Truncating a real clip just past its `fmt ` chunk is the
+    // cheap route, and the offset comes out of the file rather than out of a constant.
+    let session = orphan_session(&paths, "20260101-400005");
+    let mic = session.mic_wav();
+    clip(&mic, 1.0);
+    let bytes = std::fs::read(&mic).unwrap();
+    let fmt_len = usize::try_from(u32_at(&bytes, 16)).expect("absurd fmt chunk size");
+    assert_eq!(
+        &bytes[20 + fmt_len..24 + fmt_len],
+        b"data",
+        "the clip's layout is not the one this row truncates by"
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&mic)
+        .unwrap()
+        .set_len(u64::try_from(20 + fmt_len).unwrap())
+        .unwrap();
+    clip(&session.speaker_wav(), 1.0);
+    rows.push(ForensicRow {
+        id: "20260101-400005",
+        meaning: "a header that ends before it names any audio",
+        mic: TrackEvidence::Unknown,
+        speaker: whole,
+    });
+
+    // The variant's own second cause: the chunk walk ran off the read window. A `JUNK` prelude
+    // longer than `wav`'s 64 KiB window sits ahead of `fmt `, so the walk stops inside metadata
+    // that a foreign recorder genuinely writes. Pushing `data` past the window instead does not
+    // work -- `Chunks::next` hands back an over-window chunk with the bytes in hand, and the answer
+    // is `ShortBy`. The `RIFF` size is written honestly even though nothing consults it, so this
+    // directory is a picture of one state rather than of two lies.
+    let session = orphan_session(&paths, "20260101-500006");
+    let mic = session.mic_wav();
+    clip(&mic, 1.0);
+    let audio = std::fs::read(&mic).unwrap()[12..].to_vec();
+    const JUNK_PAYLOAD: usize = 70_000; // > the 64 KiB header window
+    let body = [
+        b"JUNK".as_slice(),
+        &(JUNK_PAYLOAD as u32).to_le_bytes(),
+        &vec![0u8; JUNK_PAYLOAD],
+        &audio,
+    ]
+    .concat();
+    let declared = u32::try_from(body.len() + 4).expect("prelude overflowed the riff size");
+    std::fs::write(
+        &mic,
+        [b"RIFF".as_slice(), &declared.to_le_bytes(), b"WAVE", &body].concat(),
+    )
+    .unwrap();
+    clip(&session.speaker_wav(), 1.0);
+    rows.push(ForensicRow {
+        id: "20260101-500006",
+        meaning: "metadata deeper than the header window, hiding the chunks behind it",
+        mic: TrackEvidence::Unknown,
+        speaker: whole,
+    });
+
+    // TASK-067.05.08's sentinel: `data` declaring `0xFFFFFFFF` over audio that is really there.
+    // FFmpeg writes headers like this, which is how a file with no length at all turns up here.
+    let session = orphan_session(&paths, "20260101-600007");
+    let mic = session.mic_wav();
+    clip(&mic, 1.0);
+    let bytes = std::fs::read(&mic).unwrap();
+    let fmt_len = usize::try_from(u32_at(&bytes, 16)).expect("absurd fmt chunk size");
+    let mut file = std::fs::OpenOptions::new().write(true).open(&mic).unwrap();
+    {
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(u64::try_from(24 + fmt_len).unwrap()))
+            .unwrap();
+    }
+    file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+    clip(&session.speaker_wav(), 1.0);
+    rows.push(ForensicRow {
+        id: "20260101-600007",
+        meaning: "audio sitting on a header that declares no length",
+        mic: TrackEvidence::NoDeclaredLength(meethook_session::wav::TrackSpan {
+            bytes: 64_000,
+            millis: 1_000,
+        }),
+        speaker: whole,
+    });
+
+    // Row 3 has to hand back a file the caller can still classify, so the chmod lives inside the
+    // construction rather than in a guard the caller has to remember to arm.
+
+    (paths, rows)
+}
+
+/// A directory named like a session and holding nothing yet.
+fn orphan_session(paths: &Paths, id: &str) -> meethook_session::SessionPaths {
+    let session = paths.session(&SessionId::parse(id).unwrap());
+    std::fs::create_dir_all(session.dir()).unwrap();
+    session
+}
+
+/// A little-endian u32 read out of a file's own bytes.
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
 /// Kills and reaps the child on every path out of a `Driver`, including the ones that never

@@ -8,14 +8,29 @@
 //! directory. Every one of those pins could sit green while `sessions`, `transcribe <id>` and
 //! `enroll --list` drifted apart on a shape none of them happened to hold.
 //!
-//! So this file puts a single root in front of the built binary three ways and compares what a
-//! user actually sees, across processes, over the four forensic shapes `common::mixed_root`
-//! builds. Nothing here needs model weights: `transcribe` reaches them lazily, and a session it
-//! passes over as an orphan never asks for one. That is also why the ids are named rather than
-//! letting `transcribe` scan the root -- a batch run with no ids would open the models for the
-//! `valid` directory and fetch 1.6 GB. [`run`] therefore carries the no-download tripwire, so a
-//! regression in the lazy fetch fails on the command that caused it rather than at the end of
-//! some other test.
+//! So this file puts roots in front of the built binary three ways and compares what a user
+//! actually sees, across processes. It runs two roots rather than one because the two sets of
+//! shapes are kept apart on purpose (see `common::forensic_root`): the four shapes
+//! `common::mixed_root` builds are the ones README advertises, and the foreign-file shapes
+//! `common::forensic_root` builds -- a header with no audio, an image renamed `.wav`, a track
+//! nobody may read, a header whose chunk walk ran off its read window, a header that declares no
+//! length -- are not advertised anywhere. Each root goes through the same comparison, which
+//! [`assert_printed_is_what_renderers_say`] holds out as one function so the second root cannot
+//! be compared by a weaker rule than the first.
+//!
+//! Before the second root existed, four arms of the exhaustive match below had never been reached
+//! by any run: every fixture here was either `mixed_root` or the fifth shape local to
+//! `readme_quotes_the_renderers.rs`, so a state could stop printing anything at all and the suite
+//! stayed green. That is the bug class this file now covers, and the per-row assertion in
+//! `the_states_nobody_had_seen_through_a_surface_are_all_there_to_be_read` is what keeps each
+//! construction honest about the state it still makes.
+//!
+//! Nothing here needs model weights: `transcribe` reaches them lazily, and a session it passes
+//! over as an orphan never asks for one. That is also why the ids are named rather than letting
+//! `transcribe` scan the root -- a batch run with no ids would open the models for a `valid`
+//! directory and fetch 1.6 GB. [`run`] therefore carries the no-download tripwire, so a regression
+//! in the lazy fetch fails on the command that caused it rather than at the end of some other
+//! test.
 //!
 //! The streams differ per surface and are not a defect: `sessions` writes its report to stdout,
 //! `transcribe` its skip lines to stdout, and `enroll --list` its narration to stderr because
@@ -32,9 +47,9 @@ mod common;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use common::mixed_root;
+use common::{forensic_root, mixed_root};
 use meethook_session::wav::{TrackEvidence, unfinished};
-use meethook_session::{SessionId, interrupted_brief, interrupted_detail};
+use meethook_session::{Paths, SessionId, interrupted_brief, interrupted_detail};
 
 /// The two directories `mixed_root` leaves without a `session.json`, oldest first.
 const ORPHANS: [&str; 2] = ["20260809-052500", "20260809-052600"];
@@ -179,19 +194,28 @@ fn transcribe_and_enroll_pass_over_the_same_orphan_in_the_same_words() {
 /// true for evidence states this fixture does not contain, instead of pinning one sentence to
 /// another. `interrupted.rs`'s own `the_two_forms_never_disagree_about_a_track` covers the unit
 /// level; what nothing else covered is that these two CLIs print those two renderings.
-#[test]
-fn what_each_surface_prints_is_what_the_renderers_say_about_those_exact_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = mixed_root(dir.path());
-
-    let (_, _, enroll_err) = run(dir.path(), &["enroll", "--list", ORPHANS[0], ORPHANS[1]]);
-    let (_, transcribe_out, _) = run(dir.path(), &["transcribe", ORPHANS[0], ORPHANS[1]]);
-    let (_, sessions_out, _) = run(dir.path(), &["sessions"]);
+///
+/// Takes the root and the ids to name rather than reaching for one fixture, because the whole
+/// point is that this relation -- byte-equality of the batch bodies against `interrupted_brief`,
+/// of the report block against `interrupted_detail`, and the exhaustive per-track match -- is one
+/// relation, asked of whatever shapes a root happens to hold. Both roots in this file go through
+/// it; a second, softer comparison for the exotic shapes would have been the thing that let a
+/// state print nothing and stay green.
+fn assert_printed_is_what_renderers_say(root: &Path, paths: &Paths, ids: &[&str]) {
+    let mut args = Vec::with_capacity(ids.len() + 2);
+    args.extend_from_slice(&["enroll", "--list"]);
+    args.extend_from_slice(ids);
+    let (_, _, enroll_err) = run(root, &args);
+    let mut args = Vec::with_capacity(ids.len() + 2);
+    args.extend_from_slice(&["transcribe"]);
+    args.extend_from_slice(ids);
+    let (_, transcribe_out, _) = run(root, &args);
+    let (_, sessions_out, _) = run(root, &["sessions"]);
 
     let skipped = bodies(&transcribe_out, "skipped");
     let passed = bodies(&enroll_err, "passed over");
 
-    for id in ORPHANS {
+    for id in ids {
         let session = paths.session(&SessionId::parse(id).unwrap());
         let tracks = unfinished(&session);
         let brief = interrupted_brief(&tracks);
@@ -294,6 +318,13 @@ fn what_each_surface_prints_is_what_the_renderers_say_about_those_exact_files() 
     }
 }
 
+#[test]
+fn what_each_surface_prints_is_what_the_renderers_say_about_those_exact_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = mixed_root(dir.path());
+    assert_printed_is_what_renderers_say(dir.path(), &paths, &ORPHANS);
+}
+
 /// AC#2: the four shapes are present and remain distinguishable, so parity is proven over real
 /// forensic states rather than one toy directory.
 #[test]
@@ -352,6 +383,117 @@ fn the_four_shapes_are_all_there_to_be_read() {
         ORPHANS.to_vec(),
         "the batch run skipped something other than the two orphans"
     );
+}
+
+/// Every non-`CompleteAsDeclared` state that `mixed_root` does not produce now reaches all three
+/// surfaces: `HeaderOnly`, `NotAWav`, `Unreadable` (twice, once without any permission bits so it
+/// survives a root run), `Unknown` (twice, by two different causes) and `NoDeclaredLength`.
+///
+/// Three things are asserted, in this order, because each is a different way the proof could be
+/// hollow. First that each directory still holds the state its row claims -- without that, the
+/// surface comparison below could be comparing fixtures that quietly drifted into a state
+/// `mixed_root` already covers. Then that all three surfaces exit 0 and name every id. Then the
+/// relation itself, via the same helper `mixed_root` goes through.
+#[test]
+fn the_states_nobody_had_seen_through_a_surface_are_all_there_to_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, rows) = forensic_root(dir.path());
+    let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
+
+    // The fixture proof. Names the row's meaning, so a construction that stops producing its state
+    // says which one and what it was supposed to be a picture of.
+    for row in &rows {
+        let tracks = unfinished(&paths.session(&SessionId::parse(row.id).unwrap()));
+        assert_eq!(tracks.mic, row.mic, "row {}: {}", row.id, row.meaning);
+        assert_eq!(tracks.speaker, row.speaker, "row {}", row.id);
+    }
+
+    // All three surfaces, over all seven, still say nothing went wrong.
+    let (sessions_code, sessions_out, _) = run(dir.path(), &["sessions"]);
+    assert_eq!(sessions_code, Some(0));
+    assert!(
+        sessions_out.starts_with(&format!(
+            "7 session(s) in {}: 0 transcribed, 0 valid, 7 orphaned\n",
+            paths.sessions_dir().display()
+        )),
+        "the census over the forensic root changed: {sessions_out}"
+    );
+    let mut args = vec!["transcribe"];
+    args.extend_from_slice(&ids);
+    let (transcribe_code, transcribe_out, _) = run(dir.path(), &args);
+    assert_eq!(transcribe_code, Some(0), "stdout:\n{transcribe_out}");
+    let mut args = vec!["enroll", "--list"];
+    args.extend_from_slice(&ids);
+    let (enroll_code, enroll_out, enroll_err) = run(dir.path(), &args);
+    assert_eq!(enroll_code, Some(0), "stderr:\n{enroll_err}");
+    // House rule, asserted rather than trusted: a batch run with no ids would scan the root and
+    // reach the weights, which is exactly what `run`'s tripwire would then fail.
+    assert_eq!(
+        bodies(&transcribe_out, "skipped")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        ids,
+        "transcribe did not name exactly the seven forensic sessions"
+    );
+    assert_eq!(
+        bodies(&enroll_err, "passed over")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        ids,
+        "enroll --list did not name exactly the seven forensic sessions"
+    );
+    assert!(
+        !enroll_out.contains("passed over"),
+        "enroll --list narrated on stdout, where only the document belongs:\n{enroll_out}"
+    );
+
+    assert_printed_is_what_renderers_say(dir.path(), &paths, &ids);
+
+    // Two directories that render the same sentence prove nothing together, so the briefs have to
+    // separate the states -- while the two rows that share a state (`Unreadable` by mode and by
+    // directory, `Unknown` by missing `data` and by an over-deep prelude) are expected to agree,
+    // since one state is one sentence however many ways there are to make it.
+    let mut seen: Vec<(TrackEvidence, &'static str, String)> = Vec::new();
+    for row in &rows {
+        let tracks = unfinished(&paths.session(&SessionId::parse(row.id).unwrap()));
+        let brief = interrupted_brief(&tracks);
+        match seen.iter().find(|(state, _, _)| *state == row.mic) {
+            // One state is one sentence, however many ways there are to put it on disk.
+            Some((_, other, first)) => assert_eq!(
+                first, &brief,
+                "{} renders its state differently from {other}, which holds the same one",
+                row.id
+            ),
+            None => {
+                if let Some((_, other, text)) = seen.iter().find(|(_, _, other)| *other == brief) {
+                    panic!(
+                        "{} ({:?}) renders the same sentence as {other}, so one proves nothing: {text}",
+                        row.id, row.mic
+                    );
+                }
+                seen.push((row.mic, row.id, brief));
+            }
+        }
+    }
+    // Spelled out rather than counted, because under root the mode-0000 row reports the track as
+    // whole and adds a sixth sentence to the display: what must never go missing is this set.
+    for state in [
+        TrackEvidence::HeaderOnly,
+        TrackEvidence::NotAWav,
+        TrackEvidence::Unreadable,
+        TrackEvidence::Unknown,
+        TrackEvidence::NoDeclaredLength(meethook_session::wav::TrackSpan {
+            bytes: 64_000,
+            millis: 1_000,
+        }),
+    ] {
+        assert!(
+            seen.iter().any(|(shown, _, _)| *shown == state),
+            "{state:?} was never put in front of a surface by this root"
+        );
+    }
 }
 
 /// The first `"<digits>[.<digits>] s"` figure in a rendered sentence.
