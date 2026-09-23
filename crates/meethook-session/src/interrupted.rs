@@ -52,6 +52,9 @@
 //! - **No repair is advertised.** Nothing here offers to rebuild a header or recover a track: the
 //!   design record refuses reopening finalized files, and naming a capability the tool does not
 //!   have manufactures the support request.
+//! - **The word ban stops at these strings.** It covers what this module renders -- both forms and
+//!   the once-per-run note, held by the token tables in the tests below. README's signal discussion
+//!   has to say `kill -9`, and the research notes predate the rule; prose outside is not drift.
 //!
 //! The long form carries the tone a standing report needs -- an unfinished session is an expected
 //! shape, not a failure -- without using the word "error" to get there.
@@ -527,6 +530,7 @@ mod tests {
             for speaker in samples {
                 let text = interrupted_detail(&both(mic, speaker)).join(" ");
                 let text = format!("{text} {}", interrupted_brief(&both(mic, speaker)));
+                // These strings only -- see "The word ban stops at these strings" above.
                 for forbidden in [
                     "crash",
                     "died",

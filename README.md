@@ -381,7 +381,8 @@ cd crates/meethook-record && cargo fmt --all --check && cargo clippy --all-targe
 See [AGENTS.md](./AGENTS.md) for the full architecture (how the five crates divide
 responsibility, and the invariants worth knowing before changing any of them), and
 [`backlog/decisions/`](./backlog/decisions/) for the design record behind specific choices (ASR,
-diarization, speaker matching, echo cancellation, calendar fit, transcript rendering, and more).
+diarization, speaker matching, echo cancellation, calendar fit, transcript rendering, interrupted
+sessions, and more).
 
 ## License
 
