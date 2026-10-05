@@ -30,6 +30,7 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -139,7 +140,35 @@ impl Driver {
             master
         };
 
+        // `crossterm`'s size queries open `/dev/tty` directly rather than trusting whatever fd is
+        // wired up as stdin/stdout (see `window_size` in its unix backend). Left alone, the child
+        // inherits whatever controlling terminal the test happened to be invoked under (another
+        // tty, a multiplexer, an SSH session) rather than `slave`, so `/dev/tty` resolves to a
+        // different rectangle than the one `slave` actually is, the frame sizes itself off that
+        // wrong rectangle while still drawing onto this one, and the keystrokes below land on a
+        // layout that was never drawn.
+        //
+        // The fix is to leave the child with *no* controlling terminal at all, not to give it a
+        // new one: `TIOCNOTTY` just detaches, so `/dev/tty` fails to open and `crossterm` falls
+        // back to `STDOUT_FILENO` -- which is `slave`, correctly. The alternative, `setsid` plus
+        // `TIOCSCTTY` to make the child a session leader owning `slave` as its controlling
+        // terminal, looks more thorough but is the wrong tool here: `interrupt_once` below kills
+        // this child outright, and killing a session leader that owns a controlling terminal is a
+        // heavier kernel teardown than killing an ordinary process -- it hung for upwards of 30
+        // minutes rather than dying, which plain detachment does not.
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_meethook"));
+        // SAFETY: opening `/dev/tty` and the `ioctl` on it are both async-signal-safe, and
+        // detaching is best-effort -- a process already without a controlling terminal (as when
+        // this harness itself runs under no tty) has nothing to detach from, which is not an
+        // error worth failing the spawn over.
+        unsafe {
+            cmd.pre_exec(move || {
+                if let Ok(tty) = std::fs::OpenOptions::new().read(true).open("/dev/tty") {
+                    libc::ioctl(tty.as_raw_fd(), libc::TIOCNOTTY, 0);
+                }
+                Ok(())
+            });
+        }
         cmd.arg("--root")
             .arg(root)
             .args(args)
