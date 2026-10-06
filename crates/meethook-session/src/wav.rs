@@ -421,6 +421,11 @@ pub fn track(path: &Path) -> TrackEvidence {
     };
 
     let file_len = match file.metadata() {
+        // Not a regular file is `Unreadable` by what it is, not by what a read happens to say:
+        // `open` succeeds on a directory, whose `len()` is filesystem-defined (0 on btrfs for an
+        // empty one), and a zero length would make `take` below skip the `read` that fails with
+        // EISDIR, classifying the directory as `NotAWav` there but `Unreadable` elsewhere.
+        Ok(metadata) if !metadata.is_file() => return TrackEvidence::Unreadable,
         Ok(metadata) => metadata.len(),
         Err(_) => return TrackEvidence::Unreadable,
     };

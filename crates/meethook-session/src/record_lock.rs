@@ -794,7 +794,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock = held(dir.path());
 
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("30")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
