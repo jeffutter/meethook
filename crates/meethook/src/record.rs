@@ -2058,17 +2058,28 @@ mod tests {
     /// [`await_end`] -- reusing the microphone's own stop edge, which is the tempting shortcut --
     /// would also produce `["start", "finish"]`, just not until the grace had elapsed. Landing
     /// inside the grace is what says the press broke the recording wait directly.
+    ///
+    /// The grace is stretched well past `LOOP_TIMING`'s so the two answers sit far apart on a
+    /// loaded machine: a direct stop lands tens of milliseconds in, and a stop that waited out the
+    /// grace cannot land before it, since scheduling delay only ever adds. The interrupt is set
+    /// *after* the grace for the same reason in the other direction -- earlier, it would end the
+    /// wait first and let the wrong implementation finalize inside the bound too.
     #[test]
     fn a_hand_stop_finalizes_the_session_and_returns_to_watching() {
+        let timing = Timing {
+            grace: SETTLE * 3 / 2,
+            ..LOOP_TIMING
+        };
         let (_tx, rx) = script(vec![
             (BLIP, Event::Started),
             (BLIP, Event::StopSession),
-            (SETTLE, Event::Interrupt),
+            (timing.grace + SETTLE, Event::Interrupt),
         ]);
 
         let mut capture = FakeCapture::default();
+        let mut silent = Silent;
         let started = Instant::now();
-        run(&rx, &mut capture, &|| true, false);
+        record_loop(&rx, &mut capture, &|| true, false, timing, &mut silent);
 
         assert_eq!(capture.calls, ["start", "finish"]);
         let finished = capture
@@ -2076,7 +2087,7 @@ mod tests {
             .expect("the session was never finalized")
             .duration_since(started);
         assert!(
-            finished < LOOP_TIMING.grace,
+            finished < timing.grace,
             "the hand stop sat in the grace period and finalized after {finished:?}"
         );
     }
