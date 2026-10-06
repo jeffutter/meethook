@@ -52,7 +52,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use jiff::{Timestamp, Zoned};
-use meethook_session::{Meeting, Paths, RosterEdit, SessionId, SessionMetadata, SessionPaths};
+use meethook_session::{
+    AppIdentities, Meeting, Paths, RosterEdit, SessionId, SessionMetadata, SessionPaths,
+};
 
 use crate::output::Output;
 use crate::teardown::Engine as _;
@@ -355,10 +357,20 @@ impl RunningSession {
     /// application goes through the fit-preserving mutation, `fit` is untouched throughout,
     /// and the `is_strong()` gate on the seedable roster applies to the edited roster by
     /// construction.
+    /// Ends the session and writes `session.json`.
+    ///
+    /// `mic_apps` is who held the input device over the whole session, as observed by the caller's
+    /// [`crate::MicActivityWatcher`] on its own cadence. It arrives rather than being read here
+    /// because the recorder never walks the device list -- only the trigger does, and only when it
+    /// is asked to -- and because the last such walk before a session ends happens *before*
+    /// `finish`, when the meeting app is still holding the device. See
+    /// [`meethook_session::SessionMetadata::mic_apps`] for why recording nothing is a normal
+    /// outcome rather than a failure.
     pub fn finish(
         self,
         hand: Option<Meeting>,
         roster_edit: Option<RosterEdit>,
+        mic_apps: AppIdentities,
     ) -> Result<Recording> {
         let RunningSession {
             id,
@@ -387,6 +399,7 @@ impl RunningSession {
             speaker_summary,
             hand,
             roster_edit,
+            mic_apps,
             &mut Output::stderr(),
         )
     }
@@ -401,7 +414,7 @@ impl RunningSession {
 /// a stream that refuses every byte -- the case that matters, because a print that panicked
 /// here landed *before* `session.json` existed and cost the recording. See
 /// [`crate::output`] for why these prints cannot fail.
-// Eight, because every one of them is something `session.json` records or something the
+// Nine, because every one of them is something `session.json` records or something the
 // diagnostics print. Bundling them into a parameter struct would name the bundle, which is a
 // second vocabulary for facts the session already has names for.
 #[allow(clippy::too_many_arguments)]
@@ -413,6 +426,7 @@ fn finalize(
     speaker_summary: TrackSummary,
     hand: Option<Meeting>,
     roster_edit: Option<RosterEdit>,
+    mic_apps: AppIdentities,
     out: &mut Output,
 ) -> Result<Recording> {
     let mic_ticks = mic_summary.first_host_ticks().ok_or(Error::SilentTrack {
@@ -455,6 +469,11 @@ fn finalize(
     // branches, matched by event id -- see the method doc for why the automatic path
     // needs it just as much as the hand-pick path does.
     metadata = metadata.apply_roster_edit(roster_edit);
+    // The observed microphone apps go on the same write as everything else, so a session that
+    // was refused or interrupted never leaves half a record behind. Accumulated rather than
+    // assigned even though this is the one call site, because the type's contract is "a set grows
+    // by union" and a later second caller must not have to re-derive that.
+    metadata.observe_mic_apps(&mic_apps);
     metadata.write(&paths.session_json())?;
 
     Ok(Recording {
@@ -650,6 +669,9 @@ mod tests {
             live_track(2_000),
             Some(hand_picked(start_time)),
             None,
+            // Who held the microphone is recorded on this same write, so it has to arrive here too
+            // -- and one of these three tests carries a real set to prove the write reaches disk.
+            AppIdentities::new(),
             &mut out,
         );
 
@@ -688,6 +710,7 @@ mod tests {
             live_track(2_000),
             Some(hand_picked(start_time)),
             None,
+            AppIdentities::new(),
             &mut out,
         )
         .expect("the ordinary finalize succeeds");
@@ -696,6 +719,44 @@ mod tests {
         assert_eq!(log.refusals(), 0, "and nothing latched");
         assert!(SessionPaths::new(dir.path()).session_json().is_file());
         assert_eq!(recording.id, id);
+    }
+
+    /// The observed microphone apps survive this write like every other fact in the file, and an
+    /// empty observation leaves the key absent rather than writing an empty object.
+    #[test]
+    fn finalize_records_the_observed_microphone_apps() {
+        let dir = tempfile::tempdir().expect("a scratch session directory");
+        let paths = SessionPaths::new(dir.path());
+        let id = SessionId::parse("20260910-120003").expect("a well-formed id");
+        let start_time = "2026-09-10T12:00:03Z".parse().expect("a valid timestamp");
+        let (stream, _log) = ScriptedStream::healthy();
+        let mut out = Output::to(stream);
+
+        finalize(
+            id,
+            paths.clone(),
+            start_time,
+            live_track(1_000),
+            live_track(2_000),
+            None,
+            None,
+            AppIdentities::from_parts(
+                ["com.microsoft.teams2".to_owned()],
+                ["/Applications/Microsoft Teams.app/Contents/MacOS/Teams".into()],
+            ),
+            &mut out,
+        )
+        .expect("the ordinary finalize succeeds");
+
+        let written = SessionMetadata::read(&paths.session_json())
+            .expect("session.json parses back as metadata");
+        assert_eq!(
+            written.mic_apps,
+            AppIdentities::from_parts(
+                ["com.microsoft.teams2".to_owned()],
+                ["/Applications/Microsoft Teams.app/Contents/MacOS/Teams".into()],
+            )
+        );
     }
 
     /// A track that heard nothing is still refused *before* the write, whatever the terminal
@@ -729,6 +790,7 @@ mod tests {
             live_track(2_000),
             Some(hand_picked(start_time)),
             None,
+            AppIdentities::new(),
             &mut out,
         );
 

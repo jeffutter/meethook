@@ -107,6 +107,23 @@ no bundle id are matched by. Find an app's bundle id with `mdls -name kMDItemCFB
 /path/to/App.app`. The file is read once when `meethook record` starts, so restart `record`
 after editing it; with no file, or empty lists, nothing is excluded.
 
+You don't have to look any of that up yourself. Every session records the apps that held the
+microphone while it ran, under `mic_apps` in its `session.json`, spelled in exactly the two keys
+above:
+
+```json
+"mic_apps": {
+  "bundle_ids": ["com.example.voiceink"],
+  "executables": ["/opt/homebrew/bin/some-dictation-tool"]
+}
+```
+
+When a session turns out not to be a meeting, copy those two lists into `exclusions.json` and
+restart `record` — the words are the same because both files are written from one type, so the
+remedy is paste rather than transcription. Only the apps the trigger *counted* appear there: your
+own recorder, Apple's capture helper, and anything already excluded are facts about the run rather
+than about the call. A session that observed nothing omits the key entirely.
+
 #### Troubleshooting: the recording will not stop
 
 The orange microphone dot in the menu bar is a weak instrument. It lights when any input device
@@ -191,10 +208,13 @@ recomputation, then one per holder with its pid, bundle id, `exe=`, `devices=[..
 embedder reports `com.apple.WebKit.GPU`, and a plain binary reports `(no bundle id)` and is
 matched by its `exe=` path. `com.apple.CoreSpeech` beside `devices=[]` holds no device at all and
 is a bystander; `on-default=no` is not an acquittal, because aggregate and virtual devices are
-objects of their own that can contain the built-in microphone. Names worth excluding go in
-`exclusions.json` above, followed by a `record` restart. Two ways to see the same list without
-capturing anything: the probe in the source tree, which opens no device and needs no permission
-but does need the checkout,
+objects of their own that can contain the built-in microphone. When a session finalizes, one more
+line names every app it watched holding the microphone over its whole lifetime —
+`[activity] session apps: com.example.voiceink, /opt/homebrew/bin/some-dictation-tool` — which is
+the same list `session.json` records, so you get it even for a session already finished. Names
+worth excluding go in `exclusions.json` above, followed by a `record` restart. Two ways to see the
+same list without capturing anything: the probe in the source tree, which opens no device and needs
+no permission but does need the checkout,
 
 ```sh
 cd crates/meethook-record && MEETHOOK_ACTIVITY_DEBUG=1 cargo run --example mic-activity -- 60

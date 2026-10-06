@@ -52,7 +52,7 @@ use meethook_session::SessionId;
 #[cfg(target_os = "macos")]
 use meethook_session::{Acquisition, RecordLock};
 #[cfg(any(target_os = "macos", test))]
-use meethook_session::{Attendee, Meeting, MeetingFit, RosterEdit};
+use meethook_session::{AppIdentities, Attendee, Meeting, MeetingFit, RosterEdit};
 // The capture backend exists only where its Apple frameworks compile; the platform-neutral
 // sequencing in `record_loop` below stays ungated and keeps testing without it.
 #[cfg(target_os = "macos")]
@@ -208,7 +208,22 @@ trait Capture {
         sink: &mut dyn Reporter,
         hand: Option<Meeting>,
         roster_edit: Option<RosterEdit>,
+        mic_apps: AppIdentities,
     ) -> Result<()>;
+    /// Who holds the input device right now, as far as the trigger can name them.
+    ///
+    /// Asked once when a session opens and then once per `Timing::recheck`, with the answers
+    /// accumulated for [`Capture::finish`]. Sampling rather than watching is deliberate: the
+    /// predicate that decides when a session starts *short-circuits* on the first counted holder,
+    /// so it never sees the rest of them, while this walks every capturing process. That walk
+    /// costs roughly five property reads per holder, which is why it rides on the poll the loop
+    /// already makes every couple of seconds instead of arriving on a notification of its own --
+    /// the module docs of `meethook_record::activity` record what a per-notification walk did to
+    /// a real Meet join.
+    ///
+    /// Returning nothing is always a legal answer, and a capture with no way to look may return it
+    /// unconditionally: this is a diagnostic, and no session's correctness depends on it.
+    fn observe_mic_apps(&mut self) -> AppIdentities;
     /// Whether the microphone track has stopped receiving audio.
     ///
     /// Asked only while a session is live, once per `Timing::recheck`. The live backend
@@ -680,6 +695,31 @@ impl Reporter for Sink {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+/// Renders observed app identities for the `[activity] session apps:` line.
+///
+/// A function here rather than a `Display` impl on the type: the same reasoning
+/// `MicHolder` records for its own identity field -- the wording of a notice is not the data
+/// type's decision to make, and `session.json` needs these lists as JSON, never as a sentence.
+///
+/// Both kinds are printed on one line because a user reading it is deciding what to paste into
+/// `exclusions.json`, and the two kinds land under different keys there. An empty observation says
+/// so in words rather than printing nothing after the colon, which would read as a broken line.
+fn summarize_app_identities(identities: &AppIdentities) -> String {
+    if identities.is_empty() {
+        return "(none observed)".to_owned();
+    }
+    let mut parts = Vec::with_capacity(identities.bundle_ids.len() + identities.executables.len());
+    parts.extend(identities.bundle_ids.iter().cloned());
+    parts.extend(
+        identities
+            .executables
+            .iter()
+            .map(|path| path.display().to_string()),
+    );
+    parts.join(", ")
+}
+
 /// The live backend: one session at a time, plus the user-facing report of it.
 #[cfg(target_os = "macos")]
 struct SessionCapture<'a> {
@@ -687,6 +727,11 @@ struct SessionCapture<'a> {
     paths: &'a Paths,
     debug: bool,
     running: Option<RunningSession>,
+    /// The trigger that names microphone holders, so a session can record who held its input.
+    ///
+    /// Held rather than consulted by a free function because the watcher owns the device walk and
+    /// the lock around it; one per run, same as the loop's `recheck` closure.
+    watcher: &'a MicActivityWatcher,
 }
 
 #[cfg(target_os = "macos")]
@@ -738,13 +783,23 @@ impl Capture for SessionCapture<'_> {
         sink: &mut dyn Reporter,
         hand: Option<Meeting>,
         roster_edit: Option<RosterEdit>,
+        mic_apps: AppIdentities,
     ) -> Result<()> {
+        // Said while the debug gate is still in scope, and before the finalize can fail: these are
+        // the lines a user greps when a stray session shows up, and the app identities they need
+        // are worth more on a session that produced no recording than on one that did.
+        if self.debug {
+            sink.note(Note::ActivityDebug(format!(
+                "[activity] session apps: {}",
+                summarize_app_identities(&mic_apps)
+            )));
+        }
         // Nothing running is not an error. The loop only finishes a start it saw succeed, so
         // defining the case away here is cheaper than a branch that can only ever be wrong.
         let Some(session) = self.running.take() else {
             return Ok(());
         };
-        let recording = session.finish(hand, roster_edit)?;
+        let recording = session.finish(hand, roster_edit, mic_apps)?;
         sink.note(Note::Recorded {
             id: recording.id.clone(),
             mic_secs: recording.mic.seconds(),
@@ -756,6 +811,25 @@ impl Capture for SessionCapture<'_> {
             meeting: recording.metadata.meeting.as_ref().map(MeetingLabel::from),
         });
         Ok(())
+    }
+
+    fn observe_mic_apps(&mut self) -> AppIdentities {
+        // Counted holders only: an app the user already excluded, and our own capture plus the
+        // ScreenCaptureKit helper, are all facts about this run rather than about the call, and
+        // naming them would put noise where a user looks for the thing to exclude.
+        let mut observed = AppIdentities::new();
+        for holder in self.watcher.holders() {
+            if holder.not_counted_because.is_some() {
+                continue;
+            }
+            if let Some(id) = holder.bundle_id {
+                observed.insert_bundle_id(id);
+            }
+            if let Some(exe) = holder.executable {
+                observed.insert_executable(exe);
+            }
+        }
+        observed
     }
 
     fn mic_stalled(&mut self, sink: &mut dyn Reporter) -> bool {
@@ -878,6 +952,7 @@ pub fn record(paths: &Paths, plain: bool) -> Result<()> {
         paths,
         debug,
         running: None,
+        watcher: &watcher,
     };
     record_loop(
         &rx,
@@ -982,6 +1057,14 @@ fn record_loop(
             });
         }
 
+        // Who holds the microphone for this session, accumulated across the session rather than
+        // read once: the app that joins late (or leaves early) is exactly the one a single sample
+        // misses, and the finish below needs the whole set. Sampled at the start and then on every
+        // re-check tick -- see [`Capture::observe_mic_apps`] for why a poll is the right cadence.
+        // Dies with this block so a device-change or stall restart cannot inherit a predecessor's
+        // roster, the same reason `hand` and `roster_edit` live here.
+        let mut mic_apps = capture.observe_mic_apps();
+
         let outcome = loop {
             match rx.recv_timeout(timing.recheck) {
                 Ok(Event::Stopped) => match await_end(rx, timing.grace) {
@@ -1080,6 +1163,12 @@ fn record_loop(
                     if capture.mic_stalled(sink) {
                         break Recording::MicStalled;
                     }
+                    // The walk behind this is the session's only other view of the world between
+                    // start and finish, and it rides the same tick as the stall check so it costs
+                    // no timer of its own. Placed after the stall break because a dead engine ends
+                    // the session on this pass, and a holder sampled then would be attributed to a
+                    // session that is already over.
+                    mic_apps.merge(&capture.observe_mic_apps());
                     let _ = recheck();
                 }
                 // Every sender is gone, so no edge can arrive again.
@@ -1097,7 +1186,12 @@ fn record_loop(
             }
         }
 
-        if let Err(e) = capture.finish(sink, hand.take(), roster_edit.take()) {
+        if let Err(e) = capture.finish(
+            sink,
+            hand.take(),
+            roster_edit.take(),
+            std::mem::take(&mut mic_apps),
+        ) {
             sink.note(Note::FinishFailed(format!(
                 "This session did not produce a usable recording: {e}"
             )));
@@ -1385,7 +1479,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::commands::Tty;
-    use meethook_session::{Holder, Meeting, MeetingFit, Paths, RosterEdit, SessionId};
+    use meethook_session::{
+        AppIdentities, Holder, Meeting, MeetingFit, Paths, RosterEdit, SessionId,
+    };
 
     use super::{
         Capture, DEVICE_CHANGED, Event, MIC_STALLED, Narration, Note, Offered, Outcome, Plain,
@@ -1716,9 +1812,32 @@ mod tests {
         /// so a test can assert both the addressing id and the edited rows reached the
         /// single finalize point.
         roster_edits: Vec<Option<RosterEdit>>,
+        /// What each `finish` was handed as the observed microphone apps -- the full sets, in
+        /// order -- so a test can assert the accumulation reached the single finalize point.
+        mic_apps: Vec<AppIdentities>,
+        /// The scripted answers `observe_mic_apps` hands back, consumed one per call and then
+        /// repeating the last. A queue rather than one fixed answer because the interesting case
+        /// is an app that appears *mid-session*: a constant answer cannot tell accumulation from
+        /// a single read.
+        observed: std::collections::VecDeque<AppIdentities>,
+        /// How many times the loop asked who holds the microphone.
+        ///
+        /// Counted because "it is sampled on the tick the loop already makes" is the whole cost
+        /// argument for this design, and a device walk on some other cadence would be the way it
+        /// quietly regresses.
+        observations: usize,
     }
 
     impl Capture for FakeCapture {
+        fn observe_mic_apps(&mut self) -> AppIdentities {
+            self.observations += 1;
+            if self.observed.len() > 1 {
+                self.observed.pop_front().expect("checked non-empty")
+            } else {
+                self.observed.front().cloned().unwrap_or_default()
+            }
+        }
+
         fn start(&mut self, _sink: &mut dyn super::Reporter) -> super::Result<()> {
             self.calls.push("start");
             if self.rechecks_before_the_first_session.is_none() {
@@ -1737,11 +1856,13 @@ mod tests {
             _sink: &mut dyn super::Reporter,
             hand: Option<Meeting>,
             roster_edit: Option<RosterEdit>,
+            mic_apps: AppIdentities,
         ) -> super::Result<()> {
             self.calls.push("finish");
             self.finished_at.get_or_insert_with(Instant::now);
             self.hands.push(hand.map(|m| m.event_id));
             self.roster_edits.push(roster_edit);
+            self.mic_apps.push(mic_apps);
             Ok(())
         }
 
@@ -1781,6 +1902,106 @@ mod tests {
             }
         });
         (tx, rx)
+    }
+
+    /// The app that joins after a session starts is the one a single sample would miss.
+    #[test]
+    fn an_app_that_appears_mid_session_is_still_recorded() {
+        // Two holders in the scripted queue: the first answered at session start, the second only
+        // once a re-check tick fires while the session is live. Accumulation is what makes the
+        // finish carry both -- an implementation that sampled once, or that overwrote instead of
+        // merging, hands back one identity or the other.
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture {
+            observed: [teams(), zoom()].into_iter().collect(),
+            ..FakeCapture::default()
+        };
+        run(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.mic_apps.len(), 1, "one session, one finish");
+        assert_eq!(
+            capture.mic_apps[0],
+            AppIdentities::from_parts(
+                [
+                    "com.microsoft.teams2".to_owned(),
+                    "com.zoom.xcode".to_owned()
+                ],
+                [],
+            ),
+            "the late arrival joined the set rather than replacing it"
+        );
+    }
+
+    /// Sampling rides the poll the loop already makes, and nothing else.
+    #[test]
+    fn the_microphone_is_asked_who_holds_it_once_at_start_and_then_per_tick() {
+        // The cost argument for this whole design is that the device walk adds no timer of its
+        // own. Asserted against the re-check count rather than a wall clock: a second timeout
+        // doing the same job would show up here as observations outpacing rechecks.
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            // Long enough for several re-check ticks to expire while the session is live.
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        let rechecks = Arc::new(AtomicUsize::new(0));
+        let counter = rechecks.clone();
+        run(
+            &rx,
+            &mut capture,
+            &|| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                true
+            },
+            false,
+        );
+
+        let asked = capture.observations;
+        let ticks = rechecks.load(Ordering::SeqCst);
+        // One ask at session start, then at most one per tick. `<=` rather than `==` because an
+        // event landing mid-tick legitimately skips that tick's ask -- the loop's own comment
+        // records that starvation -- but never more than one, which is the regression sought.
+        assert!(asked >= 1, "a session always asks at least once");
+        assert!(
+            asked - 1 <= ticks,
+            "{asked} asks against {ticks} re-check ticks means a second cadence"
+        );
+    }
+
+    /// A session that observed nothing is finalized with an empty set, not skipped.
+    #[test]
+    fn a_session_that_observed_nothing_still_finishes_with_an_empty_set() {
+        // The default `FakeCapture` has no scripted holders, which is the shape of a capture with
+        // no way to look. Reaching `finish` with an empty set is what keeps the field absent in
+        // `session.json` rather than making a session go missing.
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+
+        let mut capture = FakeCapture::default();
+        run(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(capture.mic_apps, vec![AppIdentities::new()]);
+    }
+
+    /// A meeting app spelled the way the trigger reports one.
+    fn teams() -> AppIdentities {
+        AppIdentities::from_parts(["com.microsoft.teams2".to_owned()], [])
+    }
+
+    /// A second meeting app, for the cases where two holders matter.
+    fn zoom() -> AppIdentities {
+        AppIdentities::from_parts(["com.zoom.xcode".to_owned()], [])
     }
 
     /// Two consecutive calls in one process lifetime are two separate sessions.

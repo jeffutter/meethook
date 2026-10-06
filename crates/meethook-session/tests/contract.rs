@@ -8,8 +8,8 @@ use std::path::Path;
 
 use jiff::Timestamp;
 use meethook_session::{
-    Attendee, AttendeeStatus, Classification, Meeting, MeetingFit, Paths, RosterEdit,
-    SESSION_SCHEMA_VERSION, SessionId, SessionMetadata, SessionPaths, TrackSync,
+    AppIdentities, Attendee, AttendeeStatus, Classification, Meeting, MeetingFit, Paths,
+    RosterEdit, SESSION_SCHEMA_VERSION, SessionId, SessionMetadata, SessionPaths, TrackSync,
     create_session_dir, discover_sessions, write_atomic,
 };
 use tempfile::TempDir;
@@ -428,6 +428,98 @@ fn session_json_written_before_assertions_still_reads_as_unasserted() {
     let metadata = SessionMetadata::read(&session.session_json()).unwrap();
 
     assert!(metadata.one_remote_speaker.is_none());
+}
+
+// --- the observed microphone apps --------------------------------------------------------
+
+/// A session that named nothing must write exactly the bytes it wrote before this field
+/// existed -- absent, not an empty object, which is why `SESSION_SCHEMA_VERSION` did not move.
+#[test]
+fn a_session_that_observed_no_apps_writes_no_mic_apps_key() {
+    let json = serde_json::to_string(&sample_metadata("20260809-052607")).unwrap();
+    assert!(
+        !json.contains("mic_apps"),
+        "a session that named no app must be byte-identical to a pre-observation file: {json}"
+    );
+}
+
+/// The point of the field: what a session writes uses `exclusions.json`'s own key names, so a
+/// user copies the block into the exclusion file rather than retyping it.
+#[test]
+fn mic_apps_round_trip_and_spelled_the_exclusion_vocabulary() {
+    let mut metadata = sample_metadata("20260809-052607");
+    metadata.observe_mic_apps(&AppIdentities::from_parts(
+        ["com.microsoft.teams2".to_owned()],
+        ["/Applications/Microsoft Teams (work or school).app/Contents/MacOS/Teams".into()],
+    ));
+
+    let stored = serde_json::to_value(&metadata.mic_apps).unwrap();
+    assert_eq!(
+        stored,
+        serde_json::json!({
+            "bundle_ids": ["com.microsoft.teams2"],
+            "executables": [
+                "/Applications/Microsoft Teams (work or school).app/Contents/MacOS/Teams"
+            ]
+        }),
+        "{stored}"
+    );
+
+    let json = serde_json::to_string(&metadata).unwrap();
+    assert_eq!(
+        serde_json::from_str::<SessionMetadata>(&json).unwrap(),
+        metadata
+    );
+}
+
+/// Observation accumulates rather than replaces, and stays sorted and unique: the recorder
+/// asks on every poll, so whichever call lands last must not be able to erase what an earlier
+/// one saw.
+#[test]
+fn mic_apps_accumulate_across_observations() {
+    let mut metadata = sample_metadata("20260809-052607");
+    metadata.observe_mic_apps(&AppIdentities::from_parts(
+        ["com.zoom.xcode".to_owned()],
+        [],
+    ));
+    metadata.observe_mic_apps(&AppIdentities::from_parts(
+        [
+            "com.zoom.xcode".to_owned(),
+            "com.microsoft.teams2".to_owned(),
+        ],
+        ["/Applications/Zoom.app/Contents/MacOS/Zoom".into()],
+    ));
+
+    assert_eq!(
+        metadata.mic_apps,
+        AppIdentities::from_parts(
+            [
+                "com.microsoft.teams2".to_owned(),
+                "com.zoom.xcode".to_owned()
+            ],
+            ["/Applications/Zoom.app/Contents/MacOS/Zoom".into()],
+        )
+    );
+}
+
+/// A `session.json` written before this field existed reads as having observed nothing, rather
+/// than failing to parse -- the same rule every other addition to this file has had to meet.
+#[test]
+fn session_json_written_before_mic_apps_still_reads_as_having_observed_nothing() {
+    let (_tmp, paths) = temp_root();
+    let session = make_session(&paths, "20260809-052607", &[]);
+    let before = r#"{
+      "session_id": "20260809-052607",
+      "schema_version": 1,
+      "start_time": "2026-08-09T05:26:00Z",
+      "mic": { "host_ticks": 9007199254740993, "timebase_numer": 125, "timebase_denom": 3 },
+      "speaker": { "host_ticks": 9007199254740995, "timebase_numer": 125, "timebase_denom": 3 }
+    }"#;
+    fs::write(session.session_json(), before).unwrap();
+
+    let metadata = SessionMetadata::read(&session.session_json()).unwrap();
+
+    assert!(metadata.mic_apps.is_empty());
 }
 
 // --- the fit ---------------------------------------------------------------------------

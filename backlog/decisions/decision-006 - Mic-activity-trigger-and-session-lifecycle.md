@@ -10,6 +10,8 @@ That replacement predicate needed its own corrections, discovered only on real h
 
 A default input device change mid-session (unplugging a headset, for instance) finalizes the current session and opens a new one, rather than rebuilding the audio tap into the same files, because the alignment math downstream measures one acoustic lag per session and the WAV format itself can't hold two sample rates in one file. Separately, a stalled or dead microphone engine — from a device reconfiguration, an exclusive grab by another app, sleep, or any other cause — is detected from whether the track's own delivered-frame counter has advanced recently, checked on the same recheck tick, rather than from any specific CoreAudio notification; this covers every cause structurally, since notifications only cover the causes someone thought to subscribe to, and needs no dedicated sleep/wake handling because a sleep that kills the engine is just another instance of the same stall.
 
+Because the trigger walks every capturing process to decide when a session starts, it can also say who was there — and it now does, per session. Each session records the apps whose capture *counted* toward its existence, under `mic_apps` in `session.json`, spelled in `exclusions.json`'s own two keys so that excluding a program that caused a stray session is copy-paste rather than transcription: one shared type serializes both files, so their key names cannot drift apart. Only counted holders are recorded — meethook's own tap, Apple's capture helper, and anything already excluded are facts about the run rather than about the call. The observation rides the existing two-second recheck tick plus one sample at session start, never a notification of its own: the predicate short-circuits on the first counted holder so it cannot be the source, while a full walk costs several property reads per holder and a per-notification one measurably livelocked a Meet join.
+
 ## Considered options
 
 - The original device-level "is running somewhere" signal alone — self-triggers once meethook holds its own audio tap.
@@ -17,6 +19,8 @@ A default input device change mid-session (unplugging a headset, for instance) f
 - A pidfile/advisory-lock single-instance guard instead of excluding a second process by executable path — judged the better long-term fix, but out of scope for a targeted bug fix; not built. Built days later, reversing this deferral; see Consequences.
 - A settle-and-reread after any notification that produces no edge — still can't recover an edge for which no notification arrives at all.
 - Watching `AVAudioEngineConfigurationChangeNotification` for a stalled engine — covers only two of several real causes and needs new, sandbox-untestable observer plumbing that a delivered-frame counter doesn't.
+- Sampling the microphone holders only when a session finalizes — records nothing for a normal call, since the app that ends a call has left the device by the time the session stops; the union over start-plus-tick samples is what catches an app that joins late or leaves early.
+- Deriving the recorded identities from the debug log's holder line — makes a log format the storage format, so rewording a line silently empties `session.json`; the walk reports the bundle id and canonical executable as data alongside the prose.
 
 ## Consequences
 

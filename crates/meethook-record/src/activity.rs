@@ -255,6 +255,12 @@ pub enum Activity {
 /// Produced by [`MicActivityWatcher::holders`]. Plain fields with no `Display` impl: the
 /// caller composes whatever sentence it puts on screen, and the wording of that notice is not
 /// this module's decision to make.
+///
+/// The identity is reported twice, once as prose and once as data, because the two consumers
+/// want different things from it. [`MicHolder::identity`] is the display string a notice quotes;
+/// [`MicHolder::bundle_id`] and [`MicHolder::executable`] are the same two facts a caller stores
+/// or matches, without parsing a log line. They are read off the same walk rather than derived
+/// from the string, which is what keeps a stored identity from being a format artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicHolder {
     /// Marker-free identity tail: byte-identical to what the `[activity]` line prints after
@@ -267,6 +273,19 @@ pub struct MicHolder {
     /// A non-empty `Vec` whose rows are all `Some` is therefore a meaningful state: holders
     /// exist, and every one of them is excluded.
     pub not_counted_because: Option<String>,
+    /// The holder's bundle id, when it has one.
+    ///
+    /// `None` is common and not a failure: a bare binary reports an *empty* bundle id, which is
+    /// why a second meethook and a driver helper are invisible to the bundle-id rule and have to
+    /// be named by [`MicHolder::executable`] instead.
+    pub bundle_id: Option<String>,
+    /// The canonicalized executable behind the pid, when the read resolved.
+    ///
+    /// Canonicalized, because that is the form both the predicate's own comparisons and
+    /// `exclusions.json`'s entries are in -- so an executable copied from here is one that will
+    /// actually match. An unresolved path is `None` rather than the raw path: a name that cannot
+    /// match an exclusion is not worth storing as if it could, and the debug log still prints it.
+    pub executable: Option<PathBuf>,
 }
 
 /// The variable that turns on the `[activity]` diagnostics, named once because three places
@@ -796,6 +815,10 @@ impl State {
                     &devices,
                     on_default,
                 ),
+                // The same two facts the identity string renders, kept as data for the callers
+                // that store or match them rather than print them.
+                bundle_id,
+                executable: exe.canonical_path().map(PathBuf::from),
                 bearing,
                 ours,
             });
@@ -888,6 +911,10 @@ enum Bearing {
 struct Row {
     /// The identity tail, as the debug log prints it and as [`MicHolder`] reports it.
     identity: String,
+    /// Bundle id as CoreAudio reported it, `None` for a process with none.
+    bundle_id: Option<String>,
+    /// Canonicalized executable behind the pid; `None` for either failure arm of [`Exe`].
+    executable: Option<PathBuf>,
     /// The predicate's verdict on this process, kept because the marker and the exclusion reason
     /// are both read off it.
     bearing: Bearing,
@@ -928,14 +955,23 @@ impl Row {
         if self.ours {
             return None;
         }
+        let (identity, bundle_id, executable) = (
+            self.identity.clone(),
+            self.bundle_id.clone(),
+            self.executable.clone(),
+        );
         match self.bearing {
             Bearing::Activity => Some(MicHolder {
-                identity: self.identity.clone(),
+                identity,
                 not_counted_because: None,
+                bundle_id,
+                executable,
             }),
             Bearing::Excluded(why) => Some(MicHolder {
-                identity: self.identity.clone(),
+                identity,
                 not_counted_because: Some(why.to_owned()),
+                bundle_id,
+                executable,
             }),
             Bearing::Idle => None,
         }
@@ -1553,7 +1589,7 @@ fn executable_of(pid: i32) -> Exe {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use meethook_session::AppExclusions;
+    use meethook_session::{AppExclusions, AppIdentities};
 
     use super::{
         Activity, Bearing, Devices, Exe, OnDefault, Row, bearing, device_changed, edge,
@@ -1569,11 +1605,24 @@ mod tests {
 
     /// No user exclusions: the whole pre-`exclusions.json` matrix below runs against this.
     fn no_exclusions() -> &'static AppExclusions {
-        static EXCLUSIONS: AppExclusions = AppExclusions {
-            bundle_ids: Vec::new(),
-            executables: Vec::new(),
-        };
+        static EXCLUSIONS: AppExclusions = AppExclusions::from_identities(AppIdentities::new());
         &EXCLUSIONS
+    }
+
+    /// Bundle ids spelled as the user would spell them in `exclusions.json`.
+    fn bundle_ids(ids: impl IntoIterator<Item = &'static str>) -> Vec<String> {
+        ids.into_iter().map(str::to_owned).collect()
+    }
+
+    /// Executable paths spelled as the user would spell them in `exclusions.json`.
+    fn exe_paths(paths: impl IntoIterator<Item = &'static str>) -> Vec<PathBuf> {
+        paths.into_iter().map(PathBuf::from).collect()
+    }
+
+    /// A user's exclusion list, built the way the loader builds one -- so a test cannot pass by
+    /// asserting against some shape the real file never produces.
+    fn excluded(bundle_ids: Vec<String>, executables: Vec<PathBuf>) -> AppExclusions {
+        AppExclusions::from_identities(AppIdentities::from_parts(bundle_ids, executables))
     }
 
     #[test]
@@ -1644,10 +1693,7 @@ mod tests {
         // dictation, named by the user rather than by a rebuild. The reason is asserted
         // exactly, not just matched: `State::log` renders it as `<- excluded: {why}`, so
         // this string is what a hardware run shows against the filtered pid.
-        let exclusions = AppExclusions {
-            bundle_ids: vec!["com.example.voiceink".to_owned()],
-            executables: Vec::new(),
-        };
+        let exclusions = excluded(bundle_ids(["com.example.voiceink"]), exe_paths([]));
         assert_eq!(
             bearing(
                 Some(777),
@@ -1668,10 +1714,10 @@ mod tests {
         // The plain-binary case: no bundle id to key on, so the executable entry is the
         // only fact that can name it -- which is also why the file documents listing the
         // real executable inside `.app/Contents/MacOS/`.
-        let exclusions = AppExclusions {
-            bundle_ids: Vec::new(),
-            executables: vec![PathBuf::from("/opt/homebrew/bin/some-dictation-tool")],
-        };
+        let exclusions = excluded(
+            bundle_ids([]),
+            exe_paths(["/opt/homebrew/bin/some-dictation-tool"]),
+        );
         assert_eq!(
             bearing(
                 Some(777),
@@ -1690,10 +1736,7 @@ mod tests {
         // The over-exclusion guard with the list populated: membership is exact, so an app
         // the list does not name -- even a near-miss spelling of an entry -- is still the
         // meeting signal.
-        let exclusions = AppExclusions {
-            bundle_ids: vec!["com.example.voiceink".to_owned()],
-            executables: Vec::new(),
-        };
+        let exclusions = excluded(bundle_ids(["com.example.voiceink"]), exe_paths([]));
         assert_eq!(
             bearing(
                 Some(26975),
@@ -1712,10 +1755,7 @@ mod tests {
         // An unreadable fact never silently widens the user's list: a bundle-id entry cannot
         // fire for a process whose bundle id is unreadable (counted as activity unless its
         // executable entry names it), and the pid-unreadable exclusion still outranks it.
-        let exclusions = AppExclusions {
-            bundle_ids: vec!["com.example.voiceink".to_owned()],
-            executables: Vec::new(),
-        };
+        let exclusions = excluded(bundle_ids(["com.example.voiceink"]), exe_paths([]));
         assert_eq!(
             bearing(Some(777), None, None, OUR_PID, Some(our_exe()), &exclusions,),
             Bearing::Activity
@@ -2028,8 +2068,27 @@ mod tests {
     fn row(identity: &str, bearing: Bearing, ours: bool) -> Row {
         Row {
             identity: identity.to_owned(),
+            bundle_id: None,
+            executable: None,
             bearing,
             ours,
+        }
+    }
+
+    /// A row as [`gather`] would build it, identities included: the shape a real capturing app
+    /// arrives in, for the assertions that care about what a caller can store.
+    fn holder_row(
+        identity: &str,
+        bundle_id: Option<&str>,
+        executable: Option<&str>,
+        bearing: Bearing,
+    ) -> Row {
+        Row {
+            identity: identity.to_owned(),
+            bundle_id: bundle_id.map(str::to_owned),
+            executable: executable.map(PathBuf::from),
+            bearing,
+            ours: false,
         }
     }
 
@@ -2191,5 +2250,43 @@ mod tests {
             row("pid=300 com.apple.SomethingIdle", Bearing::Idle, false).mic_holder(),
             None
         );
+    }
+
+    #[test]
+    fn the_snapshot_carries_the_identity_as_data_as_well_as_prose() {
+        // Why both forms exist: the debug log and a live notice want the string, while a session
+        // that records who held its microphone wants something it can store and later compare
+        // against `exclusions.json`. Parsing the prose for the latter would make a log format
+        // change silently empty a stored field, so the walk hands over the facts themselves.
+        let holder = holder_row(
+            "pid=26975 com.microsoft.teams2 IsRunningInput=true exe=/Applications/x devices=[] on-default=yes",
+            Some("com.microsoft.teams2"),
+            Some("/Applications/Microsoft Teams.app/Contents/MacOS/Teams"),
+            Bearing::Activity,
+        )
+        .mic_holder()
+        .expect("a counted holder is a holder");
+
+        assert_eq!(holder.bundle_id.as_deref(), Some("com.microsoft.teams2"));
+        assert_eq!(
+            holder.executable.as_deref(),
+            Some(Path::new(
+                "/Applications/Microsoft Teams.app/Contents/MacOS/Teams"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_holder_with_unreadable_facts_reports_them_as_absent_not_as_empty() {
+        // A bare binary genuinely has no bundle id, and an unresolvable path must not be stored as
+        // one that could match an exclusion. Both read as `None`, which is also what makes them
+        // invisible to the predicate's user-exclusion rules -- the same asymmetry `bearing`
+        // documents, arriving here by the same route rather than by a second rule.
+        let holder = holder_row("pid=9848 (no bundle id)", None, None, Bearing::Activity)
+            .mic_holder()
+            .expect("a counted holder is a holder");
+
+        assert_eq!(holder.bundle_id, None);
+        assert_eq!(holder.executable, None);
     }
 }

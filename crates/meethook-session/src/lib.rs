@@ -56,7 +56,7 @@ pub use cleaning::{
     PassThrough,
 };
 pub use discovery::{Classification, DiscoveredSession, discover_sessions};
-pub use exclusions::{AppExclusions, EXCLUSIONS_SCHEMA_VERSION};
+pub use exclusions::{AppExclusions, AppIdentities, EXCLUSIONS_SCHEMA_VERSION};
 pub use id::{SessionId, create_session_dir, discard_session_dir};
 pub use interrupted::{
     RootNow, UnfinishedNow, interrupted_brief, interrupted_detail, recording_in_progress,

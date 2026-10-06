@@ -3,7 +3,7 @@ use std::path::Path;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result, SessionId, write_atomic};
+use crate::{AppIdentities, Error, Result, SessionId, write_atomic};
 
 /// Bumped whenever `session.json`'s shape changes incompatibly.
 ///
@@ -385,6 +385,29 @@ pub struct SessionMetadata {
     /// overwrites, and the run converges on the new one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub one_remote_speaker: Option<String>,
+
+    /// The programs that held the microphone while this session recorded.
+    ///
+    /// Diagnostic, and written only by [`SessionMetadata::observe_mic_apps`]. Its purpose is
+    /// narrow and specific: when a session turns out to be something the user did not want
+    /// recorded -- a dictation tool, a voice-command daemon -- this field names the program
+    /// responsible, in exactly the vocabulary `exclusions.json` uses. The remedy is then a copy
+    /// and paste rather than a hunt for a bundle id, which is why the type here is the same
+    /// [`AppIdentities`] the exclusion list is built from.
+    ///
+    /// Absent, not empty, when nothing was observed: a session that recorded no counted holder
+    /// writes byte-identical JSON to what this build's predecessors wrote, which is what keeps
+    /// [`SESSION_SCHEMA_VERSION`] where it is. Note what emptiness therefore cannot mean: the
+    /// recorder's walk reads CoreAudio's process objects, and Apple warns that audio IO may be
+    /// in progress with no active stream, so no key is also consistent with a meeting app the
+    /// walk never named. It is a lead, not a certificate.
+    ///
+    /// Only holders the trigger *counted* as the meeting signal appear here. Meethook's own
+    /// process, its ScreenCaptureKit helper, and anything already in the user's exclusion list
+    /// are left out, so the answer to "why did I get a session for this?" is not padded with
+    /// processes that explain nothing.
+    #[serde(default, skip_serializing_if = "AppIdentities::is_empty")]
+    pub mic_apps: AppIdentities,
 }
 
 impl SessionMetadata {
@@ -403,7 +426,19 @@ impl SessionMetadata {
             meeting: None,
             meeting_cleared: false,
             one_remote_speaker: None,
+            mic_apps: AppIdentities::new(),
         }
+    }
+
+    /// Records that `apps` held the microphone during this session.
+    ///
+    /// Merge rather than replace, because the recorder learns the answer a holder at a time over
+    /// the life of a session: whoever calls this last must not be able to erase what an earlier
+    /// call saw. Idempotent, which is what lets the recorder ask on every poll instead of
+    /// reasoning about which polls are worth asking on -- see the record crate's activity module
+    /// for the cadence and its cost.
+    pub fn observe_mic_apps(&mut self, apps: &AppIdentities) {
+        self.mic_apps.merge(apps);
     }
 
     /// Attaches the meeting this session was recorded during, if one was found.
