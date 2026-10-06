@@ -695,7 +695,7 @@ impl Reporter for Sink {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 /// Renders observed app identities for the `[activity] session apps:` line.
 ///
 /// A function here rather than a `Display` impl on the type: the same reasoning

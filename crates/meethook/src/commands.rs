@@ -22,9 +22,11 @@ use meethook_session::{
 use crate::EnrollArgs;
 use crate::clips::Clips;
 use crate::screen::{Interface, Shared};
+#[cfg(target_os = "macos")]
+use meethook_transcribe::CPU_ENV_VAR;
 use meethook_transcribe::{
-    Attribution, CPU_ENV_VAR, EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL,
-    SILERO_VAD_MODEL, WHISPER_MODEL, WhisperEngine, run_batch,
+    Attribution, EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, SILERO_VAD_MODEL,
+    WHISPER_MODEL, WhisperEngine, run_batch,
 };
 
 /// Transcribes recorded sessions.
