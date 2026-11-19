@@ -21,8 +21,11 @@
 //! audio around the region and the region's own edge is not the edge of its input. Widened
 //! regions that touch, or lie within [`MERGE_GAP_S`] of one another, are merged into one span
 //! and each span costs one [`VoiceIsolation::isolate`] call (the engine windows inside that
-//! call). The number of calls is therefore bounded by how far apart the speech is, not by how
-//! many regions the detector found. Only the original region samples are written back, with a
+//! call). Spans never exceed [`MAX_SPAN_S`]: a longer run is closed and a new span started, and a
+//! single region longer than that is split with [`CONTEXT_S`] of overlap, the seam written back
+//! with full weight (no crossfade toward the original). Memory is thereby bounded by the cap, not
+//! the meeting, and the number of calls by the speech duration and gaps, not by how many regions
+//! the detector found. Only the original region samples are written back, with a
 //! [`FADE_S`] linear crossfade from the original into the isolated audio at each region edge
 //! (the weight is 0 at the edge sample itself), so the splice does not click or step.
 //!
@@ -43,6 +46,10 @@ const CONTEXT_S: f64 = 1.0;
 /// Widened regions closer than this are merged into one span, so tiny regions do not each pay
 /// for a graph invocation (which always runs a whole 8 s window).
 const MERGE_GAP_S: f64 = 3.0;
+/// Longest span (context included) sent to the isolator in one call. The span is held upsampled
+/// to 48 kHz, as the isolator's output, and decimated, so memory is bounded by this rather than by
+/// the meeting. A single region longer than this is split into several spans.
+const MAX_SPAN_S: f64 = 60.0;
 /// Length of the crossfade at each region edge.
 const FADE_S: f64 = 0.015;
 
@@ -131,20 +138,64 @@ fn to_samples(seconds: f64, len: usize) -> usize {
     ((seconds * f64::from(TARGET_RATE)).round().max(0.0) as usize).min(len)
 }
 
-/// The merged `(start, end)` sample spans to run, from `regions` widened by [`CONTEXT_S`].
-fn plan_spans(regions: &[SpeechRegion], len: usize) -> Vec<(usize, usize)> {
+/// A stretch of the track whose isolated audio is written back, and which of its edges are real
+/// region edges (crossfaded) rather than seams inside a region that was split to fit
+/// [`MAX_SPAN_S`] (written back with full weight, so the seam is not pulled toward the original).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Piece {
+    start: usize,
+    end: usize,
+    fade_start: bool,
+    fade_end: bool,
+}
+
+/// One [`VoiceIsolation::isolate`] call: the context-widened `(start, end)` samples sent in and
+/// the pieces written back from the result.
+#[derive(Debug, Clone, PartialEq)]
+struct Span {
+    start: usize,
+    end: usize,
+    pieces: Vec<Piece>,
+}
+
+/// The spans to run, from `regions` (sorted by start) widened by [`CONTEXT_S`]. Nearby regions
+/// merge into one span, but no span exceeds [`MAX_SPAN_S`]; a region too long to fit is split
+/// into pieces whose context overlaps the neighbouring span.
+fn plan_spans(regions: &[SpeechRegion], len: usize) -> Vec<Span> {
     let context = to_samples(CONTEXT_S, usize::MAX);
     let merge_gap = to_samples(MERGE_GAP_S, usize::MAX);
-    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let max_span = to_samples(MAX_SPAN_S, usize::MAX);
+    let max_owned = max_span.saturating_sub(2 * context).max(1);
+    let mut spans: Vec<Span> = Vec::new();
     for region in regions {
-        let start = to_samples(region.start_s, len).saturating_sub(context);
-        let end = (to_samples(region.end_s, len) + context).min(len);
-        if end <= start {
-            continue;
-        }
-        match spans.last_mut() {
-            Some(last) if start < last.1 + merge_gap => last.1 = last.1.max(end),
-            _ => spans.push((start, end)),
+        let start = to_samples(region.start_s, len);
+        let end = to_samples(region.end_s, len);
+        let mut from = start;
+        while from < end {
+            let to = end.min(from + max_owned);
+            let piece = Piece {
+                start: from,
+                end: to,
+                fade_start: from == start,
+                fade_end: to == end,
+            };
+            let wide_start = from.saturating_sub(context);
+            let wide_end = (to + context).min(len);
+            match spans.last_mut() {
+                Some(last)
+                    if wide_start < last.end + merge_gap
+                        && last.end.max(wide_end) - last.start <= max_span =>
+                {
+                    last.end = last.end.max(wide_end);
+                    last.pieces.push(piece);
+                }
+                _ => spans.push(Span {
+                    start: wide_start,
+                    end: wide_end,
+                    pieces: vec![piece],
+                }),
+            }
+            from = to;
         }
     }
     spans
@@ -162,29 +213,33 @@ fn isolate_mic(
     let fade = to_samples(FADE_S, usize::MAX).max(1);
     let mut isolated_samples = 0usize;
 
-    for (index, &(span_start, span_end)) in spans.iter().enumerate() {
+    for (index, span) in spans.iter().enumerate() {
         phase.at(index, spans.len());
-        let span = &cleaned_16k[span_start..span_end];
-        let up = resample_between(span, TARGET_RATE, ISOLATOR_RATE)?;
+        let audio = &cleaned_16k[span.start..span.end];
+        let up = resample_between(audio, TARGET_RATE, ISOLATOR_RATE)?;
         let voice_48k = isolator.isolate(&up)?;
         let voice = resample_between(&voice_48k, ISOLATOR_RATE, TARGET_RATE)?;
-        isolated_samples += span.len();
+        isolated_samples += audio.len();
 
-        for region in &regions {
-            let start = to_samples(region.start_s, cleaned_16k.len()).max(span_start);
-            let end = to_samples(region.end_s, cleaned_16k.len()).min(span_end);
-            if end <= start {
-                continue;
-            }
-            // Half the region at most on each side, so the two ramps of a short region meet
+        for piece in &span.pieces {
+            let (start, end) = (piece.start, piece.end);
+            // Half the piece at most on each side, so the two ramps of a short region meet
             // instead of overlapping.
-            let ramp = fade.min((end - start).div_ceil(2));
+            let ramp = fade.min((end - start).div_ceil(2)) as f32;
             for i in start..end {
-                let into = (i - start) as f32 / ramp as f32;
-                let outof = (end - i) as f32 / ramp as f32;
+                let into = if piece.fade_start {
+                    (i - start) as f32 / ramp
+                } else {
+                    1.0
+                };
+                let outof = if piece.fade_end {
+                    (end - i) as f32 / ramp
+                } else {
+                    1.0
+                };
                 let weight = into.min(outof).min(1.0);
                 // A resampler that came up a sample short leaves the tail as it was.
-                let Some(&iso) = voice.get(i - span_start) else {
+                let Some(&iso) = voice.get(i - span.start) else {
                     continue;
                 };
                 out[i] = cleaned_16k[i] + weight * (iso - cleaned_16k[i]);
@@ -306,14 +361,45 @@ mod tests {
 
     #[test]
     fn many_close_regions_cost_few_invocations() {
-        let audio = signal(120 * 16_000);
+        let audio = signal(60 * 16_000);
         let regions: Vec<_> = (0..200)
-            .map(|k| region(1.0 + k as f64 * 0.5, 1.2 + k as f64 * 0.5))
+            .map(|k| region(1.0 + k as f64 * 0.2, 1.1 + k as f64 * 0.2))
             .collect();
         let (_, report, calls) = run(1.0, regions, &audio);
         assert_eq!(report.regions, 200);
         assert_eq!(calls, 1);
         assert_eq!(report.batches, 1);
+    }
+
+    #[test]
+    fn continuous_speech_is_capped_into_several_calls() {
+        let audio = signal(600 * 16_000);
+        let regions = vec![region(0.0, 600.0)];
+        let spans = plan_spans(&regions, audio.len());
+        let cap = (MAX_SPAN_S * 16_000.0) as usize;
+        assert!(spans.len() > 1);
+        assert!(spans.iter().all(|s| s.end - s.start <= cap));
+        // Many back-to-back regions merge, but still respect the cap.
+        let many: Vec<_> = (0..600).map(|k| region(k as f64, k as f64 + 0.9)).collect();
+        let spans = plan_spans(&many, audio.len());
+        assert!(spans.len() > 1);
+        assert!(spans.iter().all(|s| s.end - s.start <= cap));
+        let (_, report, calls) = run(1.0, many, &audio);
+        assert!(calls > 1);
+        assert_eq!(report.batches, calls);
+    }
+
+    #[test]
+    fn a_forced_split_leaves_no_seam() {
+        // Identity isolator: output must equal the input wherever a region covers it, including
+        // across the seams of a region split to fit the cap.
+        let audio = signal(150 * 16_000);
+        let (out, _, calls) = run(1.0, vec![region(10.0, 140.0)], &audio);
+        assert!(calls > 1);
+        let worst = (10 * 16_000..140 * 16_000)
+            .map(|i| (out[i] - audio[i]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 0.02, "worst deviation {worst}");
     }
 
     #[test]
