@@ -103,6 +103,8 @@ pub struct WhisperEngine {
     tuning: VadTuning,
     threads: i32,
     accelerated: bool,
+    /// Initial prompt built from vocabulary terms; `None` leaves the recognition call untouched.
+    vocabulary_prompt: Option<String>,
 }
 
 impl WhisperEngine {
@@ -162,7 +164,19 @@ impl WhisperEngine {
             tuning: gate_tuning(),
             threads,
             accelerated,
+            vocabulary_prompt: None,
         })
+    }
+
+    /// Biases decoding toward the spelling of `terms` (names, jargon) by giving Whisper an
+    /// initial prompt. Replaces any earlier vocabulary; an empty list clears it. Returns how
+    /// many terms were dropped to fit the prompt window, for the caller to report.
+    ///
+    /// The prompt only ever reaches the gated path in [`SpeechToText::transcribe`].
+    pub fn set_vocabulary(&mut self, terms: &[String]) -> usize {
+        let built = build_vocabulary_prompt(terms);
+        self.vocabulary_prompt = built.text;
+        built.dropped
     }
 
     /// False when recognition is running on the CPU because `MEETHOOK_CPU` asked it to.
@@ -172,6 +186,72 @@ impl WhisperEngine {
     /// so loading prints on no path at all.
     pub fn accelerated(&self) -> bool {
         self.accelerated
+    }
+}
+
+/// Lead-in of the vocabulary prompt. A bare list of terms did not fix a misheard name in
+/// experiment; a short sentence naming the terms did.
+const PROMPT_LEAD_IN: &str = "Meeting notes: ";
+
+/// Byte budget for the whole prompt sentence. Whisper's prompt window is 224 tokens and no
+/// tokenizer is available here, so this is a conservative approximation: 400 bytes is at
+/// most about 2 bytes per token for unusual names, comfortably under the window.
+const PROMPT_MAX_BYTES: usize = 400;
+
+/// The result of [`build_vocabulary_prompt`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct VocabularyPrompt {
+    /// The prompt sentence, or `None` when there are no usable terms.
+    pub text: Option<String>,
+    /// Terms left out because they would not fit [`PROMPT_MAX_BYTES`]. Duplicates and blank
+    /// terms are not counted.
+    pub dropped: usize,
+}
+
+/// Builds the initial-prompt sentence `Meeting notes: A, B, C.` from `terms`.
+///
+/// Terms are trimmed, blanks skipped, and duplicates (case-insensitive) removed keeping the
+/// first spelling: a term repeated in the prompt makes the model echo it into the transcript.
+/// Order is preserved; terms that do not fit the byte budget are dropped from the end, never
+/// truncated.
+pub(crate) fn build_vocabulary_prompt(terms: &[String]) -> VocabularyPrompt {
+    let mut seen = std::collections::HashSet::new();
+    let mut text = String::from(PROMPT_LEAD_IN);
+    let mut kept = 0usize;
+    let mut dropped = 0usize;
+    for term in terms {
+        // A NUL would panic inside whisper-rs's CString conversion.
+        let term = term.replace('\0', "");
+        let term = term.trim();
+        if term.is_empty() || !seen.insert(term.to_lowercase()) {
+            continue;
+        }
+        // Once one term does not fit, later ones are dropped too, so the cut is from the end.
+        let extra = if kept == 0 {
+            term.len()
+        } else {
+            2 + term.len()
+        };
+        if dropped > 0 || text.len() + extra + 1 > PROMPT_MAX_BYTES {
+            dropped += 1;
+            continue;
+        }
+        if kept > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(term);
+        kept += 1;
+    }
+    if kept == 0 {
+        return VocabularyPrompt {
+            text: None,
+            dropped,
+        };
+    }
+    text.push('.');
+    VocabularyPrompt {
+        text: Some(text),
+        dropped,
     }
 }
 
@@ -263,6 +343,13 @@ impl SpeechToText for WhisperEngine {
         //    repetition artefact and this is the knob to reach for if that becomes the
         //    complaint.
         params.set_no_context(true);
+
+        // Below the gate on purpose: ungated, a prompt on a mostly-silent window produced runs
+        // of "I don't know." hallucinations. With no vocabulary no call is made, so the
+        // parameters are exactly what they were before.
+        if let Some(prompt) = &self.vocabulary_prompt {
+            params.set_initial_prompt(prompt);
+        }
 
         // Decoding a meeting is minutes of work behind one call, so whisper.cpp's own progress
         // hook is attached: it fires from the head of the main loop, once per 30 s decoder
@@ -363,5 +450,60 @@ fn report(total_samples: usize, plan: Option<&gate::Splice>) {
             let total = total_samples as f64 / f64::from(TARGET_RATE);
             eprintln!("speech gate: {total:.1} s in, no speech detected; nothing decoded");
         }
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    use super::*;
+
+    fn v(terms: &[&str]) -> Vec<String> {
+        terms.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn sentence_form_in_order() {
+        let p = build_vocabulary_prompt(&v(&["Brog", "Roll20", "D&D"]));
+        assert_eq!(p.text.as_deref(), Some("Meeting notes: Brog, Roll20, D&D."));
+        assert_eq!(p.dropped, 0);
+    }
+
+    #[test]
+    fn dedup_is_case_insensitive_and_keeps_first() {
+        let p = build_vocabulary_prompt(&v(&["Brog", "brog", " BROG ", "Roll20"]));
+        assert_eq!(p.text.as_deref(), Some("Meeting notes: Brog, Roll20."));
+        assert_eq!(p.dropped, 0);
+    }
+
+    #[test]
+    fn empty_and_blank_give_none() {
+        assert_eq!(
+            build_vocabulary_prompt(&[]),
+            VocabularyPrompt {
+                text: None,
+                dropped: 0
+            }
+        );
+        assert_eq!(build_vocabulary_prompt(&v(&["", "  "])).text, None);
+    }
+
+    #[test]
+    fn bound_drops_from_the_end_and_counts() {
+        let terms: Vec<String> = (0..100).map(|i| format!("Term{i:03}xxxxxxxx")).collect();
+        let p = build_vocabulary_prompt(&terms);
+        let text = p.text.unwrap();
+        assert!(text.len() <= PROMPT_MAX_BYTES);
+        assert!(p.dropped > 0);
+        let kept = text.matches("Term").count();
+        assert_eq!(kept + p.dropped, 100);
+        assert!(text.contains("Term000"));
+        assert!(!text.contains("Term099"));
+    }
+
+    #[test]
+    fn oversized_term_is_dropped_not_truncated() {
+        let p = build_vocabulary_prompt(&["x".repeat(500), "Brog".to_string()]);
+        assert_eq!(p.dropped, 2);
+        assert_eq!(p.text, None);
     }
 }
