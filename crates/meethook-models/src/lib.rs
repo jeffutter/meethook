@@ -37,7 +37,10 @@ const TMP_PREFIX: &str = ".meethook-download-";
 /// hash mismatch the user can do nothing about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelSpec {
-    /// File name inside the models directory. Also the cache key.
+    /// Path inside the models directory, and the cache key. Normally a bare file name; may
+    /// have one leading directory (`"model-dir/model.onnx"`) for a model whose files must
+    /// keep their original names to find each other, such as an ONNX graph and its
+    /// external-data file. Absolute paths and `..` are rejected.
     pub file_name: &'static str,
     pub url: &'static str,
     /// Lowercase hex sha256 of the complete file.
@@ -102,6 +105,7 @@ pub fn ensure_model(
     spec: &ModelSpec,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<PathBuf> {
+    check_relative(spec)?;
     let dest = models_dir.join(spec.file_name);
 
     match fs::metadata(&dest) {
@@ -111,7 +115,8 @@ pub fn ensure_model(
         Err(e) => return Err(Error::io(&dest, e)),
     }
 
-    fs::create_dir_all(models_dir).map_err(|e| Error::io(models_dir, e))?;
+    let dest_dir = dest.parent().unwrap_or(models_dir);
+    fs::create_dir_all(dest_dir).map_err(|e| Error::io(dest_dir, e))?;
 
     let mut request = ureq::get(spec.url);
     // A bandwidth allowance, nothing more: every model meethook uses is publicly ungated,
@@ -131,6 +136,27 @@ pub fn ensure_model(
     Ok(dest)
 }
 
+/// Rejects a `file_name` that could resolve outside the models directory or nest deeper
+/// than one directory.
+fn check_relative(spec: &ModelSpec) -> Result<()> {
+    use std::path::Component;
+    let parts: Vec<_> = Path::new(spec.file_name).components().collect();
+    let ok = !parts.is_empty()
+        && parts.len() <= 2
+        && parts.iter().all(|c| matches!(c, Component::Normal(_)));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::io(
+            spec.file_name,
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "model file name must be one file name with at most one directory, no `..`",
+            ),
+        ))
+    }
+}
+
 /// Streams `source` into a temp file beside `dest` and promotes it only if it matches
 /// `spec`.
 ///
@@ -147,7 +173,11 @@ pub fn install_verified(
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<()> {
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = parent.join(format!("{TMP_PREFIX}{}", spec.file_name));
+    let base_name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = parent.join(format!("{TMP_PREFIX}{base_name}"));
 
     let (digest, written) = match stream_and_hash(&mut source, &tmp, spec, progress) {
         Ok(pair) => pair,
@@ -302,6 +332,53 @@ mod tests {
         // against `.invalid`; a download error therefore proves the short file was rejected.
         let err = ensure_model(dir.path(), &SPEC, &mut ignore).unwrap_err();
         assert!(matches!(err, Error::Download { .. }), "{err}");
+    }
+
+    const NESTED: ModelSpec = ModelSpec {
+        file_name: "pair-dir/model.onnx_data",
+        ..SPEC
+    };
+
+    #[test]
+    fn a_nested_spec_installs_into_its_directory_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(NESTED.file_name);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+        install_verified(Cursor::new(PAYLOAD), &dest, &NESTED, &mut ignore).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), PAYLOAD);
+        assert!(temp_files(dest.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_wrong_length_nested_file_is_refetched_and_the_directory_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(NESTED.file_name);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, &PAYLOAD[..4]).unwrap();
+
+        let err = ensure_model(dir.path(), &NESTED, &mut ignore).unwrap_err();
+        assert!(matches!(err, Error::Download { .. }), "{err}");
+
+        // And a missing directory is created rather than failing before the fetch.
+        let fresh = tempfile::tempdir().unwrap();
+        let err = ensure_model(fresh.path(), &NESTED, &mut ignore).unwrap_err();
+        assert!(matches!(err, Error::Download { .. }), "{err}");
+        assert!(fresh.path().join("pair-dir").is_dir());
+    }
+
+    #[test]
+    fn escaping_or_deeply_nested_names_are_rejected_before_any_fetch() {
+        for bad in ["../x.bin", "/abs/x.bin", "a/b/c.bin", ""] {
+            let spec = ModelSpec {
+                file_name: bad,
+                ..SPEC
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let err = ensure_model(dir.path(), &spec, &mut ignore).unwrap_err();
+            assert!(matches!(err, Error::Io { .. }), "{bad}: {err}");
+        }
     }
 
     fn temp_files(dir: &Path) -> Vec<String> {

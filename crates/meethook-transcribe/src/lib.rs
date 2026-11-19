@@ -72,7 +72,10 @@ pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
 // `mixdown` gave it, instead of only the gain.
 pub use loudness::integrated_lufs;
 pub use merge::merge;
-pub use models::{EMBEDDING_MODEL, FIRERED_VAD_MODEL, SEGMENTATION_MODEL, WHISPER_MODEL};
+pub use models::{
+    EMBEDDING_MODEL, FIRERED_VAD_MODEL, NEMOTRON_DIARIZATION_DATA, NEMOTRON_DIARIZATION_GRAPH,
+    NEMOTRON_DIARIZATION_MODELS, SEGMENTATION_MODEL, WHISPER_MODEL,
+};
 pub use onnx::{Loaded, open_session};
 pub use reference::{
     Decline, DeclinedPoint, FragmentProbe, ORIGIN_DISTANCE, Sampling, StoredReference, Sweep,

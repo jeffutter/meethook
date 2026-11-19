@@ -87,3 +87,95 @@ pub const FIRERED_VAD_MODEL: ModelSpec = ModelSpec {
     sha256: "b3c97836130dc34fc32d56fab551e88cf9454511de2b3c250a5e6578dee74b93",
     size_bytes: 2_306_042,
 };
+
+/// Directory under the models directory that holds the Nemotron pair. Unique to this model.
+#[cfg(test)]
+const NEMOTRON_DIR: &str = "nemotron-3-diarization-fp16";
+
+/// The Nemotron-3-Diarization graph (fp16), half of a two-file model.
+///
+/// License: OpenMDW-1.1 (the model card says commercial use is allowed).
+///
+/// The graph is 352 kB and refers to its weights by the literal external-data name
+/// `model_fp16.onnx_data` (seen with `strings` on the graph), so the data file cannot be
+/// renamed to something collision-proof in the flat models directory. Instead both files keep
+/// their original names inside the `nemotron-3-diarization-fp16` directory, a directory name no other model uses.
+/// Install both together via [`NEMOTRON_DIARIZATION_MODELS`].
+///
+/// Revision, hash and size come from the git-LFS pointer at the `raw/` path, as for
+/// [`WHISPER_MODEL`]. A q4f16 variant (73 MB) exists but was not evaluated for accuracy.
+pub const NEMOTRON_DIARIZATION_GRAPH: ModelSpec = ModelSpec {
+    file_name: "nemotron-3-diarization-fp16/model_fp16.onnx",
+    url: "https://huggingface.co/onnx-community/Nemotron-3-Diarization-ONNX/resolve/\
+          353b6f8ad2cac3580e982d7fbdf0a010786b0406/onnx/model_fp16.onnx",
+    sha256: "286f56d64d80755eb0c84f9158c3620c9eccccb84ec53b48942c3795cf5a0c7b",
+    size_bytes: 351_782,
+};
+
+/// The external weights for [`NEMOTRON_DIARIZATION_GRAPH`] (199 MB). Same revision and
+/// license; must sit beside the graph under this exact name.
+pub const NEMOTRON_DIARIZATION_DATA: ModelSpec = ModelSpec {
+    file_name: "nemotron-3-diarization-fp16/model_fp16.onnx_data",
+    url: "https://huggingface.co/onnx-community/Nemotron-3-Diarization-ONNX/resolve/\
+          353b6f8ad2cac3580e982d7fbdf0a010786b0406/onnx/model_fp16.onnx_data",
+    sha256: "affecf841c462d78c86b56a6eee6216b119809285bcbdb4d5c4d541810e9d317",
+    size_bytes: 199_287_808,
+};
+
+/// Both Nemotron files; install every one before opening the graph.
+pub const NEMOTRON_DIARIZATION_MODELS: [ModelSpec; 2] =
+    [NEMOTRON_DIARIZATION_GRAPH, NEMOTRON_DIARIZATION_DATA];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    const ALL: [&ModelSpec; 6] = [
+        &WHISPER_MODEL,
+        &SEGMENTATION_MODEL,
+        &EMBEDDING_MODEL,
+        &FIRERED_VAD_MODEL,
+        &NEMOTRON_DIARIZATION_GRAPH,
+        &NEMOTRON_DIARIZATION_DATA,
+    ];
+
+    #[test]
+    fn the_nemotron_pair_shares_one_directory_with_the_names_the_graph_expects() {
+        let g = Path::new(NEMOTRON_DIARIZATION_GRAPH.file_name);
+        let d = Path::new(NEMOTRON_DIARIZATION_DATA.file_name);
+        assert_eq!(g.parent(), d.parent());
+        assert_eq!(g.parent(), Some(Path::new(NEMOTRON_DIR)));
+        assert_eq!(d.file_name().unwrap(), "model_fp16.onnx_data");
+        assert_eq!(g.file_name().unwrap(), "model_fp16.onnx");
+    }
+
+    #[test]
+    fn no_registry_path_collides_with_another() {
+        for (i, a) in ALL.iter().enumerate() {
+            for b in &ALL[i + 1..] {
+                assert_ne!(a.file_name, b.file_name);
+            }
+        }
+        for spec in ALL {
+            if spec.file_name != NEMOTRON_DIARIZATION_GRAPH.file_name
+                && spec.file_name != NEMOTRON_DIARIZATION_DATA.file_name
+            {
+                assert_ne!(spec.file_name, NEMOTRON_DIR);
+            }
+        }
+    }
+
+    #[test]
+    fn every_url_pins_a_forty_hex_revision() {
+        for spec in ALL {
+            let has_rev = spec
+                .url
+                .split('/')
+                .any(|seg| seg.len() == 40 && seg.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(has_rev, "{} is not pinned to a revision", spec.url);
+            assert!(!spec.url.contains("/main/"), "{}", spec.url);
+            assert_eq!(spec.sha256.len(), 64, "{}", spec.file_name);
+        }
+    }
+}

@@ -213,6 +213,23 @@ mod tests {
         assert_eq!(logits[2], 7, "powerset classes");
     }
 
+    /// The Nemotron graph finds its weights by the literal name `model_fp16.onnx_data` beside
+    /// it, so a successful load of the installed pair proves the reference resolves.
+    #[test]
+    fn the_installed_nemotron_pair_loads() {
+        let Some(dir) = models_dir() else { return };
+        let all_there = crate::NEMOTRON_DIARIZATION_MODELS
+            .iter()
+            .all(|s| dir.join(s.file_name).is_file());
+        if !all_there {
+            eprintln!("skipping: Nemotron pair not installed; run fetch-onnx-models");
+            return;
+        }
+        let graph = dir.join(crate::NEMOTRON_DIARIZATION_GRAPH.file_name);
+        let loaded = open_session(&graph).expect("the installed Nemotron pair must load");
+        assert!(!loaded.session.inputs().is_empty());
+    }
+
     #[test]
     fn the_embedding_graph_takes_fbank_features_and_emits_256_dimensions() {
         let Some(session) = open_if_installed(&EMBEDDING_MODEL) else {
