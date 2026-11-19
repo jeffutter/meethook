@@ -25,7 +25,7 @@ jobs:
           use-flakehub: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-${{ matrix.os }}
+          shared-key: test-v2-${{ matrix.os }}
           workspaces: ". -> target"
       - name: Evict stale native build caches
         run: bash .github/scripts/evict-stale-nix-store-refs.sh
@@ -98,7 +98,7 @@ jobs:
           use-flakehub: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: docs-${{ matrix.os }}
+          shared-key: docs-v2-${{ matrix.os }}
           workspaces: ". -> target"
       - name: Evict stale native build caches
         run: bash .github/scripts/evict-stale-nix-store-refs.sh
