@@ -153,7 +153,7 @@ minijinja = { version = "3", features = ["serde"] }
 # rather than re-argued.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # The sha256 behind `ModelSpec::sha256` and `stream_and_hash`. `meethook-models` is its only
 # consumer -- nothing else in the graph pulls sha2 -- which is what makes the 0.11 requirement
 # safe to state here rather than a duplicate-version hazard.
