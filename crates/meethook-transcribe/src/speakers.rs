@@ -223,7 +223,7 @@ pub const SPEAKER_FLOOR_SECONDS: f64 = 30.0;
 /// the embedding starts to be about the voice.
 ///
 /// Turns below it are skipped, not failed, and counted -- see [`Clustering::skipped`].
-const MIN_EMBEDDABLE_SECONDS: f64 = 0.5;
+pub(crate) const MIN_EMBEDDABLE_SECONDS: f64 = 0.5;
 
 /// Clips offered per cluster. Three gives `enroll` a second and a third opinion when the
 /// first is unclear, without turning naming one speaker into a listening exercise.
@@ -382,10 +382,38 @@ pub fn cluster_speaker_turns(
 }
 
 /// The samples one turn covers, clipped to the track.
-fn slice<'a>(samples: &'a [f32], turn: &LocalTurn) -> &'a [f32] {
+pub(crate) fn slice<'a>(samples: &'a [f32], turn: &LocalTurn) -> &'a [f32] {
     let at = |seconds: f64| ((seconds * TARGET_RATE as f64) as usize).min(samples.len());
     let (start, end) = (at(turn.start_s), at(turn.end_s));
     &samples[start..end.max(start)]
+}
+
+/// Something that turns a stretch of 16 kHz audio into a unit-length voice embedding, or `None`
+/// when there is too little audio to describe. A seam so callers other than the clustering here
+/// can be tested without weights; the only real implementation is [`WeSpeaker`].
+pub(crate) trait TurnEmbedder {
+    fn embed(&mut self, samples: &[f32]) -> Result<Option<Vec<f32>>>;
+}
+
+/// The WeSpeaker session and its filterbank, as a [`TurnEmbedder`].
+pub(crate) struct WeSpeaker {
+    fbank: Fbank,
+    session: Session,
+}
+
+impl WeSpeaker {
+    pub(crate) fn new(session: Session) -> Self {
+        Self {
+            fbank: Fbank::new(),
+            session,
+        }
+    }
+}
+
+impl TurnEmbedder for WeSpeaker {
+    fn embed(&mut self, samples: &[f32]) -> Result<Option<Vec<f32>>> {
+        embed(&mut self.fbank, &mut self.session, samples)
+    }
 }
 
 /// One turn's voice as a unit vector, or `None` if there was not enough audio to describe.
@@ -394,7 +422,11 @@ fn slice<'a>(samples: &'a [f32], turn: &LocalTurn) -> &'a [f32] {
 /// not millions, and batching would mean padding every turn to a common length and telling
 /// the network to ignore the padding -- a mask to get wrong in exchange for a saving nobody
 /// has measured.
-fn embed(fbank: &mut Fbank, session: &mut Session, samples: &[f32]) -> Result<Option<Vec<f32>>> {
+pub(crate) fn embed(
+    fbank: &mut Fbank,
+    session: &mut Session,
+    samples: &[f32],
+) -> Result<Option<Vec<f32>>> {
     let features = fbank.compute(samples);
     if features.is_empty() {
         return Ok(None);
@@ -425,7 +457,7 @@ fn embed(fbank: &mut Fbank, session: &mut Session, samples: &[f32]) -> Result<Op
 /// normalize at all, produces a vector that is never quite equal to anything and matches
 /// nobody. The arithmetic is [`group_mean`]'s; this only maps member indices to the borrowed
 /// slices it takes and drops the length that step also returns.
-fn reference_embedding(members: &[usize], embeddings: &[Vec<f32>]) -> Vec<f32> {
+pub(crate) fn reference_embedding(members: &[usize], embeddings: &[Vec<f32>]) -> Vec<f32> {
     let vectors: Vec<&[f32]> = members.iter().map(|&i| embeddings[i].as_slice()).collect();
     group_mean(&vectors)
         .map(|(unit, _)| unit)
@@ -791,7 +823,10 @@ fn average_linkage(a: &[usize], b: &[usize], distances: &[f32], n: usize) -> f32
 /// audio segmentation did not call speech, which in practice is this speaker's own breath
 /// or the room -- a slightly loose clip is a far better outcome than a speaker who cannot
 /// be named at all.
-fn representatives(members: &[LocalTurn], track_end_s: f64) -> Vec<RepresentativeSegment> {
+pub(crate) fn representatives(
+    members: &[LocalTurn],
+    track_end_s: f64,
+) -> Vec<RepresentativeSegment> {
     let mut longest = members.to_vec();
     longest.sort_by(|a, b| (b.end_s - b.start_s).total_cmp(&(a.end_s - a.start_s)));
     longest.truncate(MAX_REPRESENTATIVES);

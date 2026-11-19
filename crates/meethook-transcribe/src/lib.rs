@@ -29,13 +29,10 @@ mod models;
 // Not called by production code until TASK-088.08 diarizes with Nemotron.
 #[allow(dead_code)]
 mod nemotron_cache;
-// Likewise not called until TASK-088.08.
-#[allow(dead_code)]
+mod nemotron_diarize;
 mod nemotron_mel;
 // Reached through the re-export below until TASK-088.08 diarizes with it.
 mod nemotron_stream;
-// Not called until TASK-088.08 diarizes with Nemotron.
-#[allow(dead_code)]
 mod nemotron_turns;
 // Likewise not called until TASK-088.06 (the `nemotron-step` example reaches it through the
 // re-exports below).
@@ -91,6 +88,7 @@ pub use models::{
     EMBEDDING_MODEL, FIRERED_VAD_MODEL, NEMOTRON_DIARIZATION_DATA, NEMOTRON_DIARIZATION_GRAPH,
     NEMOTRON_DIARIZATION_MODELS, SEGMENTATION_MODEL, WHISPER_MODEL,
 };
+pub use nemotron_diarize::NemotronDiarizer;
 pub use nemotron_graph::{NemotronGraph, StepOutput, encoder_valid};
 pub use nemotron_mel::NemotronMel;
 pub use nemotron_stream::{SpeakerStep, speaker_probabilities};
