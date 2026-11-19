@@ -273,8 +273,15 @@ pub struct Engines {
     pub diarizer: Box<dyn Diarize>,
     /// Isolates the mic track's speech before recognition, or says why it does not.
     pub isolation: Isolation,
-    /// The vocabulary prompt `asr` was given, copied into every transcript this batch writes.
-    pub vocabulary: Option<meethook_session::VocabularyRecord>,
+    /// How each session's vocabulary is chosen; `None` applies no vocabulary at all.
+    pub vocabulary: Option<VocabularyChoice>,
+}
+
+/// The parsed `vocabulary.toml` and the explicit `--vocab` name, if any. The profile is picked
+/// per session because a title-matched profile depends on that session's calendar event.
+pub struct VocabularyChoice {
+    pub vocabulary: meethook_session::Vocabulary,
+    pub explicit: Option<String>,
 }
 
 /// Opens both engines. Boxed and fallible so the caller owns model acquisition, and so the
@@ -614,6 +621,34 @@ fn transcribe_and_write(
     mixdown_settings: mixdown::Settings,
     progress: &mut dyn Write,
 ) -> Result<usize> {
+    // Before the (long) transcription, so an ambiguous title fails the session at once. Only
+    // the title of a strongly-fitted event is used, and only to pick a profile: it is neither
+    // printed nor stored.
+    let early_metadata = session.load_metadata()?;
+    let vocabulary_profile = if let Some(choice) = &engines.vocabulary {
+        let title = early_metadata
+            .meeting
+            .as_ref()
+            .filter(|m| m.fit.is_strong())
+            .map(|m| m.title.as_str());
+        let selection = choice
+            .vocabulary
+            .select(choice.explicit.as_deref(), title)?;
+        let dropped = engines.asr.set_vocabulary(&selection.terms);
+        if dropped > 0 {
+            writeln!(
+                progress,
+                "{}  Note: {dropped} vocabulary terms did not fit the prompt window.",
+                session.id
+            )?;
+        }
+        if let Some(profile) = &selection.profile {
+            writeln!(progress, "{}  vocabulary profile: {profile}", session.id)?;
+        }
+        Some(selection.profile)
+    } else {
+        None
+    };
     let transcript = transcribe_session_isolating(
         session,
         engines.asr.as_mut(),
@@ -627,7 +662,15 @@ fn transcribe_and_write(
     // audio and returns only the transcript. One small JSON read beside a Whisper pass over a
     // whole meeting is not a cost worth widening that signature for.
     let metadata = session.load_metadata()?;
-    let transcript = transcript.with_vocabulary(engines.vocabulary.clone());
+    // Read back from the engine: the recorded text must be the text Whisper got.
+    let record = match (vocabulary_profile, engines.asr.vocabulary_prompt()) {
+        (Some(profile), Some(prompt)) => Some(meethook_session::VocabularyRecord {
+            profile,
+            prompt: prompt.to_owned(),
+        }),
+        _ => None,
+    };
+    let transcript = transcript.with_vocabulary(record);
     transcript.write(&session.paths, template, &TranscriptContext::now(&metadata))?;
     Ok(transcript.turns.len())
 }
@@ -763,6 +806,8 @@ mod tests {
         /// One canned response per call, in call order. Calls past the end answer nothing.
         responses: Vec<Vec<AsrSegment>>,
         heard: Vec<Vec<f32>>,
+        /// The "prompt" a fake would have built: the terms joined with commas.
+        prompt: Option<String>,
     }
 
     impl FakeAsr {
@@ -770,11 +815,21 @@ mod tests {
             FakeAsr {
                 responses: vec![mic, speaker],
                 heard: Vec::new(),
+                prompt: None,
             }
         }
     }
 
     impl SpeechToText for FakeAsr {
+        fn set_vocabulary(&mut self, terms: &[String]) -> usize {
+            self.prompt = (!terms.is_empty()).then(|| terms.join(", "));
+            0
+        }
+
+        fn vocabulary_prompt(&self) -> Option<&str> {
+            self.prompt.as_deref()
+        }
+
         fn transcribe(&mut self, audio: &[f32]) -> Result<Vec<AsrSegment>> {
             self.heard.push(audio.to_vec());
             Ok(self
@@ -2460,49 +2515,108 @@ mod tests {
         (opened, String::from_utf8(out).unwrap())
     }
 
+    fn give_meeting(session: &DiscoveredSession, title: &str, fit: meethook_session::MeetingFit) {
+        let meeting = meethook_session::Meeting::new(
+            "evt".into(),
+            title.into(),
+            "Home".into(),
+            "2026-08-09T05:00:00Z".parse().unwrap(),
+            "2026-08-09T06:00:00Z".parse().unwrap(),
+        )
+        .with_fit(fit);
+        let metadata = session.load_metadata().unwrap().with_meeting(Some(meeting));
+        metadata.write(&session.paths.session_json()).unwrap();
+    }
+
     #[test]
-    fn the_vocabulary_prompt_and_profile_are_recorded_and_absent_when_unused() {
+    fn the_vocabulary_profile_follows_each_sessions_event_title() {
+        use meethook_session::MeetingFit::{Confirmed, JoinedLate};
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path());
-        make_session(&paths, "20260809-052600", 1_000_000);
-        make_session(&paths, "20260809-052700", 1_000_000);
+        std::fs::write(
+            paths.vocabulary_toml(),
+            "[global]\nterms = [\"meethook\"]\n[profile.dnd]\nterms = [\"Strahd\"]\n\
+             match_title = \"(?i)curse of strahd\"\n[profile.rival]\nterms = [\"Rival\"]\n\
+             match_title = \"(?i)rival\"\n",
+        )
+        .unwrap();
+        let ids = [
+            "20260809-052600",
+            "20260809-052700",
+            "20260809-052800",
+            "20260809-052900",
+            "20260809-053000",
+        ];
+        let sessions: Vec<_> = ids
+            .iter()
+            .map(|id| make_session(&paths, id, 1_000_000))
+            .collect();
+        give_meeting(&sessions[0], "Curse of Strahd, session 9", Confirmed);
+        // No match, a weak fit that would match, and two profiles matching at once.
+        give_meeting(&sessions[1], "Sprint planning", Confirmed);
+        give_meeting(&sessions[2], "Curse of Strahd, session 10", JoinedLate);
+        give_meeting(&sessions[3], "Rival of Curse of Strahd", Confirmed);
+        // sessions[4] has no meeting at all.
 
         let mut factory = || {
             let mut engines = fake_engines();
-            engines.vocabulary = Some(meethook_session::VocabularyRecord {
-                profile: Some("dnd".into()),
-                prompt: "Meeting notes: Strahd.".into(),
+            engines.vocabulary = Some(VocabularyChoice {
+                vocabulary: meethook_session::Vocabulary::load(&paths).unwrap(),
+                explicit: None,
             });
             Ok(engines)
         };
-        let run = |factory: &mut dyn FnMut() -> std::result::Result<
-            Engines,
-            Box<dyn std::error::Error + Send + Sync>,
-        >,
-                   ids: &[SessionId]| {
-            run_batch(
-                &paths,
-                ids,
-                true,
-                false,
-                &TranscriptTemplate::builtin(),
-                mixdown::Settings::default(),
-                factory,
-                &mut Vec::new(),
-            )
-            .unwrap();
-        };
-        let first = SessionId::parse("20260809-052600").unwrap();
-        run(&mut factory, std::slice::from_ref(&first));
-        let record = transcript_of(&paths, "20260809-052600").vocabulary.unwrap();
-        assert_eq!(record.profile.as_deref(), Some("dnd"));
-        assert_eq!(record.prompt, "Meeting notes: Strahd.");
-
-        let mut factory = || Ok(fake_engines());
-        run(
+        let ids: Vec<_> = ids.iter().map(|i| SessionId::parse(i).unwrap()).collect();
+        let report = run_batch(
+            &paths,
+            &ids,
+            true,
+            false,
+            &TranscriptTemplate::builtin(),
+            mixdown::Settings::default(),
             &mut factory,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!((report.transcribed, report.failed), (4, 1));
+
+        let record = |id: &str| transcript_of(&paths, id).vocabulary.unwrap();
+        let first = record("20260809-052600");
+        assert_eq!(first.profile.as_deref(), Some("dnd"));
+        assert_eq!(first.prompt, "meethook, Strahd");
+        for id in ["20260809-052700", "20260809-052800", "20260809-053000"] {
+            let r = record(id);
+            assert_eq!((r.profile, r.prompt.as_str()), (None, "meethook"), "{id}");
+        }
+        // The ambiguous session failed rather than picking one, and wrote nothing.
+        let ambiguous = paths.session(&SessionId::parse("20260809-052900").unwrap());
+        assert!(!ambiguous.transcript_json().exists());
+
+        // The title is used to choose, never stored.
+        for id in ["20260809-052600", "20260809-052700", "20260809-052800"] {
+            let session = paths.session(&SessionId::parse(id).unwrap());
+            let json = std::fs::read_to_string(session.transcript_json()).unwrap();
+            assert!(!json.contains("Strahd, session"), "{json}");
+        }
+    }
+
+    #[test]
+    fn no_vocabulary_choice_records_no_vocabulary() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052700", 1_000_000);
+        let mut factory = || Ok(fake_engines());
+        run_batch(
+            &paths,
             &[SessionId::parse("20260809-052700").unwrap()],
-        );
+            true,
+            false,
+            &TranscriptTemplate::builtin(),
+            mixdown::Settings::default(),
+            &mut factory,
+            &mut Vec::new(),
+        )
+        .unwrap();
         let session = paths.session(&SessionId::parse("20260809-052700").unwrap());
         let json = std::fs::read_to_string(session.transcript_json()).unwrap();
         assert!(!json.contains("vocabulary"), "{json}");

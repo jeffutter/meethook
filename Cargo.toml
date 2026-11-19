@@ -154,6 +154,8 @@ minijinja = { version = "3", features = ["serde"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# Matches a calendar event title against a vocabulary profile's `match_title`.
+regex = "1"
 # Reads `vocabulary.toml`, the one hand-edited TOML file; its errors carry line and column, and
 # serde `deny_unknown_fields` gives the unknown-key rule for free.
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }

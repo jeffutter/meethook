@@ -31,6 +31,18 @@ pub struct AsrSegment {
 pub trait SpeechToText {
     /// Recognizes `audio_16k_mono`, which must be 16 kHz mono `f32`.
     fn transcribe(&mut self, audio_16k_mono: &[f32]) -> Result<Vec<AsrSegment>>;
+
+    /// Biases recognition toward `terms`, replacing any earlier vocabulary. Returns how many
+    /// terms were dropped to fit the prompt window. Recognizers with no prompt ignore it.
+    fn set_vocabulary(&mut self, _terms: &[String]) -> usize {
+        0
+    }
+
+    /// The prompt [`set_vocabulary`](Self::set_vocabulary) built, if any: the one place the
+    /// text the recognizer got can be read back, so what is recorded is what was used.
+    fn vocabulary_prompt(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Fixed to English in v1.
@@ -168,23 +180,6 @@ impl WhisperEngine {
         })
     }
 
-    /// Biases decoding toward the spelling of `terms` (names, jargon) by giving Whisper an
-    /// initial prompt. Replaces any earlier vocabulary; an empty list clears it. Returns how
-    /// many terms were dropped to fit the prompt window, for the caller to report.
-    ///
-    /// The prompt only ever reaches the gated path in [`SpeechToText::transcribe`].
-    pub fn set_vocabulary(&mut self, terms: &[String]) -> usize {
-        let built = build_vocabulary_prompt(terms);
-        self.vocabulary_prompt = built.text;
-        built.dropped
-    }
-
-    /// The initial prompt [`set_vocabulary`](Self::set_vocabulary) built, if any. The one place
-    /// the text handed to Whisper can be read back, so what gets recorded is what was used.
-    pub fn vocabulary_prompt(&self) -> Option<&str> {
-        self.vocabulary_prompt.as_deref()
-    }
-
     /// False when recognition is running on the CPU because `MEETHOOK_CPU` asked it to.
     ///
     /// Mirrors [`crate::OnnxDiarizer::accelerated`], for the same reason and with the same
@@ -262,6 +257,19 @@ pub(crate) fn build_vocabulary_prompt(terms: &[String]) -> VocabularyPrompt {
 }
 
 impl SpeechToText for WhisperEngine {
+    /// Biases decoding toward the spelling of `terms` (names, jargon) with an initial prompt.
+    /// Replaces any earlier vocabulary; an empty list clears it. The prompt only ever reaches
+    /// the gated path in [`transcribe`](Self::transcribe).
+    fn set_vocabulary(&mut self, terms: &[String]) -> usize {
+        let built = build_vocabulary_prompt(terms);
+        self.vocabulary_prompt = built.text;
+        built.dropped
+    }
+
+    fn vocabulary_prompt(&self) -> Option<&str> {
+        self.vocabulary_prompt.as_deref()
+    }
+
     /// Recognizes only the stretches of `audio_16k_mono` that hold speech.
     ///
     /// The gate is here, below the [`SpeechToText`] seam, rather than in the orchestration

@@ -165,7 +165,7 @@ pub struct Transcript {
 /// The vocabulary a transcript was produced with. See [`Transcript::vocabulary`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VocabularyRecord {
-    /// The `--vocab` profile applied on top of `[global]`; `None` when only `[global]` was.
+    /// The profile (`--vocab` or matched by `match_title`) applied on top of `[global]`; `None` when only `[global]` was.
     pub profile: Option<String>,
     /// The exact text handed to Whisper as its initial prompt.
     pub prompt: String,

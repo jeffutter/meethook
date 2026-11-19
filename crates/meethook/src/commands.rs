@@ -28,7 +28,7 @@ use meethook_transcribe::{
     Attribution, Diarize, EMBEDDING_MODEL, Engines, FIRERED_VAD_MODEL, FireRedVad,
     GateSpeechFinder, Isolation, IsolationStage, NEMOTRON_DIARIZATION_DATA,
     NEMOTRON_DIARIZATION_GRAPH, NemotronDiarizer, OnnxDiarizer, SEGMENTATION_MODEL,
-    VOICE_ISOLATOR_MODEL, VoiceIsolator, WHISPER_MODEL, WhisperEngine, run_batch,
+    VOICE_ISOLATOR_MODEL, VocabularyChoice, VoiceIsolator, WHISPER_MODEL, WhisperEngine, run_batch,
 };
 
 /// Transcribes recorded sessions.
@@ -50,7 +50,13 @@ pub fn transcribe(
     let requested = parse_session_ids(session_ids)?;
     let template = TranscriptTemplate::resolve(paths, template)?;
     // Before any engine or download, so a bad file or an unknown profile fails the run at once.
-    let selection = meethook_session::Vocabulary::load(paths)?.select(paths, vocab)?;
+    // Selection itself happens per session (a title-matched profile depends on the session's
+    // calendar event), but the file and an explicit name are validated here.
+    let vocabulary = meethook_session::Vocabulary::load(paths)?;
+    if let Some(name) = vocab {
+        vocabulary.check_explicit(name)?;
+    }
+    let mut vocabulary = Some(vocabulary);
 
     let models_dir = paths.models_dir();
     let mut open_engine =
@@ -99,18 +105,7 @@ pub fn transcribe(
             #[cfg(not(target_os = "macos"))]
             let _ = accelerated;
 
-            let mut asr = WhisperEngine::load(&whisper, &vad)?;
-            let dropped = asr.set_vocabulary(&selection.terms);
-            if dropped > 0 {
-                eprintln!("Note: {dropped} vocabulary terms did not fit the prompt window.");
-            }
-            // Read back from the engine: the recorded text must be the text Whisper got.
-            let vocabulary =
-                asr.vocabulary_prompt()
-                    .map(|prompt| meethook_session::VocabularyRecord {
-                        profile: selection.profile.clone(),
-                        prompt: prompt.to_owned(),
-                    });
+            let asr = WhisperEngine::load(&whisper, &vad)?;
             // Only when isolation is on, and after everything cheaper: the factory only runs
             // when there is real work, so `--no-isolate` and nothing-to-do runs fetch nothing.
             // Failure here never fails the batch; sessions fall back to the plain mic track
@@ -136,7 +131,10 @@ pub fn transcribe(
                 asr: Box::new(asr),
                 diarizer,
                 isolation,
-                vocabulary,
+                vocabulary: vocabulary.take().map(|vocabulary| VocabularyChoice {
+                    vocabulary,
+                    explicit: vocab.map(str::to_owned),
+                }),
             })
         };
 

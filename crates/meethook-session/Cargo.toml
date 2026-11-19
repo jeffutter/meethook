@@ -18,6 +18,7 @@ jiff = { workspace = true, features = ["serde"] }
 # crate's code rather than trusted to a dependency's backend.
 libc = { workspace = true }
 minijinja = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

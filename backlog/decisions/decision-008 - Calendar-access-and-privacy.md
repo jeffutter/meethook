@@ -1,4 +1,5 @@
 ---
+updated_date: '2026-11-19T21:37:00Z'
 id: decision-008
 title: Calendar access and privacy
 date: '2026-08-27 04:40'
@@ -17,5 +18,8 @@ Which meeting a session gets labelled with follows a fixed, unconfigurable rule 
 
 
 ## Consequences
-
+<!-- SECTION:CONSEQUENCES:BEGIN -->
 Later extended, not reversed (2026-09-02, TASK-056.02.02): the record TUI now shows and edits the attached meeting's roster in a pane of the full-screen interface, so attendee names and email addresses may appear on the terminal — but only in that pane, only for the attached meeting, and only while the alternate screen is active. Everything else stands: the invite content (notes, location, url) never reaches the frame, ever, because the projection that crosses into it carries no such field; and every non-alternate surface — log lines, stdout, plain mode, and the narration flushed to the plain screen after the alternate screen is restored — remains roster-free, pinned by the tests that predate this carve-out. The original invariant exists because of the dial-in-PIN incident named above, and the exception is safe for the reason decision-012 gives the enroll TUI its comparable identity data: an alternate-screen render is not a log line, and the headless/plain path stays reachable and roster-free. Two lanes coexist deliberately: the display roster (ungated; what the pane shows and edits, so a merely-proximate guess can still be corrected) and the seedable roster behind `MeetingFit::is_strong()` (what speaker identification may consume). An edited roster flows through the fit-preserving mutation API at the single finalize point, so the gate applies to it with no further work, and the display lane is not a bypass of it.
+
+Later extended, not reversed (TASK-085): `meethook transcribe` reads the stored `meeting.title` of a strongly fitted event from `session.json` to choose a vocabulary profile via `match_title`. The title is used only for that choice and goes nowhere else: it is not printed, logged, or written to `transcript.json`, and the transcribe path still never calls the calendar.
+<!-- SECTION:CONSEQUENCES:END -->

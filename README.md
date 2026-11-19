@@ -251,7 +251,7 @@ discovered session that doesn't already have a transcript is considered.
 | `--target-lufs <LUFS>` | -16 | Loudness each track is normalized to before mixing, in LUFS |
 | `--max-boost-db <DB>` | 18 | Most a quiet track may be turned up on its way to the target, in dB |
 | `--no-isolate` | off (isolation is on) | Skip mic isolation for this run; see below |
-| `--vocab <NAME>` | none | Apply the `[profile.<NAME>]` word list from `vocabulary.toml` on top of `[global]`; see below |
+| `--vocab <NAME>` | none | Apply the `[profile.<NAME>]` word list from `vocabulary.toml` on top of `[global]`; overrides `match_title` matching; see below |
 
 **Mic isolation.** By default, before Whisper hears your microphone, a voice-isolator model
 removes background noise from the speech regions of the (echo-cancelled) mic track. Only the mic
@@ -281,14 +281,27 @@ terms = ["meethook", "Kubernetes"]
 # D&D game: character and place names
 [profile.dnd]
 terms = ["Strahd", "Barovia", "Ireena", "Vallaki"]
+match_title = "(?i)curse of strahd|d&d"
 
 # Work meetings: product and internal jargon
 [profile.work]
 terms = ["Grafana", "Terraform", "SLO", "Quokka"]
 ```
 
-`meethook transcribe --vocab dnd` applies `[global]` plus the `dnd` profile. Exactly one profile
-applies per run and profiles are never merged; without `--vocab` only `[global]` applies. A
+`meethook transcribe --vocab dnd` applies `[global]` plus the `dnd` profile. At most one profile
+applies per session and profiles are never merged.
+
+**Choosing a profile without a flag.** A profile may declare `match_title`, an unanchored
+[Rust regex](https://docs.rs/regex) (write `(?i)` for case-insensitive). Per session the order is:
+`--vocab` if given, else the one profile whose `match_title` matches the title of the calendar
+event the session was fitted to, else `[global]` only. The event is the one already stored in the
+session's `session.json` at record time; `transcribe` never reads the calendar, so a session with
+no event (every session recorded off macOS, or without calendar access) behaves exactly as with
+no `match_title`. Only a confidently fitted event counts (it started with the recording, or you
+confirmed it); a merely nearby one is ignored. If two profiles match the same title, that session
+fails naming both profiles and the rest of the batch continues; pass `--vocab` or narrow the
+patterns. The title only picks the profile: it is not printed (the profile name is) and not
+written to `transcript.json`. An invalid `match_title` fails the run at load, naming the profile. A
 missing file means no vocabulary. An unknown key, a non-string term or malformed TOML fails the
 run with the file and line; an unknown profile name fails it listing the profiles that exist.
 The profile and the exact prompt handed to Whisper are written to the session's `transcript.json`

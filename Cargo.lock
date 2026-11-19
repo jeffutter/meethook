@@ -897,6 +897,7 @@ dependencies = [
  "jiff",
  "libc",
  "minijinja",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
