@@ -44,8 +44,6 @@ pub enum NotMeasurable {
 /// a figure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CancellationFailure {
-    /// The canceller could not be constructed.
-    ProcessorUnavailable,
     /// A frame errored partway through the track.
     FrameFailed,
 }
