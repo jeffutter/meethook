@@ -738,7 +738,9 @@ struct SessionCapture<'a> {
 impl Capture for SessionCapture<'_> {
     fn start(&mut self, sink: &mut dyn Reporter) -> Result<()> {
         let started_at = Instant::now();
-        let session = self.recorder.start(self.paths, &jiff::Zoned::now())?;
+        let session = self
+            .recorder
+            .start(self.paths, &jiff::ZonedDateTime::now())?;
         if self.debug {
             // This latency sits directly on the "no debounce, a late start loses the
             // opening" path, so it is worth being able to see rather than assume.

@@ -31,6 +31,18 @@ pub struct Loaded {
     pub accelerated: bool,
 }
 
+/// One ort environment for the process. rc.15 made it an explicit argument to
+/// `Session::builder`, and it owns the runtime's global state, so building one per session
+/// would be wasteful. A failed build is not cached: the next call retries.
+fn environment() -> ort::Result<&'static ort::environment::Environment> {
+    static ENV: std::sync::OnceLock<ort::environment::Environment> = std::sync::OnceLock::new();
+    if let Some(env) = ENV.get() {
+        return Ok(env);
+    }
+    let env = ort::init().build()?;
+    Ok(ENV.get_or_init(|| env))
+}
+
 /// Loads an ONNX graph. On macOS it prefers CoreML and falls back to CPU; on other
 /// platforms there is no accelerator compiled into the runtime, so it goes straight to CPU.
 ///
@@ -50,7 +62,7 @@ pub fn open_session(model_path: &Path) -> Result<Loaded> {
     // parse, CoreML compile -- collapse into one `?`-chain per attempt.
     #[cfg(target_os = "macos")]
     fn load_with_coreml(model_path: &Path) -> ort::Result<Session> {
-        Session::builder()?
+        Session::builder(environment()?)?
             .with_execution_providers([CoreML::default().build()])?
             .commit_from_file(model_path)
     }
@@ -70,7 +82,7 @@ pub fn open_session(model_path: &Path) -> Result<Loaded> {
     // Its own helper for the same reason `load_with_coreml` is one: the `?`-chain stays
     // inside `ort::Result`, so no `From<ort::Error>` for the crate error is needed.
     fn load_cpu(model_path: &Path) -> ort::Result<Session> {
-        Session::builder()?.commit_from_file(model_path)
+        Session::builder(environment()?)?.commit_from_file(model_path)
     }
 
     load_cpu(model_path)

@@ -36,7 +36,7 @@
 use std::path::{Path, PathBuf};
 
 use hound::{SampleFormat, WavReader};
-use jiff::{Timestamp, Zoned};
+use jiff::{Timestamp, ZonedDateTime};
 use meethook_session::{
     Paths, SessionId, SessionMetadata, SessionPaths, TrackSync, create_session_dir,
 };
@@ -134,7 +134,7 @@ pub fn build_session(
     // Creating the directory *is* the collision check, and it is the one place this function
     // writes, which is what makes the "only inside `root`" claim structural rather than
     // careful.
-    let (id, paths) = create_session_dir(root, &Zoned::now())?;
+    let (id, paths) = create_session_dir(root, &ZonedDateTime::now())?;
 
     audio::write_track_16k_mono(&paths.speaker_wav(), &speaker)?;
     audio::write_track_16k_mono(&paths.mic_wav(), &mic)?;

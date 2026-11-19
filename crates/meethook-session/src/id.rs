@@ -2,7 +2,7 @@ use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Error, Paths, Result, SessionPaths};
@@ -82,7 +82,7 @@ impl<'de> Deserialize<'de> for SessionId {
 /// Creating the directory *is* the collision check: `create_dir` fails with `AlreadyExists`
 /// rather than succeeding silently, so there is no stat-then-create window in which two
 /// recorders could agree on the same id. On collision the id gains a `-1`, `-2`, ... suffix.
-pub fn create_session_dir(paths: &Paths, now: &Zoned) -> Result<(SessionId, SessionPaths)> {
+pub fn create_session_dir(paths: &Paths, now: &ZonedDateTime) -> Result<(SessionId, SessionPaths)> {
     let sessions_dir = paths.sessions_dir();
     fs::create_dir_all(&sessions_dir).map_err(|e| Error::io(&sessions_dir, e))?;
 
@@ -180,7 +180,7 @@ mod tests {
     fn discarding_removes_a_directory_holding_only_the_two_track_headers() {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path());
-        let now: Zoned = "2026-08-14T16:45:31-05:00[America/Chicago]"
+        let now: ZonedDateTime = "2026-08-14T16:45:31-05:00[America/Chicago]"
             .parse()
             .unwrap();
         let (_id, session) = create_session_dir(&paths, &now).unwrap();
@@ -201,7 +201,7 @@ mod tests {
     fn discarding_removes_an_empty_directory() {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path());
-        let now: Zoned = "2026-08-14T16:45:31-05:00[America/Chicago]"
+        let now: ZonedDateTime = "2026-08-14T16:45:31-05:00[America/Chicago]"
             .parse()
             .unwrap();
         let (_id, session) = create_session_dir(&paths, &now).unwrap();
@@ -218,7 +218,7 @@ mod tests {
     fn discarding_leaves_a_directory_holding_anything_else() {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path());
-        let now: Zoned = "2026-08-14T16:45:31-05:00[America/Chicago]"
+        let now: ZonedDateTime = "2026-08-14T16:45:31-05:00[America/Chicago]"
             .parse()
             .unwrap();
         let (_id, session) = create_session_dir(&paths, &now).unwrap();

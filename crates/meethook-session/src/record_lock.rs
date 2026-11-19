@@ -102,7 +102,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use serde_json::Value;
 
 use crate::{Error, Paths, Result};
@@ -139,7 +139,7 @@ pub struct Holder {
     pub pid: Option<u32>,
     /// The command line that started it, joined with spaces for display.
     pub argv: Option<String>,
-    pub started: Option<Zoned>,
+    pub started: Option<ZonedDateTime>,
 }
 
 /// What a read-only question about the lock can come back with.
@@ -401,7 +401,7 @@ fn write_holder_metadata(file: &std::fs::File, path: &Path) -> Result<()> {
     let line = serde_json::json!({
         "pid": std::process::id(),
         "argv": argv,
-        "started": Zoned::now().to_string(),
+        "started": ZonedDateTime::now().to_string(),
     })
     .to_string();
 
@@ -482,14 +482,14 @@ fn parse_holder(text: &str) -> Option<Holder> {
 }
 
 /// Accepts either spelling of a timestamp: with a zone annotation, or a bare offset instant.
-fn parse_started(text: &str) -> Option<Zoned> {
-    if let Ok(started) = text.parse::<Zoned>() {
+fn parse_started(text: &str) -> Option<ZonedDateTime> {
+    if let Ok(started) = text.parse::<ZonedDateTime>() {
         return Some(started);
     }
     // `to_zoned` is infallible: any timestamp that parsed at all is inside jiff's range.
     text.parse::<jiff::Timestamp>()
         .ok()
-        .map(|stamp| stamp.to_zoned(jiff::tz::TimeZone::system()))
+        .map(|stamp| stamp.to_zoned_datetime(jiff::tz::TimeZone::system()))
 }
 
 #[cfg(test)]
@@ -499,6 +499,21 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     use crate::EnrolledSpeakers;
+
+    /// Serialises every test in this module.
+    ///
+    /// Some of these tests spawn children while others hold a lock. Observed: without this, a
+    /// full run of the crate's tests failed about 37% of the time (75 of 200), always as a lock
+    /// that one test had just released, or never held, reading as held; with it, the failures
+    /// fall to the residue `a_spawned_child_does_not_keep_the_lock` polls for. The likely
+    /// mechanism (not proven) is that a process being created briefly co-owns every OFD lock
+    /// in its parent, so a spawn on one thread makes another thread's release look unfinished.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Acquires and forgets, so the guard is dropped at the end of the scope.
     fn acquire(root: &Path) -> Acquisition {
@@ -525,6 +540,7 @@ mod tests {
     /// in one process.
     #[test]
     fn a_second_acquire_against_a_held_root_refuses_and_names_the_holder() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let lock = held(dir.path());
 
@@ -534,8 +550,11 @@ mod tests {
             Some(std::process::id()),
             "the refusal has to name the process that holds the lock"
         );
-        assert!(
-            holder.argv.unwrap().contains("record_lock"),
+        // The harness's own argv, not a name: whether a test filter appears in it depends on
+        // how cargo was invoked.
+        assert_eq!(
+            holder.argv.unwrap(),
+            std::env::args().collect::<Vec<_>>().join(" "),
             "the refusal has to say how the holder was started"
         );
         assert!(holder.started.is_some(), "and when it was started");
@@ -549,6 +568,7 @@ mod tests {
     /// wording of the refusal, never who wins.
     #[test]
     fn the_file_contents_never_decide_anything() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let path = Paths::new(dir.path()).record_lock();
         let lock = held(dir.path());
@@ -625,6 +645,7 @@ mod tests {
     /// the test is a process we cannot ask nicely.
     #[test]
     fn a_sigkilled_holder_releases_the_lock() {
+        let _serial = serial();
         if std::env::var_os(HOLDER_HELPER_ENV).is_some() {
             // The helper branch: take the lock named by the parent and sit on it until killed.
             let _lock = held(Path::new(&std::env::var(HOLDER_HELPER_ENV).unwrap()));
@@ -646,6 +667,7 @@ mod tests {
     /// file even though the verdict never does.
     #[test]
     fn a_probe_reports_another_process_holding_it_and_leaves_the_file_alone() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         let path = paths.record_lock();
@@ -677,6 +699,7 @@ mod tests {
     /// exploits -- so liveness is testable without leaving the process at all.
     #[test]
     fn a_probe_reports_a_holder_in_this_very_process() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         let _lock = held(dir.path());
@@ -693,6 +716,7 @@ mod tests {
     /// same absence from the outside; this pins it at the probe itself.
     #[test]
     fn probing_a_root_that_has_never_recorded_leaves_nothing_behind() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("meethook");
         std::fs::create_dir(&root).unwrap();
@@ -712,6 +736,7 @@ mod tests {
     /// recording in progress.
     #[test]
     fn a_dropped_guard_stops_being_live_though_the_file_still_stands() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         let lock = held(dir.path());
@@ -733,6 +758,7 @@ mod tests {
     /// holder killed by signal leaves its file behind, intact, and the probe reads it as free.
     #[test]
     fn a_sigkilled_holder_is_reported_free_though_its_file_remains() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         let mut child = spawn_holder(dir.path());
@@ -755,6 +781,7 @@ mod tests {
     /// is not a definite anything.
     #[test]
     fn an_unknown_answer_leans_toward_a_recorder_being_live() {
+        let _serial = serial();
         assert!(
             LockState::Held(Holder {
                 pid: None,
@@ -771,6 +798,7 @@ mod tests {
     /// would keep the lock held after `record` itself quit.
     #[test]
     fn the_descriptor_is_close_on_exec() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let lock = held(dir.path());
 
@@ -791,6 +819,7 @@ mod tests {
     /// a lock holder.
     #[test]
     fn a_spawned_child_does_not_keep_the_lock() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let lock = held(dir.path());
 
@@ -806,7 +835,24 @@ mod tests {
 
         // If the descriptor had leaked into the child, the child would still co-own the lock
         // and this would come back Taken while it lives.
-        let _again = held(dir.path());
+        // Polled rather than asked once. A child that inherited the descriptor co-owns the lock
+        // for as long as it lives, so a real leak stays `Taken` for the whole window below. A
+        // single immediate ask failed about 1 run in 15 when the rest of the crate's tests ran
+        // alongside, and every such failure cleared within about 10ms (observed, over 100
+        // runs): a transient co-ownership while a process is being created, not a leak. The
+        // mechanism of that transient is not established.
+        let started = Instant::now();
+        let _again = loop {
+            match acquire(dir.path()) {
+                Acquisition::Held(lock) => break lock,
+                Acquisition::Taken(_) if started.elapsed() < Duration::from_secs(5) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Acquisition::Taken(holder) => {
+                    panic!("the live child still co-owns the lock after 5s: {holder:?}")
+                }
+            }
+        };
 
         // SAFETY: `pid` names this test's own child, still owned by `child` and not yet waited
         // on. SIGTERM ends the `sleep` so the test does not leave it behind.
@@ -820,6 +866,7 @@ mod tests {
     /// the same thing from the other side by listing what a non-`record` write leaves behind.
     #[test]
     fn only_acquiring_touches_the_lock_file_and_nothing_deletes_it() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
 
@@ -842,6 +889,7 @@ mod tests {
     /// to end in a recording, not in a complaint about the directory.
     #[test]
     fn acquiring_creates_a_root_that_is_not_there_yet() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("never-created/meethook");
         let paths = Paths::new(&root);

@@ -527,7 +527,7 @@ fn count(noun: &str, counted: Option<usize>) -> String {
 fn local(date: &NSDate) -> String {
     match timestamp(date) {
         Some(at) => at
-            .to_zoned(TimeZone::system())
+            .to_zoned_datetime(TimeZone::system())
             .strftime("%Y-%m-%d %H:%M %Z")
             .to_string(),
         None => format!("<unconvertible {}>", date.timeIntervalSince1970()),

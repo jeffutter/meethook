@@ -236,7 +236,7 @@ impl TranscriptTemplate {
             .get_template(&self.name)
             .map_err(|e| Error::template(&self.source, e))?;
         template
-            .render(RenderContext::new(transcript, ctx))
+            .render(minijinja::value::Serde(RenderContext::new(transcript, ctx)))
             .map_err(|e| Error::template(&self.source, e))
     }
 }
@@ -456,11 +456,11 @@ fn escape_cue_text(text: &str) -> String {
 /// An instant as RFC 3339 in the machine's local zone, e.g. `2026-08-05T14:29:21-05:00`.
 ///
 /// Local rather than UTC because these two keys are read beside a transcript of a meeting the
-/// reader attended, and "2pm" is what they remember. `jiff::Zoned`'s own `Display` is not
+/// reader attended, and "2pm" is what they remember. `jiff::ZonedDateTime`'s own `Display` is not
 /// usable here: it appends the IANA name in brackets, which is a jiff/RFC 9557 extension that
 /// an ordinary YAML timestamp reader will reject.
 fn local_rfc3339(at: Timestamp) -> String {
-    at.to_zoned(jiff::tz::TimeZone::system())
+    at.to_zoned_datetime(jiff::tz::TimeZone::system())
         .strftime("%Y-%m-%dT%H:%M:%S%:z")
         .to_string()
 }
@@ -776,7 +776,7 @@ mod tests {
         let updated = lines[1].strip_prefix("updated: ").expect(lines[1]);
         assert_eq!(created.parse::<Timestamp>().unwrap(), md.start_time);
         assert_eq!(updated.parse::<Timestamp>().unwrap(), rendered_at());
-        // The RFC 9557 bracket `Zoned`'s own Display would append is what an ordinary YAML
+        // The RFC 9557 bracket `ZonedDateTime`'s own Display would append is what an ordinary YAML
         // timestamp reader chokes on, so its absence is the point rather than cosmetics.
         assert!(!created.contains('['), "{created}");
     }

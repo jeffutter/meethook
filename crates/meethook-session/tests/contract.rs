@@ -56,7 +56,7 @@ fn make_session(paths: &Paths, id: &str, files: &[&str]) -> SessionPaths {
 fn session_id_uses_local_time_yyyymmdd_hhmmss() {
     let (_tmp, paths) = temp_root();
     let now = "2026-08-09T05:26:07-04:00[America/Toronto]"
-        .parse::<jiff::Zoned>()
+        .parse::<jiff::ZonedDateTime>()
         .unwrap();
 
     let (id, session) = create_session_dir(&paths, &now).unwrap();
@@ -70,7 +70,7 @@ fn session_id_uses_local_time_yyyymmdd_hhmmss() {
 fn same_second_sessions_get_distinct_directories() {
     let (_tmp, paths) = temp_root();
     let now = "2026-08-09T05:26:07-04:00[America/Toronto]"
-        .parse::<jiff::Zoned>()
+        .parse::<jiff::ZonedDateTime>()
         .unwrap();
 
     let (first, first_paths) = create_session_dir(&paths, &now).unwrap();

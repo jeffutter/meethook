@@ -425,10 +425,14 @@ fn open(model: &Path, format: ModelFormat, cache: Option<&Path>) -> ort::Result<
     if let Some(dir) = cache {
         coreml = coreml.with_model_cache_dir(dir.display());
     }
-    Session::builder()?
-        .with_log_level(LogLevel::Info)?
-        .with_execution_providers([coreml.build()])?
-        .commit_from_file(model)
+    Session::builder(
+        ENVIRONMENT
+            .get()
+            .expect("Capture::install runs before any session"),
+    )?
+    .with_log_level(LogLevel::Info)?
+    .with_execution_providers([coreml.build()])?
+    .commit_from_file(model)
 }
 
 /// What one graph cost, and what CoreML did with it.
@@ -676,6 +680,10 @@ struct Line {
 /// committed session, so the pointer ONNX Runtime holds dangles the moment the session is built.
 /// The environment's builder is parked in a process-lifetime `OnceLock`, so its pointer stays
 /// valid.
+/// Held for the life of the process: rc.15 sessions are built against an explicit environment, and
+/// this one carries the log sink.
+static ENVIRONMENT: std::sync::OnceLock<ort::environment::Environment> = std::sync::OnceLock::new();
+
 struct Capture {
     lines: Arc<Mutex<Vec<Line>>>,
     mirror: bool,
@@ -688,7 +696,7 @@ impl Capture {
         // Called from ONNX Runtime's own threads across an `extern "system"` boundary, so it must
         // not panic and must not print: its whole job is to push a string and return. Filtering
         // happens here because INFO is still hundreds of lines per session.
-        let committed = ort::init()
+        let built = ort::init()
             .with_logger(Arc::new(
                 move |level: LogLevel,
                       _category: &str,
@@ -706,13 +714,16 @@ impl Capture {
                     }
                 },
             ))
-            .commit();
-        if !committed {
-            fail(
-                "ort::init().commit() returned false: an ONNX Runtime environment already \
-                 existed, so nothing would be captured and every coverage column would read \
-                 as though CoreML took nothing",
-            );
+            .build();
+        let environment = built.unwrap_or_else(|e| {
+            fail(&format!(
+                "could not build the ONNX Runtime environment with the log sink, so nothing \
+                 would be captured and every coverage column would read as though CoreML \
+                 took nothing: {e}"
+            ))
+        });
+        if ENVIRONMENT.set(environment).is_err() {
+            fail("Capture::install ran twice");
         }
         Capture { lines, mirror }
     }

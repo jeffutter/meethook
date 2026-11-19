@@ -12,7 +12,7 @@ meethook-models = { workspace = true }
 meethook-session = { workspace = true }
 
 hound = { workspace = true }
-# For the session directories `import` builds: `create_session_dir` takes a `Zoned` and
+# For the session directories `import` builds: `create_session_dir` takes a `ZonedDateTime` and
 # `SessionMetadata` a `Timestamp`. A normal dependency rather than a dev one since that path
 # is compiled into the library.
 jiff = { workspace = true }

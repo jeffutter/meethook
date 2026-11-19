@@ -51,7 +51,7 @@ pub use track::TrackSummary;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use jiff::{Timestamp, Zoned};
+use jiff::{Timestamp, ZonedDateTime};
 use meethook_session::{
     AppIdentities, Meeting, Paths, RosterEdit, SessionId, SessionMetadata, SessionPaths,
 };
@@ -203,7 +203,7 @@ impl Recorder {
     /// most failed starts never reach it. The two that can, because they are what bringing an
     /// engine up costs, discard the directory on their way out: a failed start leaves nothing
     /// behind either way.
-    pub fn start(&self, paths: &Paths, now: &Zoned) -> Result<RunningSession> {
+    pub fn start(&self, paths: &Paths, now: &ZonedDateTime) -> Result<RunningSession> {
         // Resolved per session rather than cached on the Recorder: displays and input
         // devices change between meetings, and a stale handle would fail confusingly.
         let display = speaker::default_display()?;

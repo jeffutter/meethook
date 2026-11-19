@@ -23,10 +23,10 @@ exclude = ["crates/meethook-record"]
 [workspace.package]
 version = "0.4.0"
 edition = "2024"
-# 1.88 rather than 1.85 because `ropus` declares that floor, so a 1.85 toolchain can no longer
+# 1.92 because `ort` rc.15 declares that floor (`ropus` alone needs 1.88), so an older toolchain can no longer
 # build this workspace and saying otherwise would be a false claim rather than a conservative
 # one. The devShell pins 1.97, so nothing observable changes here.
-rust-version = "1.88"
+rust-version = "1.92"
 publish = false
 license = "MIT"
 
@@ -79,7 +79,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # only thing deciding what the shipped binary links.
 ctrlc = { version = "3", features = ["termination"] }
 hound = "3.5"
-jiff = "0.2"
+jiff = "1"
 # Two raw syscalls that no std or wrapper API covers the way this project wants them covered:
 # `proc_pidpath` in meethook-record, to name the executable behind a capturing pid, and the OFD
 # lock (`open` with `O_CLOEXEC`, `fcntl` `F_OFD_SETLK`) behind meethook-session's `record_lock`,
@@ -107,7 +107,7 @@ mach2 = "0.6"
 # edge case. `meethook-session` registers its own `yaml` filter instead -- see
 # `transcript::yaml_filter`. Pure Rust either way: no build script, no C, so `flake.nix` needs
 # nothing.
-minijinja = { version = "2" }
+minijinja = { version = "3", features = ["serde"] }
 # The full-screen `enroll` frame (`meethook/src/screen/`). The line prompt asks about one voice
 # at a time in a fixed order and cannot show a ranking, a filter, or what an answer would do
 # before it is given; those are the whole of TASK-046.06.02, and none of them is expressible in
@@ -209,7 +209,7 @@ realfft = "3.5"
 # packet-loss concealment costs nothing either. `flake.nix` is unchanged by this dependency,
 # which is the observable form of that claim.
 #
-# ropus declares `rust-version = "1.88"`, which is why this workspace's floor moved up to
+# ropus declares `rust-version = "1.88"`, which is why this workspace's floor first moved up to
 # match. Six pure-Rust crates enter the graph in total: these two plus `wide`, `safe_arch`,
 # `bytemuck` and `byteorder`.
 ropus = "0.12"
@@ -244,7 +244,7 @@ whisper-rs = { version = "0.16", default-features = false }
 # whisper-rs's: it is added by meethook-transcribe under `cfg(target_os = "macos")` only.
 # On other platforms the diarization graphs run on the CPU EP and there is nothing to try
 # first, so the type `ort::ep::CoreML` itself is not compiled there.
-ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+ort = { version = "=2.0.0-rc.15", default-features = false, features = [
   "std",
   "pkg-config",
   "api-27",

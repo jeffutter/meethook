@@ -352,7 +352,7 @@ fn describe(meeting: &Meeting) -> String {
 
 /// An instant in the machine's own zone, which is the one the calendar was written in.
 fn local(at: Timestamp, format: &str) -> String {
-    at.to_zoned(jiff::tz::TimeZone::system())
+    at.to_zoned_datetime(jiff::tz::TimeZone::system())
         .strftime(format)
         .to_string()
 }
