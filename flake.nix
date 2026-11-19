@@ -100,9 +100,7 @@
             BINDGEN_EXTRA_CLANG_ARGS = "-isysroot ${pkgs.apple-sdk_26}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
           };
 
-          # AEC3 comes from the pure-Rust `sonora` crate, so it adds nothing here. The
-          # wrapped clang (non-macOS) points CC/CXX at itself, so the Rust and whisper.cpp
-          # builds compile and link through clang; the repo gates pass under that.
+          # AEC3 comes from the pure-Rust `sonora` crate, so it adds nothing here.
           commonBuildInputs =
             [ pkgs.onnxruntime ]
             ++ nixpkgs.lib.optionals isMacos [
@@ -114,17 +112,10 @@
           # ort-sys probes pkg-config for libonnxruntime at build time; the pkg-config
           # wrapper mkShell (or crane's build) generates from buildInputs is what makes the
           # probe find it.
-          commonNativeBuildInputs =
-            [
-              pkgs.cmake
-              pkgs.pkg-config
-            ]
-            ++ nixpkgs.lib.optionals (!isMacos) [
-              # No longer required by AEC3 (it was for the C++ library's meson.build, which
-              # hard-coded clang), but kept: the Linux gates were last verified through it and
-              # swapping the compiler here is not something this change tested.
-              pkgs.clang
-            ];
+          commonNativeBuildInputs = [
+            pkgs.cmake
+            pkgs.pkg-config
+          ];
 
           craneLib = crane.mkLib pkgs;
 

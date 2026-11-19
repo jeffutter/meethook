@@ -28,7 +28,7 @@ come along:
 
 The flake defines an `x86_64-linux` devShell alongside the macOS one. It carries
 the whole toolchain -- Rust (with clippy/rustfmt/rust-analyzer), cmake, pkg-config,
-onnxruntime, clang, plus lefthook, cargo-nextest, cargo-audit and
+onnxruntime, plus lefthook, cargo-nextest, cargo-audit and
 cargo-outdated --
 and sets the two environment variables the build needs (`LIBCLANG_PATH` for
 bindgen, `LD_LIBRARY_PATH` for the onnxruntime and libstdc++ shared libraries,
