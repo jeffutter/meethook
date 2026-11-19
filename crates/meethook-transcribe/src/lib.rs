@@ -25,6 +25,7 @@ mod import;
 mod levels;
 mod loudness;
 mod merge;
+mod mic_isolation;
 mod models;
 // Not called by production code until TASK-088.08 diarizes with Nemotron.
 #[allow(dead_code)]
@@ -56,9 +57,6 @@ mod speakers;
 mod timeline;
 mod trials;
 mod vad;
-// Not called until TASK-080 runs it over the mic track (the `isolate-voice` example reaches it
-// through the re-export below).
-#[allow(dead_code)]
 mod voice_isolator;
 mod voice_vectors;
 
@@ -82,6 +80,9 @@ pub use identify::{
 };
 pub use import::{BuiltSession, ImportedSource, MIC_SILENCE_S, SPLICE_GAP_S, build_session};
 pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
+pub use mic_isolation::{
+    GateSpeechFinder, IsolationReport, IsolationStage, SpeechFinder, VoiceIsolation,
+};
 // The measurement only, not the module: `loudness` stays private because its constants and
 // block arithmetic are BS.1770's business rather than a caller's. The one number comes out so
 // that `examples/session-mixdown.rs` can report a track's loudness in LUFS beside the gain
@@ -270,6 +271,9 @@ impl Error {
 pub struct Engines {
     pub asr: Box<dyn SpeechToText>,
     pub diarizer: Box<dyn Diarize>,
+    /// Isolates the mic track's speech before recognition; `None` leaves the pipeline exactly
+    /// as it was without the stage.
+    pub isolation: Option<IsolationStage>,
 }
 
 /// Opens both engines. Boxed and fallible so the caller owns model acquisition, and so the
@@ -319,6 +323,36 @@ pub fn transcribe_session(
     mixdown_settings: mixdown::Settings,
     progress: &mut dyn Write,
 ) -> Result<Transcript> {
+    transcribe_session_isolating(
+        session,
+        asr,
+        diarizer,
+        None,
+        speakers,
+        mixdown_settings,
+        progress,
+    )
+}
+
+/// [`transcribe_session`] with an optional mic-isolation stage.
+///
+/// With `Some`, the voice isolator runs over the speech regions of the AEC-cleaned mic track
+/// after the cleaned track and the mixdown are written and before recognition, and recognition
+/// hears the isolated track (same length and timeline). `mic.cleaned.wav` and `meeting.opus`
+/// stay pre-isolation: isolating regions only would make background noise step on and off in
+/// the mix, and the files keep one meaning with the stage on or off. The speaker track, the
+/// echo canceller's reference, diarization's input and the speaker pass are never touched.
+/// One progress line says what the stage did. With `None` this is exactly
+/// [`transcribe_session`].
+pub fn transcribe_session_isolating(
+    session: &DiscoveredSession,
+    asr: &mut dyn SpeechToText,
+    diarizer: &mut dyn Diarize,
+    isolation: Option<&mut IsolationStage>,
+    speakers: &EnrolledSpeakers,
+    mixdown_settings: mixdown::Settings,
+    progress: &mut dyn Write,
+) -> Result<Transcript> {
     let metadata = session.load_metadata()?;
 
     // An unreadable or absent `speaker.wav` is not fatal here, unlike `mic.wav`: it is the
@@ -340,7 +374,11 @@ pub fn transcribe_session(
         mixdown_settings,
     )?;
 
-    let mic_segments = asr.transcribe(&mic_track)?;
+    let mic_for_asr = match isolation {
+        Some(stage) => stage.run_reporting(&mic_track, &session.id.to_string(), progress)?,
+        None => mic_track,
+    };
+    let mic_segments = asr.transcribe(&mic_for_asr)?;
 
     // Diarize before recognising the speaker track, so a diarization failure costs a
     // Whisper pass over the meeting that would have been thrown away anyway.
@@ -518,10 +556,11 @@ fn transcribe_and_write(
     mixdown_settings: mixdown::Settings,
     progress: &mut dyn Write,
 ) -> Result<usize> {
-    let transcript = transcribe_session(
+    let transcript = transcribe_session_isolating(
         session,
         engines.asr.as_mut(),
         engines.diarizer.as_mut(),
+        engines.isolation.as_mut(),
         speakers,
         mixdown_settings,
         progress,
@@ -570,6 +609,9 @@ fn clean_mic_track(
 /// carries the far end bleeding back in through the microphone, delayed by the acoustic path.
 /// Summing that into a partly-panned mix is comb filtering and audible echo. The cleaned track
 /// is also what the transcript heard, so the recording and the text tell the same story.
+/// Mic isolation ([`transcribe_session_isolating`]) never feeds the mixdown: isolating only the
+/// speech regions would make background noise step on and off audibly, and the mixdown is then
+/// identical with the stage on or off.
 ///
 /// *The 16 kHz tracks already in memory, not a second read at the native rate.* Both are
 /// already loaded and resampled by this point, so the mixdown costs one pass over memory and
@@ -740,6 +782,7 @@ mod tests {
                 },
                 heard: Vec::new(),
             }),
+            isolation: None,
         }
     }
 
@@ -1009,6 +1052,102 @@ mod tests {
             mixdown::Settings::default(),
             &mut quiet(),
         )
+    }
+
+    /// An isolator that visibly changes what it is given, so "recognition heard the isolated
+    /// track" is assertable, and a finder that reports one region over the first 0.2 s.
+    fn offset_stage() -> IsolationStage {
+        struct Offset;
+        impl VoiceIsolation for Offset {
+            fn isolate(&mut self, audio: &[f32]) -> Result<Vec<f32>> {
+                Ok(audio.iter().map(|s| s + 0.1).collect())
+            }
+        }
+        struct OneRegion;
+        impl SpeechFinder for OneRegion {
+            fn speech_regions(&mut self, _: &[f32]) -> Result<Vec<crate::vad::SpeechRegion>> {
+                Ok(vec![crate::vad::SpeechRegion {
+                    start_s: 0.0,
+                    end_s: 0.2,
+                }])
+            }
+        }
+        IsolationStage {
+            isolator: Box::new(Offset),
+            finder: Box::new(OneRegion),
+        }
+    }
+
+    fn snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(&path).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn isolation_changes_what_the_mic_pass_hears_and_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600", 1_000_000);
+        let run = |stage: Option<&mut IsolationStage>, progress: &mut Vec<u8>| {
+            let mut asr = FakeAsr::default();
+            let mut diarizer = FakeDiarizer::default();
+            transcribe_session_isolating(
+                &session,
+                &mut asr,
+                &mut diarizer,
+                stage,
+                &nobody_enrolled(),
+                mixdown::Settings::default(),
+                progress,
+            )
+            .unwrap();
+            (asr.heard, diarizer.heard)
+        };
+
+        let mut off_progress = Vec::new();
+        let (off_asr, off_diarizer) = run(None, &mut off_progress);
+        let off_files = snapshot(session.paths.dir());
+
+        let mut on_progress = Vec::new();
+        let mut stage = offset_stage();
+        let (on_asr, on_diarizer) = run(Some(&mut stage), &mut on_progress);
+        let on_files = snapshot(session.paths.dir());
+
+        // AC 6/5: every file written is identical, and the speaker side heard the same audio.
+        assert_eq!(off_files, on_files);
+        let speaker = audio::read_track_16k_mono(&session.paths.speaker_wav()).unwrap();
+        assert_eq!(off_diarizer, vec![speaker.clone()]);
+        assert_eq!(on_diarizer, vec![speaker.clone()]);
+        assert_eq!(on_asr[1], speaker, "the speaker pass hears the plain track");
+        assert_eq!(off_asr[1], speaker);
+
+        // AC 1/2: the mic pass heard the isolated track, on the cleaned track's timeline.
+        let cleaned = audio::read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap();
+        assert_eq!(off_asr[0], cleaned);
+        assert_eq!(on_asr[0].len(), cleaned.len());
+        assert_ne!(on_asr[0], cleaned);
+        let tail = cleaned.len() - 1;
+        assert_eq!(
+            on_asr[0][tail], cleaned[tail],
+            "outside the region is untouched"
+        );
+
+        // AC 8: one extra line, only when the stage ran.
+        let off_text = String::from_utf8(off_progress).unwrap();
+        let on_text = String::from_utf8(on_progress).unwrap();
+        assert!(!off_text.contains("mic isolation"), "{off_text}");
+        assert!(
+            on_text.contains("mic isolation: 1 regions, 0 s of 0 s processed in 1 batches"),
+            "{on_text}"
+        );
     }
 
     #[test]

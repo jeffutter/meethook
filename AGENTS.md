@@ -120,6 +120,9 @@ session directory.** That contract is the thing to understand before touching an
   the `mixdown` module (public, unlike its siblings) that produces `meeting.opus`. The mic
   track is never diarized — there's exactly one local speaker, always labelled `You`; the
   speaker track is diarized and each turn attributed to a distinct voice.
+  An optional mic-isolation stage (`mic_isolation`, library option `Engines::isolation`; the CLI
+  switch is TASK-081) runs the voice isolator over the VAD speech regions of the AEC-cleaned mic track
+  just before ASR. `mic.cleaned.wav` and the mixdown stay pre-isolation; the speaker track is never isolated.
 - **`meethook-enroll`** — the one interactive path in the tool, but built so almost none of
   it actually is: which sessions/voices to ask about, what an answer writes, and what a
   correction costs are all decided here against two one-method seams (`Interviewer` for

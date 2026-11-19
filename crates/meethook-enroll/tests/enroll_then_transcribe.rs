@@ -146,6 +146,7 @@ fn transcribe_speaking(
                 embedding: voice(who),
                 speech_seconds,
             }),
+            isolation: None,
         })
     };
     run_batch(

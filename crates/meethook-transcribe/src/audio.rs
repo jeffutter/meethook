@@ -78,7 +78,7 @@ pub fn read_track_16k_mono(path: &Path) -> Result<Vec<f32>> {
         return Ok(samples);
     }
 
-    let mut resample = Resample::new(spec.sample_rate, frames)?;
+    let mut resample = Resample::new(spec.sample_rate, TARGET_RATE, frames)?;
     for (read, sample) in reader.into_samples::<f32>().enumerate() {
         phase.at(read, frames);
         resample.push(sample.map_err(|e| Error::wav(path, e))?)?;
@@ -99,21 +99,32 @@ pub(crate) fn file_name(path: &Path) -> String {
         .into_owned()
 }
 
+/// Converts audio already held in memory from `source_rate` to `target_rate`.
+///
+/// Delay-compensated, and the output holds exactly `len * target / source` samples (rounded
+/// down), so a 16 kHz -> 48 kHz -> 16 kHz round trip returns the input's length and timeline.
+pub(crate) fn resample_between(
+    samples: &[f32],
+    source_rate: u32,
+    target_rate: u32,
+) -> Result<Vec<f32>> {
+    if source_rate == target_rate {
+        return Ok(samples.to_vec());
+    }
+    let mut resample = Resample::new(source_rate, target_rate, samples.len())?;
+    for sample in samples {
+        resample.push(*sample)?;
+    }
+    resample.finish()
+}
+
 /// Converts audio already held in memory to [`TARGET_RATE`].
 ///
 /// The in-memory twin of the loop in [`read_track_16k_mono`], for callers whose samples did
 /// not come from a file this crate is willing to open -- see [`crate::import`]. Both go
 /// through [`Resample`], so the filter length and the delay compensation are decided once.
 pub(crate) fn resample_to_target(samples: &[f32], source_rate: u32) -> Result<Vec<f32>> {
-    if source_rate == TARGET_RATE {
-        return Ok(samples.to_vec());
-    }
-
-    let mut resample = Resample::new(source_rate, samples.len())?;
-    for sample in samples {
-        resample.push(*sample)?;
-    }
-    resample.finish()
+    resample_between(samples, source_rate, TARGET_RATE)
 }
 
 /// Writes a track in the one format everything downstream reads: 16 kHz mono float,
@@ -144,7 +155,7 @@ pub(crate) fn write_track_16k_mono(path: &Path, audio: &[f32]) -> Result<()> {
     })
 }
 
-/// A fixed-ratio conversion to [`TARGET_RATE`], fed one sample at a time.
+/// A fixed-ratio sample-rate conversion, fed one sample at a time.
 ///
 /// Push-shaped rather than slice-shaped because the caller that matters is reading a file:
 /// holding an hour of 48 kHz audio *and* its 16 kHz result at once costs ~900 MB, which is
@@ -170,11 +181,11 @@ struct Resample {
 impl Resample {
     /// `frames` is the input length, used to size the output exactly. It is a promise about
     /// how much will be pushed, not a limit: pushing fewer simply yields a shorter track.
-    fn new(source_rate: u32, frames: usize) -> Result<Self> {
+    fn new(source_rate: u32, target_rate: u32, frames: usize) -> Result<Self> {
         // Checked here rather than left to rubato, both because a rate of zero would divide
         // by zero below and because "a header claiming 0 Hz" is a diagnosis, where a
         // resampler-internal message would not be.
-        if source_rate == 0 {
+        if source_rate == 0 || target_rate == 0 {
             return Err(Error::Resample(
                 "the file's header reports a sample rate of 0".to_string(),
             ));
@@ -184,7 +195,7 @@ impl Resample {
         // anti-aliasing filter is the same one the timestamps were measured against.
         let resampler = Fft::<f32>::new_custom(
             source_rate as usize,
-            TARGET_RATE as usize,
+            target_rate as usize,
             CHUNK_FRAMES,
             SUB_CHUNKS,
             1,
@@ -198,7 +209,7 @@ impl Resample {
         // resampled track aligned with the original rather than uniformly late.
         let delay = resampler.output_delay();
         let expected =
-            (frames as u128 * u128::from(TARGET_RATE) / u128::from(source_rate)) as usize;
+            (frames as u128 * u128::from(target_rate) / u128::from(source_rate)) as usize;
 
         Ok(Resample {
             resampler,

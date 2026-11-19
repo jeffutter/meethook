@@ -160,6 +160,7 @@ fn transcribe(paths: &Paths, id: &SessionId) {
         Ok(Engines {
             asr: Box::new(FakeAsr),
             diarizer: Box::new(FingerprintDiarizer),
+            isolation: None,
         })
     };
     let report = run_batch(

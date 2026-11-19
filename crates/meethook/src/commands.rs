@@ -109,6 +109,7 @@ pub fn transcribe(
             Ok(Engines {
                 asr: Box::new(asr),
                 diarizer,
+                isolation: None,
             })
         };
 

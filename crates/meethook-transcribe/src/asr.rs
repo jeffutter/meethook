@@ -69,7 +69,7 @@ const BLANK_AUDIO: &str = "[BLANK_AUDIO]";
 ///
 /// `threshold` is [`VadTuning::default`]'s 0.35, chosen by listening to this corpus; see
 /// [`crate::FireRedVad`].
-fn gate_tuning() -> VadTuning {
+pub(crate) fn gate_tuning() -> VadTuning {
     VadTuning {
         min_silence_s: 0.5,
         ..VadTuning::default()
