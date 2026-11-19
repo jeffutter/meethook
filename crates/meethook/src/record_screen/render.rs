@@ -18,7 +18,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::state::{EditingField, Phase, State};
-use crate::record::{NO_ROSTER, meeting_clause_line, mic_line, session_id_line, speaker_line};
+use crate::record::{
+    MEETING_CLEARED_CLAUSE, NO_ROSTER, meeting_clause_line, meeting_cleared_line, mic_line,
+    session_id_line, speaker_line,
+};
 use meethook_session::AttendeeStatus;
 
 /// Places the record frame for one draw.
@@ -79,7 +82,9 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
         // clause: the settled pick first -- its fit is Confirmed by construction, so the
         // clause reads plainly and the marker says how it got there -- else the automatic
         // guess through the composer, so a weak fit shows its caveat verbatim.
-        if let Some(settled) = &state.settled {
+        if state.cleared {
+            body_lines.push(Line::from(Span::raw(meeting_cleared_line())));
+        } else if let Some(settled) = &state.settled {
             body_lines.push(Line::from(Span::raw(format!(
                 "  meeting   {}  (by hand)",
                 settled.clause()
@@ -93,6 +98,8 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
         let mut spans = vec![Span::raw(format!("recorded {}", last.id)).dim()];
         if let Some(meeting) = &last.meeting {
             spans.push(Span::raw(format!("  · {}", meeting.clause())).dim());
+        } else if last.cleared {
+            spans.push(Span::raw(format!("  · meeting {MEETING_CLEARED_CLAUSE}")).dim());
         }
         body_lines.push(Line::from(spans));
     }
@@ -221,11 +228,17 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
             }
         } else if state.selector_open {
             pane_keys.push(Span::raw("  up/down move  enter choose  esc back").dim());
+            if state.can_clear_meeting() {
+                pane_keys.push(Span::raw("  c clear meeting").dim());
+            }
         } else {
             // The roster key is advertised only while a roster is attached: with no meeting
             // there is nothing to open, and a key that cannot work is not offered.
             if state.roster.is_some() {
                 pane_keys.push(Span::raw("  r roster").dim());
+            }
+            if state.can_clear_meeting() {
+                pane_keys.push(Span::raw("  c clear meeting").dim());
             }
             pane_keys.push(Span::raw("  enter choose a meeting").dim());
         }
@@ -601,6 +614,7 @@ mod tests {
             speaker_secs: 7.5,
             dir: std::path::PathBuf::from("/tmp/meethook/sessions/20260809-050900"),
             meeting: None,
+            cleared: false,
         });
         state.apply(&Note::Watching);
         let painted = painted(80, 24, &state, None).join("\n");
@@ -662,6 +676,7 @@ mod tests {
             speaker_secs: 7.5,
             dir: "/tmp/meethook/sessions/20260809-051100".into(),
             meeting: Some(MeetingLabel::from(&meeting)),
+            cleared: false,
         });
 
         let painted = painted(80, 24, &state, None).join("\n");
@@ -1120,5 +1135,57 @@ mod tests {
         // and trouble stashed -- the two things that make a frame the busiest it gets.
         let squeezed = painted(20, 5, &state, Some(Duration::from_secs(3661)));
         assert!(squeezed.iter().any(|row| !row.is_empty()), "{squeezed:?}");
+    }
+
+    /// `c clear meeting` is advertised in the base and the selector while recording, holds the
+    /// 80-column floor on its own row, and withdraws once the meeting is removed, in the roster
+    /// pane's editing context and when no session is live.
+    #[test]
+    fn the_clear_key_is_advertised_only_where_it_works() {
+        let standup = meeting_of("EVENT-A", "Standup", MeetingFit::Started);
+        let mut base = State::default();
+        base.apply(&started(50));
+        base.apply(&Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&standup)],
+            guess: Some(MeetingLabel::from(&standup)),
+        });
+        base.apply(&secret_roster());
+        let mut selector = State::default();
+        selector.apply(&started(51));
+        // The degraded view: nothing offered, no guess, and the key is still there.
+        selector.apply(&Note::MeetingOffered {
+            offered: vec![],
+            guess: None,
+        });
+        selector.open_selector();
+
+        for (name, state) in [("the base", &base), ("an empty selector", &selector)] {
+            let rows = painted(80, 24, state, None);
+            let hint = rows
+                .iter()
+                .find(|row| row.contains("c clear meeting"))
+                .unwrap_or_else(|| panic!("`c` is not advertised in {name}: {rows:?}"));
+            assert!(hint.chars().count() <= 80, "{hint:?}");
+        }
+
+        base.apply(&Note::MeetingCleared);
+        let rows = painted(80, 24, &base, None).join("\n");
+        assert!(!rows.contains("c clear meeting"), "{rows}");
+        assert!(
+            !rows.contains("r roster"),
+            "no roster key after removal: {rows}"
+        );
+        assert!(rows.contains("meeting   none (cleared by hand)"), "{rows}");
+        assert!(!rows.contains("Standup"), "{rows}");
+        assert!(rows.contains("enter choose a meeting"), "{rows}");
+
+        let mut idle = State::default();
+        idle.apply(&Note::Watching);
+        let rows = painted(80, 24, &idle, None).join("\n");
+        assert!(!rows.contains("c clear meeting"), "{rows}");
+        let mut editing = roster_state();
+        editing.begin_edit(EditingField::Name);
+        let rows = painted(80, 24, &editing, None).join("\n");
+        assert!(!rows.contains("c clear meeting"), "{rows}");
     }
 }

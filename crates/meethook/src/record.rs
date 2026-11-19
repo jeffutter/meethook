@@ -55,6 +55,8 @@ use meethook_session::{Acquisition, RecordLock};
 use meethook_session::{AppIdentities, Attendee, Meeting, MeetingFit, RosterEdit};
 // The capture backend exists only where its Apple frameworks compile; the platform-neutral
 // sequencing in `record_loop` below stays ungated and keeps testing without it.
+#[cfg(any(target_os = "macos", test))]
+use meethook_record::HandLabel;
 #[cfg(target_os = "macos")]
 use meethook_record::{
     ACTIVITY_DEBUG_ENV_VAR, Activity, MicActivityWatcher, Recorder, RunningSession, meetings_for,
@@ -205,6 +207,11 @@ pub(crate) enum Event {
     /// `String`, so the channel's contract (one reader, events decided at the loop) is
     /// unchanged in kind, and no `Meeting` crosses it.
     MeetingPicked(String),
+    /// The user removed the meeting the session was attached to: the same decision as
+    /// `meethook meeting <session> --clear`, made while the session is live. Carries nothing
+    /// -- there is no event to address -- and never reaches the calendar. A later
+    /// [`Event::MeetingPicked`] supersedes it, as `meeting --event` does after a clear.
+    MeetingCleared,
     /// The user committed a correction to the attached meeting's roster in the frame's roster
     /// pane, riding the same addressing rule [`Event::MeetingPicked`] sets: the session
     /// crate's own [`RosterEdit`], identified by the event id the frame was shown, resolved
@@ -252,14 +259,14 @@ trait Capture {
     fn candidates(&mut self) -> Offered;
     /// Finalizes the current session and reports what it produced.
     ///
-    /// `hand` is the pick the user settled while recording, if any, and `roster_edit` the
+    /// `hand` is the pick (or removal) the user settled while recording, if any, and `roster_edit` the
     /// roster correction the frame committed, if any. Both are applied here, at the single
     /// finalize point, rather than written mid-flight: `session.json` does not exist until
     /// this write, and its presence is the completion marker every other process reads.
     fn finish(
         &mut self,
         sink: &mut dyn Reporter,
-        hand: Option<Meeting>,
+        hand: Option<HandLabel>,
         roster_edit: Option<RosterEdit>,
         mic_apps: AppIdentities,
     ) -> Result<()>;
@@ -388,6 +395,9 @@ pub(crate) enum Note {
     /// finish -- never the candidate's own fit, whose caveat would qualify a pick a human just
     /// made. Composes to nothing for the same reason [`Note::MeetingOffered`] does.
     MeetingSettled { label: MeetingLabel },
+    /// A hand removal settled: the session's meeting was cleared by the user. The frame drops
+    /// the guess, any pick and the roster. Composes to nothing, like [`Note::MeetingSettled`].
+    MeetingCleared,
     /// The attached meeting's roster, for the frame's roster pane: name, email, status and
     /// `is_you` per attendee -- the [`Attendee`] fields are exactly the disclosure unit, and
     /// nothing more crosses. The invite content (`notes`, `location`, `url`) lives on the
@@ -416,6 +426,8 @@ pub(crate) enum Note {
         speaker_secs: f64,
         dir: PathBuf,
         meeting: Option<MeetingLabel>,
+        /// A person removed the meeting, as opposed to none ever being found.
+        cleared: bool,
     },
 
     // ---- stderr class ----
@@ -465,6 +477,7 @@ impl Note {
             // away is what keeps the line-based run byte-identical.
             Note::MeetingOffered { .. }
             | Note::MeetingSettled { .. }
+            | Note::MeetingCleared
             | Note::RosterAttached { .. } => String::new(),
             Note::Recorded {
                 id,
@@ -472,12 +485,14 @@ impl Note {
                 speaker_secs,
                 dir,
                 meeting,
+                cleared,
             } => recorded_lines(
                 id,
                 *mic_secs,
                 *speaker_secs,
                 dir.display(),
                 meeting.as_ref(),
+                *cleared,
             ),
             Note::GivingUp(attempts) => giving_up_line(*attempts),
         }
@@ -588,11 +603,15 @@ pub(crate) fn recorded_lines(
     speaker_secs: f64,
     dir: impl fmt::Display,
     meeting: Option<&MeetingLabel>,
+    cleared: bool,
 ) -> String {
     let mut lines =
         format!("Recorded {id} ({mic_secs:.1}s mic, {speaker_secs:.1}s speaker) to {dir}\n");
     if let Some(meeting) = meeting {
         lines.push_str(&meeting_clause_line(meeting));
+        lines.push('\n');
+    } else if cleared {
+        lines.push_str(&meeting_cleared_line());
         lines.push('\n');
     }
     lines
@@ -836,7 +855,7 @@ impl Capture for SessionCapture<'_> {
     fn finish(
         &mut self,
         sink: &mut dyn Reporter,
-        hand: Option<Meeting>,
+        hand: Option<HandLabel>,
         roster_edit: Option<RosterEdit>,
         mic_apps: AppIdentities,
     ) -> Result<()> {
@@ -864,6 +883,7 @@ impl Capture for SessionCapture<'_> {
             // holds title and fit, which is what makes "nothing sensitive crosses" a property
             // of the type.
             meeting: recording.metadata.meeting.as_ref().map(MeetingLabel::from),
+            cleared: recording.metadata.meeting_cleared,
         });
         Ok(())
     }
@@ -1066,6 +1086,7 @@ fn record_loop(
                 // No session is live to attach a pick to -- it cannot normally arrive here --
                 // and dropping it is the answer that keeps the idle wait idle.
                 Ok(Event::MeetingPicked(_)) => continue,
+                Ok(Event::MeetingCleared) => continue,
                 // No session is live to attach an edit to either; the same answer.
                 Ok(Event::RosterEdited(_)) => continue,
                 // Nothing is recording, so there is nothing here to end -- and above all a
@@ -1091,7 +1112,7 @@ fn record_loop(
         // Both locals die with the session, so a device-change or stall restart cannot
         // inherit a predecessor's list or pick.
         let offered = capture.candidates();
-        let mut hand: Option<Meeting> = None;
+        let mut hand: Option<HandLabel> = None;
         // The frame's committed roster correction, if any: stashed beside the pick so both
         // die with the session block, and applied at the single finalize point below.
         let mut roster_edit: Option<RosterEdit> = None;
@@ -1141,7 +1162,7 @@ fn record_loop(
                         .find(|m| m.event_id == event_id)
                         .cloned()
                     {
-                        hand = Some(meeting.clone());
+                        hand = Some(HandLabel::Pick(meeting.clone()));
                         // Lifted out before the Confirmed stamp moves the meeting into the
                         // label: the supersedure below needs the same id.
                         let event_id = meeting.event_id.clone();
@@ -1170,6 +1191,16 @@ fn record_loop(
                             attendees,
                         });
                     }
+                }
+                // The user removed the meeting. Stashed as its own outcome rather than as the
+                // absence of a pick, because "nothing decided" lets the calendar attach a
+                // guess at finish. The roster edit dies with the meeting it corrected, and a
+                // later pick replaces this -- `hand` is simply overwritten. The calendar is
+                // not consulted here or at finish.
+                Ok(Event::MeetingCleared) => {
+                    hand = Some(HandLabel::Clear);
+                    roster_edit = None;
+                    sink.note(Note::MeetingCleared);
                 }
                 // The frame committed a roster correction, addressed by the event id it was
                 // shown. Validated against the held list -- an unknown id changes nothing,
@@ -1368,6 +1399,7 @@ fn begin(
             // No session exists yet to attach a pick to -- it cannot normally arrive here --
             // so the answer is the same as a redundant start edge: keep retrying.
             Ok(Event::MeetingPicked(_)) => {}
+            Ok(Event::MeetingCleared) => {}
             // No session exists yet to attach an edit to either; the same answer.
             Ok(Event::RosterEdited(_)) => {}
             // And no session exists yet to end, so the same answer again: keep retrying.
@@ -1432,6 +1464,7 @@ fn await_end(rx: &dyn Events, grace: Duration) -> Outcome {
             // is a recorded edge rather than a hole -- the post-hoc `meeting` command remains
             // the fallback. Waiting out the remainder keeps the grace honest.
             Ok(Event::MeetingPicked(_)) => {}
+            Ok(Event::MeetingCleared) => {}
             // An edit lost here is dropped with the same reasoning: the session finalizes
             // within seconds and the pane closes with it, so no further edit could arrive
             // anyway -- waiting out the remainder keeps the grace honest.
@@ -1468,6 +1501,16 @@ fn await_end(rx: &dyn Events, grace: Duration) -> Outcome {
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn meeting_clause_line(label: &MeetingLabel) -> String {
     format!("  meeting   {}", label.clause())
+}
+
+/// What a meeting a person removed reads as, in the frame and on the finish line alike.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const MEETING_CLEARED_CLAUSE: &str = "none (cleared by hand)";
+
+/// The finish line's clause for a session whose meeting was removed by hand.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn meeting_cleared_line() -> String {
+    format!("  meeting   {MEETING_CLEARED_CLAUSE}")
 }
 
 /// The record loop's sequencing, exercised without a microphone.
@@ -1543,10 +1586,10 @@ mod tests {
     };
 
     use super::{
-        Capture, DEVICE_CHANGED, Event, Events, MIC_STALLED, Narration, Note, Offered, Outcome,
-        Plain, Presenter, Reporter, Timing, WATCHING, await_end, meeting_clause_line, mic_line,
-        presenter, record_loop, recorded_lines, refusal, session_dir_line, session_id_line,
-        speaker_line,
+        Capture, DEVICE_CHANGED, Event, Events, HandLabel, MIC_STALLED, Narration, Note, Offered,
+        Outcome, Plain, Presenter, Reporter, Timing, WATCHING, await_end, meeting_clause_line,
+        mic_line, presenter, record_loop, recorded_lines, refusal, session_dir_line,
+        session_id_line, speaker_line,
     };
 
     /// A reporter that records nothing.
@@ -1830,6 +1873,9 @@ mod tests {
         /// into `calls`: the sequencing tests' exact call logs predate the seam, and asking
         /// for candidates is not a sequencing decision.
         candidates: Option<Offered>,
+        /// How many times the loop asked the calendar. A removal must not add to it: the
+        /// only question per session is the one asked at its start.
+        candidate_calls: usize,
         /// What each `finish` was handed as the in-memory pick -- the event ids, in order --
         /// so a test can assert a pick reached the single finalize point without holding a
         /// full `Meeting` of its own.
@@ -1880,19 +1926,24 @@ mod tests {
         fn finish(
             &mut self,
             _sink: &mut dyn super::Reporter,
-            hand: Option<Meeting>,
+            hand: Option<HandLabel>,
             roster_edit: Option<RosterEdit>,
             mic_apps: AppIdentities,
         ) -> super::Result<()> {
             self.calls.push("finish");
             self.finished_at.get_or_insert(self.clock.get());
-            self.hands.push(hand.map(|m| m.event_id));
+            // A removal reads as the sentinel `CLEARED`, which no calendar event id is.
+            self.hands.push(hand.map(|h| match h {
+                HandLabel::Pick(m) => m.event_id,
+                HandLabel::Clear => "CLEARED".to_owned(),
+            }));
             self.roster_edits.push(roster_edit);
             self.mic_apps.push(mic_apps);
             Ok(())
         }
 
         fn candidates(&mut self) -> Offered {
+            self.candidate_calls += 1;
             self.candidates.clone().unwrap_or_default()
         }
 
@@ -2668,6 +2719,135 @@ mod tests {
         );
     }
 
+    fn two_offers() -> Offered {
+        Offered {
+            meetings: vec![
+                meeting_of("EVENT-A", "Standup"),
+                meeting_of("EVENT-B", "Planning"),
+            ],
+            chosen: Some(meeting_of("EVENT-A", "Standup")),
+        }
+    }
+
+    /// A removal reaches the finalize point as its own outcome (not as "nothing decided",
+    /// which would let the calendar guess), tells the frame, and never asks the calendar
+    /// again: the one `candidates` call is the session start's.
+    #[test]
+    fn a_removal_reaches_finish_as_a_clear_and_never_consults_the_calendar() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP, Event::MeetingCleared),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+        let mut capture = FakeCapture {
+            candidates: Some(two_offers()),
+            ..FakeCapture::default()
+        };
+        let notes = run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.calls, ["start", "finish"]);
+        assert_eq!(capture.hands, [Some("CLEARED".to_owned())]);
+        assert_eq!(capture.candidate_calls, 1);
+        assert!(notes.iter().any(|n| matches!(n, Note::MeetingCleared)));
+        assert_eq!(
+            Note::MeetingCleared.composed(),
+            "",
+            "a plain run stays silent"
+        );
+    }
+
+    /// A roster correction made before the removal is not kept: it was a correction to a
+    /// meeting that no longer applies.
+    #[test]
+    fn a_roster_edit_made_before_the_removal_is_dropped() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (
+                BLIP,
+                Event::RosterEdited(RosterEdit {
+                    event_id: "EVENT-A".to_owned(),
+                    attendees: Vec::new(),
+                }),
+            ),
+            (BLIP, Event::MeetingCleared),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+        let mut capture = FakeCapture {
+            candidates: Some(two_offers()),
+            ..FakeCapture::default()
+        };
+        run_noted(&rx, &mut capture, &|| true, false);
+
+        assert_eq!(capture.hands, [Some("CLEARED".to_owned())]);
+        assert_eq!(capture.roster_edits, [None]);
+    }
+
+    /// The last decision wins, in either order: a pick after a removal undoes it, and a
+    /// removal after a pick undoes that.
+    #[test]
+    fn the_last_of_a_pick_and_a_removal_wins() {
+        for (events, expected) in [
+            (
+                vec![
+                    Event::MeetingCleared,
+                    Event::MeetingPicked("EVENT-B".to_owned()),
+                ],
+                "EVENT-B",
+            ),
+            (
+                vec![
+                    Event::MeetingPicked("EVENT-B".to_owned()),
+                    Event::MeetingCleared,
+                ],
+                "CLEARED",
+            ),
+        ] {
+            let mut steps = vec![(BLIP, Event::Started)];
+            steps.extend(events.into_iter().map(|e| (BLIP, e)));
+            steps.push((SETTLE, Event::Stopped));
+            steps.push((SETTLE, Event::Interrupt));
+            let (_tx, rx) = script(steps);
+            let mut capture = FakeCapture {
+                candidates: Some(two_offers()),
+                ..FakeCapture::default()
+            };
+            run_noted(&rx, &mut capture, &|| true, false);
+            assert_eq!(capture.hands, [Some(expected.to_owned())]);
+        }
+    }
+
+    /// A removal sent with no session live is dropped, and the next session starts with no
+    /// inherited decision.
+    #[test]
+    fn a_removal_with_no_session_is_dropped() {
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::MeetingCleared),
+            (BLIP, Event::Started),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+        let mut capture = FakeCapture::default();
+        run_noted(&rx, &mut capture, &|| true, false);
+        assert_eq!(capture.hands, [None]);
+    }
+
+    /// The finish line says the meeting was removed by hand, and says nothing of the kind
+    /// for a session that merely matched nothing.
+    #[test]
+    fn the_finish_line_says_the_meeting_was_cleared_by_hand() {
+        let dir = std::path::Path::new("/tmp/meethook/sessions/20260809-052600");
+        let id = SessionId::parse("20260809-052600").unwrap();
+        let cleared = recorded_lines(&id, 7.5, 7.5, dir.display(), None, true);
+        assert!(
+            cleared.ends_with("\n  meeting   none (cleared by hand)\n"),
+            "{cleared}"
+        );
+        let none = recorded_lines(&id, 7.5, 7.5, dir.display(), None, false);
+        assert!(!none.contains("meeting"), "{none}");
+    }
+
     /// An id the frame was never offered changes nothing: no settlement crosses, and the
     /// finish settles by the automatic rule rather than a pick the run cannot resolve.
     #[test]
@@ -3382,6 +3562,7 @@ mod tests {
                 speaker_secs: 2.0,
                 dir: dir.to_path_buf(),
                 meeting: None,
+                cleared: false,
             }
             .to_stderr()
         );
@@ -3438,7 +3619,7 @@ mod tests {
         );
 
         assert_eq!(
-            recorded_lines(&id, 7.5, 7.5, dir.display(), None),
+            recorded_lines(&id, 7.5, 7.5, dir.display(), None, false),
             "Recorded 20260809-052600 (7.5s mic, 7.5s speaker) to /tmp/meethook/sessions/20260809-052600\n"
         );
         assert_eq!(
@@ -3448,9 +3629,10 @@ mod tests {
                 speaker_secs: 7.5,
                 dir: dir.to_path_buf(),
                 meeting: None,
+                cleared: false,
             }
             .composed(),
-            recorded_lines(&id, 7.5, 7.5, dir.display(), None)
+            recorded_lines(&id, 7.5, 7.5, dir.display(), None, false)
         );
     }
 
@@ -3494,7 +3676,7 @@ mod tests {
         let id = SessionId::parse("20260809-052600").unwrap();
         let dir = std::path::Path::new("/tmp/meethook/sessions/20260809-052600");
         let label = super::MeetingLabel::from(&meeting);
-        let block = recorded_lines(&id, 7.5, 7.5, dir.display(), Some(&label));
+        let block = recorded_lines(&id, 7.5, 7.5, dir.display(), Some(&label), false);
 
         // The clause, and only the clause: title plus caveat if the fit is weak.
         assert!(block.contains("  meeting   Incident review"), "{block}");

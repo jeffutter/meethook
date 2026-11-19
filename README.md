@@ -172,6 +172,12 @@ terminal, or `kill -INT <pid>` from another shell. A plain `kill` (SIGTERM) and 
 `kill -9`, an abort, or a crash. Deleting `record.lock` accomplishes nothing: the lock is held by
 the operating system, not by the file.
 
+In the same UI, `c` removes the meeting the session is attached to, whether the calendar guessed it
+or you picked it, and works even when the selector lists nothing or the calendar cannot be read. It
+is the live form of `meethook meeting <session> --clear`: the session is marked as cleared by hand
+and no later pass attaches a meeting. The frame then shows the meeting as `none (cleared by hand)`
+and drops the roster pane; Enter afterwards picks an event again, which undoes the removal.
+
 What you get back depends on how it ended. An interrupted run writes `session.json` and
 transcribes normally. A panicked or unwound run leaves an orphan whose WAVs were finalized on the
 way out anyway, complete to the last sample. A `kill -9` leaves an orphan that is valid up to the

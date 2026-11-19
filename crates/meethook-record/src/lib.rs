@@ -48,6 +48,22 @@ pub use calendar::{
 pub use preflight::{Authorized, MissingPermissions, preflight};
 pub use track::TrackSummary;
 
+/// What a person decided about the session's meeting while it was recording.
+///
+/// A third outcome beside "pick" and "nothing decided": removing the meeting is a decision,
+/// and it must reach `finish` as one, because "nothing decided" lets the automatic lookup
+/// attach whatever the calendar suggests.
+// One value per session, moved once into `finish`: boxing the meeting would add an
+// allocation to every caller to save a few hundred bytes on the stack.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandLabel {
+    /// The user confirmed this meeting.
+    Pick(Meeting),
+    /// The user removed the meeting: the session was not recorded during one.
+    Clear,
+}
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -368,7 +384,7 @@ impl RunningSession {
     /// outcome rather than a failure.
     pub fn finish(
         self,
-        hand: Option<Meeting>,
+        hand: Option<HandLabel>,
         roster_edit: Option<RosterEdit>,
         mic_apps: AppIdentities,
     ) -> Result<Recording> {
@@ -424,7 +440,7 @@ fn finalize(
     start_time: Timestamp,
     mic_summary: TrackSummary,
     speaker_summary: TrackSummary,
-    hand: Option<Meeting>,
+    hand: Option<HandLabel>,
     roster_edit: Option<RosterEdit>,
     mic_apps: AppIdentities,
     out: &mut Output,
@@ -458,13 +474,25 @@ fn finalize(
         clock::track_sync(mic_ticks),
         clock::track_sync(speaker_ticks),
     );
-    if let Some(meeting) = hand {
-        metadata.label_by_hand(Some(meeting));
-    } else {
-        // Today's path, unchanged: the automatic rule decides, and `with_meeting`'s
-        // no-op guard on a hand-settled label keeps the two halves from ever disagreeing.
-        metadata = metadata.with_meeting(calendar::meeting_at(start_time));
-    }
+    let roster_edit = match hand {
+        Some(HandLabel::Pick(meeting)) => {
+            metadata.label_by_hand(Some(meeting));
+            roster_edit
+        }
+        // The same function `meethook meeting --clear` writes with. The calendar is not
+        // asked, and a roster edit made against the removed meeting has nothing left to
+        // apply to, so it is dropped here rather than left to the event-id mismatch.
+        Some(HandLabel::Clear) => {
+            metadata.label_by_hand(None);
+            None
+        }
+        None => {
+            // Today's path, unchanged: the automatic rule decides, and `with_meeting`'s
+            // no-op guard on a hand-settled label keeps the two halves from ever disagreeing.
+            metadata = metadata.with_meeting(calendar::meeting_at(start_time));
+            roster_edit
+        }
+    };
     // After the winner is resolved, before the write: one application point for both
     // branches, matched by event id -- see the method doc for why the automatic path
     // needs it just as much as the hand-pick path does.
@@ -667,7 +695,7 @@ mod tests {
             start_time,
             live_track(1_000),
             live_track(2_000),
-            Some(hand_picked(start_time)),
+            Some(HandLabel::Pick(hand_picked(start_time))),
             None,
             // Who held the microphone is recorded on this same write, so it has to arrive here too
             // -- and one of these three tests carries a real set to prove the write reaches disk.
@@ -708,7 +736,7 @@ mod tests {
             start_time,
             live_track(1_000),
             live_track(2_000),
-            Some(hand_picked(start_time)),
+            Some(HandLabel::Pick(hand_picked(start_time))),
             None,
             AppIdentities::new(),
             &mut out,
@@ -759,6 +787,50 @@ mod tests {
         );
     }
 
+    /// Removing the meeting writes the same state `meethook meeting --clear` does, drops a
+    /// roster edit made against the removed meeting, and leaves nothing for a later automatic
+    /// pass to attach. No calendar is consulted: the `Clear` branch never calls `meeting_at`.
+    #[test]
+    fn a_hand_clear_is_durable_and_discards_the_roster_edit() {
+        let dir = tempfile::tempdir().expect("a scratch session directory");
+        let paths = SessionPaths::new(dir.path());
+        let id = SessionId::parse("20260910-120004").expect("a well-formed id");
+        let start_time: Timestamp = "2026-09-10T12:00:04Z".parse().expect("a valid timestamp");
+        let (stream, _log) = ScriptedStream::healthy();
+        let mut out = Output::to(stream);
+        let meeting = hand_picked(start_time);
+        let edit = RosterEdit {
+            event_id: meeting.event_id.clone(),
+            attendees: Vec::new(),
+        };
+
+        let recording = finalize(
+            id,
+            paths.clone(),
+            start_time,
+            live_track(1_000),
+            live_track(2_000),
+            Some(HandLabel::Clear),
+            Some(edit),
+            AppIdentities::new(),
+            &mut out,
+        )
+        .expect("the ordinary finalize succeeds");
+
+        let written = SessionMetadata::read(&paths.session_json())
+            .expect("session.json parses back as metadata");
+        assert!(written.meeting.is_none());
+        assert!(
+            written.meeting_cleared,
+            "cleared by hand, not merely unmatched"
+        );
+        assert_eq!(recording.metadata, written);
+        // No later automatic pass attaches anything, and nothing seeds speaker identification.
+        let later = written.with_meeting(Some(meeting));
+        assert!(later.meeting.is_none());
+        assert!(later.meeting_cleared);
+    }
+
     /// A track that heard nothing is still refused *before* the write, whatever the terminal
     /// will do with the report.
     ///
@@ -788,7 +860,7 @@ mod tests {
             start_time,
             silent(),
             live_track(2_000),
-            Some(hand_picked(start_time)),
+            Some(HandLabel::Pick(hand_picked(start_time))),
             None,
             AppIdentities::new(),
             &mut out,

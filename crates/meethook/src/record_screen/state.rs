@@ -105,6 +105,8 @@ pub struct FinishedSession {
     /// The meeting it was attached to, projected to title and fit like everything else the
     /// run says about meetings. `None` when the session matched nothing.
     pub meeting: Option<MeetingLabel>,
+    /// Whether a person removed the meeting, as opposed to none ever being found.
+    pub cleared: bool,
 }
 
 /// Everything the frame draws, derived from the notes the run has said so far.
@@ -136,6 +138,11 @@ pub struct State {
     /// Whether the selector is open: the numbered offers replace the notice region while it
     /// is, and the shell advertises only the keys that work in that context.
     pub selector_open: bool,
+    /// Whether the user removed the session's meeting by hand: the frame then states that
+    /// instead of a guess or a pick, and the roster pane has nothing to show. Set by the run's
+    /// [`Note::MeetingCleared`], not by the keypress, so a removal the run drops never reads as
+    /// one; undone by a later pick.
+    pub cleared: bool,
     /// The row under the cursor within `offered`. Meaningful while the selector is open;
     /// reset with the pane rather than trusted across sessions.
     pub cursor: usize,
@@ -184,6 +191,7 @@ impl State {
             guess: None,
             settled: None,
             selector_open: false,
+            cleared: false,
             cursor: 0,
             roster: None,
             roster_event_id: None,
@@ -201,6 +209,7 @@ impl State {
         self.guess = None;
         self.settled = None;
         self.selector_open = false;
+        self.cleared = false;
         self.cursor = 0;
         self.roster = None;
         self.roster_event_id = None;
@@ -263,6 +272,7 @@ impl State {
                 self.offered = offered.clone();
                 self.guess = guess.clone();
                 self.settled = None;
+                self.cleared = false;
                 self.selector_open = false;
                 self.cursor = 0;
             }
@@ -271,7 +281,23 @@ impl State {
                 // stuck is what confirms it, not the keypress -- so a pick the run drops never
                 // reads as one.
                 self.settled = Some(label.clone());
+                self.cleared = false;
                 self.selector_open = false;
+            }
+            Note::MeetingCleared => {
+                // Everything that described the removed meeting goes: the guess it would have
+                // been attached as, a pick, and the roster with any in-flight correction. The
+                // offers stay -- choosing one afterwards is how the removal is undone.
+                self.guess = None;
+                self.settled = None;
+                self.cleared = true;
+                self.selector_open = false;
+                self.roster = None;
+                self.roster_event_id = None;
+                self.roster_open = false;
+                self.roster_cursor = 0;
+                self.editing = None;
+                self.edit_buffer.clear();
             }
             Note::RosterAttached {
                 event_id,
@@ -282,6 +308,7 @@ impl State {
                 // restarted session starts clean rather than inheriting its predecessor's
                 // people. The pane itself stays closed -- the run showing a roster is not
                 // the user opening it.
+                self.cleared = false;
                 self.roster = Some(attendees.clone());
                 self.roster_event_id = Some(event_id.clone());
                 self.roster_open = false;
@@ -313,10 +340,16 @@ impl State {
                 self.phase = Phase::Idle;
                 self.notice = Some(NO_NEW_SESSION.to_string());
             }
-            Note::Recorded { id, meeting, .. } => {
+            Note::Recorded {
+                id,
+                meeting,
+                cleared,
+                ..
+            } => {
                 self.last = Some(FinishedSession {
                     id: id.clone(),
                     meeting: meeting.clone(),
+                    cleared: *cleared,
                 });
                 self.session = None;
                 self.phase = Phase::Idle;
@@ -355,6 +388,17 @@ impl State {
     /// so this keeps the channel clean and the hint honest rather than preventing a fault.
     pub fn can_stop_session(&self) -> bool {
         self.phase == Phase::Recording
+    }
+
+    /// Whether a meeting removal is on offer: a session is recording and its meeting is not
+    /// already removed.
+    ///
+    /// Deliberately independent of the offers and of any guess: the removal has to be
+    /// reachable when the selector lists nothing and the calendar could not be read, because
+    /// that is exactly when a stale automatic guess may still be attached. The caller sends
+    /// the removal to the run, and [`Note::MeetingCleared`] is what changes the frame.
+    pub fn can_clear_meeting(&self) -> bool {
+        self.phase == Phase::Recording && !self.cleared
     }
 
     /// Opens the selector while a session is recording.
@@ -596,6 +640,7 @@ mod tests {
             speaker_secs: 7.5,
             dir: std::path::PathBuf::from(format!("/tmp/meethook/sessions/20260809-05{n:02}00")),
             meeting: meeting.map(MeetingLabel::from),
+            cleared: false,
         }
     }
 
@@ -930,7 +975,7 @@ mod tests {
             format!(
                 "{WATCHING}\n{}{STOPPING}\n{}",
                 session_started_lines(id(5), dir, 48_000, 1, 44_100),
-                recorded_lines(id(5), 7.5, 7.5, dir, None)
+                recorded_lines(id(5), 7.5, 7.5, dir, None, false)
             )
         );
         assert!(
@@ -1252,5 +1297,94 @@ mod tests {
         s.edit_buffer.clear();
         s.backspace_edit();
         assert_eq!(s.edit_buffer, "");
+    }
+
+    /// Removing the meeting: offered whenever a session records (even with no offers and no
+    /// guess), changes the frame only when the run's note comes back, takes the guess, the pick
+    /// and the roster with it, makes the roster key a no-op, and is undone by a later pick.
+    #[test]
+    fn clearing_the_meeting_drops_the_guess_and_the_roster_and_a_pick_undoes_it() {
+        let standup = meeting_of("EVENT-A", "Standup");
+        let mut s = State::default();
+        assert!(!s.can_clear_meeting(), "nothing is recording yet");
+        s.apply(&started(40));
+        s.apply(&Note::MeetingOffered {
+            offered: vec![offer_of("EVENT-A", "Standup")],
+            guess: Some(MeetingLabel::from(&standup)),
+        });
+        s.apply(&roster_of("EVENT-A"));
+        s.open_roster();
+        assert!(s.can_clear_meeting());
+
+        // The key alone changes nothing; the run's note is what settles it.
+        assert!(s.guess.is_some() && s.roster.is_some() && !s.cleared);
+
+        s.apply(&Note::MeetingCleared);
+        assert!(s.cleared);
+        assert!(s.guess.is_none() && s.settled.is_none());
+        assert!(s.roster.is_none() && !s.roster_open);
+        assert!(!s.can_clear_meeting(), "already removed");
+        s.open_roster();
+        assert!(!s.roster_open, "the roster key no longer applies");
+        s.roster_next();
+        assert!(s.remove_selected().is_none(), "no roster row to edit");
+        s.open_selector();
+        assert!(
+            s.selector_open && !s.offered.is_empty(),
+            "choosing is still possible"
+        );
+
+        s.apply(&Note::MeetingSettled {
+            label: MeetingLabel::from(&standup.with_fit(MeetingFit::Confirmed)),
+        });
+        assert!(!s.cleared, "a pick undoes the removal");
+        assert!(s.can_clear_meeting());
+    }
+
+    /// The degraded view: no offers, no guess, no roster -- the removal is still offered, and
+    /// it does nothing outside a recording.
+    #[test]
+    fn clearing_is_offered_with_nothing_on_the_calendar_and_only_while_recording() {
+        let mut s = State::default();
+        s.apply(&started(41));
+        s.apply(&Note::MeetingOffered {
+            offered: vec![],
+            guess: None,
+        });
+        assert!(s.can_clear_meeting());
+        s.apply(&Note::MeetingCleared);
+        assert!(s.cleared);
+
+        s.apply(&Note::Stopping);
+        let mut idle = State::default();
+        assert!(!idle.can_clear_meeting());
+        idle.apply(&Note::Watching);
+        assert!(!idle.can_clear_meeting());
+        s.apply(&Note::Stopping);
+        assert!(
+            !s.can_clear_meeting(),
+            "a finalizing session takes no removal"
+        );
+    }
+
+    /// A finished session remembers that its meeting was removed by hand, and the next
+    /// session starts clean.
+    #[test]
+    fn the_finish_remembers_the_removal_and_the_next_session_inherits_nothing() {
+        let mut s = State::default();
+        s.apply(&started(42));
+        s.apply(&Note::MeetingCleared);
+        s.apply(&Note::Recorded {
+            id: id(42),
+            mic_secs: 1.0,
+            speaker_secs: 1.0,
+            dir: "/tmp/x".into(),
+            meeting: None,
+            cleared: true,
+        });
+        assert!(s.last.as_ref().unwrap().cleared);
+        assert!(!s.cleared);
+        s.apply(&started(43));
+        assert!(!s.cleared);
     }
 }

@@ -361,6 +361,16 @@ fn run(
                                         let _ = tx.send(Event::StopSession);
                                     }
                                 }
+                                Action::ClearMeeting => {
+                                    // The removal rides to the run as an event; the frame
+                                    // changes when the run's note comes back, so a removal
+                                    // the run drops never reads as one. Gated on a live
+                                    // session only -- not on offers or a guess, since it must
+                                    // work with an empty selector and no calendar.
+                                    if state.can_clear_meeting() {
+                                        let _ = tx.send(Event::MeetingCleared);
+                                    }
+                                }
                                 // The stop never reaches this arm: the interrupt arm
                                 // above decides Ctrl-C before the selector commands get
                                 // a look at the key.
@@ -442,6 +452,10 @@ enum Action {
     Confirm,
     /// Close the selector without picking.
     CloseSelector,
+    /// Remove the meeting the session is attached to: crosses as an [`Event::MeetingCleared`],
+    /// the same decision as `meethook meeting <session> --clear`. Bound in the base and the
+    /// selector, so it works when the selector lists nothing; a later pick undoes it.
+    ClearMeeting,
     /// Open the roster pane: the attached meeting's attendees replace the notice region while
     /// it is open. A no-op in the state machine when no meeting is attached, which is why the
     /// hint line advertises the key only while a roster is on screen.
@@ -538,6 +552,10 @@ fn event(key: KeyEvent, ctx: KeyContext) -> Option<Action> {
         (KeyCode::Char('s'), KeyContext::Base | KeyContext::Selector | KeyContext::Roster) => {
             Some(Action::StopSession)
         }
+        // Removing the meeting: wherever the meeting is on screen or being chosen, and not in
+        // the roster pane (the meeting it would remove is the one being edited there) nor
+        // while a field is being typed into, where `c` is just a letter.
+        (KeyCode::Char('c'), KeyContext::Base | KeyContext::Selector) => Some(Action::ClearMeeting),
         // The roster pane's toggle: bound wherever the pane might be opened or closed, and a
         // no-op in the state machine when there is no attachment to open it on.
         (KeyCode::Char('r'), KeyContext::Base) => Some(Action::OpenRoster),
@@ -784,5 +802,37 @@ mod tests {
                 "{code:?} is unbound in the selector"
             );
         }
+    }
+
+    /// `c` removes the meeting from the base and the selector (so it works when the selector
+    /// lists nothing), and is just a letter while a roster field is typed into and unbound in
+    /// the roster pane itself. Uppercase and Ctrl-C keep their own meanings.
+    #[test]
+    fn c_clears_the_meeting_only_where_it_is_advertised() {
+        let at = |ctx, ctrl, kind| event(press(KeyCode::Char('c'), kind, ctrl), ctx);
+        for ctx in [KeyContext::Base, KeyContext::Selector] {
+            assert_eq!(
+                at(ctx, false, KeyEventKind::Press),
+                Some(Action::ClearMeeting)
+            );
+            assert_eq!(at(ctx, false, KeyEventKind::Release), None);
+            assert_eq!(at(ctx, true, KeyEventKind::Press), Some(Action::Interrupt));
+        }
+        assert_eq!(at(KeyContext::Roster, false, KeyEventKind::Press), None);
+        assert_eq!(
+            at(
+                KeyContext::RosterEditing(EditingField::Name),
+                false,
+                KeyEventKind::Press
+            ),
+            Some(Action::Type('c'))
+        );
+        assert_eq!(
+            event(
+                press(KeyCode::Char('C'), KeyEventKind::Press, false),
+                KeyContext::Base
+            ),
+            None
+        );
     }
 }
