@@ -1,3 +1,11 @@
+---
+id: doc-009
+title: 'Prior art: manual stop affordance, key choice and pty testing for TASK-066.07'
+type: research
+created_date: '2026-09-11 21:05'
+updated_date: '2026-09-11 21:05'
+---
+
 # TASK-066.07 research — manual stop that keeps the watcher running
 
 Gathered for planning `task-066.07 - Add-a-record-frame-key-that-ends-the-current-session-and-keeps-watching`.

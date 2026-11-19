@@ -1,3 +1,11 @@
+---
+id: doc-014
+title: 'Prior art: constructing every TrackEvidence state for a surface for TASK-067.05.09'
+type: research
+created_date: '2026-09-22 17:58'
+updated_date: '2026-09-22 17:58'
+---
+
 # doc-014 - Prior art: constructing every `TrackEvidence` state for a surface (TASK-067.05.09)
 
 Research only, no plan. Everything under "Measured here" was run on this machine
