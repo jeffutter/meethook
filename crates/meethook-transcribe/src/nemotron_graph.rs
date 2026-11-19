@@ -30,7 +30,7 @@ pub struct NemotronGraph {
 
 /// What one step returns.
 pub struct StepOutput {
-    /// Raw logits, `(cached + encoder frames) * STACK` rows of [`SPEAKERS`].
+    /// Raw logits, `(cached + encoder frames) * STACK` rows of `SPEAKERS`.
     pub logits: Vec<f32>,
     /// Embeddings of the step's own encoder frames, `encoder frames * HIDDEN`; the cached rows
     /// are not echoed back.
@@ -144,7 +144,7 @@ impl NemotronGraph {
     ///
     /// - `features`: `mel_frames * MEL_BINS` log-mel values of the chunk and its right context.
     /// - `cached`: `cached_frames * HIDDEN`, the cache rows then the FIFO rows
-    ///   ([`crate::nemotron_cache::SpeakerCache::cached_embeds`]).
+    ///   (`crate::nemotron_cache::SpeakerCache::cached_embeds`).
     /// - `valid`: one entry per encoder frame of `features` ([`encoder_valid`]).
     pub fn step(&mut self, features: &[f32], cached: &[f32], valid: &[bool]) -> Result<StepOutput> {
         let enc = check_step(features, cached, valid)?;

@@ -31,7 +31,7 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-/// Per-slot speech probabilities for a 16 kHz mono track: one row of [`SPEAKERS`] values per
+/// Per-slot speech probabilities for a 16 kHz mono track: one row of `SPEAKERS` values per
 /// 10 ms mel frame, `frame_count(samples.len()) * SPEAKERS` values in all, slot-minor. An
 /// empty track returns no rows and never touches the graph.
 pub fn speaker_probabilities(
