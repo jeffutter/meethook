@@ -244,6 +244,21 @@ discovered session that doesn't already have a transcript is considered.
 | `--pan <WIDTH>` | 0.3 | How far each track is panned from centre: `0.0` is mono, `1.0` is hard left/right |
 | `--target-lufs <LUFS>` | -16 | Loudness each track is normalized to before mixing, in LUFS |
 | `--max-boost-db <DB>` | 18 | Most a quiet track may be turned up on its way to the target, in dB |
+| `--no-isolate` | off (isolation is on) | Skip mic isolation for this run; see below |
+
+**Mic isolation.** By default, before Whisper hears your microphone, a voice-isolator model
+removes background noise from the speech regions of the (echo-cancelled) mic track. Only the mic
+track is affected: `mic.cleaned.wav`, `meeting.opus` and the speaker track are never changed, and
+the speaker track is never isolated. The model is about 260 MB, downloaded once on first use (only
+when there is something to transcribe) into `models/`; `--no-isolate` avoids the download. If it
+cannot be fetched or loaded, `transcribe` says so and uses the plain mic track. What each run did
+is recorded in the session's `cleaning.json`. Cost: the isolator runs on the CPU at about 0.3x realtime (0.30x measured: 600 s of continuous
+speech in 2022 s wall, peak memory 8.9 GB, Apple M1 Pro with 32 GB, release build, through the
+whole stage with the real speech detector; `cargo run --release --example isolate-voice
+<48 kHz wav> --stage --minutes 10`). That is worst case, since only speech regions are isolated:
+a meeting with 20 minutes of your own speech in it adds roughly an hour. A one-hour continuous
+track was not run (it would take about 3.4 hours at that rate); cost is linear in speech
+duration, so the ten-minute figure extrapolates. Pass `--no-isolate` if you would rather not pay it.
 
 `--pan`, `--target-lufs`, and `--max-boost-db` are refused outside the range the mixdown
 arithmetic admits, rather than silently clamped, so a mistyped value is reported instead of
@@ -360,7 +375,7 @@ Everything meethook writes lives under one root (`~/meethook` by default, overri
 
 - `sessions/<id>/` — one directory per recorded session: raw tracks, `session.json`,
   `transcript.md`/`.json`, `meeting.opus`
-- `models/` — downloaded model weights (Whisper, diarization, speaker embedding), fetched and
+- `models/` — downloaded model weights (Whisper, diarization, speaker embedding, voice isolator), fetched and
   hash-verified on first use
 - `speakers.json` — enrolled voice references, shared across every session
 - `exclusions.json` — apps excluded from the mic-activity trigger (`record` only); user-
