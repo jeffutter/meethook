@@ -33,3 +33,22 @@ find . -type f \( -name CMakeCache.txt -o -name build.ninja \) 2>/dev/null | whi
     rm -rf "$stale_dir"
   fi
 done
+
+# The same rot hits compiled build-script executables (ring's `build-script-build`, say): their
+# ELF interpreter and rpath are absolute store paths of the glibc they were linked with. Once
+# the store rotates, cargo reuses the cached binary as "fresh" and exec fails with "No such
+# file or directory" -- surfacing as `could not execute process build_script_build (never
+# executed)`. Deleting one crate's directory is not enough, because cargo's fingerprints and
+# the dependent rlibs still point at it, so a hit evicts the whole target directory.
+# (Cargo names the file `build-script-build` or `build_script_build-<hash>` by version.)
+find . -type f -path '*/target/*/build/*' \( -name 'build-script-build' -o -name 'build_script_build*' \) \
+  ! -name '*.d' 2>/dev/null | while IFS= read -r script; do
+  for store_path in $(tr '\0' '\n' <"$script" | grep -aoE '/nix/store/[a-z0-9]{32}-[^"'"'"'[:space:]:]*' | sort -u); do
+    if [[ ! -e "$store_path" ]]; then
+      target_dir="${script%%/target/*}/target"
+      echo "evicting stale target dir (build script $script references missing $store_path): $target_dir"
+      rm -rf "$target_dir"
+      break 2
+    fi
+  done
+done
