@@ -56,6 +56,10 @@ mod speakers;
 mod timeline;
 mod trials;
 mod vad;
+// Not called until TASK-080 runs it over the mic track (the `isolate-voice` example reaches it
+// through the re-export below).
+#[allow(dead_code)]
+mod voice_isolator;
 mod voice_vectors;
 
 use std::io::Write;
@@ -86,7 +90,7 @@ pub use loudness::integrated_lufs;
 pub use merge::merge;
 pub use models::{
     EMBEDDING_MODEL, FIRERED_VAD_MODEL, NEMOTRON_DIARIZATION_DATA, NEMOTRON_DIARIZATION_GRAPH,
-    NEMOTRON_DIARIZATION_MODELS, SEGMENTATION_MODEL, WHISPER_MODEL,
+    NEMOTRON_DIARIZATION_MODELS, SEGMENTATION_MODEL, VOICE_ISOLATOR_MODEL, WHISPER_MODEL,
 };
 pub use nemotron_diarize::NemotronDiarizer;
 pub use nemotron_graph::{NemotronGraph, StepOutput, encoder_valid};
@@ -111,6 +115,7 @@ pub use trials::{
     EqualError, Spread, Trial, TrialReport, ZeroFalseAccept, score_trials, wilson_interval,
 };
 pub use vad::{FireRedVad, SpeechRegion, VadTuning, regions_from};
+pub use voice_isolator::VoiceIsolator;
 pub use voice_vectors::{GroupDistance, cosine_distance, group_distance};
 
 use meethook_session::{
@@ -193,6 +198,11 @@ pub enum Error {
     /// contract in doc-015. Loading is [`Error::Onnx`].
     #[error("Nemotron diarization failed: {0}")]
     Nemotron(String),
+
+    /// Loading or running the voice isolator, or an output that does not match its graph
+    /// contract (see [`crate::VOICE_ISOLATOR_MODEL`]).
+    #[error("voice isolation failed: {0}")]
+    VoiceIsolator(String),
 
     /// The graph's rotary position table holds 5000 encoder frames and cannot grow, so a step
     /// whose cache, FIFO and chunk together exceed that cannot run at all.

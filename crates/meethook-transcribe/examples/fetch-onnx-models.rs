@@ -12,13 +12,15 @@
 //! byte what the tool will install later -- verified against the embedded sha256, not
 //! merely downloaded.
 //!
-//! Together they are about 231 MB (the Nemotron weights are 199 MB of that), which is why this is a deliberate invocation rather than
+//! Together they are about 491 MB (the Nemotron weights are 199 MB and the voice isolator 261 MB of that), which is why this is a deliberate invocation rather than
 //! something `cargo test` does behind the user's back.
 
 use std::io::Write;
 
 use meethook_models::{ModelSpec, ensure_model};
-use meethook_transcribe::{EMBEDDING_MODEL, NEMOTRON_DIARIZATION_MODELS, SEGMENTATION_MODEL};
+use meethook_transcribe::{
+    EMBEDDING_MODEL, NEMOTRON_DIARIZATION_MODELS, SEGMENTATION_MODEL, VOICE_ISOLATOR_MODEL,
+};
 
 fn main() {
     let root = match std::env::var_os("MEETHOOK_ROOT") {
@@ -29,7 +31,7 @@ fn main() {
     };
     let models_dir = root.join("models");
 
-    for spec in [&SEGMENTATION_MODEL, &EMBEDDING_MODEL]
+    for spec in [&SEGMENTATION_MODEL, &EMBEDDING_MODEL, &VOICE_ISOLATOR_MODEL]
         .into_iter()
         .chain(&NEMOTRON_DIARIZATION_MODELS)
     {

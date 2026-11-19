@@ -122,6 +122,27 @@ pub const NEMOTRON_DIARIZATION_DATA: ModelSpec = ModelSpec {
     size_bytes: 199_287_808,
 };
 
+/// The voice isolator that strips room noise from the microphone track.
+///
+/// Inworld's voice isolator (Apache-2.0, a 64M-parameter denoiser) in the community ONNX
+/// conversion `mrfakename/voice-isolator-onnx`. Graph contract, from that model card and
+/// asserted in the `voice_isolator` module's ignored smoke test: input `spec` f32
+/// `[1, frames, 1025, 2]`, the real/imaginary STFT of 48 kHz mono audio (n_fft 2048, hop 480,
+/// periodic Hann, centred with reflect padding); output `correction` f32 `[1, frames, 1025, 2]`,
+/// a complex correction to add back through the inverse STFT. See [`crate::VoiceIsolator`].
+///
+/// The file name is the repository's `voice_isolator_offline.onnx` with underscores turned to
+/// hyphens, to match the other entries in this flat directory. Like [`SEGMENTATION_MODEL`], the
+/// URL pins an immutable revision and the hash and size come from the git-LFS pointer served at
+/// the `raw/` path.
+pub const VOICE_ISOLATOR_MODEL: ModelSpec = ModelSpec {
+    file_name: "voice-isolator-offline.onnx",
+    url: "https://huggingface.co/mrfakename/voice-isolator-onnx/resolve/\
+          f97841f53d911c6aa6f1c7778e2d1d214c741861/voice_isolator_offline.onnx",
+    sha256: "11bd40a8089098d847a7c26aaf786b1af0383aa23ebe8a51c9d6877a5aa4ffd0",
+    size_bytes: 260_588_988,
+};
+
 /// Both Nemotron files; install every one before opening the graph.
 pub const NEMOTRON_DIARIZATION_MODELS: [ModelSpec; 2] =
     [NEMOTRON_DIARIZATION_GRAPH, NEMOTRON_DIARIZATION_DATA];
@@ -131,13 +152,14 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    const ALL: [&ModelSpec; 6] = [
+    const ALL: [&ModelSpec; 7] = [
         &WHISPER_MODEL,
         &SEGMENTATION_MODEL,
         &EMBEDDING_MODEL,
         &FIRERED_VAD_MODEL,
         &NEMOTRON_DIARIZATION_GRAPH,
         &NEMOTRON_DIARIZATION_DATA,
+        &VOICE_ISOLATOR_MODEL,
     ];
 
     #[test]
