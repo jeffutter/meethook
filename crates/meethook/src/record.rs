@@ -12,7 +12,7 @@
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
 #[cfg(any(target_os = "macos", test))]
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvError, RecvTimeoutError};
 #[cfg(any(target_os = "macos", test))]
 use std::time::{Duration, Instant};
 
@@ -118,6 +118,57 @@ impl Timing {
         // The cost while recording is one walk of the process objects every two seconds.
         recheck: Duration::from_secs(2),
     };
+}
+
+#[cfg(any(target_os = "macos", test))]
+/// Where the record loop's events come from, and the only clock it reads.
+///
+/// The loop's behaviour is made of waits -- the grace period, the retry interval, the
+/// re-check tick -- and a wait is a receive with a timeout, so the channel and the clock are
+/// one seam. Production uses [`LiveEvents`], a real channel on the real monotonic clock. The
+/// tests use a scripted source on a virtual clock, which makes every timing assertion exact:
+/// a test that compared real sleeps against a 120 ms grace period was at the mercy of the
+/// scheduler.
+trait Events {
+    /// Blocks until an event arrives.
+    fn recv(&self) -> Result<Event, RecvError>;
+    /// Blocks until an event arrives or `timeout` has passed.
+    fn recv_timeout(&self, timeout: Duration) -> Result<Event, RecvTimeoutError>;
+    /// A monotonic reading, as the time since some fixed origin. Only differences between two
+    /// readings from the same source mean anything.
+    fn now(&self) -> Duration;
+}
+
+#[cfg(any(target_os = "macos", test))]
+/// The real thing: an `mpsc` channel on the system's monotonic clock.
+struct LiveEvents {
+    rx: Receiver<Event>,
+    origin: Instant,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl LiveEvents {
+    fn new(rx: Receiver<Event>) -> Self {
+        Self {
+            rx,
+            origin: Instant::now(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Events for LiveEvents {
+    fn recv(&self) -> Result<Event, RecvError> {
+        self.rx.recv()
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<Event, RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -957,7 +1008,7 @@ pub fn record(paths: &Paths, plain: bool) -> Result<()> {
         watcher: &watcher,
     };
     record_loop(
-        &rx,
+        &LiveEvents::new(rx),
         &mut capture,
         &|| watcher.recheck(),
         already_active,
@@ -992,7 +1043,7 @@ pub fn record(paths: &Paths, plain: bool) -> Result<()> {
 /// `already_active` skips the first idle wait, because a call that was already in progress
 /// when this process started will not produce a start edge.
 fn record_loop(
-    rx: &Receiver<Event>,
+    rx: &dyn Events,
     capture: &mut dyn Capture,
     recheck: &dyn Fn() -> bool,
     already_active: bool,
@@ -1281,7 +1332,7 @@ enum Begin {
 /// Bounded, because a permanent failure should cost this call rather than the day, and the
 /// loop stays responsive to Ctrl-C and to the call ending throughout.
 fn begin(
-    rx: &Receiver<Event>,
+    rx: &dyn Events,
     capture: &mut dyn Capture,
     recheck: &dyn Fn() -> bool,
     timing: Timing,
@@ -1362,10 +1413,10 @@ enum Outcome {
 ///
 /// The remaining time is recomputed each pass so that events which do not resolve the wait
 /// cannot extend it indefinitely.
-fn await_end(rx: &Receiver<Event>, grace: Duration) -> Outcome {
-    let deadline = Instant::now() + grace;
+fn await_end(rx: &dyn Events, grace: Duration) -> Outcome {
+    let deadline = rx.now() + grace;
     loop {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        match rx.recv_timeout(deadline.saturating_sub(rx.now())) {
             Ok(Event::Started) => return Outcome::Continue,
             Ok(Event::Interrupt) => return Outcome::Interrupted,
             // Edges alternate, so a second stop should not be possible; wait out the
@@ -1474,9 +1525,13 @@ fn refusal(paths: &Paths, holder: &Holder) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::io::{self, Write};
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::mpsc::{RecvError, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1486,9 +1541,10 @@ mod tests {
     };
 
     use super::{
-        Capture, DEVICE_CHANGED, Event, MIC_STALLED, Narration, Note, Offered, Outcome, Plain,
-        Presenter, Reporter, Timing, WATCHING, await_end, meeting_clause_line, mic_line, presenter,
-        record_loop, recorded_lines, refusal, session_dir_line, session_id_line, speaker_line,
+        Capture, DEVICE_CHANGED, Event, Events, MIC_STALLED, Narration, Note, Offered, Outcome,
+        Plain, Presenter, Reporter, Timing, WATCHING, await_end, meeting_clause_line, mic_line,
+        presenter, record_loop, recorded_lines, refusal, session_dir_line, session_id_line,
+        speaker_line,
     };
 
     /// A reporter that records nothing.
@@ -1506,7 +1562,7 @@ mod tests {
     /// Drives [`record_loop`] with a silent reporter at the test timing, so the call sites
     /// read like the loop itself rather than like a plumbing exercise.
     fn run(
-        rx: &mpsc::Receiver<Event>,
+        rx: &Script,
         capture: &mut FakeCapture,
         recheck: &dyn Fn() -> bool,
         already_active: bool,
@@ -1541,7 +1597,7 @@ mod tests {
     /// Drives [`record_loop`] with a note-recording reporter at the test timing, handing back
     /// what the loop said in the order it said it.
     fn run_noted(
-        rx: &mpsc::Receiver<Event>,
+        rx: &Script,
         capture: &mut FakeCapture,
         recheck: &dyn Fn() -> bool,
         already_active: bool,
@@ -1570,25 +1626,8 @@ mod tests {
         )
     }
 
-    /// Long enough that scheduling noise cannot be mistaken for a timeout, short enough
-    /// that the suite stays fast.
+    /// Virtual time, so the value only has to be distinguishable from its fractions.
     const GRACE: Duration = Duration::from_millis(300);
-
-    /// A channel plus a feeder thread that sends one event after `delay`.
-    ///
-    /// The returned `Sender` is the point of this helper rather than an accident: the
-    /// feeder gets a *clone*, so the channel does not disconnect when it exits. In the
-    /// real loop the original sender lives for the whole run, and a disconnect there means
-    /// something quite different from "the feeder is done".
-    fn feed(delay: Duration, event: Event) -> (mpsc::Sender<Event>, mpsc::Receiver<Event>) {
-        let (tx, rx) = mpsc::channel::<Event>();
-        let feeder = tx.clone();
-        thread::spawn(move || {
-            thread::sleep(delay);
-            let _ = feeder.send(event);
-        });
-        (tx, rx)
-    }
 
     /// The finish line says the title plainly for a match the start supports, and qualifies
     /// one it does not -- driven over every fit so a variant added later cannot slip through
@@ -1665,40 +1704,32 @@ mod tests {
 
     #[test]
     fn silence_for_the_whole_grace_period_ends_the_call() {
-        let (_tx, rx) = mpsc::channel::<Event>();
-        let started = Instant::now();
+        let (_tx, rx) = script(vec![]);
         assert_eq!(await_end(&rx, GRACE), Outcome::CallEnded);
-        assert!(
-            started.elapsed() >= GRACE,
-            "returned before the grace elapsed"
-        );
+        assert_eq!(rx.elapsed(), GRACE, "returned before the grace elapsed");
     }
 
     /// A mute toggle, or any other blip: the microphone comes back before the grace
     /// expires, and the session must survive it whole.
     #[test]
     fn activity_inside_the_grace_period_keeps_the_session() {
-        let (_tx, rx) = feed(GRACE / 6, Event::Started);
+        let (_tx, rx) = script(vec![(GRACE / 6, Event::Started)]);
 
-        let started = Instant::now();
         assert_eq!(await_end(&rx, GRACE), Outcome::Continue);
         // The early return is the point: waiting out the full grace and *then* continuing
         // would look identical from the outcome alone.
-        assert!(
-            started.elapsed() < GRACE,
-            "waited out the whole grace period"
-        );
+        assert_eq!(rx.elapsed(), GRACE / 6, "waited out the whole grace period");
     }
 
     #[test]
     fn an_interrupt_inside_the_grace_period_wins() {
-        let (_tx, rx) = feed(GRACE / 6, Event::Interrupt);
+        let (_tx, rx) = script(vec![(GRACE / 6, Event::Interrupt)]);
         assert_eq!(await_end(&rx, GRACE), Outcome::Interrupted);
     }
 
     #[test]
     fn activity_after_the_grace_period_does_not_rescue_the_session() {
-        let (_tx, rx) = feed(GRACE * 2, Event::Started);
+        let (_tx, rx) = script(vec![(GRACE * 2, Event::Started)]);
         assert_eq!(await_end(&rx, GRACE), Outcome::CallEnded);
     }
 
@@ -1707,26 +1738,18 @@ mod tests {
     /// arriving -- the same silent truncation the device change is reported to prevent.
     #[test]
     fn a_device_change_during_the_grace_period_does_not_rescue_the_session() {
-        let (_tx, rx) = feed(GRACE / 6, Event::InputDeviceChanged);
+        let (_tx, rx) = script(vec![(GRACE / 6, Event::InputDeviceChanged)]);
 
-        let started = Instant::now();
         assert_eq!(await_end(&rx, GRACE), Outcome::CallEnded);
-        assert!(
-            started.elapsed() >= GRACE,
-            "the device change cut the wait short"
-        );
+        assert_eq!(rx.elapsed(), GRACE, "the device change cut the wait short");
     }
 
     #[test]
     fn a_stray_stop_does_not_shorten_or_resolve_the_wait() {
-        let (_tx, rx) = feed(GRACE / 6, Event::Stopped);
+        let (_tx, rx) = script(vec![(GRACE / 6, Event::Stopped)]);
 
-        let started = Instant::now();
         assert_eq!(await_end(&rx, GRACE), Outcome::CallEnded);
-        assert!(
-            started.elapsed() >= GRACE,
-            "the stray stop cut the wait short"
-        );
+        assert_eq!(rx.elapsed(), GRACE, "the stray stop cut the wait short");
     }
 
     /// Nor does a hand stop. Once the session is in the grace wait it is ending either way,
@@ -1734,30 +1757,26 @@ mod tests {
     /// owner of "when is this session over" for a saving nobody can see.
     #[test]
     fn a_hand_stop_inside_the_grace_period_waits_it_out() {
-        let (_tx, rx) = feed(GRACE / 6, Event::StopSession);
+        let (_tx, rx) = script(vec![(GRACE / 6, Event::StopSession)]);
 
-        let started = Instant::now();
         assert_eq!(await_end(&rx, GRACE), Outcome::CallEnded);
-        assert!(
-            started.elapsed() >= GRACE,
-            "the hand stop cut the wait short"
-        );
+        assert_eq!(rx.elapsed(), GRACE, "the hand stop cut the wait short");
     }
 
     /// Losing every sender cannot leave a live recording waiting forever.
     #[test]
     fn a_disconnected_channel_ends_the_call() {
-        let (tx, rx) = mpsc::channel::<Event>();
+        let (tx, rx) = script(vec![]);
         drop(tx);
         assert_eq!(await_end(&rx, GRACE), Outcome::CallEnded);
     }
 
     /// Timing for the whole-loop tests below.
     ///
-    /// `SETTLE` is what separates one call from the next: comfortably longer than `grace`,
-    /// so a gap the loop is meant to read as "the call ended" cannot be mistaken for
-    /// scheduling noise. `BLIP` is the opposite -- short enough that it must land inside the
-    /// grace window.
+    /// `SETTLE` is what separates one call from the next: longer than `grace`, so a gap the
+    /// loop is meant to read as "the call ended" is unambiguous. `BLIP` is the opposite --
+    /// shorter than it, so it must land inside the grace window. All of this is virtual time,
+    /// so the margins only have to be ordered, not wide enough to survive a busy machine.
     ///
     /// `recheck` is well inside `SETTLE`, so every test below also exercises a safety-net
     /// re-check that has to stay inert.
@@ -1801,7 +1820,10 @@ mod tests {
         /// `record_loop` returns only once it is interrupted, so its own elapsed time says
         /// nothing about *when* a session ended; this is what distinguishes a session the
         /// loop ended on its own from one an interrupt cleaned up afterwards.
-        finished_at: Option<Instant>,
+        finished_at: Option<Duration>,
+        /// The virtual clock the script runs on, shared in with [`Script::clock`] by a test
+        /// that asserts on `finished_at`; unshared, it never advances.
+        clock: Clock,
         /// The calendar's answer `candidates` hands back, scripted like the rest. Not logged
         /// into `calls`: the sequencing tests' exact call logs predate the seam, and asking
         /// for candidates is not a sequencing decision.
@@ -1861,7 +1883,7 @@ mod tests {
             mic_apps: AppIdentities,
         ) -> super::Result<()> {
             self.calls.push("finish");
-            self.finished_at.get_or_insert_with(Instant::now);
+            self.finished_at.get_or_insert(self.clock.get());
             self.hands.push(hand.map(|m| m.event_id));
             self.roster_edits.push(roster_edit);
             self.mic_apps.push(mic_apps);
@@ -1882,28 +1904,155 @@ mod tests {
         }
     }
 
-    /// Plays a script of events into a channel from its own thread.
+    /// The virtual clock a [`Script`] runs on. Shared with a [`FakeCapture`] when a test needs
+    /// to know *when* the loop did something.
+    type Clock = Rc<Cell<Duration>>;
+
+    /// What a [`Script`] and its [`Sender`]s share.
+    struct Shared {
+        clock: Clock,
+        /// Events not yet received, as (absolute time due, event), in time order.
+        queue: RefCell<VecDeque<(Duration, Event)>>,
+        /// Live [`Sender`]s, so that "every sender is gone" can be told from "nothing is due".
+        senders: Cell<usize>,
+    }
+
+    /// Plays a script of events at the record loop on a virtual clock.
     ///
     /// A script rather than pre-queued messages, because the loop's decisions are made of
     /// *gaps*: a stop followed immediately by a queued start is a blip, and the same pair
     /// separated by the grace period is two calls. Sending them all up front would collapse
     /// every one of those distinctions.
     ///
-    /// The returned `Sender` is kept alive by the caller on purpose: in the real loop the
+    /// The clock moves only when the loop waits: a receive with a timeout jumps straight to
+    /// whichever comes first, the next event or the end of the timeout. So the loop's waits
+    /// are exact and instantaneous, and nothing here can be reordered by a busy machine. The
+    /// loop's own work takes no virtual time, which is what a test of its sequencing wants.
+    struct Script {
+        shared: Rc<Shared>,
+    }
+
+    /// A handle that can add events to a [`Script`], and whose lifetime is what keeps the
+    /// channel connected.
+    struct Sender {
+        shared: Rc<Shared>,
+    }
+
+    /// Virtual time after which a script is taken to have run away: a loop still waiting then
+    /// is waiting for an interrupt the script never sends.
+    const RUNAWAY: Duration = Duration::from_secs(3600);
+
+    impl Script {
+        /// Virtual time since the script began.
+        fn elapsed(&self) -> Duration {
+            self.shared.clock.get()
+        }
+
+        fn clock(&self) -> Clock {
+            Rc::clone(&self.shared.clock)
+        }
+
+        /// Pops the next event if it is due by `deadline` (or at all, with no deadline),
+        /// moving the clock up to its due time.
+        fn take(&self, deadline: Option<Duration>) -> Option<Event> {
+            let mut queue = self.shared.queue.borrow_mut();
+            match queue.front() {
+                Some((due, _)) if deadline.is_none_or(|d| *due <= d) => {
+                    let (due, event) = queue.pop_front().expect("checked non-empty");
+                    let now = self.shared.clock.get();
+                    self.shared.clock.set(now.max(due));
+                    Some(event)
+                }
+                _ => None,
+            }
+        }
+    }
+
+    impl Events for Script {
+        fn recv(&self) -> Result<Event, RecvError> {
+            if let Some(event) = self.take(None) {
+                return Ok(event);
+            }
+            assert!(
+                self.shared.senders.get() == 0,
+                "the loop blocked in `recv` with nothing left in the script, which would wait \
+                 forever on a live channel"
+            );
+            Err(RecvError)
+        }
+
+        fn recv_timeout(&self, timeout: Duration) -> Result<Event, RecvTimeoutError> {
+            let now = self.shared.clock.get();
+            assert!(
+                now < RUNAWAY,
+                "the loop was still waiting {now:?} into the script; it never sent an interrupt"
+            );
+            if let Some(event) = self.take(Some(now + timeout)) {
+                return Ok(event);
+            }
+            if self.shared.queue.borrow().is_empty() && self.shared.senders.get() == 0 {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            self.shared.clock.set(now + timeout);
+            Err(RecvTimeoutError::Timeout)
+        }
+
+        fn now(&self) -> Duration {
+            self.shared.clock.get()
+        }
+    }
+
+    impl Sender {
+        /// Delivers `event` at the current virtual time, after anything already due.
+        fn send(&self, event: Event) -> Result<(), Event> {
+            let now = self.shared.clock.get();
+            let mut queue = self.shared.queue.borrow_mut();
+            let at = queue.partition_point(|(due, _)| *due <= now);
+            queue.insert(at, (now, event));
+            Ok(())
+        }
+    }
+
+    impl Clone for Sender {
+        fn clone(&self) -> Self {
+            self.shared.senders.set(self.shared.senders.get() + 1);
+            Self {
+                shared: Rc::clone(&self.shared),
+            }
+        }
+    }
+
+    impl Drop for Sender {
+        fn drop(&mut self) {
+            self.shared.senders.set(self.shared.senders.get() - 1);
+        }
+    }
+
+    /// Builds a [`Script`] from events spaced `delay` apart, each measured from the one before.
+    ///
+    /// The returned [`Sender`] is kept alive by the caller on purpose: in the real loop the
     /// original sender lives for the whole run, and a disconnect means something quite
     /// different from "the script is finished".
-    fn script(events: Vec<(Duration, Event)>) -> (mpsc::Sender<Event>, mpsc::Receiver<Event>) {
-        let (tx, rx) = mpsc::channel::<Event>();
-        let feeder = tx.clone();
-        thread::spawn(move || {
-            for (delay, event) in events {
-                thread::sleep(delay);
-                if feeder.send(event).is_err() {
-                    return;
-                }
-            }
+    fn script(events: Vec<(Duration, Event)>) -> (Sender, Script) {
+        let mut at = Duration::ZERO;
+        let queue = events
+            .into_iter()
+            .map(|(delay, event)| {
+                at += delay;
+                (at, event)
+            })
+            .collect();
+        let shared = Rc::new(Shared {
+            clock: Rc::new(Cell::new(Duration::ZERO)),
+            queue: RefCell::new(queue),
+            senders: Cell::new(1),
         });
-        (tx, rx)
+        (
+            Sender {
+                shared: Rc::clone(&shared),
+            },
+            Script { shared },
+        )
     }
 
     /// The app that joins after a session starts is the one a single sample would miss.
@@ -2061,11 +2210,11 @@ mod tests {
     /// would also produce `["start", "finish"]`, just not until the grace had elapsed. Landing
     /// inside the grace is what says the press broke the recording wait directly.
     ///
-    /// The grace is stretched well past `LOOP_TIMING`'s so the two answers sit far apart on a
-    /// loaded machine: a direct stop lands tens of milliseconds in, and a stop that waited out the
-    /// grace cannot land before it, since scheduling delay only ever adds. The interrupt is set
-    /// *after* the grace for the same reason in the other direction -- earlier, it would end the
-    /// wait first and let the wrong implementation finalize inside the bound too.
+    /// The grace is stretched past `LOOP_TIMING`'s so the two answers sit apart: a direct stop
+    /// lands a blip in, and a stop that waited out the grace cannot land before it. The
+    /// interrupt is set *after* the grace for the same reason in the other direction -- earlier,
+    /// it would end the wait first and let the wrong implementation finalize inside the bound
+    /// too.
     #[test]
     fn a_hand_stop_finalizes_the_session_and_returns_to_watching() {
         let timing = Timing {
@@ -2078,16 +2227,17 @@ mod tests {
             (timing.grace + SETTLE, Event::Interrupt),
         ]);
 
-        let mut capture = FakeCapture::default();
+        let mut capture = FakeCapture {
+            clock: rx.clock(),
+            ..FakeCapture::default()
+        };
         let mut silent = Silent;
-        let started = Instant::now();
         record_loop(&rx, &mut capture, &|| true, false, timing, &mut silent);
 
         assert_eq!(capture.calls, ["start", "finish"]);
         let finished = capture
             .finished_at
-            .expect("the session was never finalized")
-            .duration_since(started);
+            .expect("the session was never finalized");
         assert!(
             finished < timing.grace,
             "the hand stop sat in the grace period and finalized after {finished:?}"
@@ -2150,12 +2300,11 @@ mod tests {
         let (_tx, rx) = script(vec![(BLIP, Event::StopSession), (SETTLE, Event::Interrupt)]);
 
         let mut capture = FakeCapture::default();
-        let started = Instant::now();
         run(&rx, &mut capture, &|| true, false);
 
         assert!(capture.calls.is_empty(), "{:?}", capture.calls);
         assert!(
-            started.elapsed() >= SETTLE,
+            rx.elapsed() >= SETTLE,
             "the loop returned on the hand stop, not on the interrupt"
         );
     }
@@ -2974,15 +3123,16 @@ mod tests {
             false
         };
 
-        let mut capture = FakeCapture::default();
-        let started = Instant::now();
+        let mut capture = FakeCapture {
+            clock: rx.clock(),
+            ..FakeCapture::default()
+        };
         run(&rx, &mut capture, &recheck, false);
 
         assert_eq!(capture.calls, ["start", "finish"]);
         let finished = capture
             .finished_at
-            .expect("the session was never finalized")
-            .duration_since(started);
+            .expect("the session was never finalized");
         assert!(
             finished < SETTLE * 3,
             "the interrupt ended this session after {finished:?}, not the recheck"
@@ -3036,14 +3186,13 @@ mod tests {
         ]);
 
         let mut capture = FakeCapture::default();
-        let started = Instant::now();
         run(&rx, &mut capture, &|| true, false);
 
         assert!(capture.calls.is_empty(), "{:?}", capture.calls);
         // "Returned early" and "returned on the interrupt" are indistinguishable from an empty
         // call log alone, and the first of those is the recorder exiting on a device swap.
         assert!(
-            started.elapsed() >= SETTLE,
+            rx.elapsed() >= SETTLE,
             "the loop returned on the device change, not on the interrupt"
         );
     }
@@ -3084,16 +3233,15 @@ mod tests {
 
         let mut capture = FakeCapture {
             stalling_sessions: 1,
+            clock: rx.clock(),
             ..FakeCapture::default()
         };
-        let started = Instant::now();
         run(&rx, &mut capture, &|| true, false);
 
         assert_eq!(capture.calls, ["start", "finish", "start", "finish"]);
         let finished = capture
             .finished_at
-            .expect("the first session was never finalized")
-            .duration_since(started);
+            .expect("the first session was never finalized");
         assert!(
             finished < SETTLE * 3,
             "the interrupt ended this session after {finished:?}, not the stall check"
