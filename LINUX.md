@@ -28,7 +28,7 @@ come along:
 
 The flake defines an `x86_64-linux` devShell alongside the macOS one. It carries
 the whole toolchain -- Rust (with clippy/rustfmt/rust-analyzer), cmake, pkg-config,
-onnxruntime, meson, ninja, clang, plus lefthook, cargo-nextest, cargo-audit and
+onnxruntime, clang, plus lefthook, cargo-nextest, cargo-audit and
 cargo-outdated --
 and sets the two environment variables the build needs (`LIBCLANG_PATH` for
 bindgen, `LD_LIBRARY_PATH` for the onnxruntime and libstdc++ shared libraries,
@@ -53,7 +53,6 @@ The same requirements, by hand:
 | A recent Rust toolchain + `clippy`, `rustfmt` | the repo gates are `-D warnings` |
 | `cargo-nextest` (e.g. `cargo binstall cargo-nextest`) | the pre-push test gate runs the suite through it |
 | `cmake` and a C/C++ toolchain | whisper.cpp compiles from source |
-| `meson`, `ninja`, `clang` | off macOS the `webrtc-audio-processing` crate builds AEC3 from source, and its `meson.build` hard-codes `clang` as the compiler |
 | `libclang` on `LIBCLANG_PATH` | bindgen invokes libclang directly, outside any cc wrapper |
 | `libonnxruntime` findable via `pkg-config` | `ort-sys` probes for it at build time and links it dynamically |
 
@@ -82,15 +81,13 @@ The `.tar.gz` binaries the CD workflow (`.github/workflows/cd.yml`) attaches to
 each GitHub release are plain `cargo build --release` output -- not the Nix
 package below -- so they carry the same dynamic-linking requirements as
 "Without Nix" above: `libonnxruntime` findable via the loader (on both
-platforms), plus `libwebrtc_audio_processing` on macOS specifically (Linux
-compiles AEC3 from source into the binary instead, so it has no such runtime
-dependency there). Neither is bundled in the tarball. A machine without those
-libraries already installed -- via Nix, Homebrew, or a distro package -- will
-fail to start the binary with a dynamic-linker error, not a clean one.
+platforms). It is not bundled in the tarball. A machine without it already
+installed -- via Nix, Homebrew, or a distro package -- will fail to start the
+binary with a dynamic-linker error, not a clean one. (Echo cancellation is
+pure Rust and compiled in, so it adds no runtime library.)
 
 `nix build .#meethook` (or `nix profile install`/`nix run` against this flake)
-is the reliable install path: it resolves those libraries from the same Nix
+is the reliable install path: it resolves libonnxruntime from the same Nix
 store the build already depends on, rather than assuming the target machine
 happens to have them. Prefer it over the tarball unless you already know the
-target machine has onnxruntime (and, on macOS, webrtc-audio-processing)
-available outside Nix.
+target machine has onnxruntime available outside Nix.

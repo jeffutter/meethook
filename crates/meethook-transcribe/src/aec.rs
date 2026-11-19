@@ -5,10 +5,13 @@
 //! played back into its own microphone. Whisper transcribes that leakage as if it were the
 //! local user, so it has to be removed before the mic track is transcribed.
 //!
-//! The remover is WebRTC's AEC3, reached through the tonarino `webrtc-audio-processing`
-//! crate. It is linked dynamically against the flake's `webrtc-audio-processing` package
-//! rather than built here: the crate's `bundled` feature compiles the vendored C++ itself
-//! and does not cross-compile on Apple (tonarino/webrtc-audio-processing#102).
+//! The remover is WebRTC's AEC3, reached through the pure-Rust `sonora` port of WebRTC's audio
+//! processing module (github.com/dignifiedquire/sonora). It is a behavioural port, not a
+//! bit-exact one: it passes the upstream C++ test suite but its output differs sample for
+//! sample from the C++ library's. No C++ toolchain, meson, or system library is involved, so
+//! the same code builds on macOS and Linux. It was chosen over the tonarino
+//! `webrtc-audio-processing` crate because that one hard-codes `-std=c++17` and stopped
+//! building against current abseil.
 //!
 //! This is real reference-based cancellation, and it is possible only because the recorder
 //! captured the speaker output as an independent synced track. `AVAudioEngine`'s built-in
@@ -31,15 +34,15 @@
 //! timestamp. Shifting the mic to meet the reference would silently skew every timestamp in
 //! the transcript, so the measured lag is applied to the reference instead.
 
-use webrtc_audio_processing::{Config, Processor, config::EchoCanceller};
+use sonora::config::EchoCanceller;
+use sonora::{AudioProcessing, StreamConfig};
 
 use crate::align::{self, Alignment, NotMeasurable};
 use crate::audio::TARGET_RATE;
 use crate::progress::Phase;
 
-/// AEC3's frame size is fixed at 10 ms, and feeding it any other length is a panic rather
-/// than an error, so the 16 kHz frame size is pinned here rather than left to be discovered
-/// by a crash mid-meeting.
+/// AEC3's frame size is fixed at 10 ms. [`Canceller::process_pair`] rejects any other length
+/// rather than handing it to the library, so the 16 kHz frame size is pinned here.
 const SAMPLES_PER_FRAME: usize = 160;
 
 /// How much later a sample comes out of the capture path than it went in, with the echo
@@ -78,17 +81,11 @@ const RENDER_HEADROOM: i64 = TARGET_RATE as i64 * 20 / 1000;
 ///
 /// The figure is only ever used for a median across the whole track, and a median does not
 /// need 294,000 samples of anything. At this stride a 49-minute session still contributes
-/// ~2,900 readings, which is far more than enough to place one, while the loop stops making
-/// 294,000 FFI calls into C++ and stops accumulating a 2.35 MB `Vec<f64>` to produce a single
-/// number.
+/// ~2,900 readings, which is far more than enough to place one, while the loop stops
+/// accumulating a 2.35 MB `Vec<f64>` to produce a single number.
 ///
-/// What a stride actually samples is worth knowing, because it is not what the loop looks
-/// like it does. The APM hands stats over a queue that holds exactly one entry
-/// (`ApmStatsReporter` in `audio_processing_impl.cc`: `stats_message_queue_(1)`, whose
-/// `Insert` discards when full). A read therefore returns what the *first frame after the
-/// previous read* produced, with everything in between dropped. So this is a uniform
-/// subsample of the per-frame series at a fixed phase -- exactly what a median wants, and
-/// neither a smoothed value nor a final one.
+/// A read returns the figure as of the last frame processed, so this is a uniform subsample
+/// of the per-frame series -- exactly what a median wants.
 const FRAMES_PER_STATS_READ: usize = 100;
 
 /// A mic track with the speaker bleed taken out of it, and an account of what happened.
@@ -149,8 +146,6 @@ pub enum PassThrough {
 /// to completion but never converged far enough to report a figure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancellationFailure {
-    /// `Processor::new` could not construct the canceller.
-    ProcessorUnavailable,
     /// A frame errored partway through the track.
     FrameFailed,
 }
@@ -158,9 +153,6 @@ pub enum CancellationFailure {
 impl std::fmt::Display for CancellationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CancellationFailure::ProcessorUnavailable => {
-                write!(f, "the echo canceller could not be constructed")
-            }
             CancellationFailure::FrameFailed => {
                 write!(f, "the echo canceller failed partway through the track")
             }
@@ -267,9 +259,6 @@ impl From<NotMeasurable> for meethook_session::NotMeasurable {
 impl From<CancellationFailure> for meethook_session::CancellationFailure {
     fn from(failure: CancellationFailure) -> Self {
         match failure {
-            CancellationFailure::ProcessorUnavailable => {
-                meethook_session::CancellationFailure::ProcessorUnavailable
-            }
             CancellationFailure::FrameFailed => meethook_session::CancellationFailure::FrameFailed,
         }
     }
@@ -377,7 +366,7 @@ fn subtract(
     debug_assert_eq!(mic.len(), reference.len());
     debug_assert!(stats_every >= 1);
 
-    let processor = build_processor(TARGET_RATE)?;
+    let mut canceller = Canceller::new();
 
     // The track is run through with `PROCESSOR_DELAY` samples of silence appended, so the
     // last real sample gets pushed out of the canceller rather than being left inside it,
@@ -386,8 +375,8 @@ fn subtract(
     let processed_len = mic.len() + PROCESSOR_DELAY;
     let mut cleaned: Vec<f32> = Vec::with_capacity(processed_len);
     // Reused across frames so an hour of audio is two allocations, not two per 10 ms.
-    let mut render_frame = vec![vec![0.0f32; SAMPLES_PER_FRAME]];
-    let mut capture_frame = vec![vec![0.0f32; SAMPLES_PER_FRAME]];
+    let mut render_frame = vec![0.0f32; SAMPLES_PER_FRAME];
+    let mut capture_frame = vec![0.0f32; SAMPLES_PER_FRAME];
 
     // A whole frame's worth of `track`, starting at `start`, zero-filled past its end.
     let frame_from = |track: &[f32], start: usize, into: &mut [f32]| {
@@ -410,20 +399,20 @@ fn subtract(
         // zero-padded to a full frame and trimmed back afterwards; this is the one place a
         // sample could be silently gained or lost.
         let taken = SAMPLES_PER_FRAME.min(processed_len - start);
-        frame_from(reference, start, &mut render_frame[0]);
-        frame_from(mic, start, &mut capture_frame[0]);
+        frame_from(reference, start, &mut render_frame);
+        frame_from(mic, start, &mut capture_frame);
 
         // Render before capture, always: the canceller has to have seen what was played
         // before it can be asked what of it survives in what was heard.
         //
         // Mid-track failure would leave a half-cancelled track, which is worse than an
         // uncancelled one because nothing downstream could tell.
-        process_frame_pair(&processor, &mut render_frame, &mut capture_frame)?;
+        canceller.process_pair(&render_frame, &mut capture_frame)?;
 
-        cleaned.extend_from_slice(&capture_frame[0][..taken]);
+        cleaned.extend_from_slice(&capture_frame[..taken]);
         // `Option` iterates over its contents, so this is "record it if there was one".
         if frame % stats_every == 0 {
-            erle.extend(processor.get_stats().echo_return_loss_enhancement);
+            erle.extend(canceller.echo_return_loss_enhancement());
         }
     }
     phase.done();
@@ -438,42 +427,62 @@ fn subtract(
     Ok((cleaned, median))
 }
 
-/// Constructs the canceller, applying the config every caller of `subtract` needs.
+/// One single-channel AEC3 instance at [`TARGET_RATE`], configured the way `subtract` needs
+/// it: echo canceller on with the library's default tuning, full-band high-pass filter, and
+/// no stream delay given (the alignment step and AEC3's own estimator do that job).
 ///
-/// A separate function so a test can exercise the failure path directly: constructing the
-/// processor is the linkage check, and it succeeded once at startup for the whole workspace's
-/// tests, so a real failure here is worth its own coverage rather than trusting the one
-/// happy-path construction elsewhere to stand in for it.
-fn build_processor(sample_rate_hz: u32) -> Result<Processor, CancellationFailure> {
-    let processor =
-        Processor::new(sample_rate_hz).map_err(|_| CancellationFailure::ProcessorUnavailable)?;
-    assert_eq!(
-        processor.num_samples_per_frame(),
-        SAMPLES_PER_FRAME,
-        "AEC3 panics rather than erroring on a frame-length mismatch"
-    );
-
-    processor.set_config(Config {
-        echo_canceller: Some(EchoCanceller::Full {
-            stream_delay_ms: None,
-        }),
-        high_pass_filter: Some(Default::default()),
-        ..Default::default()
-    });
-
-    Ok(processor)
+/// Wrapped so the rest of the module sees frames of `f32` and a pass/fail, and none of the
+/// library's channel-slice plumbing.
+struct Canceller {
+    apm: AudioProcessing,
 }
 
-/// Runs one render/capture frame pair through `processor` in place.
-fn process_frame_pair(
-    processor: &Processor,
-    render: &mut [Vec<f32>],
-    capture: &mut [Vec<f32>],
-) -> Result<(), CancellationFailure> {
-    processor
-        .process_render_frame(render)
-        .and_then(|()| processor.process_capture_frame(capture))
-        .map_err(|_| CancellationFailure::FrameFailed)
+impl Canceller {
+    fn new() -> Self {
+        let apm = AudioProcessing::builder()
+            .config(sonora::Config {
+                echo_canceller: Some(EchoCanceller::default()),
+                high_pass_filter: Some(Default::default()),
+                ..Default::default()
+            })
+            .capture_config(StreamConfig::new(TARGET_RATE, 1))
+            .render_config(StreamConfig::new(TARGET_RATE, 1))
+            .build();
+        Self { apm }
+    }
+
+    /// Runs one render/capture frame pair through the canceller, replacing `capture` with its
+    /// cleaned version. Render goes in first, always: the canceller has to have seen what was
+    /// played before it can be asked what of it survives in what was heard.
+    ///
+    /// Anything but exactly [`SAMPLES_PER_FRAME`] samples per frame is refused here instead of
+    /// being handed to the library.
+    fn process_pair(
+        &mut self,
+        render: &[f32],
+        capture: &mut [f32],
+    ) -> Result<(), CancellationFailure> {
+        if render.len() != SAMPLES_PER_FRAME || capture.len() != SAMPLES_PER_FRAME {
+            return Err(CancellationFailure::FrameFailed);
+        }
+        // The library takes separate input and output buffers; the render output is unused.
+        let mut render_out = [0.0f32; SAMPLES_PER_FRAME];
+        let mut capture_in = [0.0f32; SAMPLES_PER_FRAME];
+        capture_in.copy_from_slice(capture);
+
+        self.apm
+            .process_render_f32(&[render], &mut [&mut render_out[..]])
+            .and_then(|()| {
+                self.apm
+                    .process_capture_f32(&[&capture_in[..]], &mut [capture])
+            })
+            .map_err(|_| CancellationFailure::FrameFailed)
+    }
+
+    /// The most recent echo-return-loss-enhancement reading in dB, if the canceller has one.
+    fn echo_return_loss_enhancement(&self) -> Option<f64> {
+        self.apm.statistics().echo_return_loss_enhancement
+    }
 }
 
 fn samples_to_ms(samples: i64) -> f64 {
@@ -731,9 +740,8 @@ mod tests {
 
     /// Acceptance criterion #4. Reading AEC3's echo-return-loss figure once a second instead
     /// of once per 10 ms frame has to leave the reported number saying the same thing, and it
-    /// has to leave the audio alone: draining the APM's one-entry stats queue at a different
-    /// rate must not perturb the processor, or the saving would have been bought with the
-    /// cleaned track.
+    /// has to leave the audio alone: reading the statistic at a different rate must not
+    /// perturb the processor, or the saving would have been bought with the cleaned track.
     #[test]
     fn the_reported_echo_reduction_does_not_move_when_the_stat_is_read_less_often() {
         let lag = (RATE as i64) * 120 / 1000;
@@ -765,18 +773,22 @@ mod tests {
         );
     }
 
-    /// Acceptance criterion #2. `process_capture_frame`/`process_render_frame` really do
-    /// return `Err(BadNumberChannels)` for a zero-channel frame -- proven by
-    /// `webrtc_audio_processing`'s own `test_zero_channels` -- so driving `process_frame_pair`
-    /// with an empty capture buffer is real library failure, not an assumption.
+    /// Acceptance criterion #2. A frame of the wrong length is refused as a failure rather
+    /// than reaching the library, and `subtract` propagates that with `?` instead of
+    /// swallowing it, so a bad frame mid-track is reported, not silently skipped.
     #[test]
     fn a_frame_that_errors_mid_track_is_reported_as_a_failure_not_swallowed() {
-        let processor = build_processor(TARGET_RATE).expect("processor should construct");
-        let mut render = vec![vec![0.0f32; SAMPLES_PER_FRAME]];
-        let mut capture: Vec<Vec<f32>> = vec![];
+        let mut canceller = Canceller::new();
+        let render = vec![0.0f32; SAMPLES_PER_FRAME];
+        let mut capture: Vec<f32> = vec![];
 
         assert_eq!(
-            process_frame_pair(&processor, &mut render, &mut capture),
+            canceller.process_pair(&render, &mut capture),
+            Err(CancellationFailure::FrameFailed)
+        );
+        let mut short = vec![0.0f32; SAMPLES_PER_FRAME - 1];
+        assert_eq!(
+            canceller.process_pair(&render, &mut short),
             Err(CancellationFailure::FrameFailed)
         );
     }
@@ -785,10 +797,6 @@ mod tests {
     /// reading as the generic "no echo cancellation" a caller could mistake for success.
     #[test]
     fn a_cancellation_failure_names_its_cause() {
-        assert_eq!(
-            PassThrough::Cancellation(CancellationFailure::ProcessorUnavailable).to_string(),
-            "the echo canceller could not be constructed"
-        );
         assert_eq!(
             PassThrough::Cancellation(CancellationFailure::FrameFailed).to_string(),
             "the echo canceller failed partway through the track"
@@ -801,17 +809,13 @@ mod tests {
     #[test]
     fn a_cancellation_failure_still_returns_the_mic_track_byte_for_byte() {
         let mic = voice_band(5, RATE * 3 + 73);
-        for failure in [
-            CancellationFailure::ProcessorUnavailable,
-            CancellationFailure::FrameFailed,
-        ] {
-            let cleaned = passed_through(&mic, PassThrough::Cancellation(failure));
-            assert_eq!(cleaned.audio, mic);
-            assert_eq!(
-                cleaned.cleaning,
-                Cleaning::PassedThrough(PassThrough::Cancellation(failure))
-            );
-        }
+        let failure = CancellationFailure::FrameFailed;
+        let cleaned = passed_through(&mic, PassThrough::Cancellation(failure));
+        assert_eq!(cleaned.audio, mic);
+        assert_eq!(
+            cleaned.cleaning,
+            Cleaning::PassedThrough(PassThrough::Cancellation(failure))
+        );
     }
 
     /// Pins the measured capture-path delay the code compensates for. If a library update
@@ -819,27 +823,19 @@ mod tests {
     /// every transcript timestamp with it, so it is worth re-measuring rather than trusting.
     #[test]
     fn the_processor_delay_constant_still_matches_the_library() {
-        let processor = Processor::new(TARGET_RATE).unwrap();
-        processor.set_config(Config {
-            echo_canceller: Some(EchoCanceller::Full {
-                stream_delay_ms: None,
-            }),
-            high_pass_filter: Some(Default::default()),
-            ..Default::default()
-        });
+        let mut canceller = Canceller::new();
 
         let marker_at = SAMPLES_PER_FRAME * 100 + 37;
         let total = SAMPLES_PER_FRAME * 200;
         let mut out: Vec<f32> = Vec::with_capacity(total);
         for start in (0..total).step_by(SAMPLES_PER_FRAME) {
-            let mut render = vec![vec![0.0f32; SAMPLES_PER_FRAME]];
-            let mut capture = vec![vec![0.0f32; SAMPLES_PER_FRAME]];
+            let render = vec![0.0f32; SAMPLES_PER_FRAME];
+            let mut capture = vec![0.0f32; SAMPLES_PER_FRAME];
             if (start..start + SAMPLES_PER_FRAME).contains(&marker_at) {
-                capture[0][marker_at - start] = 0.5;
+                capture[marker_at - start] = 0.5;
             }
-            processor.process_render_frame(&mut render).unwrap();
-            processor.process_capture_frame(&mut capture).unwrap();
-            out.extend_from_slice(&capture[0]);
+            canceller.process_pair(&render, &mut capture).unwrap();
+            out.extend_from_slice(&capture);
         }
 
         let (peak_at, _) = out

@@ -39,11 +39,8 @@ thiserror = { workspace = true }
 whisper-rs = { workspace = true }
 
 # AEC3 for the echo-cancellation pre-pass. A normal dependency, not a dev one: the pre-pass
-# is on the real transcribe path, not just in tests. On macOS the sys crate probes pkg-config
-# and links the flake's library dynamically; off macOS there is no such system library, so
-# the `bundled` feature is turned on under the non-macOS target gate below and the vendored
-# C++ is compiled with the local C++ toolchain instead.
-webrtc-audio-processing = { workspace = true }
+# is on the real transcribe path, not just in tests.
+sonora = { workspace = true }
 
 # Apple-side accelerators, present only where the OS provides them. These are target-gated
 # rather than feature-gated because there is no meaningful "off" build of them on macOS --
@@ -60,11 +57,6 @@ ort = { workspace = true, features = ["coreml"] }
 # avoid. This is what makes `WhisperContextParameters::use_gpu` default to true on macOS;
 # see the assertion in `asr` that keeps that honest.
 whisper-rs = { workspace = true, features = ["metal"] }
-
-# The non-macOS half of the AEC3 story: compile the vendored C++ rather than link a system
-# library, because there is no flake-provided `webrtc-audio-processing` to probe for here.
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-webrtc-audio-processing = { workspace = true, features = ["bundled"] }
 
 [dev-dependencies]
 # The `speaker-trials` example's `--embeddings` cache, and nothing else. The examples here

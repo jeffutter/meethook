@@ -22,9 +22,8 @@ and doesn't come along off macOS.
 
 ### With Nix (recommended)
 
-The flake resolves `meethook`'s runtime dependencies (onnxruntime, and on macOS
-webrtc-audio-processing) from the Nix store, so the binary it produces doesn't depend on
-anything already being installed on the target machine:
+The flake resolves `meethook`'s runtime dependency (onnxruntime) from the Nix store, so the binary it produces doesn't
+depend on anything already being installed on the target machine:
 
 ```sh
 nix profile install github:jeffutter/meethook
@@ -37,9 +36,8 @@ nix run github:jeffutter/meethook -- --help
 Prebuilt binaries for macOS (arm64) and Linux (x86_64) are attached to each
 [GitHub release](https://github.com/jeffutter/meethook/releases). They're built with a plain
 `cargo build --release`, so unlike the Nix package they are **not** self-contained: the machine
-running them needs `libonnxruntime` on the loader path already (and, on macOS,
-`libwebrtc-audio-processing`), or the binary will fail to start with a dynamic-linker error.
-Prefer the Nix install above unless you already have those libraries from somewhere else (Nix,
+running them needs `libonnxruntime` on the loader path already, or the binary will fail to start with a dynamic-linker error.
+Prefer the Nix install above unless you already have libonnxruntime from somewhere else (Nix,
 Homebrew, or your distro's package manager).
 
 ```sh
@@ -58,7 +56,7 @@ cargo build --release --workspace
 ```
 
 Building without Nix is possible but means installing the native toolchain (cmake, a C/C++
-compiler, meson/ninja/clang, libclang, libonnxruntime) yourself — see
+compiler, libclang, libonnxruntime) yourself — see
 [LINUX.md](./LINUX.md#without-nix) for the full list and why each one is needed.
 
 Model weights (Whisper, diarization, speaker embedding) are downloaded on first use into

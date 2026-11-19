@@ -250,16 +250,11 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
   "api-27",
 ] }
 
-# WebRTC AEC3, for the echo-cancellation pre-pass. The tilde requirement is what upstream
-# recommends: the crate's major version tracks the PulseAudio-maintained APM major version,
-# so a minor bump is allowed to break the API. `bundled` is deliberately off in the base
-# entry -- it would compile the vendored C++ here, which does not cross-compile on Apple
-# (tonarino/webrtc-audio-processing#102); instead the sys crate probes pkg-config and links
-# dynamically against the flake's `webrtc-audio-processing`. On non-macOS platforms there is
-# no such system library to probe for, so meethook-transcribe turns on `bundled` under
-# `cfg(not(target_os = "macos"))`: the vendored C++ compiles fine with an ordinary C++
-# toolchain off Apple, which is exactly where it is needed.
-webrtc-audio-processing = "~2.1"
+# WebRTC AEC3 for the echo-cancellation pre-pass: a pure-Rust port of WebRTC's audio processing
+# module, so there is no C++ toolchain or system library to build or link. A 0.x crate, so a
+# minor bump may break the API (hence the tilde); the `aec` tests in meethook-transcribe pin the
+# behaviour the pipeline relies on, including the measured capture-path delay.
+sonora = "~0.3"
 
 # Only for `MTLCreateSystemDefaultDevice`, the pre-flight probe in meethook-transcribe::gpu.
 # `default-features = false` is load-bearing: the default feature set is an enormous list

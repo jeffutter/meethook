@@ -11,7 +11,7 @@
   # all: a single `nix develop` gives a shell whose PATH carries the exact toolchain the
   # project builds with. The `packages.meethook` output below rides on that same wiring --
   # it exists so the CD workflow (and `nix run`/`nix profile install`) has a build of the
-  # binary whose dynamic libraries (onnxruntime, webrtc-audio-processing) actually resolve,
+  # binary whose dynamic libraries (onnxruntime) actually resolve,
   # which a plain `cargo build` on a bare GitHub Actions runner cannot give it.
   #
   # The Whisper / speaker-diarization model weights are still deliberately kept OUT of the
@@ -66,9 +66,8 @@
           }
           # nix develop does not set LD_LIBRARY_PATH, and off macOS the ELF binaries need it
           # twice over: the test binaries link libonnxruntime dynamically, and the statically
-          # linked C++ libraries (AEC3, whisper.cpp) pull in libstdc++.so.6, which meson's
-          # clang-built sanity executables also need while the build itself is running. On
-          # macOS dyld resolves the .dylibs by absolute install name, so nothing is needed.
+          # linked whisper.cpp pulls in libstdc++.so.6. On macOS dyld resolves the .dylibs by
+          # absolute install name, so nothing is needed.
           // nixpkgs.lib.optionalAttrs (!isMacos) {
             # The hyphen in the package name keeps it out of plain attribute syntax, so the
             # reference is bound here rather than inlined into the string below.
@@ -94,47 +93,22 @@
             # without real SDK headers, libc++'s `<cstddef>`/`<cstring>`/`<cmath>`
             # wrappers can't find the real C library declarations they're supposed to
             # layer on top of. Confirmed by replaying bindgen's exact clang_args
-            # through `clang -fsyntax-only` against webrtc-audio-processing-sys's own
-            # `src/wrapper.hpp`: the bare package root reproduces the failure
+            # through `clang -fsyntax-only` against a C++ wrapper header (at the time
+            # webrtc-audio-processing-sys's, since removed; whisper-rs-sys's bindgen run
+            # takes the same path): the bare package root reproduces the failure
             # reliably, and the corrected, SDKROOT-matching path fixes it reliably.
             BINDGEN_EXTRA_CLANG_ARGS = "-isysroot ${pkgs.apple-sdk_26}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
           };
 
-          # On macOS the AEC3 library links dynamically against the flake's
-          # webrtc-audio-processing package, so nothing extra is needed. Off
-          # macOS the crate builds AEC3 from source (the bundled feature):
-          # meson + ninja drive the build, and the compiler must be clang
-          # because AEC3's meson.build hard-codes it. The wrapped clang also
-          # points CC/CXX at itself, so the Rust and whisper.cpp builds
-          # compile and link through clang as well; the repo gates pass
-          # under that.
+          # AEC3 comes from the pure-Rust `sonora` crate, so it adds nothing here. The
+          # wrapped clang (non-macOS) points CC/CXX at itself, so the Rust and whisper.cpp
+          # builds compile and link through clang; the repo gates pass under that.
           commonBuildInputs =
             [ pkgs.onnxruntime ]
             ++ nixpkgs.lib.optionals isMacos [
               # Frameworks live outside the Nix store, so the SDK has to be on
               # the search path explicitly.
               pkgs.apple-sdk_26
-              # Links the flake's libwebrtc_audio_processing.dylib via
-              # pkg-config, which is how the dynamic AEC3 dependency reaches
-              # the linker.
-              pkgs.webrtc-audio-processing
-            ]
-            ++ nixpkgs.lib.optionals (!isMacos) [
-              # AEC3's own meson.build asks for `absl_base`/`absl_flags`/etc via
-              # dependency(), which meson resolves through pkg-config first. Without
-              # this, none of those probes find anything (the sandbox has no
-              # PKG_CONFIG_PATH pointed at abseil at all), so meson falls back to its
-              # subproject-wrap mechanism for abseil-cpp -- and that fallback path
-              # unconditionally `os.makedirs()`s a subprojects/packagecache dir to
-              # stage the fetch into, inside the copy of the read-only Nix store
-              # source that webrtc-audio-processing-sys's build.rs made with `cp -a`
-              # (which preserves the store's read-only mode bits on the copy). The
-              # mkdir dies with EACCES before the build ever gets far enough to need
-              # network -- sandboxing isn't actually why this fails. Putting
-              # abseil-cpp's pkg-config files on PKG_CONFIG_PATH lets both the crate's
-              # own build.rs probe (build.rs:167) and meson's identical probe resolve
-              # abseil directly, so the subproject/packagecache path is never taken.
-              pkgs.abseil-cpp
             ];
 
           # ort-sys probes pkg-config for libonnxruntime at build time; the pkg-config
@@ -146,8 +120,9 @@
               pkgs.pkg-config
             ]
             ++ nixpkgs.lib.optionals (!isMacos) [
-              pkgs.meson
-              pkgs.ninja
+              # No longer required by AEC3 (it was for the C++ library's meson.build, which
+              # hard-coded clang), but kept: the Linux gates were last verified through it and
+              # swapping the compiler here is not something this change tested.
               pkgs.clang
             ];
 
