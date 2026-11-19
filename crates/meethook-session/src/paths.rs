@@ -65,6 +65,11 @@ impl Paths {
         self.root.join("speakers.json")
     }
 
+    /// The user's hand-written word lists that bias Whisper toward names and jargon.
+    pub fn vocabulary_toml(&self) -> PathBuf {
+        self.root.join("vocabulary.toml")
+    }
+
     /// The template every session's `transcript.md` is rendered through, when it exists.
     ///
     /// One file for the whole root rather than one per session, and that is the point rather

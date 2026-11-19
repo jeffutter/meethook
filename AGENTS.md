@@ -106,7 +106,10 @@ session directory.** That contract is the thing to understand before touching an
 
 - **`meethook-session`** — the on-disk contract itself: session directory layout, ids,
   atomic writes, and every JSON schema (`session.json`, `speaker_clusters.json`,
-  `speaker_names.json`, `speakers.json`, `transcript.json`/`.md`, `cleaning.json`). Its
+  `speaker_names.json`, `speakers.json`, `transcript.json`/`.md`, `cleaning.json`) and the user-authored
+  `vocabulary.toml` (`[global]` plus `[profile.<name>]` term lists, user data under
+  `MEETHOOK_ROOT`; `transcribe --vocab <name>` picks one profile per run, and the applied profile
+  and prompt are recorded in `transcript.json`). Its
   module doc lays out the full directory tree. Every other crate depends on this one and on
   nothing else in the workspace for shared state — a layout change is a change to this one
   crate.

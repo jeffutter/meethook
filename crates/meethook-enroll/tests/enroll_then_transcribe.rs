@@ -186,6 +186,7 @@ fn transcribe_isolating(
             } else {
                 Isolation::Off
             },
+            vocabulary: None,
         })
     };
     run_batch(

@@ -276,6 +276,13 @@ enum Command {
         #[arg(long)]
         no_isolate: bool,
 
+        /// Vocabulary profile from vocabulary.toml to bias Whisper with, on top of [global]
+        ///
+        /// One profile per run, never a merge. Without this only [global] applies. Naming a
+        /// profile the file does not have is an error that lists the ones it does.
+        #[arg(long, value_name = "NAME")]
+        vocab: Option<String>,
+
         /// Bitrate of the meeting.opus mixdown, in bits per second
         ///
         /// The default was settled by listening to a real meeting rather than taken from a
@@ -560,6 +567,7 @@ fn main() -> Result<()> {
             session_ids,
             force,
             no_isolate,
+            vocab,
             bitrate,
             pan,
             target_lufs,
@@ -580,6 +588,7 @@ fn main() -> Result<()> {
                 },
             },
             diarizer,
+            vocab.as_deref(),
         ),
         Command::Enroll(args) => commands::enroll(&paths, &args, template),
         Command::Speakers => commands::speakers(&paths),
@@ -655,6 +664,19 @@ mod tests {
             Command::Transcribe { diarizer, .. } => diarizer,
             other => panic!("expected a transcribe command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transcribe_vocab_takes_a_profile_name() {
+        let vocab = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Command::Transcribe { vocab, .. } => vocab,
+            _ => unreachable!(),
+        };
+        assert_eq!(vocab(&["meethook", "transcribe"]), None);
+        assert_eq!(
+            vocab(&["meethook", "transcribe", "--vocab", "dnd"]).as_deref(),
+            Some("dnd")
+        );
     }
 
     #[test]

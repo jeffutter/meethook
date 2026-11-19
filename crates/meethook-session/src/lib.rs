@@ -10,6 +10,7 @@
 //! ```text
 //! <root>/
 //!   speakers.json                 enrolled-speaker embedding DB
+//!   vocabulary.toml               optional word lists biasing Whisper (user-authored)
 //!   exclusions.json               apps excluded from the mic-activity trigger (user-authored)
 //!   record.lock                   held by a live `record`; keeps a second one out.
 //!                                   Liveness is queryable without taking it -- see
@@ -42,6 +43,7 @@ mod speaker_names;
 mod speakers;
 mod transcript;
 mod transcript_render;
+mod vocabulary;
 
 // The header spelling of the tracks named above. A module rather than a flat re-export
 // because its surface is constructors: `wav::create` reads better than `create_wav`.
@@ -79,8 +81,11 @@ pub use speakers::{
 };
 pub use transcript::{
     SourceTrack, TRANSCRIPT_SCHEMA_VERSION, TimestampError, Transcript, TranscriptContext,
-    TranscriptTemplate, TranscriptTime, Turn, VoiceAt, YOU as SPEAKER_YOU, unknown_speaker,
+    TranscriptTemplate, TranscriptTime, Turn, VocabularyRecord, VoiceAt, YOU as SPEAKER_YOU,
+    unknown_speaker,
 };
+
+pub use vocabulary::{Selection, Vocabulary};
 
 use std::path::PathBuf;
 
@@ -104,6 +109,11 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    /// `vocabulary.toml` that is malformed, or a `--vocab` that cannot be honoured. `detail`
+    /// carries the line and column when the file is the problem.
+    #[error("vocabulary file {path}: {detail}")]
+    Vocabulary { path: PathBuf, detail: String },
 
     #[error("malformed JSON at {path}: {source}")]
     Json {

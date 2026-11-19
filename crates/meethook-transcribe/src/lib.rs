@@ -273,6 +273,8 @@ pub struct Engines {
     pub diarizer: Box<dyn Diarize>,
     /// Isolates the mic track's speech before recognition, or says why it does not.
     pub isolation: Isolation,
+    /// The vocabulary prompt `asr` was given, copied into every transcript this batch writes.
+    pub vocabulary: Option<meethook_session::VocabularyRecord>,
 }
 
 /// Opens both engines. Boxed and fallible so the caller owns model acquisition, and so the
@@ -625,6 +627,7 @@ fn transcribe_and_write(
     // audio and returns only the transcript. One small JSON read beside a Whisper pass over a
     // whole meeting is not a cost worth widening that signature for.
     let metadata = session.load_metadata()?;
+    let transcript = transcript.with_vocabulary(engines.vocabulary.clone());
     transcript.write(&session.paths, template, &TranscriptContext::now(&metadata))?;
     Ok(transcript.turns.len())
 }
@@ -842,6 +845,7 @@ mod tests {
                 heard: Vec::new(),
             }),
             isolation: Isolation::Off,
+            vocabulary: None,
         }
     }
 
@@ -2454,6 +2458,54 @@ mod tests {
             .unwrap();
         }
         (opened, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn the_vocabulary_prompt_and_profile_are_recorded_and_absent_when_unused() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        make_session(&paths, "20260809-052600", 1_000_000);
+        make_session(&paths, "20260809-052700", 1_000_000);
+
+        let mut factory = || {
+            let mut engines = fake_engines();
+            engines.vocabulary = Some(meethook_session::VocabularyRecord {
+                profile: Some("dnd".into()),
+                prompt: "Meeting notes: Strahd.".into(),
+            });
+            Ok(engines)
+        };
+        let run = |factory: &mut dyn FnMut() -> std::result::Result<
+            Engines,
+            Box<dyn std::error::Error + Send + Sync>,
+        >,
+                   ids: &[SessionId]| {
+            run_batch(
+                &paths,
+                ids,
+                true,
+                false,
+                &TranscriptTemplate::builtin(),
+                mixdown::Settings::default(),
+                factory,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        };
+        let first = SessionId::parse("20260809-052600").unwrap();
+        run(&mut factory, std::slice::from_ref(&first));
+        let record = transcript_of(&paths, "20260809-052600").vocabulary.unwrap();
+        assert_eq!(record.profile.as_deref(), Some("dnd"));
+        assert_eq!(record.prompt, "Meeting notes: Strahd.");
+
+        let mut factory = || Ok(fake_engines());
+        run(
+            &mut factory,
+            &[SessionId::parse("20260809-052700").unwrap()],
+        );
+        let session = paths.session(&SessionId::parse("20260809-052700").unwrap());
+        let json = std::fs::read_to_string(session.transcript_json()).unwrap();
+        assert!(!json.contains("vocabulary"), "{json}");
     }
 
     #[test]

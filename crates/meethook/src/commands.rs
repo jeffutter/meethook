@@ -36,6 +36,7 @@ use meethook_transcribe::{
 /// Fully non-interactive, deliberately: this is meant to be aimed at a directory of
 /// meetings and left alone. All four models are acquired lazily through the one factory
 /// below, so a run that turns out to have nothing to do never pays for a download.
+#[allow(clippy::too_many_arguments)] // one flat call per CLI option; a settings struct would only rename them
 pub fn transcribe(
     paths: &Paths,
     session_ids: &[String],
@@ -44,9 +45,12 @@ pub fn transcribe(
     template: Option<&Path>,
     mixdown_settings: meethook_transcribe::mixdown::Settings,
     diarizer_choice: DiarizerChoice,
+    vocab: Option<&str>,
 ) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
     let template = TranscriptTemplate::resolve(paths, template)?;
+    // Before any engine or download, so a bad file or an unknown profile fails the run at once.
+    let selection = meethook_session::Vocabulary::load(paths)?.select(paths, vocab)?;
 
     let models_dir = paths.models_dir();
     let mut open_engine =
@@ -95,7 +99,18 @@ pub fn transcribe(
             #[cfg(not(target_os = "macos"))]
             let _ = accelerated;
 
-            let asr = WhisperEngine::load(&whisper, &vad)?;
+            let mut asr = WhisperEngine::load(&whisper, &vad)?;
+            let dropped = asr.set_vocabulary(&selection.terms);
+            if dropped > 0 {
+                eprintln!("Note: {dropped} vocabulary terms did not fit the prompt window.");
+            }
+            // Read back from the engine: the recorded text must be the text Whisper got.
+            let vocabulary =
+                asr.vocabulary_prompt()
+                    .map(|prompt| meethook_session::VocabularyRecord {
+                        profile: selection.profile.clone(),
+                        prompt: prompt.to_owned(),
+                    });
             // Only when isolation is on, and after everything cheaper: the factory only runs
             // when there is real work, so `--no-isolate` and nothing-to-do runs fetch nothing.
             // Failure here never fails the batch; sessions fall back to the plain mic track
@@ -121,6 +136,7 @@ pub fn transcribe(
                 asr: Box::new(asr),
                 diarizer,
                 isolation,
+                vocabulary,
             })
         };
 

@@ -179,6 +179,12 @@ impl WhisperEngine {
         built.dropped
     }
 
+    /// The initial prompt [`set_vocabulary`](Self::set_vocabulary) built, if any. The one place
+    /// the text handed to Whisper can be read back, so what gets recorded is what was used.
+    pub fn vocabulary_prompt(&self) -> Option<&str> {
+        self.vocabulary_prompt.as_deref()
+    }
+
     /// False when recognition is running on the CPU because `MEETHOOK_CPU` asked it to.
     ///
     /// Mirrors [`crate::OnnxDiarizer::accelerated`], for the same reason and with the same

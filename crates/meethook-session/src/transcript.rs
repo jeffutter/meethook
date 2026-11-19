@@ -151,14 +151,38 @@ pub struct Transcript {
     pub schema_version: u32,
     pub session_id: SessionId,
     pub turns: Vec<Turn>,
+    /// The vocabulary prompt Whisper was given, so a re-transcribe after editing
+    /// `vocabulary.toml` is explainable and reproducible. Absent when no prompt was used.
+    ///
+    /// Additive and optional, so [`TRANSCRIPT_SCHEMA_VERSION`] stays 2 and older files still
+    /// parse. The reasoning for `Turn::cluster` does not apply: there an absent key would have
+    /// to be read as a null that asserts something false, whereas here absent means "no prompt
+    /// was used", which is what an older tool did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocabulary: Option<VocabularyRecord>,
+}
+
+/// The vocabulary a transcript was produced with. See [`Transcript::vocabulary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VocabularyRecord {
+    /// The `--vocab` profile applied on top of `[global]`; `None` when only `[global]` was.
+    pub profile: Option<String>,
+    /// The exact text handed to Whisper as its initial prompt.
+    pub prompt: String,
 }
 
 impl Transcript {
+    pub fn with_vocabulary(mut self, vocabulary: Option<VocabularyRecord>) -> Self {
+        self.vocabulary = vocabulary;
+        self
+    }
+
     pub fn new(session_id: SessionId, turns: Vec<Turn>) -> Self {
         Transcript {
             schema_version: TRANSCRIPT_SCHEMA_VERSION,
             session_id,
             turns,
+            vocabulary: None,
         }
     }
 

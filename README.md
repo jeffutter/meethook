@@ -245,6 +245,7 @@ discovered session that doesn't already have a transcript is considered.
 | `--target-lufs <LUFS>` | -16 | Loudness each track is normalized to before mixing, in LUFS |
 | `--max-boost-db <DB>` | 18 | Most a quiet track may be turned up on its way to the target, in dB |
 | `--no-isolate` | off (isolation is on) | Skip mic isolation for this run; see below |
+| `--vocab <NAME>` | none | Apply the `[profile.<NAME>]` word list from `vocabulary.toml` on top of `[global]`; see below |
 
 **Mic isolation.** By default, before Whisper hears your microphone, a voice-isolator model
 removes background noise from the speech regions of the (echo-cancelled) mic track. Only the mic
@@ -259,6 +260,33 @@ whole stage with the real speech detector; `cargo run --release --example isolat
 a meeting with 20 minutes of your own speech in it adds roughly an hour. A one-hour continuous
 track was not run (it would take about 3.4 hours at that rate); cost is linear in speech
 duration, so the ten-minute figure extrapolates. Pass `--no-isolate` if you would rather not pay it.
+
+**Vocabulary.** Whisper misspells names and jargon it has not seen. `~/meethook/vocabulary.toml`
+(under `--root` / `MEETHOOK_ROOT`, beside `speakers.json`; optional) lists the words to bias it
+toward, and they reach Whisper as an initial prompt. List only words Whisper actually gets wrong:
+common names are not worth the room, and the prompt holds about 224 tokens (meethook keeps it
+under 400 bytes and reports how many terms did not fit). The file has an optional `[global]`
+list that always applies and any number of `[profile.<name>]` lists:
+
+```toml
+[global]
+terms = ["meethook", "Kubernetes"]
+
+# D&D game: character and place names
+[profile.dnd]
+terms = ["Strahd", "Barovia", "Ireena", "Vallaki"]
+
+# Work meetings: product and internal jargon
+[profile.work]
+terms = ["Grafana", "Terraform", "SLO", "Quokka"]
+```
+
+`meethook transcribe --vocab dnd` applies `[global]` plus the `dnd` profile. Exactly one profile
+applies per run and profiles are never merged; without `--vocab` only `[global]` applies. A
+missing file means no vocabulary. An unknown key, a non-string term or malformed TOML fails the
+run with the file and line; an unknown profile name fails it listing the profiles that exist.
+The profile and the exact prompt handed to Whisper are written to the session's `transcript.json`
+under `vocabulary`, so a re-transcribe after editing the file is explainable.
 
 `--pan`, `--target-lufs`, and `--max-boost-db` are refused outside the range the mixdown
 arithmetic admits, rather than silently clamped, so a mistyped value is reported instead of
@@ -362,7 +390,7 @@ session currently carries and the candidate meetings around it, numbered, and wr
 
 | Flag / env var | Default | Meaning |
 | --- | --- | --- |
-| `--root <PATH>` / `MEETHOOK_ROOT` | `~/meethook` | The meethook data directory (`sessions/`, `models/`, `speakers.json`) |
+| `--root <PATH>` / `MEETHOOK_ROOT` | `~/meethook` | The meethook data directory (`sessions/`, `models/`, `speakers.json`, `vocabulary.toml`) |
 | `--template <PATH>` / `MEETHOOK_TEMPLATE` | built-in | Jinja template every `transcript.md` is rendered through |
 | `MEETHOOK_ACTIVITY_DEBUG` | unset | Print which processes hold the microphone, and why `record` started or stayed running, to stderr. Setting it at all counts, an empty value included |
 | `MEETHOOK_CPU` | unset | Run speech recognition on the CPU rather than Metal, many times slower for the same transcript. Any non-empty value counts, `0` included |
@@ -378,6 +406,8 @@ Everything meethook writes lives under one root (`~/meethook` by default, overri
 - `models/` — downloaded model weights (Whisper, diarization, speaker embedding, voice isolator), fetched and
   hash-verified on first use
 - `speakers.json` — enrolled voice references, shared across every session
+- `vocabulary.toml` — word lists biasing Whisper, chosen per run with `transcribe --vocab`;
+  user-authored, absent by default
 - `exclusions.json` — apps excluded from the mic-activity trigger (`record` only); user-
   authored, absent by default
 - `record.lock` — held by a live `meethook record` so a second one refuses to start; written by
