@@ -12,7 +12,7 @@
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
 #[cfg(any(target_os = "macos", test))]
-use std::sync::mpsc::{Receiver, RecvError, RecvTimeoutError};
+use std::sync::mpsc::{RecvError, RecvTimeoutError};
 #[cfg(any(target_os = "macos", test))]
 use std::time::{Duration, Instant};
 
@@ -139,16 +139,18 @@ trait Events {
     fn now(&self) -> Duration;
 }
 
-#[cfg(any(target_os = "macos", test))]
+// macOS only, like `record`, its one user: tests drive the loop through their own `Events`, so
+// off macOS this would be dead code.
+#[cfg(target_os = "macos")]
 /// The real thing: an `mpsc` channel on the system's monotonic clock.
 struct LiveEvents {
-    rx: Receiver<Event>,
+    rx: mpsc::Receiver<Event>,
     origin: Instant,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 impl LiveEvents {
-    fn new(rx: Receiver<Event>) -> Self {
+    fn new(rx: mpsc::Receiver<Event>) -> Self {
         Self {
             rx,
             origin: Instant::now(),
@@ -156,7 +158,7 @@ impl LiveEvents {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 impl Events for LiveEvents {
     fn recv(&self) -> Result<Event, RecvError> {
         self.rx.recv()
