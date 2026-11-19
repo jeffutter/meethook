@@ -276,9 +276,9 @@ enum Command {
         #[arg(long)]
         no_isolate: bool,
 
-        /// Vocabulary profile from vocabulary.toml to bias Whisper with, on top of [global]
+        /// Vocabulary profile from vocabulary.toml to bias Whisper with, on top of `[global]`
         ///
-        /// One profile per run, never a merge. Without this only [global] applies. Naming a
+        /// One profile per run, never a merge. Without this only `[global]` applies. Naming a
         /// profile the file does not have is an error that lists the ones it does.
         #[arg(long, value_name = "NAME")]
         vocab: Option<String>,
