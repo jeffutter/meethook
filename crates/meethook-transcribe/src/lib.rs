@@ -1273,6 +1273,114 @@ mod tests {
         }
     }
 
+    /// The two real diarizers (pyannote and Nemotron) number their clusters differently, but
+    /// both feed the same files. A fake diarizer stands in for either: the schema versions in
+    /// the files a session carries are the constants, whoever produced the clusters.
+    #[test]
+    fn the_session_files_keep_their_schema_versions_whatever_the_diarizer() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let (session, mut asr, mut diarizer) = two_party(&paths, "20260809-052600");
+
+        let transcript = transcribe_session(
+            &session,
+            &mut asr,
+            &mut diarizer,
+            &nobody_enrolled(),
+            mixdown::Settings::default(),
+            &mut quiet(),
+        )
+        .unwrap();
+        write_transcript(&transcript, &session);
+
+        let clusters =
+            meethook_session::SpeakerClusters::read(&session.paths.speaker_clusters_json())
+                .unwrap();
+        assert_eq!(
+            clusters.schema_version,
+            meethook_session::SPEAKER_CLUSTERS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            transcript_of(&paths, "20260809-052600").schema_version,
+            meethook_session::TRANSCRIPT_SCHEMA_VERSION
+        );
+    }
+
+    /// A name given by hand survives a `--force` re-run by a different diarizer, as long as
+    /// the voice is the same. The second fake numbers the same two voices the other way round,
+    /// which is what switching between pyannote and Nemotron does to cluster ids.
+    #[test]
+    fn a_hand_given_name_survives_a_re_run_with_a_differently_numbered_diarizer() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let id = "20260809-052600";
+
+        let (session, mut asr, mut first) = two_party(&paths, id);
+        let transcript = transcribe_session(
+            &session,
+            &mut asr,
+            &mut first,
+            &nobody_enrolled(),
+            mixdown::Settings::default(),
+            &mut quiet(),
+        )
+        .unwrap();
+        write_transcript(&transcript, &session);
+
+        let mut names = SpeakerNames::new(session.id.clone(), Vec::new());
+        names.assign(1, "Bob", voice(1));
+        names.write(&session.paths).unwrap();
+
+        // Same voices, opposite ids: voice(1) is now cluster 0.
+        let (session, mut asr, mut second) = two_party(&paths, id);
+        second.diarization = Diarization {
+            clusters: vec![
+                meethook_session::SpeakerCluster {
+                    id: 0,
+                    ..cluster(1, 1.0, 3.0)
+                },
+                meethook_session::SpeakerCluster {
+                    id: 1,
+                    ..cluster(0, 1.9, 0.0)
+                },
+            ],
+            turns: vec![
+                SpeakerTurn {
+                    start_s: 0.0,
+                    end_s: 0.9,
+                    cluster: 1,
+                },
+                SpeakerTurn {
+                    start_s: 3.0,
+                    end_s: 4.0,
+                    cluster: 0,
+                },
+                SpeakerTurn {
+                    start_s: 7.0,
+                    end_s: 8.0,
+                    cluster: 1,
+                },
+            ],
+        };
+        let transcript = transcribe_session(
+            &session,
+            &mut asr,
+            &mut second,
+            &nobody_enrolled(),
+            mixdown::Settings::default(),
+            &mut quiet(),
+        )
+        .unwrap();
+
+        let said: Vec<(&str, &str)> = transcript
+            .turns
+            .iter()
+            .map(|turn| (turn.speaker.as_str(), turn.text.as_str()))
+            .collect();
+        assert!(said.contains(&("Bob", "and from me")), "{said:?}");
+        assert!(said.contains(&("Unknown 1", "hi there")), "{said:?}");
+    }
+
     /// Acceptance criteria #1 and #5, at the level a user meets them: a hand-written
     /// `speakers.json` turns "Unknown 1" into a name, the similarity that decided it lands on
     /// those turns, and nothing that makes no identity claim carries a number.

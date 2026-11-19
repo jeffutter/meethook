@@ -116,7 +116,7 @@ session directory.** That contract is the thing to understand before touching an
   than one unified capture, both to dodge a known macOS 15 corruption bug and because echo
   cancellation later needs the speaker track as an independent reference signal.
 - **`meethook-transcribe`** — the batch pipeline: AEC pre-pass, VAD (FireRedVAD, via ONNX), diarization
-  (ONNX), speaker embedding/matching, ASR (whisper.cpp via `whisper-rs`), turn merging, and
+  (Nemotron-3-Diarization by default; pyannote via the temporary `--diarizer` flag), speaker embedding/matching, ASR (whisper.cpp via `whisper-rs`), turn merging, and
   the `mixdown` module (public, unlike its siblings) that produces `meeting.opus`. The mic
   track is never diarized — there's exactly one local speaker, always labelled `You`; the
   speaker track is diarized and each turn attributed to a distinct voice.

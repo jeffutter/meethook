@@ -20,7 +20,7 @@ mod screen;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use meethook_session::{Paths, TranscriptTime};
 use meethook_transcribe::{CPU_ENV_VAR, mixdown};
 // The two debug variables the capture path reads live in the crate that reads them, and that
@@ -322,6 +322,12 @@ enum Command {
             value_parser = parse_max_boost_db,
         )]
         max_boost_db: f64,
+
+        /// Which diarizer to run (temporary; removed by TASK-088.13)
+        ///
+        /// Exists only so one session can be run both ways for the evaluation.
+        #[arg(long, value_enum, default_value_t = DiarizerChoice::Nemotron, hide = true)]
+        diarizer: DiarizerChoice,
     },
 
     /// Name speakers that transcription could not identify
@@ -524,6 +530,14 @@ pub struct EnrollArgs {
     json: bool,
 }
 
+/// The diarizer `transcribe` runs. Temporary: TASK-088.13 removes this enum, the flag and the
+/// pyannote arm once the evaluation is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DiarizerChoice {
+    Nemotron,
+    Pyannote,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::new(resolve_root(cli.root)?);
@@ -539,6 +553,7 @@ fn main() -> Result<()> {
             pan,
             target_lufs,
             max_boost_db,
+            diarizer,
         } => commands::transcribe(
             &paths,
             &session_ids,
@@ -552,6 +567,7 @@ fn main() -> Result<()> {
                     max_boost_db,
                 },
             },
+            diarizer,
         ),
         Command::Enroll(args) => commands::enroll(&paths, &args, template),
         Command::Speakers => commands::speakers(&paths),
@@ -620,6 +636,26 @@ mod tests {
             Command::Enroll(args) => args,
             other => panic!("expected an enroll command, got {other:?}"),
         }
+    }
+
+    fn chosen_diarizer(args: &[&str]) -> DiarizerChoice {
+        match Cli::try_parse_from(args).expect("should parse").command {
+            Command::Transcribe { diarizer, .. } => diarizer,
+            other => panic!("expected a transcribe command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transcribe_defaults_to_nemotron_and_can_select_pyannote() {
+        assert_eq!(
+            chosen_diarizer(&["meethook", "transcribe"]),
+            DiarizerChoice::Nemotron
+        );
+        assert_eq!(
+            chosen_diarizer(&["meethook", "transcribe", "--diarizer", "pyannote"]),
+            DiarizerChoice::Pyannote
+        );
+        refused(&["meethook", "transcribe", "--diarizer", "bogus"]);
     }
 
     #[test]

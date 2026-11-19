@@ -60,7 +60,9 @@ compiler, libclang, libonnxruntime) yourself — see
 [LINUX.md](./LINUX.md#without-nix) for the full list and why each one is needed.
 
 Model weights (Whisper, diarization, speaker embedding) are downloaded on first use into
-`<data dir>/models/` rather than bundled — see [Data directory](#data-directory) below.
+`<data dir>/models/` rather than bundled. Diarization uses Nemotron-3-Diarization by default,
+a one-time 199 MB download; a hidden, temporary `transcribe --diarizer pyannote` selects the
+previous diarizer until it is removed — see [Data directory](#data-directory) below.
 
 ## Usage
 

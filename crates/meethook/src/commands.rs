@@ -19,14 +19,15 @@ use meethook_session::{
     Classification, Paths, RootNow, SessionId, TranscriptTemplate, discover_sessions,
 };
 
-use crate::EnrollArgs;
 use crate::clips::Clips;
 use crate::screen::{Interface, Shared};
+use crate::{DiarizerChoice, EnrollArgs};
 #[cfg(target_os = "macos")]
 use meethook_transcribe::CPU_ENV_VAR;
 use meethook_transcribe::{
-    Attribution, EMBEDDING_MODEL, Engines, FIRERED_VAD_MODEL, OnnxDiarizer, SEGMENTATION_MODEL,
-    WHISPER_MODEL, WhisperEngine, run_batch,
+    Attribution, Diarize, EMBEDDING_MODEL, Engines, FIRERED_VAD_MODEL, NEMOTRON_DIARIZATION_DATA,
+    NEMOTRON_DIARIZATION_GRAPH, NemotronDiarizer, OnnxDiarizer, SEGMENTATION_MODEL, WHISPER_MODEL,
+    WhisperEngine, run_batch,
 };
 
 /// Transcribes recorded sessions.
@@ -40,6 +41,7 @@ pub fn transcribe(
     force: bool,
     template: Option<&Path>,
     mixdown_settings: meethook_transcribe::mixdown::Settings,
+    diarizer_choice: DiarizerChoice,
 ) -> Result<()> {
     let requested = parse_session_ids(session_ids)?;
     let template = TranscriptTemplate::resolve(paths, template)?;
@@ -48,23 +50,48 @@ pub fn transcribe(
     let mut open_engine =
         || -> std::result::Result<Engines, Box<dyn std::error::Error + Send + Sync>> {
             // Smallest first, so that a first run reaches its slowest download last -- by which
-            // point everything else is known to be in place. The VAD weights are 2.3 MB,
-            // diarization's two models are 32 MB, and Whisper is 1.6 GB.
+            // point everything else is known to be in place. The VAD weights are 2.3 MB, the
+            // WeSpeaker embedder is 26 MB, and Whisper is 1.6 GB. The Nemotron diarizer's
+            // 199 MB is the visible reason the first default run is slow, so it is announced.
             let vad = fetch(&models_dir, &FIRERED_VAD_MODEL)?;
-            let segmentation = fetch(&models_dir, &SEGMENTATION_MODEL)?;
-            let embedding = fetch(&models_dir, &EMBEDDING_MODEL)?;
+            let (diarizer, accelerated): (Box<dyn Diarize>, bool) = match diarizer_choice {
+                DiarizerChoice::Pyannote => {
+                    let segmentation = fetch(&models_dir, &SEGMENTATION_MODEL)?;
+                    let embedding = fetch(&models_dir, &EMBEDDING_MODEL)?;
+                    let diarizer = OnnxDiarizer::load(&segmentation, &embedding)?;
+                    let accelerated = diarizer.accelerated();
+                    (Box::new(diarizer), accelerated)
+                }
+                DiarizerChoice::Nemotron => {
+                    let embedding = fetch(&models_dir, &EMBEDDING_MODEL)?;
+                    if !models_dir
+                        .join(NEMOTRON_DIARIZATION_DATA.file_name)
+                        .is_file()
+                    {
+                        eprintln!(
+                            "Note: first run with the Nemotron diarizer downloads 199 MB of \
+                             weights; later runs do not."
+                        );
+                    }
+                    fetch(&models_dir, &NEMOTRON_DIARIZATION_GRAPH)?;
+                    fetch(&models_dir, &NEMOTRON_DIARIZATION_DATA)?;
+                    let diarizer = NemotronDiarizer::load(&models_dir, &embedding)?;
+                    let accelerated = diarizer.accelerated();
+                    (Box::new(diarizer), accelerated)
+                }
+            };
             let whisper = fetch(&models_dir, &WHISPER_MODEL)?;
-
-            let diarizer = OnnxDiarizer::load(&segmentation, &embedding)?;
             // Only meaningful where a CoreML EP was compiled in: off macOS `accelerated` is
             // always false by construction of the build, and printing "CoreML declined"
             // there would name a component the platform never had.
             #[cfg(target_os = "macos")]
-            if !diarizer.accelerated() {
+            if !accelerated {
                 // Correct but several times slower. Worth a line: the alternative is a user
                 // wondering why transcribing a meeting suddenly takes minutes.
                 eprintln!("Note: CoreML declined these graphs; diarization is running on CPU.");
             }
+            #[cfg(not(target_os = "macos"))]
+            let _ = accelerated;
 
             let asr = WhisperEngine::load(&whisper, &vad)?;
             // Same reasoning: off macOS the CPU is the only path, so a non-accelerated
@@ -81,7 +108,7 @@ pub fn transcribe(
 
             Ok(Engines {
                 asr: Box::new(asr),
-                diarizer: Box::new(diarizer),
+                diarizer,
             })
         };
 
