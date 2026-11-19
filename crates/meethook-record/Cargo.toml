@@ -11,10 +11,10 @@
 # The costs, accepted rather than papered over:
 #
 # - Versions are literals here rather than `workspace = true` inheritance, because inheritance
-#   only resolves inside the workspace that lists you as a member. They mirror the root
-#   workspace's `[workspace.dependencies]`; keep them in step when bumping either side. When
-#   built from the root (macOS), both requirement sets must agree or the root's resolution
-#   fails loudly, which is the drift detector.
+#   only resolves inside the workspace that lists you as a member. The Apple-framework
+#   crates and `mach2` are declared only here: the root workspace has no member that inherits
+#   them, so a root entry would be dead. `hound`, `jiff` and `libc` are shared with the root,
+#   and must stay in step with its `[workspace.dependencies]` when bumping either side.
 # - This directory carries its own `Cargo.lock`. Building from here resolves against it;
 #   building the `meethook` binary from the root resolves against the root's lock file. Both
 #   graphs contain the same crates at the same versions while the mirrors hold.
@@ -51,8 +51,17 @@ libc = "0.2"
 mach2 = "0.7"
 thiserror = "2"
 
+# Apple framework bindings. Deliberately one binding family (objc2) for every framework
+# this slice touches, so there is one `Retained<T>`, one `NSObject`, and no duplicate
+# framework bindings in the tree. None of these have build scripts: they link via
+# `#[link(kind = "framework")]`, which the flake's apple-sdk_26 already satisfies.
 block2 = "0.6"
 dispatch2 = "0.3"
+# `exception` is for `objc2::exception::catch`. Apple's audio frameworks report some failures
+# by raising an `NSException`, and one that unwinds into Rust aborts the process outright --
+# see meethook-record::exception for what that cost. Deliberately not `catch-all`, which would
+# wrap every `msg_send!` in the workspace in a `@try` to guard the handful of calls that can
+# actually raise; the wrapping is done at those call sites instead, where it is visible.
 objc2 = { version = "0.6", features = ["exception"] }
 objc2-av-foundation = "0.3"
 objc2-avf-audio = "0.3"
@@ -61,6 +70,21 @@ objc2-core-audio-types = "0.3"
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
 objc2-core-media = "0.3"
+# EventKit, for naming a finished session after the meeting it was recorded during.
+# `default-features = false` is load-bearing, not cosmetic: the default feature set pulls
+# objc2-app-kit, objc2-core-location and objc2-map-kit, none of which are in this tree and
+# one of which is enormous. With the list below the only crate this line adds to the build
+# graph is objc2-event-kit itself -- objc2, objc2-foundation and block2 are already here.
+#
+# `EKSource` is here for the diagnostic in crates/meethook-record/examples/calendar-access.rs
+# and for nothing in `src/`. It is what distinguishes "the work meetings are in an Exchange
+# account synced into Calendar.app" from "there are accounts configured and none of them is
+# the work one" -- `EKCalendar::type()` alone answers CalDAV/Exchange/Local but not *which*
+# account, and this machine has three. Measured rather than assumed, by diffing
+# `cargo tree -p meethook-record` and `Cargo.lock` across the change: it adds no crate and
+# does not move the lock file. Its only effect beyond compiling `EKSource.rs` is turning on
+# `objc2-foundation/NSSet` and `objc2-foundation/NSString`, and objc2-foundation is already
+# in the tree with default features, so both were already on.
 objc2-event-kit = { version = "0.3", default-features = false, features = [
   "EKCalendar",
   "EKCalendarItem",
