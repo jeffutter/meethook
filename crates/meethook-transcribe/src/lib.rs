@@ -34,6 +34,9 @@ mod nemotron_cache;
 mod nemotron_mel;
 // Reached through the re-export below until TASK-088.08 diarizes with it.
 mod nemotron_stream;
+// Not called until TASK-088.08 diarizes with Nemotron.
+#[allow(dead_code)]
+mod nemotron_turns;
 // Likewise not called until TASK-088.06 (the `nemotron-step` example reaches it through the
 // re-exports below).
 #[allow(dead_code)]
@@ -91,6 +94,7 @@ pub use models::{
 pub use nemotron_graph::{NemotronGraph, StepOutput, encoder_valid};
 pub use nemotron_mel::NemotronMel;
 pub use nemotron_stream::{SpeakerStep, speaker_probabilities};
+pub use nemotron_turns::{SlotTurn, slot_turns};
 pub use onnx::{Loaded, open_session};
 pub use reference::{
     Decline, DeclinedPoint, FragmentProbe, ORIGIN_DISTANCE, Sampling, StoredReference, Sweep,

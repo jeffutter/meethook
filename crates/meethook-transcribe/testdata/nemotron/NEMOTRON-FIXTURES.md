@@ -123,3 +123,11 @@ differences above are well inside), embeddings 1e-3.
 - Only offline mode (chunk 340 / right context 40) was captured; the model's streaming latency modes were not.
 - The probabilities fixture is the HF torch result. The ONNX fp32 graph agrees with it (max abs 2.4e-6 once the mask is
   passed); the fp16 export and CoreML were not checked.
+
+## Expected turns (TASK-088.07)
+
+`expected-turns.py` decodes `nemotron-probs.bin` into speaker turns (enter above 0.5, stay while
+at least 0.25, merge gaps up to 1.0 s, drop turns under 0.5 s) with a loop written separately from
+`nemotron_turns::slot_turns`, and prints `(start_frame, end_frame, slot)` tuples. The test
+`the_fixture_probabilities_decode_to_the_independent_expectation` holds that output as a literal.
+Rerun the script and update the literal if the constants change.
