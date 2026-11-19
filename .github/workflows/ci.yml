@@ -74,7 +74,7 @@ jobs:
           use-flakehub: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: clippy-${{ matrix.os }}
+          shared-key: clippy-v2-${{ matrix.os }}
           workspaces: ". -> target"
       - name: Evict stale native build caches
         run: bash .github/scripts/evict-stale-nix-store-refs.sh

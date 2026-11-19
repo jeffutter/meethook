@@ -1919,7 +1919,15 @@ mod tests {
             panic!("expected a cancelled outcome, got {:?}", record.outcome);
         };
         assert_eq!(lag_samples, expected_lag);
-        assert_eq!(erle_db, expected_erle);
+        // Not `assert_eq!`: the value went through `cleaning.json`, and serde_json's default
+        // float parser can land one ULP off the f64 it printed (seen on Linux:
+        // 20.29586601257324 vs 20.295866012573242). That is JSON precision, not a mismatch
+        // between the record and the run.
+        let (erle_db, expected_erle) = (erle_db.unwrap(), expected_erle.unwrap());
+        assert!(
+            (erle_db - expected_erle).abs() < 1e-9,
+            "recorded ERLE {erle_db} vs recomputed {expected_erle}"
+        );
     }
 
     /// AC #4: the pass-through case is as legible in the record as the cancelled case.
