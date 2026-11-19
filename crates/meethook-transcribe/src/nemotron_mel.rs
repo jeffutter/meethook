@@ -211,13 +211,13 @@ fn slaney_filters() -> Vec<MelFilter> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const CLIP: &[u8] = include_bytes!("../testdata/nemotron/nemotron-clip.mulaw");
     const FEATURES: &[u8] = include_bytes!("../testdata/nemotron/nemotron-features.bin");
 
-    fn decode_mulaw(code: u8) -> f32 {
+    pub(crate) fn decode_mulaw(code: u8) -> f32 {
         let c = !code;
         let sign = c & 0x80;
         let exp = (c >> 4) & 7;
@@ -226,7 +226,7 @@ mod tests {
         (if sign != 0 { -x } else { x }) as f32 / 32768.0
     }
 
-    fn clip() -> Vec<f32> {
+    pub(crate) fn clip() -> Vec<f32> {
         CLIP.iter().map(|&b| decode_mulaw(b)).collect()
     }
 

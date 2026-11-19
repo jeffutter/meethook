@@ -32,6 +32,10 @@ mod nemotron_cache;
 // Likewise not called until TASK-088.06.
 #[allow(dead_code)]
 mod nemotron_mel;
+// Likewise not called until TASK-088.06 (the `nemotron-step` example reaches it through the
+// re-exports below).
+#[allow(dead_code)]
+mod nemotron_graph;
 // Public, unlike every other module here, for the same reason `meethook_session::wav` is: its
 // two functions are called `mix` and `write`, and those names carry their meaning only next to
 // the module's own.
@@ -82,6 +86,8 @@ pub use models::{
     EMBEDDING_MODEL, FIRERED_VAD_MODEL, NEMOTRON_DIARIZATION_DATA, NEMOTRON_DIARIZATION_GRAPH,
     NEMOTRON_DIARIZATION_MODELS, SEGMENTATION_MODEL, WHISPER_MODEL,
 };
+pub use nemotron_graph::{NemotronGraph, StepOutput, encoder_valid};
+pub use nemotron_mel::NemotronMel;
 pub use onnx::{Loaded, open_session};
 pub use reference::{
     Decline, DeclinedPoint, FragmentProbe, ORIGIN_DISTANCE, Sampling, StoredReference, Sweep,
@@ -177,6 +183,29 @@ pub enum Error {
     /// without a caller having to know that [`FireRedVad`] sits on ONNX Runtime.
     #[error("voice activity detection failed: {0}")]
     Vad(String),
+
+    /// Inference through the Nemotron graph, or an input or output that does not match the
+    /// contract in doc-015. Loading is [`Error::Onnx`].
+    #[error("Nemotron diarization failed: {0}")]
+    Nemotron(String),
+
+    /// The graph's rotary position table holds 5000 encoder frames and cannot grow, so a step
+    /// whose cache, FIFO and chunk together exceed that cannot run at all.
+    #[error(
+        "a Nemotron step of {cached} cached + {chunk} chunk encoder frames exceeds the graph's \
+         limit of {limit} encoder frames (400 s); the cache and FIFO are held to {cache_len} + \
+         {fifo} frames and a chunk to {chunk_len} + {right} right-context frames, so a step \
+         this long means the caller is not chunking"
+    )]
+    NemotronPositionLimit {
+        cached: usize,
+        chunk: usize,
+        limit: usize,
+        cache_len: usize,
+        fifo: usize,
+        chunk_len: usize,
+        right: usize,
+    },
 
     #[error("could not load the ONNX model at {path}: {source}")]
     Onnx {
