@@ -2,11 +2,11 @@
 
 usage: generate-reference.py OUT_DIR
   reads  OUT_DIR/nemotron-clip.mulaw   (written by gen_clip.py)
-  writes OUT_DIR/nemotron-features.bin, nemotron-cache-step{0..3}.bin, nemotron-probs.bin
+  writes OUT_DIR/nemotron-features.bin, nemotron-cache-step{0..3}.bin, nemotron-update-step{0..3}.bin, nemotron-probs.bin
   prints the parity report (HF torch vs ONNX graph vs the doc-015 numpy port).
 Nothing here runs from cargo; it only documents how the fixtures were made.
 """
-import math, sys
+import inspect, math, sys
 import numpy as np, torch
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForAudioFrameClassification, AutoProcessor
@@ -41,8 +41,23 @@ with open(f"{OUT}/nemotron-features.bin", "wb") as f:
 
 # --- HF offline forward, recording the cache after each update
 states = []
+update_inputs = []
 orig_update = M.Nemotron3DiarizationSpeakerCache.update
 def recording_update(self, *a, **k):
+    # what update() consumes at this step, captured before it runs (the state it starts from is the previous step's)
+    bound = inspect.signature(orig_update).bind(self, *a, **k)
+    bound.apply_defaults()
+    args = bound.arguments
+    nc0, nf0 = self.num_cache_frames, self.num_fifo_frames
+    n_chunk = int(args["num_chunk_frames"])
+    start = nc0 + nf0 + int(args["num_lookback_frames"])
+    mask = args["mask"]
+    update_inputs.append(dict(
+        n_cache=nc0, n_fifo=nf0, n_chunk=n_chunk,
+        logits=args["chunk_logits"][0].clone().numpy(),
+        mask=(mask[0].to(torch.float32).numpy() if mask is not None else np.ones(args["chunk_logits"].shape[1] // 8, np.float32)),
+        chunk_embeds=args["chunk_input_embeds"][0, start:start + n_chunk].clone().numpy(),
+        silence=args["silence_embeds"].reshape(-1).clone().numpy()))
     orig_update(self, *a, **k)
     nc, nf = self.num_cache_frames, self.num_fifo_frames
     states.append(dict(
@@ -63,6 +78,14 @@ for i in range(4):
         s["embeds"].astype("<f4").tofile(f)
         s["probs"].astype("<f4").tofile(f)
         s["fifo"].astype("<f4").tofile(f)
+for i in range(4):
+    u = update_inputs[i]
+    with open(f"{OUT}/nemotron-update-step{i}.bin", "wb") as f:
+        np.array([u["n_cache"], u["n_fifo"], u["n_chunk"], len(u["mask"]), 512, 8], "<u4").tofile(f)
+        u["logits"].astype("<f4").tofile(f)      # f32[n_in * 8][8], raw logits of the whole step
+        u["mask"].astype("<f4").tofile(f)        # f32[n_in], 1.0 valid / 0.0 padding encoder frame
+        u["chunk_embeds"].astype("<f4").tofile(f)  # f32[n_chunk][512], the rows that join the FIFO
+        u["silence"].astype("<f4").tofile(f)     # f32[512]
 with open(f"{OUT}/nemotron-probs.bin", "wb") as f:
     np.array([n_mel, 8], "<u4").tofile(f)
     probs_hf.astype("<f4").tofile(f)

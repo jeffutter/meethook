@@ -28,6 +28,9 @@ mod merge;
 mod models;
 // Not called by production code until TASK-088.06 runs a track through Nemotron.
 #[allow(dead_code)]
+mod nemotron_cache;
+// Likewise not called until TASK-088.06.
+#[allow(dead_code)]
 mod nemotron_mel;
 // Public, unlike every other module here, for the same reason `meethook_session::wav` is: its
 // two functions are called `mix` and `write`, and those names carry their meaning only next to

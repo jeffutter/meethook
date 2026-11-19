@@ -10,13 +10,14 @@ Background and the algorithm: `backlog/docs/evaluations/doc-015`.
 
 ## Files
 
-All integers and floats are little-endian. Total size is about 4.4 MB.
+All integers and floats are little-endian. Total size is about 7.6 MB.
 
 | file | content |
 |---|---|
 | `nemotron-clip.mulaw` | 1,600,000 bytes, the clip: 100.0 s, 16 kHz mono, 8-bit mu-law (G.711), one byte per sample |
 | `nemotron-features.bin` | header 4 x u32 `[mel_frames=10001, bins=128, head=64, tail=64]`, then `f32[64][128]` (frames 0..63), then `f32[64][128]` (frames 9937..10000) |
 | `nemotron-cache-step{0,1,2,3}.bin` | header 4 x u32 `[n_cache, n_fifo, hidden=512, speakers=8]`, then `f32[n_cache][512]` cache embeddings, `f32[n_cache][8]` stored cache probabilities, `f32[n_fifo][512]` FIFO embeddings |
+| `nemotron-update-step{0,1,2,3}.bin` | what `Nemotron3DiarizationSpeakerCache.update` consumed at that step (TASK-088.04): header 6 x u32 `[n_cache, n_fifo, n_chunk, n_in, hidden=512, speakers=8]` (cache and FIFO rows held *before* the step, so the state to start from is `nemotron-cache-step{N-1}.bin`; none at step 0), then `f32[n_in*8][8]` raw logits of the step, `f32[n_in]` attention mask (1.0 valid, 0.0 padding), `f32[n_chunk][512]` chunk embeddings that join the FIFO, `f32[512]` silence embedding. Sizes 797 KB, 876 KB, 876 KB, 614 KB; `n_in` is 380, 684, 684, 535 |
 | `nemotron-probs.bin` | header 2 x u32 `[frames=10001, speakers=8]`, then `f32[10001][8]` sigmoid probabilities, one row per 10 ms mel frame |
 | `generate-clip.py`, `generate-reference.py` | the generators (documentation only) |
 
@@ -62,7 +63,7 @@ v/bin/pip install torch==2.15.0 transformers==5.23.0 numpy==2.5.5 onnxruntime==1
     scipy==1.18.1 soundfile==0.14.0 huggingface_hub==2.4.0
 mkdir out
 v/bin/python generate-clip.py out        # writes out/nemotron-clip.mulaw
-v/bin/python generate-reference.py out   # writes the four other fixture kinds, prints the parity report
+v/bin/python generate-reference.py out   # writes the other fixture kinds, prints the parity report
 ```
 
 Both scripts were run twice from scratch (the clip was rebuilt from the network; the reference was regenerated)
