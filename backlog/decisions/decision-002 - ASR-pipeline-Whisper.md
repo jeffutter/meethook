@@ -1,4 +1,5 @@
 ---
+updated_date: '2026-11-19T14:38:00Z'
 id: decision-002
 title: ASR pipeline (Whisper)
 date: '2026-08-27 04:38'
@@ -17,4 +18,12 @@ The investigation initially suspected Whisper's decoder was carrying context acr
 - Reusing pyannote segmentation as VAD — would cross a deliberately maintained architectural boundary.
 - A text blocklist for hallucinated phrases — destroys real speech, doesn't generalize.
 - Core ML `MLProgram` for diarization, plus a compiled-model cache — doesn't load the model at all; the cache's benefit is smaller than measurement noise.
+
+## Consequences
+
+<!-- SECTION:CONSEQUENCES:BEGIN -->
+The speech gate's detector is FireRedVAD's streaming model, not Silero (amended 2026-11-19; the Silero text above is the original reasoning, and the gate's shape - splice, one decode pass, exact timestamp map-back - is unchanged). It runs through `ort` on the CPU with a Kaldi-style fbank frontend in `fbank.rs`, the training-time CMVN statistics embedded in the crate, and whisper.cpp's region walk ported into `vad.rs`, so the dependency on whisper.cpp's VAD is gone entirely. Chosen on one real session (129 minutes, both tracks) against Silero, and against SAVA, which was rejected because its output depended on stream history and dropped minutes of quiet speech. FireRed keeps short backchannels Silero cut, joins a speaker's turn into fewer pieces, and its output depends only on a bounded window of audio. Threshold 0.35 was picked by listening, not by a metric.
+
+Costs: about 20% more audio goes to Whisper on the speaker track than under Silero (61.9 min against 50.6 min at the same 0.1 s minimum silence; the Silero figure comes from a Python approximation of the walk and the FireRed figure from this crate, so the two are not exactly like for like). The weights come from the FireRedVAD GitHub repo at a pinned commit rather than Hugging Face, and `assets/firered-vad-cmvn.ark` must move in step with them. The 0.5 s `min_silence_s` in `gate_tuning` was measured under Silero and has not been re-measured for FireRed.
+<!-- SECTION:CONSEQUENCES:END -->
 

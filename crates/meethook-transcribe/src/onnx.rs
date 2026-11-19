@@ -78,22 +78,28 @@ pub fn open_session(model_path: &Path) -> Result<Loaded> {
     // Only the CPU attempt's error is reported. A CoreML error here would name a compiler
     // that the user cannot act on, in place of the parse or permission failure that is the
     // actual reason nothing loaded.
-    //
-    // Its own helper for the same reason `load_with_coreml` is one: the `?`-chain stays
-    // inside `ort::Result`, so no `From<ort::Error>` for the crate error is needed.
-    fn load_cpu(model_path: &Path) -> ort::Result<Session> {
+    open_cpu_session(model_path).map(|session| Loaded {
+        session,
+        accelerated: false,
+    })
+}
+
+/// Loads an ONNX graph on the CPU, whatever accelerators the platform has.
+///
+/// For graphs where an accelerator is a loss rather than a missing nicety: the speech
+/// detector is a 2 MB network called once per 0.5 s of audio with a state tensor passed in and
+/// out each time, and a CoreML partition boundary on every call would cost more than the
+/// network does.
+pub fn open_cpu_session(model_path: &Path) -> Result<Session> {
+    // A helper for the same reason `load_with_coreml` is one: the `?`-chain stays inside
+    // `ort::Result`, so no `From<ort::Error>` for the crate error is needed.
+    fn load(model_path: &Path) -> ort::Result<Session> {
         Session::builder(environment()?)?.commit_from_file(model_path)
     }
-
-    load_cpu(model_path)
-        .map(|session| Loaded {
-            session,
-            accelerated: false,
-        })
-        .map_err(|source| Error::Onnx {
-            path: model_path.to_path_buf(),
-            source: Box::new(source),
-        })
+    load(model_path).map_err(|source| Error::Onnx {
+        path: model_path.to_path_buf(),
+        source: Box::new(source),
+    })
 }
 
 #[cfg(test)]

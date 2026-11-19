@@ -8,7 +8,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 use crate::audio::TARGET_RATE;
 use crate::gate;
 use crate::gpu;
-use crate::vad::{SileroVad, VadTuning};
+use crate::vad::{FireRedVad, VadTuning};
 use crate::{Error, Result};
 
 /// One stretch of recognized speech, timed from the start of the audio that was handed to
@@ -59,16 +59,16 @@ const BLANK_AUDIO: &str = "[BLANK_AUDIO]";
 
 /// The detector settings the speech gate runs at.
 ///
-/// `min_silence_s` is raised from whisper.cpp's 0.1 s default. Measured with
-/// `examples/vad-regions` on `20260810-093047`'s `mic.cleaned.wav`: 0.1 s gives 463 regions
-/// holding 713.4 s of speech, 0.5 s gives 315 regions holding 791.6 s. That is 148 fewer seams
-/// for 78 s more audio -- roughly three more 30 s decoder windows -- and a seam is the only
-/// place rule 4 of [`gate::Splice::to_original`] can fire, so fewer of them is the axis worth
-/// buying on.
+/// `min_silence_s` is raised from the detector's 0.1 s default. Measured with
+/// `examples/vad-regions` on `20260810-093047`'s `mic.cleaned.wav` under the previous detector
+/// (Silero): 0.1 s gave 463 regions holding 713.4 s of speech, 0.5 s gave 315 regions holding
+/// 791.6 s. That is 148 fewer seams for 78 s more audio -- roughly three more 30 s decoder
+/// windows -- and a seam is the only place rule 4 of [`gate::Splice::to_original`] can fire, so
+/// fewer of them is the axis worth buying on. It also keeps one speaker's turn in one piece
+/// across a short pause. Re-measure before treating those two numbers as FireRed's.
 ///
-/// `threshold` stays at whisper.cpp's 0.5. A sweep over 0.30..0.95 moved the detected speech on
-/// that track from 792 s to 454 s, and the criterion that must not break is the user's quietest
-/// real speech surviving, so there is nothing in that range worth taking.
+/// `threshold` is [`VadTuning::default`]'s 0.35, chosen by listening to this corpus; see
+/// [`crate::FireRedVad`].
 fn gate_tuning() -> VadTuning {
     VadTuning {
         min_silence_s: 0.5,
@@ -80,10 +80,9 @@ fn gate_tuning() -> VadTuning {
 ///
 /// Without this, both write their progress and load messages straight to stderr, interleaved
 /// with whatever the CLI or a diagnostic is printing. Every whisper.cpp entry point in this
-/// crate has to call it before loading anything -- [`crate::SileroVad`] as well as
-/// [`WhisperEngine`] -- which is why the `Once` lives here rather than inside `load`. One
-/// global gets one piece of state; a second `Once` elsewhere would be two states for one
-/// global, and that is how a global ends up half-initialised.
+/// crate has to call it before loading anything -- which is why the `Once` lives here rather
+/// than inside `load`. One global gets one piece of state; a second `Once` elsewhere would be
+/// two states for one global, and that is how a global ends up half-initialised.
 pub(crate) fn install_logging_hooks() {
     static HOOKS: Once = Once::new();
     HOOKS.call_once(whisper_rs::install_logging_hooks);
@@ -100,7 +99,7 @@ pub(crate) fn install_logging_hooks() {
 /// [`Self::load`] requires the VAD weights and there is no builder to forget.
 pub struct WhisperEngine {
     context: WhisperContext,
-    vad: SileroVad,
+    vad: FireRedVad,
     tuning: VadTuning,
     threads: i32,
     accelerated: bool,
@@ -122,13 +121,13 @@ impl WhisperEngine {
     /// to touch. See the `gpu` module for why a missing device is an error rather than a silent
     /// CPU fallback.
     ///
-    /// `vad_model_path` is [`crate::SILERO_VAD_MODEL`], and it is loaded **first**: 885 KB on
+    /// `vad_model_path` is [`crate::FIRERED_VAD_MODEL`], and it is loaded **first**: 2.3 MB on
     /// the CPU, so a missing or truncated file fails in under a second rather than after 1.6 GB
     /// has been read and uploaded to the GPU.
     pub fn load(model_path: &Path, vad_model_path: &Path) -> Result<WhisperEngine> {
         install_logging_hooks();
 
-        let vad = SileroVad::load(vad_model_path)?;
+        let vad = FireRedVad::load(vad_model_path)?;
 
         let mut params = WhisperContextParameters::default();
         // Only meaningful where a GPU backend was compiled in. A macOS build without the
@@ -184,10 +183,8 @@ impl SpeechToText for WhisperEngine {
     /// tests running against a fake recogniser, and means both of a session's tracks are gated
     /// by one code path with no branch to get wrong.
     fn transcribe(&mut self, audio_16k_mono: &[f32]) -> Result<Vec<AsrSegment>> {
-        // Bracketing note rather than progress: Silero runs over the whole track before the
-        // gate can say anything about it -- a minute or so on a 49-minute session -- and it
-        // exposes no callback to tick from, so saying what is being scanned before it starts
-        // is all that is available. The `report` line below closes it with the answer.
+        // Opens the bracket the detector's own heartbeat ticks inside (a `Phase`, silent unless
+        // the scan is slow) and the `report` line below closes with the answer.
         eprintln!(
             "speech gate: scanning {:.0} s for speech...",
             audio_16k_mono.len() as f64 / f64::from(TARGET_RATE)

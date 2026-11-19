@@ -10,6 +10,12 @@
 //! both are called out where they happen: the int16 scaling in [`Fbank::compute`] and the
 //! per-utterance mean normalization at the end of it.
 //!
+//! The speech detector in [`crate::vad`] reads the same 80 bins from the same extractor, with
+//! the one parameter that differs between the two networks -- the window function -- chosen at
+//! construction ([`Window`]) and the normalization left to the caller
+//! ([`Fbank::compute_unnormalized`]): the detector's is a fixed table learned offline, not a
+//! mean over this utterance, because it runs over a stream that has no end to take a mean at.
+//!
 //! This is a from-scratch implementation over the `realfft` dependency the workspace
 //! already has, rather than a binding to kaldi's C++. That is only defensible because it
 //! is checked against the real thing: `testdata/kaldi-fbank-hamming.bin` holds a fixed
@@ -41,6 +47,19 @@ const HIGH_FREQ: f32 = TARGET_RATE as f32 / 2.0;
 /// First-difference filter that flattens the ~-6 dB/octave tilt of voiced speech.
 const PREEMPHASIS: f32 = 0.97;
 
+/// The taper applied to each 25 ms frame before the FFT.
+///
+/// The two networks that read this extractor were trained on different ones, and nothing fails
+/// when they are swapped -- the features just stop being the ones the weights learned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// WeSpeaker's (`window_type='hamming'` in its training pipeline).
+    Hamming,
+    /// Kaldi's own default, `(0.5 - 0.5 cos)^0.85`, which FireRedVAD's `kaldi_native_fbank`
+    /// frontend uses without overriding.
+    Povey,
+}
+
 /// One triangular mel filter, stored as the run of FFT bins it actually touches.
 struct MelFilter {
     first_bin: usize,
@@ -62,10 +81,19 @@ pub struct Fbank {
 }
 
 impl Fbank {
+    /// The extractor WeSpeaker's embedder expects: Hamming window, per-utterance mean
+    /// normalization through [`Self::compute`].
     pub fn new() -> Self {
+        Fbank::with_window(Window::Hamming)
+    }
+
+    pub fn with_window(window: Window) -> Self {
         Fbank {
             fft: realfft::RealFftPlanner::<f32>::new().plan_fft_forward(PADDED_LENGTH),
-            window: hamming_window(),
+            window: match window {
+                Window::Hamming => hamming_window(),
+                Window::Povey => povey_window(),
+            },
             filters: mel_filters(),
             frame: vec![0.0; PADDED_LENGTH],
             spectrum: vec![Complex::default(); PADDED_LENGTH / 2 + 1],
@@ -83,6 +111,19 @@ impl Fbank {
     /// Frames are snipped at the edges, kaldi's default: only whole frames that fit inside
     /// the audio are emitted, so `T == 1 + (samples - 400) / 160`.
     pub fn compute(&mut self, samples: &[f32]) -> Vec<f32> {
+        let mut out = self.compute_unnormalized(samples);
+        // Per-utterance cepstral mean normalization, again a WeSpeaker convention rather
+        // than part of fbank: subtract each bin's mean over time. This is what makes an
+        // embedding describe the voice instead of the microphone and room it was recorded
+        // through -- and what makes two clips of one person comparable at all.
+        let frames = out.len() / MEL_BINS;
+        subtract_mean_over_time(&mut out, frames);
+        out
+    }
+
+    /// The same features as [`Self::compute`] before any normalization: raw log-mel
+    /// energies, `[T, 80]` row-major, with the same framing and the same empty-on-short rule.
+    pub fn compute_unnormalized(&mut self, samples: &[f32]) -> Vec<f32> {
         if samples.len() < FRAME_LENGTH {
             return Vec::new();
         }
@@ -107,12 +148,6 @@ impl Fbank {
 
             self.frame_energies(&mut out[f * MEL_BINS..(f + 1) * MEL_BINS]);
         }
-
-        // Per-utterance cepstral mean normalization, again a WeSpeaker convention rather
-        // than part of fbank: subtract each bin's mean over time. This is what makes an
-        // embedding describe the voice instead of the microphone and room it was recorded
-        // through -- and what makes two clips of one person comparable at all.
-        subtract_mean_over_time(&mut out, frames);
         out
     }
 
@@ -198,6 +233,15 @@ fn hamming_window() -> Vec<f32> {
         .collect()
 }
 
+/// Kaldi's default window: a Hann raised to the 0.85 power, with the same symmetric
+/// `frame_length - 1` denominator as [`hamming_window`].
+fn povey_window() -> Vec<f32> {
+    let a = std::f64::consts::TAU / (FRAME_LENGTH - 1) as f64;
+    (0..FRAME_LENGTH)
+        .map(|i| (0.5 - 0.5 * (a * i as f64).cos()).powf(0.85) as f32)
+        .collect()
+}
+
 /// The 80 triangular filters, evenly spaced on the HTK mel scale between 20 Hz and Nyquist.
 ///
 /// Adjacent triangles overlap by half: filter `b` rises from the centre of `b - 1` and
@@ -260,15 +304,24 @@ mod tests {
     /// implementation forever without a C++ toolchain, a cmake build, or a network.
     const REFERENCE: &[u8] = include_bytes!("../testdata/kaldi-fbank-hamming.bin");
 
+    /// The same input through kaldi-native-fbank's defaults (Povey window), with no mean
+    /// normalization: what FireRedVAD's frontend computes before its own fixed CMVN.
+    /// Layout identical to [`REFERENCE`], magic `MPFBANK1`.
+    const POVEY_REFERENCE: &[u8] = include_bytes!("../testdata/kaldi-fbank-povey.bin");
+
     fn reference() -> (Vec<f32>, usize, Vec<f32>) {
-        assert_eq!(&REFERENCE[..8], b"MHFBANK1");
+        decode(REFERENCE, b"MHFBANK1")
+    }
+
+    fn decode(bytes: &[u8], magic: &[u8; 8]) -> (Vec<f32>, usize, Vec<f32>) {
+        assert_eq!(&bytes[..8], magic);
         let word = |i: usize| {
-            u32::from_le_bytes(REFERENCE[8 + i * 4..12 + i * 4].try_into().unwrap()) as usize
+            u32::from_le_bytes(bytes[8 + i * 4..12 + i * 4].try_into().unwrap()) as usize
         };
         let (samples, frames, bins) = (word(0), word(1), word(2));
         assert_eq!(bins, MEL_BINS);
 
-        let (chunks, _remainder) = REFERENCE[20..].as_chunks::<4>();
+        let (chunks, _remainder) = bytes[20..].as_chunks::<4>();
         let floats: Vec<f32> = chunks.iter().map(|b| f32::from_le_bytes(*b)).collect();
         assert_eq!(floats.len(), samples + frames * bins);
         let (audio, features) = floats.split_at(samples);
@@ -288,6 +341,23 @@ mod tests {
         let (audio, frames, expected) = reference();
 
         let got = Fbank::new().compute(&audio);
+
+        assert_eq!(got.len(), frames * MEL_BINS, "frame count");
+        let worst = got
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-3, "worst deviation from kaldi was {worst}");
+    }
+
+    /// The Povey window and the un-normalized path, which is the half of this module the
+    /// speech detector depends on. Same tolerance and same reasoning as the test above.
+    #[test]
+    fn povey_features_match_kaldi_native_fbank_before_normalization() {
+        let (audio, frames, expected) = decode(POVEY_REFERENCE, b"MPFBANK1");
+
+        let got = Fbank::with_window(Window::Povey).compute_unnormalized(&audio);
 
         assert_eq!(got.len(), frames * MEL_BINS, "frame count");
         let worst = got

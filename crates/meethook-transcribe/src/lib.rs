@@ -72,7 +72,7 @@ pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
 // `mixdown` gave it, instead of only the gain.
 pub use loudness::integrated_lufs;
 pub use merge::merge;
-pub use models::{EMBEDDING_MODEL, SEGMENTATION_MODEL, SILERO_VAD_MODEL, WHISPER_MODEL};
+pub use models::{EMBEDDING_MODEL, FIRERED_VAD_MODEL, SEGMENTATION_MODEL, WHISPER_MODEL};
 pub use onnx::{Loaded, open_session};
 pub use reference::{
     Decline, DeclinedPoint, FragmentProbe, ORIGIN_DISTANCE, Sampling, StoredReference, Sweep,
@@ -90,7 +90,7 @@ pub use timeline::{mic_offset_seconds, speaker_offset_seconds};
 pub use trials::{
     EqualError, Spread, Trial, TrialReport, ZeroFalseAccept, score_trials, wilson_interval,
 };
-pub use vad::{SileroVad, SpeechRegion, VadTuning};
+pub use vad::{FireRedVad, SpeechRegion, VadTuning, regions_from};
 pub use voice_vectors::{GroupDistance, cosine_distance, group_distance};
 
 use meethook_session::{
@@ -163,11 +163,9 @@ pub enum Error {
     #[error("speaker embedding failed: {0}")]
     Embedding(String),
 
-    /// Loading or running the voice-activity detector. A `String` rather than a `#[source]`
-    /// because whisper-rs's VAD errors carry no information at all -- `NullPointer` on load
-    /// and on segmentation, `GenericError(-1)` on detection -- with the real diagnosis going
-    /// to the logging hooks. Since the crate will not say what went wrong, the message
-    /// [`SileroVad`] builds has to.
+    /// Loading or running the voice-activity detector. A `String` so the message can say which
+    /// stage failed (the embedded statistics, the graph's inputs, the cache it handed back)
+    /// without a caller having to know that [`FireRedVad`] sits on ONNX Runtime.
     #[error("voice activity detection failed: {0}")]
     Vad(String),
 

@@ -1,7 +1,7 @@
 //! The timeline policy behind the speech gate: which stretches of a track to hand the
 //! recogniser, and how to read the timestamps it returns back onto the original track.
 //!
-//! [`crate::SileroVad`] says where speech is. This module decides what to do with that answer,
+//! [`crate::FireRedVad`] says where speech is. This module decides what to do with that answer,
 //! and it is deliberately the part with no audio, no model and no `whisper_rs` type in it.
 //! A mistake here is invisible in the worst way: the transcript still reads correctly, and
 //! every turn in it is timed wrongly, which [`crate::merge()`] then interleaves against the
@@ -95,7 +95,7 @@ impl Splice {
     /// nothing to decode.
     ///
     /// `regions` is expected ascending and non-overlapping, which is what
-    /// [`crate::SileroVad::speech_regions`] documents and guarantees. Nothing here depends on
+    /// [`crate::FireRedVad::speech_regions`] documents and guarantees. Nothing here depends on
     /// that being true: every end is clamped to the track and to the next region's start, every
     /// start is held at or after the previous piece's end, and a piece left with no samples is
     /// dropped. So a detector that stopped honouring its contract would cost audio, not

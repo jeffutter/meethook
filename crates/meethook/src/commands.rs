@@ -25,7 +25,7 @@ use crate::screen::{Interface, Shared};
 #[cfg(target_os = "macos")]
 use meethook_transcribe::CPU_ENV_VAR;
 use meethook_transcribe::{
-    Attribution, EMBEDDING_MODEL, Engines, OnnxDiarizer, SEGMENTATION_MODEL, SILERO_VAD_MODEL,
+    Attribution, EMBEDDING_MODEL, Engines, FIRERED_VAD_MODEL, OnnxDiarizer, SEGMENTATION_MODEL,
     WHISPER_MODEL, WhisperEngine, run_batch,
 };
 
@@ -48,9 +48,9 @@ pub fn transcribe(
     let mut open_engine =
         || -> std::result::Result<Engines, Box<dyn std::error::Error + Send + Sync>> {
             // Smallest first, so that a first run reaches its slowest download last -- by which
-            // point everything else is known to be in place. The VAD weights are 885 KB,
+            // point everything else is known to be in place. The VAD weights are 2.3 MB,
             // diarization's two models are 32 MB, and Whisper is 1.6 GB.
-            let silero = fetch(&models_dir, &SILERO_VAD_MODEL)?;
+            let vad = fetch(&models_dir, &FIRERED_VAD_MODEL)?;
             let segmentation = fetch(&models_dir, &SEGMENTATION_MODEL)?;
             let embedding = fetch(&models_dir, &EMBEDDING_MODEL)?;
             let whisper = fetch(&models_dir, &WHISPER_MODEL)?;
@@ -66,7 +66,7 @@ pub fn transcribe(
                 eprintln!("Note: CoreML declined these graphs; diarization is running on CPU.");
             }
 
-            let asr = WhisperEngine::load(&whisper, &silero)?;
+            let asr = WhisperEngine::load(&whisper, &vad)?;
             // Same reasoning: off macOS the CPU is the only path, so a non-accelerated
             // engine is not a reportable choice -- it is the build.
             #[cfg(target_os = "macos")]

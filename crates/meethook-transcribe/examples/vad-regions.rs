@@ -5,8 +5,8 @@
 //! cargo run --release --example vad-regions -- --threshold 0.3 --min-silence 0.5 some.wav
 //! ```
 //!
-//! `--release` matters: a 43-minute track is ~81,000 sequential graph evaluations, and a debug
-//! build turns seconds into minutes.
+//! `--release` matters: a 43-minute track is ~5,000 graph calls over 260,000 feature frames, and
+//! a debug build turns seconds into minutes.
 //!
 //! # Why this exists
 //!
@@ -41,12 +41,11 @@
 //!
 //! # Getting the weights
 //!
-//! This fetches [`SILERO_VAD_MODEL`] itself, through the same [`ensure_model`] the real command
+//! This fetches [`FIRERED_VAD_MODEL`] itself, through the same [`ensure_model`] the real command
 //! uses, so it works before `transcribe` has ever run. That is a departure from
 //! `fetch-onnx-models`, deliberately: that example exists because 32 MB pulled behind
-//! `cargo test` is a download nobody asked for, and 885 KB inside an explicitly invoked
-//! diagnostic is not that case. `fetch-onnx-models` is left alone -- it is correct by its name
-//! and its contents, and bolting a ggml file onto it would make the name a lie.
+//! `cargo test` is a download nobody asked for, and 2.3 MB inside an explicitly invoked
+//! diagnostic is not that case.
 
 #[path = "support/mod.rs"]
 mod support;
@@ -55,7 +54,7 @@ use std::path::{Path, PathBuf};
 
 use meethook_models::ensure_model;
 use meethook_transcribe::{
-    SILERO_VAD_MODEL, SileroVad, SpeechRegion, TARGET_RATE, VadTuning, read_track_16k_mono,
+    FIRERED_VAD_MODEL, FireRedVad, SpeechRegion, TARGET_RATE, VadTuning, read_track_16k_mono,
 };
 use support::fail;
 
@@ -63,7 +62,7 @@ use support::fail;
 /// and it is what turns "seconds of audio saved" into "decoder passes saved".
 const WHISPER_WINDOW_S: f64 = 30.0;
 
-/// The floor whisper.cpp merges regions under whatever `--min-silence` says. Printed rather
+/// The floor regions are merged under whatever `--min-silence` says. Printed rather
 /// than enforced, so a sweep that stops responding below it reads as documented behaviour.
 const MERGE_FLOOR_S: f64 = 0.2;
 
@@ -72,7 +71,7 @@ fn main() {
         eprintln!("{message}");
         eprintln!(
             "usage: vad-regions [--root <dir>] [--threshold <p>] [--min-silence <s>]\n       \
-             [--min-speech <s>] [--speech-pad <s>] [--max-speech <s>] <session-dir | wav-file>"
+             [--min-speech <s>] [--speech-pad <s>] <session-dir | wav-file>"
         );
         std::process::exit(2);
     });
@@ -82,28 +81,24 @@ fn main() {
     println!("{}", args.target.display());
     println!(
         "tuning:    threshold {:.2} (speech ends below {:.2}), min speech {:.3} s, \
-         min silence {:.3} s, pad {:.3} s, max speech {}",
+         min silence {:.3} s, pad {:.3} s",
         args.tuning.threshold,
-        // Hysteresis is whisper.cpp's, not this tool's, and one knob moving two edges is
-        // surprising enough to spell out at the setting actually in use.
+        // One knob moving two edges is surprising enough to spell out at the setting actually
+        // in use.
         (args.tuning.threshold - 0.15).max(0.01),
         args.tuning.min_speech_s,
         args.tuning.min_silence_s,
         args.tuning.speech_pad_s,
-        match args.tuning.max_speech_s {
-            Some(seconds) => format!("{seconds:.1} s"),
-            None => "unbounded".to_string(),
-        }
     );
     if args.tuning.min_silence_s < MERGE_FLOOR_S {
         println!(
-            "note:      whisper.cpp merges regions separated by under {MERGE_FLOOR_S:.1} s \
+            "note:      regions are merged separated by under {MERGE_FLOOR_S:.1} s \
              regardless, so min silence below that changes little"
         );
     }
 
     let model = install(&args.root);
-    let mut vad = SileroVad::load(&model).unwrap_or_else(|e| fail(&e.to_string()));
+    let mut vad = FireRedVad::load(&model).unwrap_or_else(|e| fail(&e.to_string()));
 
     let mut measured: Vec<Measurement> = Vec::new();
     for track in &tracks {
@@ -137,7 +132,7 @@ impl Measurement {
 /// Every failure short of "the process cannot continue" is reported and returned from: with
 /// three tracks the state of the others is still worth knowing, and one missing track is itself
 /// a diagnosis.
-fn report(vad: &mut SileroVad, track: &Path, tuning: VadTuning) -> Option<Measurement> {
+fn report(vad: &mut FireRedVad, track: &Path, tuning: VadTuning) -> Option<Measurement> {
     let name = Path::new(track.file_name().unwrap_or(track.as_os_str()))
         .display()
         .to_string();
@@ -276,16 +271,16 @@ fn tracks_of(target: &Path) -> Vec<PathBuf> {
 /// Fetches the weights if they are not installed, verified against the embedded sha256.
 fn install(root: &Path) -> PathBuf {
     let models_dir = root.join("models");
-    // One line when a download happens, and none on a cache hit: 885 KB does not need a
+    // One line when a download happens, and none on a cache hit: 2.3 MB does not need a
     // percentage.
     let mut announced = false;
     let mut progress = |_done: u64, _total: u64| {
         if !announced {
             announced = true;
-            println!("fetching {} ...", SILERO_VAD_MODEL.file_name);
+            println!("fetching {} ...", FIRERED_VAD_MODEL.file_name);
         }
     };
-    ensure_model(&models_dir, &SILERO_VAD_MODEL, &mut progress)
+    ensure_model(&models_dir, &FIRERED_VAD_MODEL, &mut progress)
         .unwrap_or_else(|e| fail(&format!("could not install the VAD weights: {e}")))
 }
 
@@ -298,7 +293,7 @@ struct Args {
 /// Hand-rolled rather than clap, matching the other examples in this crate: a diagnostic must
 /// never be the reason a build breaks.
 ///
-/// Every default comes from [`VadTuning::default`], which is whisper.cpp's own set, and the
+/// Every default comes from [`VadTuning::default`], and the
 /// resolved tuning is printed before any number derived from it -- a measurement whose settings
 /// are not on the page is not evidence.
 fn parse() -> Result<Args, String> {
@@ -331,9 +326,6 @@ fn parse() -> Result<Args, String> {
             Some("--speech-pad") => {
                 tuning.speech_pad_s = number("--speech-pad", value("--speech-pad")?)?;
             }
-            Some("--max-speech") => {
-                tuning.max_speech_s = Some(number("--max-speech", value("--max-speech")?)?);
-            }
             Some(flag) if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ if target.is_none() => target = Some(PathBuf::from(arg)),
             _ => return Err("only one session directory or wav file may be given".to_string()),
@@ -342,7 +334,7 @@ fn parse() -> Result<Args, String> {
 
     Ok(Args {
         // A `~/meethook` fallback, unlike `speaker-trials`: nothing here creates a session
-        // directory, and the only thing the root is used for is where to keep 885 KB of
+        // directory, and the only thing the root is used for is where to keep 2.3 MB of
         // weights.
         root: root
             .or_else(|| std::env::home_dir().map(|home| home.join("meethook")))

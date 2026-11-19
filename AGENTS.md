@@ -115,7 +115,7 @@ session directory.** That contract is the thing to understand before touching an
   lookup via EventKit for meeting-fit guessing. Deliberately two independent streams rather
   than one unified capture, both to dodge a known macOS 15 corruption bug and because echo
   cancellation later needs the speaker track as an independent reference signal.
-- **`meethook-transcribe`** — the batch pipeline: AEC pre-pass, VAD (Silero), diarization
+- **`meethook-transcribe`** — the batch pipeline: AEC pre-pass, VAD (FireRedVAD, via ONNX), diarization
   (ONNX), speaker embedding/matching, ASR (whisper.cpp via `whisper-rs`), turn merging, and
   the `mixdown` module (public, unlike its siblings) that produces `meeting.opus`. The mic
   track is never diarized — there's exactly one local speaker, always labelled `You`; the

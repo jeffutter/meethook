@@ -1,4 +1,4 @@
-//! The model catalog: the four checkpoints this tool downloads, each pinned by hash and size.
+//! The model catalog: the checkpoints this tool downloads, each pinned by hash and size.
 
 use meethook_models::ModelSpec;
 
@@ -68,22 +68,22 @@ pub const EMBEDDING_MODEL: ModelSpec = ModelSpec {
 
 /// The voice-activity detector that says which stretches of a track hold speech.
 ///
-/// Silero v5.1.2, in whisper.cpp's own ggml format. 885 KB, and no new crate dependency at
-/// all: whisper.cpp 1.8.3 is already vendored by `whisper-rs-sys`, and `whisper-rs` 0.16
-/// exposes a safe wrapper around its standalone VAD. See [`crate::SileroVad`] for why a separate
-/// detector rather than the pyannote graph already installed.
+/// FireRedVAD's streaming model with an explicit cache input (`fireredvad_stream_vad_with_cache`),
+/// 2.3 MB, Apache-2.0. Graph contract, asserted in the `vad` module's tests:
+/// inputs `feat` f32 `[1, T, 80]` and `caches_in` f32 `[8, 1, 128, 19]`; outputs the speech
+/// probability per frame `[1, T, 1]` and the updated cache `[8, 1, 128, >= 19]`. See
+/// [`crate::FireRedVad`] for why this detector and why this variant.
 ///
-/// v5.1.2 rather than the v6.2.0 that also sits in that repository: v5.1.2 is what
-/// whisper.cpp's own documentation and default tooling use, so it is the version its
-/// thresholds and post-processing were tuned against.
-///
-/// Like [`WHISPER_MODEL`], the URL pins an immutable revision rather than `main`, and the hash
-/// and size come from the git-LFS pointer Hugging Face serves at the `raw/` path -- so bumping
-/// the revision does not require downloading the weights to re-derive them.
-pub const SILERO_VAD_MODEL: ModelSpec = ModelSpec {
-    file_name: "ggml-silero-v5.1.2.bin",
-    url: "https://huggingface.co/ggml-org/whisper-vad/resolve/\
-          9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v5.1.2.bin",
-    sha256: "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf",
-    size_bytes: 885_098,
+/// The weights are not on Hugging Face's CDN but in the project's GitHub repository, so the URL
+/// pins a commit and the hash was computed from the file at that commit. The input
+/// normalisation that must accompany these exact weights (`cmvn.ark`, from the same commit) is
+/// embedded in the crate rather than listed here: see `assets/firered-vad-cmvn.ark`. Changing
+/// the commit means changing both.
+pub const FIRERED_VAD_MODEL: ModelSpec = ModelSpec {
+    file_name: "fireredvad-stream-vad-with-cache.onnx",
+    url: "https://raw.githubusercontent.com/FireRedTeam/FireRedVAD/\
+          c30ec49e8cc69642b0ee65362eba11b9d11c6e54/pretrained_models/onnx_models/\
+          fireredvad_stream_vad_with_cache.onnx",
+    sha256: "b3c97836130dc34fc32d56fab551e88cf9454511de2b3c250a5e6578dee74b93",
+    size_bytes: 2_306_042,
 };
