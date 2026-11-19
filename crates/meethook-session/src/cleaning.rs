@@ -9,7 +9,10 @@ use crate::{Error, Result, SessionId, SessionPaths, write_atomic};
 /// Separate from every other schema version in this crate for the reason they are all
 /// separate from each other: this file is written by `transcribe`'s AEC pre-pass and read by
 /// nobody in-process today, on its own schedule.
-pub const CLEANING_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 added `isolation`. Version 1 files stay readable: the field is absent and reads
+/// as `None`.
+pub const CLEANING_SCHEMA_VERSION: u32 = 2;
 
 /// Why cancellation did not run. Every variant is a normal outcome of a real recording, not an
 /// error -- `mic.cleaned.wav` is written on every one of these paths, so the rest of the
@@ -72,6 +75,40 @@ pub enum Cleaning {
     PassedThrough { reason: PassThrough },
 }
 
+/// Why the mic isolation pass did not run, though it was asked for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IsolationSkip {
+    /// The speech finder found no speech, so there was nothing to isolate.
+    NoSpeech,
+    /// The model could not be fetched or loaded; recognition heard the un-isolated mic track.
+    ModelUnavailable { detail: String },
+}
+
+/// What the mic isolation pass did to one session, recorded so a later rewrite of the
+/// transcript (`transcribe --force`, or `enroll` bringing a stale transcript up to date) can
+/// tell which audio the recorded transcript came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IsolationOutcome {
+    /// The isolator ran over the speech regions of the mic track.
+    Ran {
+        regions: usize,
+        isolated_s: f64,
+        total_s: f64,
+    },
+    /// The user turned isolation off for the run (`--no-isolate`).
+    DisabledByFlag,
+    /// Isolation was on but did not run.
+    Skipped { reason: IsolationSkip },
+}
+
+impl IsolationOutcome {
+    /// Whether the run that wrote this asked for isolation. Only the flag says no: a skipped
+    /// pass was still requested.
+    pub fn was_requested(&self) -> bool {
+        !matches!(self, IsolationOutcome::DisabledByFlag)
+    }
+}
+
 /// `cleaning.json`: a durable answer to "was this session's mic track cleaned, and by how
 /// much", written by `transcribe`'s AEC pre-pass.
 ///
@@ -86,6 +123,10 @@ pub struct CleaningRecord {
     pub schema_version: u32,
     pub session_id: SessionId,
     pub outcome: Cleaning,
+    /// What the mic isolation pass did. `None` for a record written before schema version 2,
+    /// when nothing recorded the choice.
+    #[serde(default)]
+    pub isolation: Option<IsolationOutcome>,
 }
 
 impl CleaningRecord {
@@ -94,7 +135,13 @@ impl CleaningRecord {
             schema_version: CLEANING_SCHEMA_VERSION,
             session_id,
             outcome,
+            isolation: None,
         }
+    }
+
+    pub fn with_isolation(mut self, isolation: IsolationOutcome) -> Self {
+        self.isolation = Some(isolation);
+        self
     }
 
     pub fn write(&self, paths: &SessionPaths) -> Result<()> {
@@ -237,5 +284,68 @@ mod tests {
 
         let read = CleaningRecord::read_if_present(&paths).unwrap().unwrap();
         assert_eq!(read, second);
+    }
+
+    /// A version 1 file, as written before isolation was recorded, still reads, with the
+    /// isolation choice unknown rather than invented.
+    #[test]
+    fn a_version_1_file_reads_with_no_isolation_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(dir.path());
+        std::fs::write(
+            paths.cleaning_json(),
+            r#"{
+  "schema_version": 1,
+  "session_id": "20260809-052600",
+  "outcome": { "PassedThrough": { "reason": "NoReference" } }
+}"#,
+        )
+        .unwrap();
+
+        let read = CleaningRecord::read_if_present(&paths).unwrap().unwrap();
+
+        assert_eq!(read.schema_version, 1);
+        assert_eq!(read.isolation, None);
+    }
+
+    #[test]
+    fn every_isolation_outcome_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(dir.path());
+
+        for outcome in [
+            IsolationOutcome::Ran {
+                regions: 3,
+                isolated_s: 12.5,
+                total_s: 60.0,
+            },
+            IsolationOutcome::DisabledByFlag,
+            IsolationOutcome::Skipped {
+                reason: IsolationSkip::NoSpeech,
+            },
+            IsolationOutcome::Skipped {
+                reason: IsolationSkip::ModelUnavailable {
+                    detail: "offline".into(),
+                },
+            },
+        ] {
+            let written = cancelled().with_isolation(outcome.clone());
+            written.write(&paths).unwrap();
+
+            let read = CleaningRecord::read_if_present(&paths).unwrap().unwrap();
+            assert_eq!(read, written, "{outcome:?} did not round-trip");
+            assert_eq!(read.schema_version, 2);
+        }
+    }
+
+    #[test]
+    fn only_the_flag_counts_as_not_requested() {
+        assert!(!IsolationOutcome::DisabledByFlag.was_requested());
+        assert!(
+            IsolationOutcome::Skipped {
+                reason: IsolationSkip::NoSpeech
+            }
+            .was_requested()
+        );
     }
 }

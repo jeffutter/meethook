@@ -34,8 +34,8 @@ use meethook_session::{
     Transcript, TranscriptTemplate,
 };
 use meethook_transcribe::{
-    AsrSegment, Diarization, Diarize, Engines, Result, SpeakerTurn, SpeechToText, TARGET_RATE,
-    build_session, read_track_16k_mono, run_batch,
+    AsrSegment, Diarization, Diarize, Engines, Isolation, Result, SpeakerTurn, SpeechToText,
+    TARGET_RATE, build_session, read_track_16k_mono, run_batch,
 };
 
 /// The two tones the fixtures are built from, and the frequencies [`fingerprint`] probes at.
@@ -160,12 +160,13 @@ fn transcribe(paths: &Paths, id: &SessionId) {
         Ok(Engines {
             asr: Box::new(FakeAsr),
             diarizer: Box::new(FingerprintDiarizer),
-            isolation: None,
+            isolation: Isolation::Off,
         })
     };
     let report = run_batch(
         paths,
         std::slice::from_ref(id),
+        false,
         false,
         &TranscriptTemplate::resolve(paths, None).unwrap(),
         meethook_transcribe::mixdown::Settings::default(),

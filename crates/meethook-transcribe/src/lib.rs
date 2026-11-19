@@ -81,7 +81,7 @@ pub use identify::{
 pub use import::{BuiltSession, ImportedSource, MIC_SILENCE_S, SPLICE_GAP_S, build_session};
 pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
 pub use mic_isolation::{
-    GateSpeechFinder, IsolationReport, IsolationStage, SpeechFinder, VoiceIsolation,
+    GateSpeechFinder, Isolation, IsolationReport, IsolationStage, SpeechFinder, VoiceIsolation,
 };
 // The measurement only, not the module: `loudness` stays private because its constants and
 // block arithmetic are BS.1770's business rather than a caller's. The one number comes out so
@@ -120,9 +120,9 @@ pub use voice_isolator::VoiceIsolator;
 pub use voice_vectors::{GroupDistance, cosine_distance, group_distance};
 
 use meethook_session::{
-    Classification, CleaningRecord, DiscoveredSession, EnrolledSpeakers, Paths, SessionId,
-    SessionMetadata, SpeakerClusters, SpeakerNames, Transcript, TranscriptContext,
-    TranscriptTemplate, discover_sessions, unfinished_now,
+    Classification, CleaningRecord, DiscoveredSession, EnrolledSpeakers, IsolationOutcome,
+    IsolationSkip, Paths, SessionId, SessionMetadata, SpeakerClusters, SpeakerNames, Transcript,
+    TranscriptContext, TranscriptTemplate, discover_sessions, unfinished_now,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -271,9 +271,8 @@ impl Error {
 pub struct Engines {
     pub asr: Box<dyn SpeechToText>,
     pub diarizer: Box<dyn Diarize>,
-    /// Isolates the mic track's speech before recognition; `None` leaves the pipeline exactly
-    /// as it was without the stage.
-    pub isolation: Option<IsolationStage>,
+    /// Isolates the mic track's speech before recognition, or says why it does not.
+    pub isolation: Isolation,
 }
 
 /// Opens both engines. Boxed and fallible so the caller owns model acquisition, and so the
@@ -327,7 +326,7 @@ pub fn transcribe_session(
         session,
         asr,
         diarizer,
-        None,
+        &mut Isolation::Off,
         speakers,
         mixdown_settings,
         progress,
@@ -336,19 +335,21 @@ pub fn transcribe_session(
 
 /// [`transcribe_session`] with an optional mic-isolation stage.
 ///
-/// With `Some`, the voice isolator runs over the speech regions of the AEC-cleaned mic track
+/// With [`Isolation::Ready`], the voice isolator runs over the speech regions of the AEC-cleaned mic track
 /// after the cleaned track and the mixdown are written and before recognition, and recognition
 /// hears the isolated track (same length and timeline). `mic.cleaned.wav` and `meeting.opus`
 /// stay pre-isolation: isolating regions only would make background noise step on and off in
 /// the mix, and the files keep one meaning with the stage on or off. The speaker track, the
 /// echo canceller's reference, diarization's input and the speaker pass are never touched.
-/// One progress line says what the stage did. With `None` this is exactly
-/// [`transcribe_session`].
+/// One progress line says what the stage did. With [`Isolation::Off`] this is exactly
+/// [`transcribe_session`]. With [`Isolation::Unavailable`] recognition hears the un-isolated
+/// track and a progress line says so. Either way the outcome is recorded in `cleaning.json`
+/// ([`IsolationOutcome`]), so a later rewrite can tell which audio the transcript came from.
 pub fn transcribe_session_isolating(
     session: &DiscoveredSession,
     asr: &mut dyn SpeechToText,
     diarizer: &mut dyn Diarize,
-    isolation: Option<&mut IsolationStage>,
+    isolation: &mut Isolation,
     speakers: &EnrolledSpeakers,
     mixdown_settings: mixdown::Settings,
     progress: &mut dyn Write,
@@ -359,7 +360,7 @@ pub fn transcribe_session_isolating(
     // far end of the call, and a call with no far end recorded is still a call.
     let speaker_track =
         audio::read_track_16k_mono(&session.paths.speaker_wav()).unwrap_or_default();
-    let mic_track = clean_mic_track(
+    let (mic_track, cleaning) = clean_mic_track(
         session,
         &speaker_track,
         crate::timeline::mic_minus_speaker_seconds(&metadata)?,
@@ -374,10 +375,42 @@ pub fn transcribe_session_isolating(
         mixdown_settings,
     )?;
 
-    let mic_for_asr = match isolation {
-        Some(stage) => stage.run_reporting(&mic_track, &session.id.to_string(), progress)?,
-        None => mic_track,
+    let label = session.id.to_string();
+    let (mic_for_asr, isolation_outcome) = match isolation {
+        Isolation::Ready(stage) => {
+            let (audio, report) = stage.run_reporting(&mic_track, &label, progress)?;
+            let outcome = if report.regions == 0 {
+                IsolationOutcome::Skipped {
+                    reason: IsolationSkip::NoSpeech,
+                }
+            } else {
+                IsolationOutcome::Ran {
+                    regions: report.regions,
+                    isolated_s: report.isolated_s,
+                    total_s: report.total_s,
+                }
+            };
+            (audio, outcome)
+        }
+        Isolation::Off => (mic_track, IsolationOutcome::DisabledByFlag),
+        Isolation::Unavailable(reason) => {
+            writeln!(
+                progress,
+                "{label}  mic isolation skipped: {reason}; using the un-isolated mic track"
+            )?;
+            (
+                mic_track,
+                IsolationOutcome::Skipped {
+                    reason: IsolationSkip::ModelUnavailable {
+                        detail: reason.clone(),
+                    },
+                },
+            )
+        }
     };
+    CleaningRecord::new(session.id.clone(), cleaning)
+        .with_isolation(isolation_outcome)
+        .write(&session.paths)?;
     let mic_segments = asr.transcribe(&mic_for_asr)?;
 
     // Diarize before recognising the speaker track, so a diarization failure costs a
@@ -437,16 +470,22 @@ pub fn transcribe_session_isolating(
 /// already-transcribed directory must not trigger a multi-gigabyte model download in order
 /// to then do nothing.
 ///
+/// `isolate` is the requested mic-isolation setting. The factory is what acts on it; here it
+/// is only compared with what an already-transcribed session recorded, so a re-run without
+/// `--force` under a different setting reports the mismatch instead of silently mixing them.
+///
 /// `template` is handed in already compiled rather than resolved here, so a template with a
 /// syntax error costs the caller a millisecond at start-up instead of an hour of recognition
 /// followed by a batch that can write nothing.
 ///
 /// `mixdown_settings` is validated by the same argument: a bitrate or pan the encoder would
 /// reject is refused where the user typed it, not partway through the batch.
+#[allow(clippy::too_many_arguments)] // one flat call per CLI option; a settings struct would only rename them
 pub fn run_batch(
     paths: &Paths,
     requested: &[SessionId],
     force: bool,
+    isolate: bool,
     template: &TranscriptTemplate,
     mixdown_settings: mixdown::Settings,
     open_engine: &mut EngineFactory<'_>,
@@ -499,11 +538,28 @@ pub fn run_batch(
                 report.skipped += 1;
             }
             Classification::Transcribed if !force => {
-                writeln!(
-                    out,
-                    "{}  skipped: already transcribed (use --force to redo)",
-                    session.id
-                )?;
+                // A transcript made from different mic audio than this run would use is not
+                // quietly accepted as current, and not quietly redone either: the skip names
+                // the difference. A record that predates isolation (`None`) says nothing, so
+                // it reads as the plain case.
+                let recorded = CleaningRecord::read_if_present(&session.paths)?
+                    .and_then(|record| record.isolation)
+                    .map(|outcome| outcome.was_requested());
+                match recorded {
+                    Some(was_on) if was_on != isolate => writeln!(
+                        out,
+                        "{}  skipped: already transcribed with mic isolation {}; this run asked \
+                         for {} (use --force to redo)",
+                        session.id,
+                        if was_on { "on" } else { "off" },
+                        if isolate { "on" } else { "off" },
+                    )?,
+                    _ => writeln!(
+                        out,
+                        "{}  skipped: already transcribed (use --force to redo)",
+                        session.id
+                    )?,
+                }
                 report.skipped += 1;
             }
             _ => work.push(session),
@@ -560,7 +616,7 @@ fn transcribe_and_write(
         session,
         engines.asr.as_mut(),
         engines.diarizer.as_mut(),
-        engines.isolation.as_mut(),
+        &mut engines.isolation,
         speakers,
         mixdown_settings,
         progress,
@@ -589,15 +645,18 @@ fn clean_mic_track(
     speaker: &[f32],
     mic_minus_speaker_s: f64,
     progress: &mut dyn Write,
-) -> Result<Vec<f32>> {
+) -> Result<(Vec<f32>, meethook_session::Cleaning)> {
     let mic = audio::read_track_16k_mono(&session.paths.mic_wav())?;
 
     let cleaned = aec::cancel_bleed(&mic, speaker, mic_minus_speaker_s);
     writeln!(progress, "{}  {}", session.id, cleaned.cleaning)?;
     audio::write_track_16k_mono(&session.paths.mic_cleaned_wav(), &cleaned.audio)?;
-    CleaningRecord::new(session.id.clone(), cleaned.cleaning.into()).write(&session.paths)?;
+    let record = meethook_session::Cleaning::from(cleaned.cleaning);
+    // Written now with the isolation choice still unknown, so a crash in the (long) isolation
+    // pass leaves the AEC outcome behind; the caller rewrites it once the choice is settled.
+    CleaningRecord::new(session.id.clone(), record.clone()).write(&session.paths)?;
 
-    Ok(cleaned.audio)
+    Ok((cleaned.audio, record))
 }
 
 /// Writes `meeting.opus`: both tracks on the transcript's own timeline, panned apart, as one
@@ -782,7 +841,7 @@ mod tests {
                 },
                 heard: Vec::new(),
             }),
-            isolation: None,
+            isolation: Isolation::Off,
         }
     }
 
@@ -1031,6 +1090,7 @@ mod tests {
                 paths,
                 &requested,
                 force,
+                false,
                 &TranscriptTemplate::builtin(),
                 mixdown::Settings::default(),
                 &mut factory,
@@ -1096,7 +1156,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path());
         let session = make_session(&paths, "20260809-052600", 1_000_000);
-        let run = |stage: Option<&mut IsolationStage>, progress: &mut Vec<u8>| {
+        let run = |stage: &mut Isolation, progress: &mut Vec<u8>| {
             let mut asr = FakeAsr::default();
             let mut diarizer = FakeDiarizer::default();
             transcribe_session_isolating(
@@ -1113,13 +1173,16 @@ mod tests {
         };
 
         let mut off_progress = Vec::new();
-        let (off_asr, off_diarizer) = run(None, &mut off_progress);
-        let off_files = snapshot(session.paths.dir());
+        let (off_asr, off_diarizer) = run(&mut Isolation::Off, &mut off_progress);
+        let mut off_files = snapshot(session.paths.dir());
 
         let mut on_progress = Vec::new();
-        let mut stage = offset_stage();
-        let (on_asr, on_diarizer) = run(Some(&mut stage), &mut on_progress);
-        let on_files = snapshot(session.paths.dir());
+        let mut stage = Isolation::Ready(offset_stage());
+        let (on_asr, on_diarizer) = run(&mut stage, &mut on_progress);
+        let mut on_files = snapshot(session.paths.dir());
+        // `cleaning.json` differs on purpose: it records the isolation choice.
+        off_files.remove("cleaning.json");
+        on_files.remove("cleaning.json");
 
         // AC 6/5: every file written is identical, and the speaker side heard the same audio.
         assert_eq!(off_files, on_files);
@@ -1670,6 +1733,7 @@ mod tests {
             &paths,
             &[],
             false,
+            false,
             &TranscriptTemplate::builtin(),
             mixdown::Settings::default(),
             &mut || Ok(fake_engines()),
@@ -1707,6 +1771,7 @@ mod tests {
         let error = run_batch(
             &paths,
             &[],
+            false,
             false,
             &TranscriptTemplate::builtin(),
             mixdown::Settings::default(),
@@ -2273,6 +2338,193 @@ mod tests {
                 reason: meethook_session::PassThrough::NoReference
             },
             "the second run's pass-through outcome must replace the first run's cancelled one"
+        );
+    }
+
+    fn isolation_recorded(session: &DiscoveredSession) -> Option<IsolationOutcome> {
+        CleaningRecord::read_if_present(&session.paths)
+            .unwrap()
+            .expect("cleaning.json must exist after a transcribe run")
+            .isolation
+    }
+
+    /// Transcribes one session under `isolation`, returning the progress text.
+    fn transcribe_under(
+        session: &DiscoveredSession,
+        isolation: &mut Isolation,
+    ) -> (String, Vec<f32>) {
+        let mut asr = FakeAsr::default();
+        let mut progress = Vec::new();
+        transcribe_session_isolating(
+            session,
+            &mut asr,
+            &mut FakeDiarizer::default(),
+            isolation,
+            &nobody_enrolled(),
+            mixdown::Settings::default(),
+            &mut progress,
+        )
+        .unwrap();
+        (
+            String::from_utf8(progress).unwrap(),
+            asr.heard.swap_remove(0),
+        )
+    }
+
+    #[test]
+    fn the_isolation_outcome_is_recorded_for_each_setting() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600", 1_000_000);
+        let cleaned = || audio::read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap();
+
+        let (_, heard) = transcribe_under(&session, &mut Isolation::Off);
+        assert_eq!(
+            isolation_recorded(&session),
+            Some(IsolationOutcome::DisabledByFlag)
+        );
+        assert_eq!(
+            heard,
+            cleaned(),
+            "off: the mic pass hears the un-isolated track"
+        );
+
+        let (progress, heard) = transcribe_under(&session, &mut Isolation::Ready(offset_stage()));
+        assert!(
+            matches!(
+                isolation_recorded(&session),
+                Some(IsolationOutcome::Ran { regions: 1, .. })
+            ),
+            "{:?}",
+            isolation_recorded(&session)
+        );
+        assert_ne!(heard, cleaned());
+        assert!(progress.contains("mic isolation: 1 regions"), "{progress}");
+
+        let (progress, heard) = transcribe_under(
+            &session,
+            &mut Isolation::Unavailable("model download failed".into()),
+        );
+        assert_eq!(
+            isolation_recorded(&session),
+            Some(IsolationOutcome::Skipped {
+                reason: IsolationSkip::ModelUnavailable {
+                    detail: "model download failed".into()
+                }
+            })
+        );
+        assert_eq!(
+            heard,
+            cleaned(),
+            "unavailable: falls back to the plain track"
+        );
+        assert!(
+            progress.contains(
+                "20260809-052600  mic isolation skipped: model download failed; using the \
+                 un-isolated mic track"
+            ),
+            "{progress}"
+        );
+    }
+
+    /// Runs a batch whose engines carry `Isolation::Off` or a ready stage, as the CLI would for
+    /// the requested setting.
+    fn run_isolating(paths: &Paths, force: bool, isolate: bool) -> (usize, String) {
+        let mut opened = 0usize;
+        let mut out = Vec::new();
+        {
+            let mut factory = || {
+                opened += 1;
+                let mut engines = fake_engines();
+                if isolate {
+                    engines.isolation = Isolation::Ready(offset_stage());
+                }
+                Ok(engines)
+            };
+            run_batch(
+                paths,
+                &[],
+                force,
+                isolate,
+                &TranscriptTemplate::builtin(),
+                mixdown::Settings::default(),
+                &mut factory,
+                &mut out,
+            )
+            .unwrap();
+        }
+        (opened, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn a_rerun_under_a_different_isolation_setting_is_skipped_loudly_and_force_redoes_it() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600", 1_000_000);
+
+        let (opened, _) = run_isolating(&paths, false, true);
+        assert_eq!(opened, 1);
+        assert!(matches!(
+            isolation_recorded(&session),
+            Some(IsolationOutcome::Ran { .. })
+        ));
+
+        // Same setting: the plain skip, nothing opened.
+        let (opened, out) = run_isolating(&paths, false, true);
+        assert_eq!(opened, 0);
+        assert!(
+            out.contains("skipped: already transcribed (use --force"),
+            "{out}"
+        );
+
+        // Different setting: the mismatch is named, nothing opened, record untouched.
+        let (opened, out) = run_isolating(&paths, false, false);
+        assert_eq!(opened, 0, "a mismatch skip must not open any model");
+        assert!(
+            out.contains(
+                "skipped: already transcribed with mic isolation on; this run asked for off \
+                 (use --force to redo)"
+            ),
+            "{out}"
+        );
+        assert!(matches!(
+            isolation_recorded(&session),
+            Some(IsolationOutcome::Ran { .. })
+        ));
+
+        // --force redoes it under the new setting.
+        let (opened, _) = run_isolating(&paths, true, false);
+        assert_eq!(opened, 1);
+        assert_eq!(
+            isolation_recorded(&session),
+            Some(IsolationOutcome::DisabledByFlag)
+        );
+
+        let (_, out) = run_isolating(&paths, false, true);
+        assert!(
+            out.contains("with mic isolation off; this run asked for on"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_session_whose_record_predates_isolation_is_plainly_already_transcribed() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(root.path());
+        let session = make_session(&paths, "20260809-052600", 1_000_000);
+        run_isolating(&paths, false, false);
+        let mut record = CleaningRecord::read_if_present(&session.paths)
+            .unwrap()
+            .unwrap();
+        record.isolation = None;
+        record.write(&session.paths).unwrap();
+
+        let (opened, out) = run_isolating(&paths, false, true);
+
+        assert_eq!(opened, 0);
+        assert!(
+            out.contains("skipped: already transcribed (use --force"),
+            "{out}"
         );
     }
 

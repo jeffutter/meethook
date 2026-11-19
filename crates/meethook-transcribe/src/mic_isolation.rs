@@ -87,6 +87,17 @@ pub struct IsolationStage {
     pub finder: Box<dyn SpeechFinder>,
 }
 
+/// Whether and how the mic track is isolated for a run.
+pub enum Isolation {
+    /// Switched off by the user (`--no-isolate`).
+    Off,
+    /// On, with the stage loaded.
+    Ready(IsolationStage),
+    /// On, but the model could not be fetched or loaded; the run falls back to the
+    /// un-isolated mic track and says why.
+    Unavailable(String),
+}
+
 /// What one isolation pass did.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IsolationReport {
@@ -127,10 +138,10 @@ impl IsolationStage {
         cleaned_16k: &[f32],
         label: &str,
         progress: &mut dyn Write,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<(Vec<f32>, IsolationReport)> {
         let (audio, report) = self.run(cleaned_16k)?;
         writeln!(progress, "{label}  {report}")?;
-        Ok(audio)
+        Ok((audio, report))
     }
 }
 

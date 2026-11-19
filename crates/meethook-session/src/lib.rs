@@ -52,8 +52,8 @@ pub mod wav;
 
 pub use atomic::{write_atomic, write_atomic_with};
 pub use cleaning::{
-    CLEANING_SCHEMA_VERSION, CancellationFailure, Cleaning, CleaningRecord, NotMeasurable,
-    PassThrough,
+    CLEANING_SCHEMA_VERSION, CancellationFailure, Cleaning, CleaningRecord, IsolationOutcome,
+    IsolationSkip, NotMeasurable, PassThrough,
 };
 pub use discovery::{Classification, DiscoveredSession, discover_sessions};
 pub use exclusions::{AppExclusions, AppIdentities, EXCLUSIONS_SCHEMA_VERSION};

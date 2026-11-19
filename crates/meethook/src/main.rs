@@ -266,6 +266,16 @@ enum Command {
         #[arg(long)]
         force: bool,
 
+        /// Do not isolate the voice on the mic track before transcription
+        ///
+        /// Isolation is on by default: a voice-isolator model (a 260 MB one-time download)
+        /// cleans the speech regions of the mic track before recognition. The choice is
+        /// recorded in the session's cleaning.json, and `enroll` leaves it alone. Re-running
+        /// without --force on a session transcribed under the other setting skips it and says
+        /// so; use --force to redo it with this run's setting.
+        #[arg(long)]
+        no_isolate: bool,
+
         /// Bitrate of the meeting.opus mixdown, in bits per second
         ///
         /// The default was settled by listening to a real meeting rather than taken from a
@@ -549,6 +559,7 @@ fn main() -> Result<()> {
         Command::Transcribe {
             session_ids,
             force,
+            no_isolate,
             bitrate,
             pan,
             target_lufs,
@@ -558,6 +569,7 @@ fn main() -> Result<()> {
             &paths,
             &session_ids,
             force,
+            !no_isolate,
             template,
             mixdown::Settings {
                 bitrate_bps: bitrate,
@@ -643,6 +655,16 @@ mod tests {
             Command::Transcribe { diarizer, .. } => diarizer,
             other => panic!("expected a transcribe command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transcribe_isolates_by_default_and_no_isolate_turns_it_off() {
+        let no_isolate = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Command::Transcribe { no_isolate, .. } => no_isolate,
+            other => panic!("expected a transcribe command, got {other:?}"),
+        };
+        assert!(!no_isolate(&["meethook", "transcribe"]));
+        assert!(no_isolate(&["meethook", "transcribe", "--no-isolate"]));
     }
 
     #[test]

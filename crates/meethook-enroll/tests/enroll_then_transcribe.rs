@@ -27,8 +27,8 @@ use meethook_session::{
     TrackSync, Transcript, TranscriptTemplate,
 };
 use meethook_transcribe::{
-    AsrSegment, BatchReport, Diarization, Diarize, Engines, Result, SpeakerTurn, SpeechToText,
-    TARGET_RATE, run_batch,
+    AsrSegment, BatchReport, Diarization, Diarize, Engines, Isolation, IsolationStage, Result,
+    SpeakerTurn, SpeechFinder, SpeechRegion, SpeechToText, TARGET_RATE, VoiceIsolation, run_batch,
 };
 
 /// Apple Silicon's timebase, matching the recorder's.
@@ -139,6 +139,38 @@ fn transcribe_speaking(
     speech_seconds: f64,
     force: bool,
 ) -> BatchReport {
+    transcribe_isolating(paths, id, who, speech_seconds, force, false)
+}
+
+/// Passes the audio through unchanged; the stage's presence is what is recorded, not its effect.
+struct PassThroughIsolator;
+
+impl VoiceIsolation for PassThroughIsolator {
+    fn isolate(&mut self, audio_48k: &[f32]) -> Result<Vec<f32>> {
+        Ok(audio_48k.to_vec())
+    }
+}
+
+struct OneRegion;
+
+impl SpeechFinder for OneRegion {
+    fn speech_regions(&mut self, _: &[f32]) -> Result<Vec<SpeechRegion>> {
+        Ok(vec![SpeechRegion {
+            start_s: 0.0,
+            end_s: 0.5,
+        }])
+    }
+}
+
+/// `transcribe_speaking`, with mic isolation requested (`isolate`) as the CLI would run it.
+fn transcribe_isolating(
+    paths: &Paths,
+    id: &SessionId,
+    who: u32,
+    speech_seconds: f64,
+    force: bool,
+    isolate: bool,
+) -> BatchReport {
     let mut factory = || {
         Ok(Engines {
             asr: Box::new(FakeAsr),
@@ -146,13 +178,21 @@ fn transcribe_speaking(
                 embedding: voice(who),
                 speech_seconds,
             }),
-            isolation: None,
+            isolation: if isolate {
+                Isolation::Ready(IsolationStage {
+                    isolator: Box::new(PassThroughIsolator),
+                    finder: Box::new(OneRegion),
+                })
+            } else {
+                Isolation::Off
+            },
         })
     };
     run_batch(
         paths,
         std::slice::from_ref(id),
         force,
+        isolate,
         &TranscriptTemplate::resolve(paths, None).unwrap(),
         meethook_transcribe::mixdown::Settings::default(),
         &mut factory,
@@ -437,4 +477,44 @@ fn a_different_voice_in_the_next_session_is_still_unknown() {
     let mut interviewer = AsksOnce::answering(None);
     enroll(&paths, &mut interviewer);
     assert_eq!(interviewer.asked, vec![format!("{february} Unknown 1")]);
+}
+
+/// An `enroll` rewrite brings the transcript up to date without touching the audio or the
+/// isolation record, and what it leaves is what `transcribe --force` with the same flag
+/// produces: the isolation choice recorded for the session is the one that is reproduced.
+#[test]
+fn an_enroll_rewrite_keeps_the_recorded_isolation_choice_and_matches_a_forced_transcribe() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let january = make_session(&paths, "20260105-090000");
+    let session = paths.session(&january);
+
+    transcribe_isolating(&paths, &january, 0, 10.0, false, true);
+    let recorded = std::fs::read(session.cleaning_json()).unwrap();
+    assert!(
+        String::from_utf8_lossy(&recorded).contains("Ran"),
+        "isolation should be recorded as run: {}",
+        String::from_utf8_lossy(&recorded)
+    );
+
+    let mut interviewer = AsksOnce::answering(Some("Alex"));
+    assert_eq!(enroll(&paths, &mut interviewer).named, 1);
+    assert_eq!(
+        std::fs::read(session.cleaning_json()).unwrap(),
+        recorded,
+        "enroll must leave the isolation record alone"
+    );
+    let after_enroll = std::fs::read(session.transcript_json()).unwrap();
+
+    transcribe_isolating(&paths, &january, 0, 10.0, true, true);
+    assert_eq!(
+        std::fs::read(session.cleaning_json()).unwrap(),
+        recorded,
+        "a forced run with the same flag records the same choice"
+    );
+    assert_eq!(
+        std::fs::read(session.transcript_json()).unwrap(),
+        after_enroll,
+        "the enroll rewrite should equal a forced transcribe with the same flag"
+    );
 }

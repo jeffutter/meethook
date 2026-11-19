@@ -120,9 +120,17 @@ session directory.** That contract is the thing to understand before touching an
   the `mixdown` module (public, unlike its siblings) that produces `meeting.opus`. The mic
   track is never diarized — there's exactly one local speaker, always labelled `You`; the
   speaker track is diarized and each turn attributed to a distinct voice.
-  An optional mic-isolation stage (`mic_isolation`, library option `Engines::isolation`; the CLI
-  switch is TASK-081) runs the voice isolator over the VAD speech regions of the AEC-cleaned mic track
-  just before ASR. `mic.cleaned.wav` and the mixdown stay pre-isolation; the speaker track is never isolated.
+  A mic-isolation stage (`mic_isolation`, `Engines::isolation: Isolation`) runs the voice isolator
+  over the VAD speech regions of the AEC-cleaned mic track just before ASR. It is on by default for
+  `transcribe`; `--no-isolate` turns it off for a run. `mic.cleaned.wav` and the mixdown stay
+  pre-isolation; the speaker track is never isolated. The model (260 MB) is fetched inside the lazy
+  engine factory, so only when isolation is on and there is work; if it cannot be fetched or loaded the
+  session uses the plain mic track, prints `mic isolation skipped: ...`, and records it.
+  `cleaning.json` (schema v2) records the outcome in `isolation` (`Ran`, `DisabledByFlag`,
+  `Skipped`); v1 files read as `None`. Re-running `transcribe` without `--force` on a session
+  recorded under the other setting skips it with a message naming both settings, rather than mixing
+  them; `--force` redoes it. `enroll` never touches audio or `cleaning.json`, so a rewrite it makes is
+  what `transcribe --force` with the recorded setting would produce.
 - **`meethook-enroll`** — the one interactive path in the tool, but built so almost none of
   it actually is: which sessions/voices to ask about, what an answer writes, and what a
   correction costs are all decided here against two one-method seams (`Interviewer` for

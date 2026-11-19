@@ -25,9 +25,10 @@ use crate::{DiarizerChoice, EnrollArgs};
 #[cfg(target_os = "macos")]
 use meethook_transcribe::CPU_ENV_VAR;
 use meethook_transcribe::{
-    Attribution, Diarize, EMBEDDING_MODEL, Engines, FIRERED_VAD_MODEL, NEMOTRON_DIARIZATION_DATA,
-    NEMOTRON_DIARIZATION_GRAPH, NemotronDiarizer, OnnxDiarizer, SEGMENTATION_MODEL, WHISPER_MODEL,
-    WhisperEngine, run_batch,
+    Attribution, Diarize, EMBEDDING_MODEL, Engines, FIRERED_VAD_MODEL, FireRedVad,
+    GateSpeechFinder, Isolation, IsolationStage, NEMOTRON_DIARIZATION_DATA,
+    NEMOTRON_DIARIZATION_GRAPH, NemotronDiarizer, OnnxDiarizer, SEGMENTATION_MODEL,
+    VOICE_ISOLATOR_MODEL, VoiceIsolator, WHISPER_MODEL, WhisperEngine, run_batch,
 };
 
 /// Transcribes recorded sessions.
@@ -39,6 +40,7 @@ pub fn transcribe(
     paths: &Paths,
     session_ids: &[String],
     force: bool,
+    isolate: bool,
     template: Option<&Path>,
     mixdown_settings: meethook_transcribe::mixdown::Settings,
     diarizer_choice: DiarizerChoice,
@@ -94,6 +96,15 @@ pub fn transcribe(
             let _ = accelerated;
 
             let asr = WhisperEngine::load(&whisper, &vad)?;
+            // Only when isolation is on, and after everything cheaper: the factory only runs
+            // when there is real work, so `--no-isolate` and nothing-to-do runs fetch nothing.
+            // Failure here never fails the batch; sessions fall back to the plain mic track
+            // and say so.
+            let isolation = if isolate {
+                open_isolation(&models_dir, &vad)
+            } else {
+                Isolation::Off
+            };
             // Same reasoning: off macOS the CPU is the only path, so a non-accelerated
             // engine is not a reportable choice -- it is the build.
             #[cfg(target_os = "macos")]
@@ -109,7 +120,7 @@ pub fn transcribe(
             Ok(Engines {
                 asr: Box::new(asr),
                 diarizer,
-                isolation: None,
+                isolation,
             })
         };
 
@@ -118,6 +129,7 @@ pub fn transcribe(
         paths,
         &requested,
         force,
+        isolate,
         &template,
         mixdown_settings,
         &mut open_engine,
@@ -134,6 +146,32 @@ pub fn transcribe(
         );
     }
     Ok(())
+}
+
+/// Loads the voice-isolator stage, or reports why it cannot be had.
+fn open_isolation(models_dir: &Path, vad: &Path) -> Isolation {
+    let load = || -> std::result::Result<IsolationStage, Box<dyn std::error::Error>> {
+        if !models_dir.join(VOICE_ISOLATOR_MODEL.file_name).is_file() {
+            eprintln!(
+                "Note: first run with mic isolation downloads 260 MB of weights; later runs \
+                 do not. Pass --no-isolate to skip it."
+            );
+        }
+        fetch(models_dir, &VOICE_ISOLATOR_MODEL)?;
+        let isolator = VoiceIsolator::open(models_dir)?;
+        let finder = GateSpeechFinder(FireRedVad::load(vad)?);
+        Ok(IsolationStage {
+            isolator: Box::new(isolator),
+            finder: Box::new(finder),
+        })
+    };
+    match load() {
+        Ok(stage) => Isolation::Ready(stage),
+        Err(e) => {
+            eprintln!("Note: mic isolation unavailable ({e}); using the un-isolated mic track.");
+            Isolation::Unavailable(e.to_string())
+        }
+    }
 }
 
 /// Acquires one model, reporting its download identically to every other model's.
