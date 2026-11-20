@@ -50,7 +50,7 @@ use ort::value::TensorRef;
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
-use crate::onnx::{open_cpu_session, open_session};
+use crate::onnx::{open_cpu_session_with_threads, open_session, performance_cores};
 use crate::{Error, Result, VOICE_ISOLATOR_MODEL};
 
 /// The only rate the graph works at.
@@ -83,7 +83,7 @@ impl VoiceIsolator {
     pub fn open(models_dir: &Path) -> Result<Self> {
         let path = installed(models_dir)?;
         Ok(Self {
-            session: open_cpu_session(&path)?,
+            session: open_cpu_session_with_threads(&path, performance_cores())?,
             accelerated: false,
             stft: Stft::new(),
         })

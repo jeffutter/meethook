@@ -91,15 +91,50 @@ pub fn open_session(model_path: &Path) -> Result<Loaded> {
 /// out each time, and a CoreML partition boundary on every call would cost more than the
 /// network does.
 pub fn open_cpu_session(model_path: &Path) -> Result<Session> {
-    // A helper for the same reason `load_with_coreml` is one: the `?`-chain stays inside
-    // `ort::Result`, so no `From<ort::Error>` for the crate error is needed.
-    fn load(model_path: &Path) -> ort::Result<Session> {
-        Session::builder(environment()?)?.commit_from_file(model_path)
+    open_cpu_session_with_threads(model_path, None)
+}
+
+/// [`open_cpu_session`] with an intra-op thread count (`None` is ONNX Runtime's default, every
+/// logical core). For a large graph, like the voice isolator, that is dominated by matrix
+/// work: on an M1 Pro the default 10 threads include the 2 efficiency cores, and the
+/// performance cores wait on them at every operator. 8 threads measured about 20% faster
+/// (30-33 s against 40 s for the same two windows).
+pub fn open_cpu_session_with_threads(model_path: &Path, threads: Option<usize>) -> Result<Session> {
+    fn load(model_path: &Path, threads: Option<usize>) -> ort::Result<Session> {
+        let mut builder = Session::builder(environment()?)?;
+        if let Some(n) = threads {
+            builder = builder.with_intra_threads(n)?;
+        }
+        builder.commit_from_file(model_path)
     }
-    load(model_path).map_err(|source| Error::Onnx {
+    load(model_path, threads).map_err(|source| Error::Onnx {
         path: model_path.to_path_buf(),
         source: Box::new(source),
     })
+}
+
+/// Cores worth giving to a throughput-bound graph: the performance cores on Apple silicon,
+/// else `None` (let ONNX Runtime decide).
+pub fn performance_cores() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut value: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let name = c"hw.perflevel0.physicalcpu";
+        // SAFETY: `name` is NUL-terminated and `value`/`size` describe a c_int.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&mut value as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        return (rc == 0 && value > 0).then_some(value as usize);
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 #[cfg(test)]

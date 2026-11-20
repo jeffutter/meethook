@@ -47,6 +47,7 @@ sonora = { workspace = true }
 # a Mac that cannot reach its GPU is a broken environment, not a configuration -- and no
 # non-macOS platform has any of them to begin with.
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
 # Solely for `MTLCreateSystemDefaultDevice`, the pre-flight device probe in `gpu`, without
 # which whisper.cpp's Metal path segfaults instead of failing.
 objc2-metal = { workspace = true }
