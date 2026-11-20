@@ -14,7 +14,11 @@ use std::sync::mpsc;
 #[cfg(any(target_os = "macos", test))]
 use std::sync::mpsc::{RecvError, RecvTimeoutError};
 #[cfg(any(target_os = "macos", test))]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// `Instant` is named only by `LiveEvents` and `SessionCapture`, both macOS-only; the tests
+// import their own.
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 #[cfg(any(target_os = "macos", test))]
 use std::fmt;
@@ -52,11 +56,9 @@ use meethook_session::SessionId;
 #[cfg(target_os = "macos")]
 use meethook_session::{Acquisition, RecordLock};
 #[cfg(any(target_os = "macos", test))]
-use meethook_session::{AppIdentities, Attendee, Meeting, MeetingFit, RosterEdit};
+use meethook_session::{AppIdentities, Attendee, HandLabel, Meeting, MeetingFit, RosterEdit};
 // The capture backend exists only where its Apple frameworks compile; the platform-neutral
 // sequencing in `record_loop` below stays ungated and keeps testing without it.
-#[cfg(any(target_os = "macos", test))]
-use meethook_record::HandLabel;
 #[cfg(target_os = "macos")]
 use meethook_record::{
     ACTIVITY_DEBUG_ENV_VAR, Activity, MicActivityWatcher, Recorder, RunningSession, meetings_for,

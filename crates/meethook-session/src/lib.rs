@@ -65,7 +65,7 @@ pub use interrupted::{
     unfinished_now,
 };
 pub use metadata::{
-    Attendee, AttendeeStatus, Meeting, MeetingFit, RosterEdit, SESSION_SCHEMA_VERSION,
+    Attendee, AttendeeStatus, HandLabel, Meeting, MeetingFit, RosterEdit, SESSION_SCHEMA_VERSION,
     SessionMetadata, TrackSync,
 };
 pub use paths::{Paths, SessionPaths};

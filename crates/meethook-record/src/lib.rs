@@ -45,31 +45,16 @@ pub use calendar::{
     CALENDAR_DEBUG_ENV_VAR, MeetingLookup, NoCalendarAccess, meetings_around, meetings_for,
     request_calendar_access,
 };
+pub use meethook_session::HandLabel;
 pub use preflight::{Authorized, MissingPermissions, preflight};
 pub use track::TrackSummary;
-
-/// What a person decided about the session's meeting while it was recording.
-///
-/// A third outcome beside "pick" and "nothing decided": removing the meeting is a decision,
-/// and it must reach `finish` as one, because "nothing decided" lets the automatic lookup
-/// attach whatever the calendar suggests.
-// One value per session, moved once into `finish`: boxing the meeting would add an
-// allocation to every caller to save a few hundred bytes on the stack.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HandLabel {
-    /// The user confirmed this meeting.
-    Pick(Meeting),
-    /// The user removed the meeting: the session was not recorded during one.
-    Clear,
-}
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use jiff::{Timestamp, ZonedDateTime};
 use meethook_session::{
-    AppIdentities, Meeting, Paths, RosterEdit, SessionId, SessionMetadata, SessionPaths,
+    AppIdentities, Paths, RosterEdit, SessionId, SessionMetadata, SessionPaths,
 };
 
 use crate::output::Output;
@@ -633,7 +618,7 @@ mod tests {
     use super::*;
     use crate::output::Output;
     use crate::output::scripted::{ScriptedStream, input_output_error};
-    use meethook_session::SessionId;
+    use meethook_session::{Meeting, SessionId};
 
     /// A track that received audio, so the silent-track gates let the finalize proceed.
     ///

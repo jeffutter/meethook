@@ -62,6 +62,22 @@ pub struct Attendee {
     pub is_you: bool,
 }
 
+/// What a person decided about the session's meeting while it was recording.
+///
+/// A third outcome beside "pick" and "nothing decided": removing the meeting is a decision,
+/// and it must reach `finish` as one, because "nothing decided" lets the automatic lookup
+/// attach whatever the calendar suggests.
+// One value per session, moved once into `finish`: boxing the meeting would add an
+// allocation to every caller to save a few hundred bytes on the stack.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandLabel {
+    /// The user confirmed this meeting.
+    Pick(Meeting),
+    /// The user removed the meeting: the session was not recorded during one.
+    Clear,
+}
+
 /// How strongly a session's start supports the meeting it was matched to.
 ///
 /// **The fit is about the start, and only about the start.** A session's *end* is not an input
