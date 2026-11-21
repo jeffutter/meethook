@@ -17,19 +17,28 @@ use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::keys::Keys;
 use super::state::{EditingField, Phase, State};
 use crate::record::{
     MEETING_CLEARED_CLAUSE, NO_ROSTER, meeting_clause_line, meeting_cleared_line, mic_line,
     session_id_line, speaker_line,
 };
+use crate::tui_kit::{HelpOverlay, footer_height, render_footer};
 use meethook_session::AttendeeStatus;
 
 /// Places the record frame for one draw.
 ///
 /// `elapsed` is a parameter rather than a [`State`] field, for the same reason enroll's draw
 /// takes its playback progress: it is derived from a clock, and the state machine is documented
-/// as having none in it. `None` outside recording.
-pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
+/// as having none in it. `None` outside recording. `keys` is the table the footer and the help
+/// overlay read, and `help` the overlay itself when it is open.
+pub fn draw(
+    frame: &mut Frame,
+    state: &State,
+    keys: &Keys,
+    help: Option<&mut HelpOverlay>,
+    elapsed: Option<Duration>,
+) {
     let whole = frame.area();
     // Too small to mean anything; drawing into it would only produce a wall of borders.
     if whole.height < 5 || whole.width < 20 {
@@ -50,11 +59,18 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
             .min(whole.height.saturating_sub(4) as usize) as u16
     };
 
-    let [header, body, footer] = Layout::default()
+    // The key footer's height is decided first, from the hints at this width, so a narrow
+    // terminal gets a taller footer and the body gives the rows back instead of the hints being
+    // clipped. It never takes the rows the header, three body rows and the sessions line need.
+    let theme = &keys.theme;
+    let hints = keys.hints(state);
+    let key_rows = footer_height(&hints, whole.width, theme).min(whole.height.saturating_sub(5));
+    let [header, body, key_area, footer] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
+            Constraint::Length(key_rows),
             Constraint::Length(1),
         ])
         .areas(whole);
@@ -63,7 +79,12 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
         Line::from(vec![
             Span::raw("meethook record").bold(),
             Span::raw("  ").dim(),
-            Span::raw(format!("· {}", state.phase.word())).dim(),
+            Span::raw(format!(
+                "· {} · {}",
+                state.phase.word(),
+                Keys::context_name(state)
+            ))
+            .dim(),
         ]),
         header,
     );
@@ -194,60 +215,6 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
         body_lines.push(Line::from(Span::raw(notice.clone())));
     }
 
-    body_lines.push(Line::from(Span::raw(" ")));
-    // Two key rows rather than one wrapped paragraph. Every binding cannot fit one line at the
-    // 80-column floor once the hand stop joins it: the widest combination -- the exit keys, the
-    // hand stop and the roster pane's five bindings -- measures 101 columns, and a folded hint
-    // splits a binding from its key. The roster pane already folded by one column before this key
-    // existed (81); adding `s` pushed the open selector (88) and a base frame with a roster
-    // attached (84) past it too. So the keys that act on the run take the first row and the keys
-    // that act on whichever pane is on screen take a row of their own, which holds every frame to
-    // 51 columns on either row.
-    //
-    // What each row advertises is unchanged from the single line: the run's stop always, the
-    // meeting keys only while a session is recording -- a key that cannot work in the current
-    // context is not advertised -- and the hand stop answers both halves of that rule, since it
-    // needs a live session to end and needs its printable letter free. Enter's wording still
-    // follows what it would do now.
-    let mut run_keys = vec![
-        Span::raw("Ctrl-C / Ctrl-D").bold(),
-        Span::raw("  stop and exit").dim(),
-    ];
-    let mut pane_keys: Vec<Span<'static>> = Vec::new();
-    if state.phase == Phase::Recording {
-        if state.editing.is_none() {
-            run_keys.push(Span::raw("  s").bold());
-            run_keys.push(Span::raw(" end this session").dim());
-        }
-        if state.roster_open {
-            if state.editing.is_some() {
-                pane_keys.push(Span::raw("  type  enter save  esc cancel").dim());
-            } else {
-                pane_keys
-                    .push(Span::raw("  up/down move  x remove  n name  e email  esc back").dim());
-            }
-        } else if state.selector_open {
-            pane_keys.push(Span::raw("  up/down move  enter choose  esc back").dim());
-            if state.can_clear_meeting() {
-                pane_keys.push(Span::raw("  c clear meeting").dim());
-            }
-        } else {
-            // The roster key is advertised only while a roster is attached: with no meeting
-            // there is nothing to open, and a key that cannot work is not offered.
-            if state.roster.is_some() {
-                pane_keys.push(Span::raw("  r roster").dim());
-            }
-            if state.can_clear_meeting() {
-                pane_keys.push(Span::raw("  c clear meeting").dim());
-            }
-            pane_keys.push(Span::raw("  enter choose a meeting").dim());
-        }
-    }
-    body_lines.push(Line::from(run_keys));
-    if !pane_keys.is_empty() {
-        body_lines.push(Line::from(pane_keys));
-    }
-
     if trouble_height > 0 {
         let [main, trouble] = Layout::default()
             .direction(Direction::Vertical)
@@ -282,6 +249,13 @@ pub fn draw(frame: &mut Frame, state: &State, elapsed: Option<Duration>) {
         ),
         footer,
     );
+
+    render_footer(frame.buffer_mut(), key_area, &hints, theme);
+
+    if let Some(help) = help {
+        let rows = keys.help_rows(state);
+        help.render(frame.buffer_mut(), whole, " keys ", &rows, theme);
+    }
 }
 
 /// The first line of the body: what the run is doing right now, and since when if it is
@@ -323,6 +297,7 @@ fn format_elapsed(elapsed: Duration) -> String {
 mod tests {
     use super::*;
     use crate::record::{Note, STOPPING, WATCHING};
+    use crate::tui_kit::{HelpOverlay, Theme};
     use meethook_enroll::{MeetingLabel, MeetingOffer};
     use meethook_session::{Attendee, AttendeeStatus, Meeting, MeetingFit, SessionId};
     use ratatui::Terminal;
@@ -334,7 +309,7 @@ mod tests {
     fn painted(width: u16, height: u16, state: &State, elapsed: Option<Duration>) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
         terminal
-            .draw(|frame| draw(frame, state, elapsed))
+            .draw(|frame| draw(frame, state, &Keys::new(Theme::default()), None, elapsed))
             .expect("drawing into a buffer cannot fail");
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -380,7 +355,7 @@ mod tests {
     ) -> Vec<(String, bool)> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
         terminal
-            .draw(|frame| draw(frame, state, elapsed))
+            .draw(|frame| draw(frame, state, &Keys::new(Theme::default()), None, elapsed))
             .expect("drawing into a buffer cannot fail");
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -461,8 +436,8 @@ mod tests {
         assert!(painted.contains("meethook record"), "{painted}");
         assert!(painted.contains("watching"), "{painted}");
         assert!(painted.contains(WATCHING), "{painted}");
-        assert!(painted.contains("Ctrl-C"), "{painted}");
-        assert!(painted.contains("stop and exit"), "{painted}");
+        assert!(painted.contains("[^C] stop and exit"), "{painted}");
+        assert!(painted.contains("· watching · overview"), "{painted}");
         assert!(painted.contains("sessions"), "{painted}");
         // No session is recording, so the meeting keys are not advertised: a key that cannot
         // work in the current context is not offered. The hand stop goes the same way -- there is
@@ -509,12 +484,8 @@ mod tests {
     /// and nowhere else. A press against a field under correction has to type a letter, not end
     /// a call, so the key withdraws there; and with no session live there is nothing to end.
     ///
-    /// Both assertions are the width measurement rather than a style preference: a hint that
-    /// folds at the 80-column floor separates a binding from its key, so `s` would sit above the
-    /// words that say what it does. The hand stop must stay on the row with the exit keys, and the
-    /// pane row must keep its own phrase whole -- together those hold only because the two rows
-    /// exist. On the single row the frame used before TASK-066.07 the widest case measured 101
-    /// columns and orphaned `esc back` from the roster pane's bindings.
+    /// The footer's `[s] end this session` is also what the live pty proof greps for by its
+    /// ` end this session` tail, so the label must stay verbatim.
     #[test]
     fn the_stop_key_is_advertised_only_where_it_works() {
         let standup = meeting_of("EVENT-A", "Standup", MeetingFit::Started);
@@ -524,8 +495,6 @@ mod tests {
         };
 
         let advertised_in = [
-            // The widest base a run reaches: a live session with a roster attached, so `r
-            // roster` joins the hint alongside `enter choose a meeting`.
             ("a recording frame", {
                 let mut s = State::default();
                 s.apply(&started(30));
@@ -543,21 +512,10 @@ mod tests {
             ("the open roster pane", roster_state()),
         ];
         for (name, state) in advertised_in {
-            let rows = painted(80, 24, &state, None);
-            let hint = rows
-                .iter()
-                .find(|row| row.contains("Ctrl-C"))
-                .expect("every frame advertises how to leave it");
+            let painted = painted(80, 24, &state, None).join("\n");
             assert!(
-                hint.contains("s end this session"),
-                "`s` is not advertised on the same row as the exit keys in {name}: {rows:?}"
-            );
-            // The other row, held whole by the same width limit: whichever pane is open, its
-            // closing phrase arrives on one row rather than folded across the floor.
-            let pane_hint = rows.join("\n");
-            assert!(
-                pane_hint.contains("enter choose a meeting") || pane_hint.contains("esc back"),
-                "the pane bindings folded across rows in {name}: {rows:?}"
+                painted.contains("[s] end this session"),
+                "`s` is not advertised in {name}: {painted}"
             );
         }
 
@@ -584,6 +542,93 @@ mod tests {
             assert!(
                 !painted.contains("end this session"),
                 "`s` is advertised in {name}, where it cannot work: {painted}"
+            );
+        }
+    }
+
+    /// The footer is the keymap's hints and nothing else, in every context, so what is painted
+    /// cannot drift from what dispatch accepts; the header names the context it is for.
+    #[test]
+    fn the_footer_is_the_keymap_and_the_header_names_the_context() {
+        let standup = meeting_of("EVENT-A", "Standup", MeetingFit::Started);
+        let mut base = State::default();
+        base.apply(&started(60));
+        base.apply(&Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&standup)],
+            guess: Some(MeetingLabel::from(&standup)),
+        });
+        base.apply(&secret_roster());
+        let mut selector = State::default();
+        selector.apply(&started(61));
+        selector.apply(&Note::MeetingOffered {
+            offered: vec![MeetingOffer::from(&standup)],
+            guess: Some(MeetingLabel::from(&standup)),
+        });
+        selector.open_selector();
+        let mut editing = roster_state();
+        editing.begin_edit(EditingField::Email);
+        let mut idle = State::default();
+        idle.apply(&Note::Watching);
+
+        let keys = Keys::new(Theme::default());
+        for (context, state) in [
+            ("overview", &base),
+            ("meeting list", &selector),
+            ("roster", &roster_state()),
+            ("editing email", &editing),
+            ("overview", &idle),
+        ] {
+            let rows = painted(80, 24, state, None);
+            assert!(
+                rows[0].contains(&format!("· {context}")),
+                "the header names {context}: {rows:?}"
+            );
+            let footer = crate::tui_kit::hint_lines(&keys.hints(state), 80, &keys.theme)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            for line in footer {
+                assert!(
+                    rows.iter().any(|row| row.trim_end() == line.trim_end()),
+                    "the footer row {line:?} is not painted in {context}: {rows:?}"
+                );
+            }
+        }
+    }
+
+    /// The `?` overlay paints the context's rows over the frame, and a narrow terminal wraps
+    /// the footer rather than clipping a hint.
+    #[test]
+    fn the_help_overlay_and_a_narrow_footer() {
+        let state = roster_state();
+        let keys = Keys::new(Theme::default());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut help = HelpOverlay::default();
+        terminal
+            .draw(|f| draw(f, &state, &keys, Some(&mut help), None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = (0..24)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("keys"), "{text}");
+        assert!(
+            text.contains("Remove the attendee under the cursor"),
+            "{text}"
+        );
+
+        let rows = painted(40, 24, &state, None).join("\n");
+        for hint in keys.hints(&state) {
+            assert!(
+                rows.contains(&format!("[{}] {}", hint.key, hint.label)),
+                "{} was clipped at 40 columns: {rows}",
+                hint.label
             );
         }
     }
@@ -724,7 +769,7 @@ mod tests {
             painted.contains("began after this meeting had"),
             "the weak fit's caveat is missing: {painted}"
         );
-        assert!(painted.contains("enter choose a meeting"), "{painted}");
+        assert!(painted.contains("[Enter] choose a meeting"), "{painted}");
     }
 
     /// A settled pick supersedes the guess wherever the frame states the meeting: the clause
@@ -790,11 +835,11 @@ mod tests {
         assert!(planning.1, "the cursor row is highlighted: {rows:?}");
         assert!(!standup.1, "only the cursor row is highlighted: {rows:?}");
         assert!(
-            rows.iter().any(|(text, _)| text.contains("up/down move")),
+            rows.iter().any(|(text, _)| text.contains("[j] down")),
             "the open selector advertises its keys: {rows:?}"
         );
         assert!(
-            rows.iter().any(|(text, _)| text.contains("esc back")),
+            rows.iter().any(|(text, _)| text.contains("[Esc] back")),
             "the open selector advertises its escape: {rows:?}"
         );
     }
@@ -1163,29 +1208,29 @@ mod tests {
             let rows = painted(80, 24, state, None);
             let hint = rows
                 .iter()
-                .find(|row| row.contains("c clear meeting"))
+                .find(|row| row.contains("[c] clear meeting"))
                 .unwrap_or_else(|| panic!("`c` is not advertised in {name}: {rows:?}"));
             assert!(hint.chars().count() <= 80, "{hint:?}");
         }
 
         base.apply(&Note::MeetingCleared);
         let rows = painted(80, 24, &base, None).join("\n");
-        assert!(!rows.contains("c clear meeting"), "{rows}");
+        assert!(!rows.contains("clear meeting"), "{rows}");
         assert!(
-            !rows.contains("r roster"),
+            !rows.contains("[r] roster"),
             "no roster key after removal: {rows}"
         );
         assert!(rows.contains("meeting   none (cleared by hand)"), "{rows}");
         assert!(!rows.contains("Standup"), "{rows}");
-        assert!(rows.contains("enter choose a meeting"), "{rows}");
+        assert!(rows.contains("[Enter] choose a meeting"), "{rows}");
 
         let mut idle = State::default();
         idle.apply(&Note::Watching);
         let rows = painted(80, 24, &idle, None).join("\n");
-        assert!(!rows.contains("c clear meeting"), "{rows}");
+        assert!(!rows.contains("clear meeting"), "{rows}");
         let mut editing = roster_state();
         editing.begin_edit(EditingField::Name);
         let rows = painted(80, 24, &editing, None).join("\n");
-        assert!(!rows.contains("c clear meeting"), "{rows}");
+        assert!(!rows.contains("clear meeting"), "{rows}");
     }
 }

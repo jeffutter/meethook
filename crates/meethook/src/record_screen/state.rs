@@ -443,6 +443,21 @@ impl State {
         }
     }
 
+    /// Jumps the cursor to the first row. No-op on an empty list; no wrap, unlike
+    /// [`State::next`], because "top" is a place and not a step.
+    pub fn first(&mut self) {
+        if !self.offered.is_empty() {
+            self.cursor = 0;
+        }
+    }
+
+    /// Jumps the cursor to the last row. No-op on an empty list.
+    pub fn last(&mut self) {
+        if !self.offered.is_empty() {
+            self.cursor = self.offered.len() - 1;
+        }
+    }
+
     /// The `event_id` under the cursor, addressed back to the run -- or none when the
     /// selector has no row to confirm.
     ///
@@ -497,6 +512,22 @@ impl State {
             && !roster.is_empty()
         {
             self.roster_cursor = (self.roster_cursor + roster.len() - 1) % roster.len();
+        }
+    }
+
+    /// Jumps the roster cursor to the first row. No-op on an empty roster.
+    pub fn roster_first(&mut self) {
+        if self.roster.as_ref().is_some_and(|r| !r.is_empty()) {
+            self.roster_cursor = 0;
+        }
+    }
+
+    /// Jumps the roster cursor to the last row. No-op on an empty roster.
+    pub fn roster_last(&mut self) {
+        if let Some(roster) = &self.roster
+            && !roster.is_empty()
+        {
+            self.roster_cursor = roster.len() - 1;
         }
     }
 
@@ -1077,6 +1108,35 @@ mod tests {
         assert_eq!(s.roster_cursor, 0, "down wraps");
         s.roster_previous();
         assert_eq!(s.roster_cursor, 1, "up wraps");
+    }
+
+    /// `first`/`last` jump to the ends without wrapping, and do nothing on an empty list.
+    #[test]
+    fn the_cursors_jump_to_either_end() {
+        let mut s = State::default();
+        s.apply(&started(25));
+        s.apply(&roster_of("EVENT-A"));
+        s.open_roster();
+        s.roster_last();
+        assert_eq!(s.roster_cursor, 1);
+        s.roster_last();
+        assert_eq!(s.roster_cursor, 1, "last does not wrap");
+        s.roster_first();
+        assert_eq!(s.roster_cursor, 0);
+        s.roster_first();
+        assert_eq!(s.roster_cursor, 0, "first does not wrap");
+
+        let mut empty = State::default();
+        empty.apply(&started(26));
+        empty.apply(&Note::RosterAttached {
+            event_id: "EVENT-A".to_owned(),
+            attendees: vec![],
+        });
+        empty.roster_first();
+        empty.roster_last();
+        empty.first();
+        empty.last();
+        assert_eq!((empty.roster_cursor, empty.cursor), (0, 0));
     }
 
     /// Every committed local change crosses exactly once, as the full edited roster: a

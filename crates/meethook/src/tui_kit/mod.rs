@@ -7,9 +7,7 @@
 //! All three read the same table and format keys with the same function, so a key cannot be
 //! bound but missing from the help, or advertised but dead.
 //!
-//! The enroll screen adopted the kit in MH-42. `record_screen` has not yet (that migration is
-//! separate follow-up work, so record behaves exactly as before); the allow below covers the
-//! parts only it will use.
+//! The enroll screen adopted the kit in MH-42 and the record screen in MH-43.
 #![allow(dead_code, unused_imports)]
 
 mod help;
