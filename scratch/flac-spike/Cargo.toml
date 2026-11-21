@@ -1,0 +1,11 @@
+[package]
+name = "flac-spike"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+[dependencies]
+rusty_flac = "=0.5.1"
+
+[workspace]

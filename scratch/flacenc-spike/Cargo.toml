@@ -1,0 +1,8 @@
+[package]
+name = "fe"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+[dependencies]
+flacenc = "=0.5.1"
+[workspace]
