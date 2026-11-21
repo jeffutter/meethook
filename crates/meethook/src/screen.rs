@@ -40,7 +40,9 @@ use std::time::Duration;
 use meethook_enroll::{Answer, GroupConsequence, Interviewer, Preview, Scan, Snippet, Voice};
 use meethook_session::Paths;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{Event as Key, poll, read};
+use ratatui::crossterm::event::{
+    Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
+};
 
 use crate::clips::{Clips, Progress};
 use crate::tui_kit::{HelpOutcome, HelpOverlay, Theme};
@@ -466,8 +468,10 @@ impl Interface {
                     .size()
                     .map(|size| HelpOverlay::page_height(size.into(), rows.len()))
                     .unwrap_or(1);
-                if overlay.handle_key(key, rows.len(), page) == HelpOutcome::Close {
-                    help = None;
+                match help_key(overlay, key, rows.len(), page) {
+                    HelpKey::Quit => return Answer::Quit,
+                    HelpKey::Close => help = None,
+                    HelpKey::Open => {}
                 }
                 continue;
             }
@@ -530,6 +534,30 @@ impl Interface {
                 Step::Answered(answer) => return answer,
             }
         }
+    }
+}
+
+/// What a key does while the `?` overlay is open.
+#[derive(Debug, PartialEq, Eq)]
+enum HelpKey {
+    Open,
+    Close,
+    Quit,
+}
+
+/// Routes a key while the overlay has the keyboard. Ctrl-C is checked first because the overlay
+/// takes every key and its own handler knows nothing of quit, and in raw mode no SIGINT arrives
+/// to make up for it. A function beside [`wait`] so `cargo test` can decide it with no terminal.
+fn help_key(overlay: &mut HelpOverlay, key: KeyEvent, rows: usize, page: usize) -> HelpKey {
+    if key.kind != KeyEventKind::Release
+        && key.code == KeyCode::Char('c')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return HelpKey::Quit;
+    }
+    match overlay.handle_key(key, rows, page) {
+        HelpOutcome::Close => HelpKey::Close,
+        _ => HelpKey::Open,
     }
 }
 
@@ -625,6 +653,9 @@ mod tests {
     use super::state::Context;
     use super::state::tests::heard;
     use super::{Background, Interface, Progress, Shared, TICK, line_to_play, rewrites, wait};
+    use super::{HelpKey, help_key};
+    use crate::tui_kit::HelpOverlay;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// A scan that costs nothing and counts how often it was asked for. The root is never read,
     /// which is the point: what is being measured is how many times the frame asks.
@@ -897,5 +928,17 @@ mod tests {
             String::from_utf8(out).expect("what went in was utf-8"),
             "20260819-100000  named Milo\nthe terminal stopped being readable\n"
         );
+    }
+
+    /// MH-45: with the overlay open Ctrl-C still quits, and `?` still only closes it.
+    #[test]
+    fn ctrl_c_quits_from_inside_the_help_overlay() {
+        let mut overlay = HelpOverlay::default();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        let plain_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(help_key(&mut overlay, plain_c, 20, 5), HelpKey::Open);
+        assert_eq!(help_key(&mut overlay, ctrl_c, 20, 5), HelpKey::Quit);
+        assert_eq!(help_key(&mut overlay, question, 20, 5), HelpKey::Close);
     }
 }
