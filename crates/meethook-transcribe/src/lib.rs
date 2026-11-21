@@ -30,6 +30,8 @@ mod mic_isolation;
 mod mlx_isolator;
 #[cfg(mlx_engine)]
 mod mlx_kernels;
+#[cfg(mlx_engine)]
+mod mlx_metallib;
 mod models;
 // Not called by production code until TASK-088.08 diarizes with Nemotron.
 #[allow(dead_code)]

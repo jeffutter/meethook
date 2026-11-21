@@ -265,6 +265,17 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
 # engine instead. Tilde pin: a 0.x crate. How the isolator was ported, and how to update it:
 # MLX.md.
 mlx-rs = "~0.34"
+# `mlx-rs`'s own build dependency. Declared here as well because only a direct dependent sees
+# the `DEP_MLX_*` variables its build script publishes, and `meethook-transcribe`'s build script
+# needs `DEP_MLX_INCLUDE` to find the compiled `mlx.metallib` it embeds (see MLX.md). Cargo
+# resolves one copy, the one `mlx-rs` asks for.
+mlx-sys = "~0.7"
+
+# Compresses `mlx.metallib` (136 MB, 9.9 MB at level 19) for embedding, and decompresses it on
+# first use. Its `zstd-sys` builds the bundled libzstd C source with `cc` and links it
+# statically; the `pkg-config` feature (a system libzstd) is opt-in and not enabled. Default
+# features off: no legacy formats, no dictionary builder.
+zstd = { version = "0.14", default-features = false }
 
 # WebRTC AEC3 for the echo-cancellation pre-pass: a pure-Rust port of WebRTC's audio processing
 # module, so there is no C++ toolchain or system library to build or link. A 0.x crate, so a

@@ -61,6 +61,14 @@ whisper-rs = { workspace = true, features = ["metal"] }
 # The voice isolator on the GPU through MLX. Optional only so that a sandboxed `nix build` can
 # turn it off (`--no-default-features`); see the workspace entry and MLX.md.
 mlx-rs = { workspace = true, optional = true }
+# The compiled shaders are embedded zstd-compressed and unpacked on first use, so the release is
+# one file; `mlx-sys` is here for `DEP_MLX_INCLUDE` (see build.rs and MLX.md).
+mlx-sys = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+
+# Host-gated, like the build script it serves: only a macOS host ever builds the MLX engine.
+[target.'cfg(target_os = "macos")'.build-dependencies]
+zstd = { workspace = true, optional = true }
 
 [features]
 # The voice isolator on Apple's GPU through MLX: about 11x the ONNX CPU path through the whole
@@ -68,7 +76,7 @@ mlx-rs = { workspace = true, optional = true }
 # runs on the ONNX Runtime CPU provider. `--no-default-features` selects the ONNX engine on
 # macOS too, for builds that cannot compile Metal shaders.
 default = ["mlx"]
-mlx = ["dep:mlx-rs"]
+mlx = ["dep:mlx-rs", "dep:mlx-sys", "dep:zstd"]
 
 [dev-dependencies]
 # The `speaker-trials` example's `--embeddings` cache, and nothing else. The examples here

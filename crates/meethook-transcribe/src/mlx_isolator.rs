@@ -583,16 +583,31 @@ pub(crate) struct MlxNetwork {
 impl MlxNetwork {
     /// Loads the fp16 weights of [`crate::VOICE_ISOLATOR_MLX_MODEL`].
     ///
-    /// Starting MLX's GPU stack can fail where the Metal shaders cannot be found: MLX loads
-    /// `mlx.metallib` from beside the executable, else from a path baked in at build time (inside
-    /// the build machine's home directory), and when neither exists mlx-rs panics. That becomes
-    /// an error here, so the stage falls back to the un-isolated mic track instead of crashing
-    /// the run.
+    /// MLX will not start its GPU stack without its compiled shaders (`mlx.metallib`), and it can
+    /// only read them from a file. They are embedded in this binary (`mlx_metallib`), so this
+    /// first unpacks them beside the weights and tells MLX where they are. If that fails (a
+    /// read-only directory, a full disk) MLX falls back to its own lookup: the file next to the
+    /// executable, then the path baked in at build time, which exists on the machine that built
+    /// this binary. When that fails too, mlx-rs panics creating its GPU stream; that becomes an
+    /// error here, so the stage falls back to the un-isolated mic track instead of crashing.
     pub(crate) fn load(path: &Path) -> Result<Self> {
+        let unpacked = path
+            .parent()
+            .map_or_else(
+                || Err(std::io::Error::other("the weights path has no directory")),
+                crate::mlx_metallib::install,
+            )
+            .and_then(|shaders| {
+                let shaders = shaders.to_string_lossy().into_owned();
+                mlx_rs::metal::set_metallib_path(&shaders)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            });
         guarded(|| Self::try_load(path)).map_err(|e| {
-            Error::VoiceIsolator(format!(
-                "MLX could not start ({e}); is mlx.metallib installed next to the executable?"
-            ))
+            let note = match &unpacked {
+                Ok(()) => String::new(),
+                Err(why) => format!("; the embedded shaders could not be unpacked: {why}"),
+            };
+            Error::VoiceIsolator(format!("MLX could not start ({e}{note})"))
         })
     }
 
