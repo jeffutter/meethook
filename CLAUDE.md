@@ -5,26 +5,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Project and architecture guidance lives in [`AGENTS.md`](./AGENTS.md) — read it before
 working in this repository.
 
-<!-- BACKLOG.MD GUIDELINES START -->
-<!-- backlog.md-instructions-version: 1.49.3 -->
-<CRITICAL_INSTRUCTION>
+## Ticket tracking
 
-## Backlog.md Workflow
+This project tracks work with scree, project key `MH`
+(tickets are `MH-12`, subtasks `MH-12.3`). Use the `scree` skill for the work loop, and
+`scree list`, `scree show MH-12` and `scree add` for everything else.
 
-This project uses Backlog.md for task and project management.
-
-**For every user request in this project, run `backlog instructions overview` before answering or taking action.**
-
-Use the overview to decide whether to search, read, create, or update Backlog tasks.
-
-Before task lifecycle actions, read the matching detailed guide:
-- `backlog instructions task-creation` before creating or splitting tasks
-- `backlog instructions task-execution` before planning, changing status or assignee, adding a plan or implementation notes, or implementing task work
-- `backlog instructions task-finalization` before checking acceptance criteria, writing final summaries, or moving tasks to terminal statuses
-
-Use `backlog <command> --help` before running unfamiliar commands. Help shows options, fields, and examples.
-
-Do not edit Backlog task, draft, document, decision, or milestone markdown files directly. Use the `backlog` CLI so metadata, relationships, and history stay consistent.
-
-</CRITICAL_INSTRUCTION>
-<!-- BACKLOG.MD GUIDELINES END -->
+- Create tickets as `draft` with at least one acceptance criterion; a human makes them `ready`.
+- Skills that publish tickets (`to-spec`, `to-tickets`) and the issue tracker they ask about:
+  the tracker is scree, not local files or GitHub. Publish with `scree add`, blockers first,
+  using `--blocked-by` for dependencies and `--parent` for a subtask of a top-level ticket.
+  scree has no labels, so skip any triage label.
+- Tickets migrated from Backlog.md say "was TASK-n" in their description, and
+  `backlog/TASK-ID-MAP.md` maps every old id to its scree id.
+- Backlog.md is no longer used. Do not run the `backlog` CLI. `backlog/decisions/` and
+  `backlog/docs/` are plain markdown that stay as the design record; `backlog/tasks/` and
+  `backlog/archive/` are old local files, ignored by git, kept only until the user deletes them.

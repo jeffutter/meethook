@@ -6,8 +6,8 @@ result-*
 __pycache__
 .claude/settings.local.json
 
-# Backlog.md task tracking is local working state, not repository content.
-# Other backlog/ material (decisions, docs, milestones) stays tracked.
+# Backlog.md task files from before the move to scree are local leftovers, not repository
+# content. backlog/decisions/ and backlog/docs/ stay tracked.
 backlog/tasks/
 
 # Recorded and generated audio under scratch/. The scripts that produce and
@@ -34,5 +34,5 @@ scratch/**/*.tar.gz
 scratch/**/*.tgz
 scratch/**/*.zip
 
-# Same reasoning: archiving a task leaves its file behind, still working state.
+# Same reasoning: archived Backlog.md task files.
 backlog/archive/

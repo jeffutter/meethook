@@ -6,12 +6,6 @@
 # commit made from a shell where direnv is not active fails with command-not-found
 # rather than a lint error; that is accepted for this repo, which ships a committed
 # .envrc.
-#
-# backlog/config.yml keeps bypassGitHooks: true on purpose. `backlog task edit` auto-
-# commits task metadata on nearly every invocation, so running the Rust gates would add
-# minutes of latency to each CLI call and would fail outright whenever the working tree
-# is mid-edit. Those commits touch markdown only, so they have nothing for these gates
-# to check.
 
 pre-commit:
   # rustfmt has to succeed, and restage, before clippy is worth running at all.
