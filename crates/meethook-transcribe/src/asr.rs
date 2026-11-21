@@ -464,13 +464,25 @@ impl WhisperEngine {
             phase.at(percent.max(0) as usize, 100);
         });
 
+        // Two settings follow screenpipe's whisper_rs use (`screenpipe-audio`,
+        // `transcription/whisper/batch.rs`), adopted on trust rather than measured here:
+        //
+        // - `suppress_nst` bans the non-speech tokens (music notes, bracketed sound tags) so
+        //   they cannot be emitted. Off by default in whisper.cpp (`:5947`).
+        // - `logprob_thold` -2.0 instead of the default -1.0. It gates both the temperature
+        //   fallback (`:7555`) and the drop of a window judged silent (`:7585`), so a lower
+        //   bar means fewer retries and a window needs a worse score to be dropped.
+        //
+        // Neither is aimed at decoder loops, which score as confident; see `repair_loops`.
+        params.set_suppress_nst(true);
+        params.set_logprob_thold(-2.0);
+
         // Every other decoder parameter is left at whisper.cpp's default, checked rather than
         // assumed against the vendored 1.8.3: `suppress_blank` is already true (`:5946`),
         // `no_speech_thold` is 0.6 and *is* live (`:7555`, `:7585`) despite whisper-rs's stale
-        // comment, and `temperature` 0.0 / `temperature_inc` 0.2 / `entropy_thold` 2.4 /
-        // `logprob_thold` -1.0 are the temperature-fallback loop that already rejects
-        // degenerate output. None of them is what let the silence hallucinations through, so
-        // none of them is changed here.
+        // comment, and `temperature` 0.0 / `temperature_inc` 0.2 / `entropy_thold` 2.4 are the
+        // temperature-fallback loop. None of them is what let the silence hallucinations
+        // through, so none of them is changed here.
 
         state.full(params, audio).map_err(|e| Error::Asr {
             source: Box::new(e),
