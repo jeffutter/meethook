@@ -1,0 +1,37 @@
+# cargo-about configuration: the third-party license notices of the Rust crates that end up in
+# the `meethook` binary. `scripts/gen_licenses.sh` runs it; see THIRD_PARTY_LICENSES.md and
+# licenses/README.md. Native code (ONNX Runtime, MLX, whisper.cpp, ...) is not a crate and is
+# covered by licenses/native/.
+
+# Both release platforms, so the output is the same wherever it is generated. cargo-about reads
+# cargo metadata for these targets; it builds nothing.
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+
+# (`--all-features` is a flag, given by scripts/gen_licenses.sh: the `mlx` feature adds crates on
+# macOS.)
+
+# Build scripts and tests are not linked into the binary, so their dependencies are not
+# redistributed with it.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Our own workspace crates (publish = false) are meethook itself, under the root LICENSE.
+private = { ignore = true }
+
+# What a dependency may be licensed under for us to ship it. A crate offering a choice (`MIT OR
+# Apache-2.0`) needs one of them accepted. Adding a license here is a decision to read it first:
+# nothing copyleft is on this list, which is the point of listing rather than excluding.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "0BSD",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+]

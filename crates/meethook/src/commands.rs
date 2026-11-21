@@ -495,6 +495,27 @@ pub fn speakers(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+/// The third-party notices, generated from the dependency graph and `licenses/native/` by
+/// `scripts/gen_licenses.py`, which CI checks is current. Built in so that a release that is one
+/// file still carries the notices its dependencies' licenses require.
+const THIRD_PARTY_LICENSES: &str = include_str!("../../../THIRD_PARTY_LICENSES.md");
+
+/// Prints the third-party license notices.
+pub fn licenses() -> Result<()> {
+    write_licenses(&mut io::stdout().lock(), THIRD_PARTY_LICENSES)
+}
+
+/// [`licenses`] off a writer and a text, so a test holds the behaviour without the 500 KiB.
+///
+/// A closed pipe is a success: `meethook licenses | head` stops reading on purpose, and the
+/// reader that went away got what it asked for.
+fn write_licenses(out: &mut dyn Write, text: &str) -> Result<()> {
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
 /// Prints every session directory under `--root` and what became of it. Read-only.
 pub fn sessions(paths: &Paths) -> Result<()> {
     let mut out = io::stdout().lock();
@@ -938,9 +959,57 @@ fn parse_session_ids(raw: &[String]) -> Result<Vec<SessionId>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A writer that fails every write the way a closed pipe does.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_license_notices_cover_the_native_code_and_the_crates() {
+        let text = THIRD_PARTY_LICENSES;
+        assert!(text.starts_with("# Third-party licenses"));
+        // Native code that is statically linked into a release, none of it visible to cargo.
+        for native in [
+            "ONNX Runtime",
+            "MLX",
+            "whisper.cpp",
+            "Zstandard",
+            "VoiceIsolatorMLX",
+            "metal-cpp",
+        ] {
+            assert!(text.contains(native), "no notice for {native}");
+        }
+        // The Rust side, and that a real license text came with it rather than a bare name.
+        assert!(text.contains("# Third-party licenses: Rust crates"));
+        assert!(text.contains("- serde "), "no crate list");
+        assert!(text.contains("Permission is hereby granted, free of charge"));
+        assert!(text.contains("Apache License"));
+        // Our own crates are meethook itself, not a third party.
+        assert!(!text.contains("- meethook-transcribe "));
+    }
+
+    #[test]
+    fn licenses_prints_the_whole_text_and_a_closed_pipe_is_not_an_error() {
+        let mut out = Vec::new();
+        write_licenses(&mut out, "notice text\n").unwrap();
+        assert_eq!(out, b"notice text\n");
+        write_licenses(&mut ClosedPipe, "notice text\n").unwrap();
+    }
     use meethook_enroll::Interviewer;
 
-    use super::{Answerer, Clips, EnrollReport, Terminal, Tty, answerer};
+    use super::{
+        Answerer, Clips, EnrollReport, THIRD_PARTY_LICENSES, Terminal, Tty, answerer,
+        write_licenses,
+    };
+    use std::io::{self, Write};
 
     /// Builds a session directory holding exactly `files`, each written as a placeholder.
     ///

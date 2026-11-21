@@ -60,6 +60,24 @@ jobs:
       - name: Check formatting
         run: nix develop -c cargo fmt --all --check
 
+  # THIRD_PARTY_LICENSES.md is built into the binary (`meethook licenses`) because the licenses of
+  # what it contains require their notices to travel with it. It is generated from the dependency
+  # graph, so it goes stale when a dependency is added or changes license, and nothing else would
+  # notice. Regenerate with `python3 scripts/gen_licenses.py` (licenses/README.md).
+  licenses:
+    name: Third-party licenses are current
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+        timeout-minutes: 15
+        with:
+          use-flakehub: false
+      - name: Check THIRD_PARTY_LICENSES.md
+        run: nix develop -c python3 scripts/gen_licenses.py --check
+
   clippy:
     name: Clippy (${{ matrix.os }})
     strategy:

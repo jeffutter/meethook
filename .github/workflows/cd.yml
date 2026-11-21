@@ -135,6 +135,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -148,5 +151,6 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.sha256
+            THIRD_PARTY_LICENSES.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

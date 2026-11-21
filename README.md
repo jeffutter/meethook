@@ -34,11 +34,15 @@ nix run github:jeffutter/meethook -- --help
 ### Release binaries
 
 Prebuilt binaries for macOS (arm64) and Linux (x86_64) are attached to each
-[GitHub release](https://github.com/jeffutter/meethook/releases). They're built with a plain
-`cargo build --release`, so unlike the Nix package they are **not** self-contained: the machine
-running them needs `libonnxruntime` on the loader path already, or the binary will fail to start with a dynamic-linker error.
-Prefer the Nix install above unless you already have libonnxruntime from somewhere else (Nix,
-Homebrew, or your distro's package manager).
+[GitHub release](https://github.com/jeffutter/meethook/releases).
+
+- **macOS (arm64)** is a single file: ONNX Runtime is linked statically, the GPU shaders for the
+  voice isolator are embedded (and unpacked into the models directory on first use), and the only
+  other libraries it loads are the ones macOS ships. There is nothing to install beside it.
+- **Linux (x86_64)** is built with a plain `cargo build --release` and is **not** self-contained:
+  the machine running it needs `libonnxruntime` on the loader path already, or the binary will
+  fail to start with a dynamic-linker error. Prefer the Nix install above unless you already have
+  libonnxruntime from somewhere else (Nix, or your distro's package manager).
 
 ```sh
 tar xzf meethook-vX.Y.Z-<os>-<arch>.tar.gz
@@ -477,4 +481,6 @@ sessions, and more).
 
 ## License
 
-[MIT](./LICENSE)
+[MIT](./LICENSE). The third-party code it includes (ONNX Runtime, MLX, whisper.cpp and the Rust
+crates) is under its own licenses: `meethook licenses` prints the notices from the binary, and the
+same text is [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md), attached to each release too.

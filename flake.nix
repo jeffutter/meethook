@@ -194,6 +194,8 @@
               rustToolchain
               pkgs.lefthook
               pkgs.cargo-audit
+              # scripts/gen_licenses.py: THIRD_PARTY_LICENSES.md, the notices `meethook licenses` prints.
+              pkgs.cargo-about
               pkgs.cargo-outdated
               # The pre-push test gate runs the suite through nextest, which
               # isolates each test binary and reports failures without the

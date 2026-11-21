@@ -1,0 +1,17 @@
+VoiceIsolatorMLX
+Copyright 2026 Dmitry Starkov
+
+A port of the Inworld Voice Isolator to MLX Swift.
+
+The network architecture, the inference semantics (offline rendering and the
+streaming session) and the model weights are those of the Inworld Voice
+Isolator, Copyright 2026 Inworld AI, released under the Apache License 2.0:
+https://github.com/inworld-ai/voice-isolator
+https://huggingface.co/inworld/voice-isolator
+
+Sources/VoiceIsolatorMLX/KernelSources.swift contains an erf approximation
+adapted from MLX (MIT License, Copyright 2023 Apple Inc.), after N. Juffa's
+faithfully rounded erff.
+
+Sources/VoiceIsolatorMLX/TorchWindow.swift holds the float32 values of
+torch.hann_window(2048) (PyTorch, BSD-3-Clause).

@@ -268,7 +268,7 @@ enum Command {
 
         /// Do not isolate the voice on the mic track before transcription
         ///
-        /// Isolation is on by default: a voice-isolator model (a 260 MB one-time download)
+        /// Isolation is on by default: a voice-isolator model (a one-time download, 152 MiB on macOS and 260 MB elsewhere)
         /// cleans the speech regions of the mic track before recognition. The choice is
         /// recorded in the session's cleaning.json, and `enroll` leaves it alone. Re-running
         /// without --force on a session transcribed under the other setting skips it and says
@@ -382,6 +382,15 @@ enum Command {
     /// writes nothing; a missing or empty `sessions/` is reported rather than treated as an
     /// error, and a path it cannot scan at all is the one thing that exits nonzero.
     Sessions,
+
+    /// Print the third-party license notices
+    ///
+    /// meethook includes open-source code -- ONNX Runtime, MLX, whisper.cpp and the Rust crates
+    /// it is built from -- whose licenses require their notices to travel with the binary. This
+    /// prints them, from a copy built in, so a release that is a single file still carries them.
+    /// The same text is THIRD_PARTY_LICENSES.md in the repository. Needs no data directory and
+    /// touches nothing.
+    Licenses,
 
     /// Remove a stored recording of somebody, or remove them entirely
     ///
@@ -557,6 +566,10 @@ enum DiarizerChoice {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Before the data directory is resolved: printing a notice must not depend on $HOME.
+    if matches!(cli.command, Command::Licenses) {
+        return commands::licenses();
+    }
     let paths = Paths::new(resolve_root(cli.root)?);
     let template = cli.template.as_deref();
 
@@ -591,6 +604,7 @@ fn main() -> Result<()> {
             vocab.as_deref(),
         ),
         Command::Enroll(args) => commands::enroll(&paths, &args, template),
+        Command::Licenses => unreachable!("printed before the root was resolved"),
         Command::Speakers => commands::speakers(&paths),
         Command::Sessions => commands::sessions(&paths),
         Command::Forget {
