@@ -715,7 +715,7 @@ pub(crate) fn enroll_session(
                 // ignored there for the same reason a group never pays a third party's name.
                 Answer::Named { name, anyway } => {
                     if live.len() > 1 {
-                        commit_group_walk(
+                        let taken_over = commit_group_walk(
                             &live[..],
                             name.trim(),
                             false,
@@ -727,6 +727,7 @@ pub(crate) fn enroll_session(
                             &mut shown,
                             &baseline,
                             &mut committed,
+                            &mut answered_solo,
                             report,
                             &mut vetoes_overridden,
                             &mut asserted_voices,
@@ -737,6 +738,7 @@ pub(crate) fn enroll_session(
                             &metadata,
                             assertion.as_deref(),
                         )?;
+                        forget_settled(&mut settled, &taken_over);
                         continue;
                     }
                     // `Some` exactly when this voice was answered earlier and is being asked
@@ -827,7 +829,7 @@ pub(crate) fn enroll_session(
                         Some(resolved) => {
                             // Veto authority iff the group names two or more voices: one member
                             // is a plain naming, and the veto refuses it exactly as today.
-                            commit_group_walk(
+                            let taken_over = commit_group_walk(
                                 &resolved[..],
                                 &group_name,
                                 resolved.len() >= 2,
@@ -839,6 +841,7 @@ pub(crate) fn enroll_session(
                                 &mut shown,
                                 &baseline,
                                 &mut committed,
+                                &mut answered_solo,
                                 report,
                                 &mut vetoes_overridden,
                                 &mut asserted_voices,
@@ -849,6 +852,7 @@ pub(crate) fn enroll_session(
                                 &metadata,
                                 assertion.as_deref(),
                             )?;
+                            forget_settled(&mut settled, &taken_over);
                             // The voice the answer was given on, if the group did not name it:
                             // asked, went unanswered, counted the way every other unanswered
                             // voice is -- the group walked its members, not the anchor.
@@ -884,7 +888,7 @@ pub(crate) fn enroll_session(
                         resolve_group_members(&clusters.clusters, &unknown, &group_name, &members);
                     match members {
                         Some(resolved) => {
-                            commit_group_walk(
+                            let taken_over = commit_group_walk(
                                 &resolved[..],
                                 &group_name,
                                 false,
@@ -896,6 +900,7 @@ pub(crate) fn enroll_session(
                                 &mut shown,
                                 &baseline,
                                 &mut committed,
+                                &mut answered_solo,
                                 report,
                                 &mut vetoes_overridden,
                                 &mut asserted_voices,
@@ -906,6 +911,7 @@ pub(crate) fn enroll_session(
                                 &metadata,
                                 assertion.as_deref(),
                             )?;
+                            forget_settled(&mut settled, &taken_over);
                             if !resolved.iter().any(|m| m.id == anchor.id) {
                                 left_unanswered(std::iter::once(anchor), &shown, &baseline, report);
                             }
@@ -1459,6 +1465,7 @@ fn commit_group_walk<'d, 'm>(
     shown: &'m mut BTreeMap<u32, Attribution>,
     baseline: &'d BTreeMap<u32, Attribution>,
     committed: &'m mut Vec<&'d SpeakerCluster>,
+    answered_solo: &'m mut BTreeMap<u32, bool>,
     report: &'m mut EnrollReport,
     vetoes_overridden: &'m mut usize,
     asserted_voices: &'m mut usize,
@@ -1468,7 +1475,10 @@ fn commit_group_walk<'d, 'm>(
     rules: &'d EnrollRules<'d>,
     metadata: &SessionMetadata,
     assertion: Option<&str>,
-) -> Result<()> {
+) -> Result<Vec<u32>> {
+    // Voices answered alone earlier and renamed by this group, for the caller to drop from
+    // its reopenable set.
+    let mut taken_over: Vec<u32> = Vec::new();
     // Trimmed once here rather than in each member's dry run, so the forced map's key and the
     // names committed agree on the same normalisation.
     let group_name = group_name.trim();
@@ -1480,7 +1490,10 @@ fn commit_group_walk<'d, 'm>(
         // Answered earlier in this run, by any door: counted then, not committed again -- and
         // not inserted into the forced set, because the tier claims the voice reads the group's
         // name, and a voice committed under another name does not.
-        if committed.iter().any(|done| done.id == member.id) {
+        // A voice answered alone and reopened is the exception: the group's name replaces that
+        // answer, and its counters are taken back by the commit rather than added to.
+        let mut contribution = answered_solo.get(&member.id).copied();
+        if contribution.is_none() && committed.iter().any(|done| done.id == member.id) {
             continue;
         }
         if authority {
@@ -1510,8 +1523,14 @@ fn commit_group_walk<'d, 'm>(
             false,
             false,
             fref,
-            &mut None,
+            &mut contribution,
         )?;
+        // A group answer is not reopenable, like any group member: the voice leaves the solo
+        // bookkeeping, so later skip and leave counting treats it as the committed voice it is.
+        if matches!(outcome, CommitOutcome::Committed) && answered_solo.remove(&member.id).is_some()
+        {
+            taken_over.push(member.id);
+        }
         // A refused member is not committed, so it stops being a declared holder for the
         // members after it -- the state the run actually reaches, and the one the next member
         // previews against.
@@ -1519,7 +1538,20 @@ fn commit_group_walk<'d, 'm>(
             forced.remove(&member.id);
         }
     }
-    Ok(())
+    Ok(taken_over)
+}
+
+/// Drops the reopenable entries for voices a group answer has since taken over.
+fn forget_settled(settled: &mut Vec<(usize, Question<'_>)>, taken_over: &[u32]) {
+    if taken_over.is_empty() {
+        return;
+    }
+    settled.retain(|(_, question)| {
+        !question
+            .members()
+            .iter()
+            .any(|c| taken_over.contains(&c.id))
+    });
 }
 
 /// Ranks several voices against the database as one: a person appears once, scored at their

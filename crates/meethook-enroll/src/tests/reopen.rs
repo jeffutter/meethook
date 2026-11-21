@@ -241,6 +241,72 @@ fn a_group_member_is_not_reopened() {
     assert_eq!(report.named, 2, "{output}");
 }
 
+/// A reopened voice marked into a group with another voice is named by the group: the
+/// earlier name's reference is replaced, the transcript reads the group's name, and the voice
+/// is counted once.
+#[test]
+fn a_reopened_voice_answered_as_a_group_is_renamed_and_counted_once() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    let session = make_session(&paths, "20260809-052600");
+
+    let mut interviewer = Scripted::answering(vec![
+        named("Bob"),
+        Answer::Later,
+        Answer::Group {
+            name: "Carol".to_string(),
+            members: vec!["Unknown 1".to_string(), "Unknown 2".to_string()],
+        },
+    ])
+    .steering(&[Some("Unknown 1")]);
+    let (report, output) = run(&paths, &[], &mut interviewer);
+
+    assert_eq!(report.named, 2, "{output}");
+    assert_eq!(report.skipped + report.kept + report.refused, 0, "{output}");
+    assert!(
+        stored(&paths).iter().all(|(name, _)| name == "Carol"),
+        "no reference left under Bob: {output}"
+    );
+    let said = transcript_of(&session);
+    assert_eq!(
+        (
+            said.turns[0].speaker.as_str(),
+            said.turns[2].speaker.as_str(),
+            said.turns[3].speaker.as_str()
+        ),
+        ("Carol", "Carol", "Carol"),
+        "{output}"
+    );
+}
+
+/// After a group answer took over a reopened voice, that voice no longer counts as a solo
+/// answer, so a later skip on another voice is counted the way it would be in a run that
+/// never reopened anything.
+#[test]
+fn a_group_answer_over_a_reopened_voice_leaves_later_counts_right() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(root.path());
+    make_session(&paths, "20260809-052600");
+    let mut interviewer = Scripted::answering(vec![
+        named("Bob"),
+        Answer::Later,
+        Answer::Group {
+            name: "Carol".to_string(),
+            members: vec!["Unknown 1".to_string()],
+        },
+        Answer::Skip,
+    ])
+    .steering(&[Some("Unknown 1")]);
+    let (report, output) = run(&paths, &[], &mut interviewer);
+
+    assert_eq!(report.named, 1, "{output}");
+    assert_eq!(report.skipped + report.kept, 1, "{output}");
+    assert!(
+        stored(&paths).iter().all(|(name, _)| name == "Carol"),
+        "{output}"
+    );
+}
+
 /// A target nobody settled is ignored, so the answerer's own bound on steering is what ends
 /// it and the loop cannot spin.
 #[test]
