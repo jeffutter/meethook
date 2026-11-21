@@ -32,10 +32,10 @@
 //! the speaker track starts joining regions across speakers. It is a setting for this tool's
 //! recordings (a mic and a call), not FireRed's published operating point.
 //!
-//! The pyannote segmentation graph was rejected as a detector for the reason it was rejected
-//! before: the invariant at the top of [`crate`] -- the microphone track is never handed to the
+//! A diarization graph was rejected as a detector for the reason it was rejected before: the
+//! invariant at the top of [`crate`] -- the microphone track is never handed to the
 //! diarization models -- is checked against the samples themselves, and gating the mic with
-//! that graph would make it false.
+//! such a graph would make it false.
 //!
 //! # The frontend
 //!
@@ -52,7 +52,7 @@
 //! # The boundary
 //!
 //! Everything crossing this module's edge is seconds into the audio that was handed in, the
-//! same contract [`crate::AsrSegment`] and [`crate::LocalTurn`] use. No `ort` type is visible
+//! same contract [`crate::AsrSegment`] and [`crate::SpeakerTurn`] use. No `ort` type is visible
 //! outside this file.
 //!
 //! The detector runs on the CPU ([`crate::onnx::open_cpu_session`]), for the reason documented

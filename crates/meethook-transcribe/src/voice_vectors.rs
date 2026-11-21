@@ -22,19 +22,15 @@ pub(crate) fn normalize(vector: &mut [f32]) {
 /// reason they are returned together rather than measured separately.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GroupDistance {
-    /// The mean of every cross-group pairwise cosine distance: the criterion clustering merges
-    /// on, against [`crate::MERGE_DISTANCE`].
+    /// The mean of every cross-group pairwise cosine distance.
     ///
-    /// Computed from the embeddings alone, *without* the cannot-link substitution, so it is a
-    /// distance rather than a decision and the identity below holds for it. Whether a merge is
-    /// forbidden is a separate question with a separate answer, and folding the two into one
-    /// number would erase both.
+    /// Computed from the embeddings alone, with no blocked-pair substitution, so it is a
+    /// distance rather than a decision and the identity below holds for it.
     pub average_linkage: f32,
 
     /// The cosine distance between the two groups' normalized means.
     ///
-    /// This is what [`crate::ADOPTION_DISTANCE`] thresholds, and the quantity
-    /// [`crate::IDENTIFY_DISTANCE`] is measured in -- the distance between a cluster's
+    /// This is the quantity [`crate::IDENTIFY_DISTANCE`] is measured in -- the distance between a cluster's
     /// reference vector and another's.
     pub centroid: f32,
 
@@ -50,7 +46,7 @@ pub struct GroupDistance {
 /// empty or has no direction.
 ///
 /// Members must be unit length and of one dimensionality -- which is what one embedding model
-/// produces, and what [`crate::Clustering::turn_embeddings`] hands over.
+/// produces, such as the per-turn embeddings of one speaker.
 ///
 /// For unit-length members these are not two independent measurements but one. With `a` and
 /// `b` the *unnormalized* group means, the mean of the cross-group pairwise cosine distances
@@ -103,11 +99,8 @@ pub fn group_distance(a: &[&[f32]], b: &[&[f32]]) -> Option<GroupDistance> {
 /// unreachable for real voices but trivially reachable in a test, and a zero vector normalizes
 /// to itself, which would otherwise be reported as a confident distance of 1.0 to everything.
 ///
-/// Visible to the crate because [`crate::reference_duration_sweep`] builds references out of
-/// parts of a cluster and has to build them the way the pipeline's `reference_embedding`
-/// does, or it would be
-/// measuring an algorithm meethook does not run. Reaching for this rather than re-deriving a
-/// mean over there is what makes that a fact about the code instead of a comment.
+/// Visible to the crate so that anything building a reference out of parts of a cluster builds
+/// it the way the pipeline's `reference_embedding` does, rather than re-deriving a mean.
 pub(crate) fn group_mean(members: &[&[f32]]) -> Option<(Vec<f32>, f32)> {
     let mut mean = vec![0.0f32; members.first()?.len()];
     for member in members {
@@ -132,7 +125,7 @@ pub(crate) fn group_mean(members: &[&[f32]]) -> Option<(Vec<f32>, f32)> {
 /// The raw arithmetic only -- no length checks, no renormalization, and no
 /// blocked-pair policy. For unit-length inputs the dot product *is* the cosine,
 /// so nothing here re-derives it; callers that substitute infinity for a pair
-/// segmentation heard at once (`crate::speakers` does) keep that policy at
+/// heard at once keep that policy at
 /// their own call site rather than folding it into this helper.
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot(a, b)

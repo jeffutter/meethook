@@ -3,9 +3,8 @@
 //!
 //! [`crate::IDENTIFY_DISTANCE`] is only as good as the population it was priced against, and
 //! the thing that prices it is not another distance -- it is a *population* of them. Hundreds of pairs, split into the two that matter: two recordings of
-//! one person, and two recordings of two people. `cluster-speaker-track` prints every
-//! cluster-to-reference distance for one session, which is the right arithmetic at the wrong
-//! scale; false-accept rate, false-reject rate, equal-error rate and "is there any cut that
+//! one person, and two recordings of two people. A single session's distance table is the right
+//! arithmetic at the wrong scale; false-accept rate, false-reject rate, equal-error rate and "is there any cut that
 //! separates these at all" are not obtainable by reading a table by eye.
 //!
 //! This module is that arithmetic and none of the plumbing -- no files, no models, no session
@@ -34,8 +33,8 @@
 //! - **A false accept is a different-speaker pair below the cut; a false reject is a
 //!   same-speaker pair at or above it.**
 //! - **The median of an even count is the mean of the two middle values**, and an empty
-//!   population is [`None`] rather than zeroes or NaN. Both inherited verbatim from
-//!   `cluster-speaker-track`, which is the other caller.
+//!   population is [`None`] rather than zeroes or NaN. Both inherited verbatim from the
+//!   diagnostic this module was extracted from.
 //! - **Percentiles are nearest-rank** on the sorted copy, so `p05` and `p95` are always values
 //!   that actually occurred rather than interpolations between two that did.
 //! - **The equal-error rate is the mean of the two rates at the cut minimising their
@@ -49,7 +48,7 @@ use std::cmp::Ordering;
 ///
 /// Which pairs are legal is not decided here -- it is a question about items rather than about
 /// numbers, and the runner enforces it. The rule that matters is that no pair drawn from a
-/// single recording session is ever a trial: that is `MERGE_DISTANCE`'s question, and folding
+/// single recording session is ever a trial: that is a question about within-session variation, and folding
 /// those in would flatter the same-speaker side with exactly the within-session variation
 /// [`crate::IDENTIFY_DISTANCE`] does not govern.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -511,8 +510,8 @@ mod tests {
     }
 
     /// Two medians, so neither is right by accident: an odd count takes the middle value and
-    /// an even count takes the mean of the two middles. The same rule `cluster-speaker-track`
-    /// has always used, restated here because this is now the only place it is implemented.
+    /// an even count takes the mean of the two middles. The rule the original
+    /// diagnostics used, restated here because this is the only place it is implemented.
     #[test]
     fn the_median_takes_the_middle_value_and_the_mean_of_two_middles() {
         let odd = Spread::of(&[0.4, 0.1, 0.3, 0.2, 0.5]).unwrap();

@@ -21,12 +21,11 @@
 //! ```text
 //! meethook transcribe --root /tmp/calibration
 //! printf 'Alice\n' | meethook enroll --root /tmp/calibration
-//! MEETHOOK_ROOT=/tmp/calibration \
-//!   cargo run --release --example cluster-speaker-track /tmp/calibration/sessions/<second-id>
+//! meethook sessions --root /tmp/calibration
 //! ```
 //!
 //! The root is `--root` or `$MEETHOOK_ROOT`, and **there is deliberately no `~/meethook`
-//! fallback**, unlike `cluster-speaker-track`. A tool whose whole purpose is to create session
+//! fallback**, unlike a read-only diagnostic. A tool whose whole purpose is to create session
 //! directories should not be able to create them among a real set of recordings because an
 //! environment variable was unset.
 //!

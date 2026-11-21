@@ -182,7 +182,7 @@ impl WhisperEngine {
 
     /// False when recognition is running on the CPU because `MEETHOOK_CPU` asked it to.
     ///
-    /// Mirrors [`crate::OnnxDiarizer::accelerated`], for the same reason and with the same
+    /// Mirrors [`crate::NemotronDiarizer::accelerated`], for the same reason and with the same
     /// rule: a CPU run is correct and many times slower, and reporting is the caller's job,
     /// so loading prints on no path at all.
     pub fn accelerated(&self) -> bool {

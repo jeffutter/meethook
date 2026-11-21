@@ -1,8 +1,10 @@
 ---
+superseded_by: decision-14
+updated_date: '2026-11-21T06:07:00Z'
 id: decision-003
 title: Diarization and speaker clustering
 date: '2026-08-27 04:39'
-status: accepted
+status: superseded
 ---
 Diarization decodes pyannote's `segmentation-3.0` ONNX model in 10-second, non-overlapping windows and embeds each turn with a WeSpeaker ResNet34 model, both run through the `ort` crate — chosen over NeMo's Sortformer (broken ONNX export) and TitaNet (less turnkey export than WeSpeaker) for a zero-Python-dependency pipeline. Turns are clustered by constrained agglomerative clustering with average linkage over cosine distance, stopped at a single measured threshold (`MERGE_DISTANCE = 0.45`), biased deliberately toward under-merging: a silent merge misattributes one person's words to another, while a missed merge only adds a visible extra "Unknown" speaker. Two supervision signals feed the clustering for free from segmentation's own output — a cannot-link constraint (turns segmentation heard in the same window under different local speakers can never merge) and a must-link seed (turns heard together under the same local speaker start pre-merged) — both free of any threshold or embedding cost.
 

@@ -24,32 +24,6 @@ pub const WHISPER_MODEL: ModelSpec = ModelSpec {
     size_bytes: 1_624_555_275,
 };
 
-/// The speaker-segmentation graph diarization runs over the speaker track.
-///
-/// pyannote segmentation 3.0, exported to ONNX. It consumes a fixed-length window of raw
-/// audio and emits, per frame, a distribution over the *powerset* of up to three concurrent
-/// speakers -- which is why the output's last dimension is 7 (silence, three singles, three
-/// pairs) rather than a speaker count.
-///
-/// Graph contract, asserted in the `onnx` module's smoke test:
-/// input `input_values` f32 `[batch_size, num_channels, num_samples]`;
-/// output `logits` f32 `[batch_size, num_frames, 7]`.
-///
-/// The file name is the repository's, not the repository's `model.onnx`: the models
-/// directory is flat and shared, so a generic name would collide with the next ONNX model
-/// added.
-///
-/// Like [`WHISPER_MODEL`], the URL pins an immutable revision and the hash and size come
-/// from the git-LFS pointer Hugging Face serves at the `raw/` path, so bumping the revision
-/// does not require downloading the weights to re-derive them.
-pub const SEGMENTATION_MODEL: ModelSpec = ModelSpec {
-    file_name: "pyannote-segmentation-3.0.onnx",
-    url: "https://huggingface.co/onnx-community/pyannote-segmentation-3.0/resolve/\
-          733a93b6473d019a773298e08cefa686894b1854/onnx/model.onnx",
-    sha256: "057ee564753071c0b09b5b611648b50ac188d50846bff5f01e9f7bbf1591ea25",
-    size_bytes: 5_986_908,
-};
-
 /// The speaker-embedding graph that turns a segment of speech into a voice fingerprint.
 ///
 /// WeSpeaker's VoxCeleb ResNet34-LM. It takes fbank features rather than raw audio -- 80
@@ -132,7 +106,7 @@ pub const NEMOTRON_DIARIZATION_DATA: ModelSpec = ModelSpec {
 /// a complex correction to add back through the inverse STFT. See [`crate::VoiceIsolator`].
 ///
 /// The file name is the repository's `voice_isolator_offline.onnx` with underscores turned to
-/// hyphens, to match the other entries in this flat directory. Like [`SEGMENTATION_MODEL`], the
+/// hyphens, to match the other entries in this flat directory. Like [`WHISPER_MODEL`], the
 /// URL pins an immutable revision and the hash and size come from the git-LFS pointer served at
 /// the `raw/` path.
 pub const VOICE_ISOLATOR_MODEL: ModelSpec = ModelSpec {
@@ -165,9 +139,8 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    const ALL: [&ModelSpec; 8] = [
+    const ALL: [&ModelSpec; 7] = [
         &WHISPER_MODEL,
-        &SEGMENTATION_MODEL,
         &EMBEDDING_MODEL,
         &FIRERED_VAD_MODEL,
         &NEMOTRON_DIARIZATION_GRAPH,

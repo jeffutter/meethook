@@ -1,5 +1,4 @@
-//! Diarizing a speaker track with Nemotron-3-Diarization, producing the same [`Diarization`]
-//! the pyannote pipeline does.
+//! Diarizing a speaker track with Nemotron-3-Diarization, producing a [`Diarization`].
 //!
 //! Nemotron says who spoke when but gives no voice fingerprint, and a [`SpeakerCluster`] is
 //! mostly fingerprint. So the slots' turns (see [`slot_turns`]) are embedded with the existing
@@ -23,15 +22,15 @@ use crate::nemotron_mel::NemotronMel;
 use crate::nemotron_stream::{SpeakerStep, speaker_probabilities};
 use crate::nemotron_turns::{SlotTurn, slot_turns};
 use crate::progress::Phase;
-use crate::segmentation::LocalTurn;
 use crate::speakers::{
-    MIN_EMBEDDABLE_SECONDS, TurnEmbedder, WeSpeaker, reference_embedding, representatives, slice,
+    MIN_EMBEDDABLE_SECONDS, Turn, TurnEmbedder, WeSpeaker, reference_embedding, representatives,
+    slice,
 };
 use crate::{Result, onnx};
 
 /// Diarization by Nemotron's streaming speaker cache, with WeSpeaker voice fingerprints.
 ///
-/// Both graphs are loaded once and reused across a batch, like [`crate::OnnxDiarizer`].
+/// Both graphs are loaded once and reused across a batch, like the Whisper context: loading is the expensive part.
 pub struct NemotronDiarizer {
     graph: NemotronGraph,
     mel: NemotronMel,
@@ -53,7 +52,7 @@ impl NemotronDiarizer {
         })
     }
 
-    /// False when either graph fell back to CPU. See [`crate::OnnxDiarizer::accelerated`].
+    /// False when either graph fell back to CPU. Worth reporting: a CPU-only pass is correct and several times slower.
     pub fn accelerated(&self) -> bool {
         self.accelerated
     }
@@ -105,11 +104,9 @@ fn assemble(
         if turn.end_s - turn.start_s < MIN_EMBEDDABLE_SECONDS {
             continue;
         }
-        let clip = LocalTurn {
+        let clip = Turn {
             start_s: turn.start_s,
             end_s: turn.end_s,
-            window: 0,
-            local_speaker: turn.slot,
         };
         let Some(embedding) = embedder.embed(slice(samples, &clip))? else {
             continue;
@@ -140,13 +137,11 @@ fn assemble(
     for (id, (_, members)) in slots.iter().enumerate() {
         let embeddings: Vec<Vec<f32>> = members.iter().map(|m| m.embedding.clone()).collect();
         let indices: Vec<usize> = (0..embeddings.len()).collect();
-        let local: Vec<LocalTurn> = members
+        let local: Vec<Turn> = members
             .iter()
-            .map(|m| LocalTurn {
+            .map(|m| Turn {
                 start_s: m.turn.start_s,
                 end_s: m.turn.end_s,
-                window: 0,
-                local_speaker: m.turn.slot,
             })
             .collect();
         let heard_at_once_with = slots

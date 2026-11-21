@@ -16,7 +16,7 @@ pub struct TrialList {
 /// Every legal unordered pair of items.
 ///
 /// The one rule with teeth: **two items from the same session are never a trial**, whoever
-/// they are. For two items of one speaker that is `MERGE_DISTANCE`'s question rather than this
+/// they are. For two items of one speaker that is a question about within-session variation rather than this
 /// one; for two speakers recorded in a single session it is a pair that shares a microphone,
 /// a room and a codec, which is exactly the variation a cross-session threshold has to survive
 /// and would therefore be measured too favourably.
@@ -76,7 +76,7 @@ pub fn report_shape(voices: &[Voice], trials: &TrialList) {
     println!("  {same} same-speaker pair(s)");
     println!("  {} different-speaker pair(s)", trials.trials.len() - same);
     println!(
-        "  {} pair(s) refused for sharing one session (MERGE_DISTANCE's question, not this one)",
+        "  {} pair(s) refused for sharing one session (within-session variation, not this question)",
         trials.within_session
     );
 

@@ -10,7 +10,6 @@
 //! 1.6 GB model in order to do nothing -- and they need to be testable against a fake
 //! recognizer rather than a real one.
 
-mod adoption;
 mod aec;
 mod align;
 mod asr;
@@ -56,9 +55,7 @@ mod nemotron_graph;
 pub mod mixdown;
 mod onnx;
 mod progress;
-mod reference;
 mod reference_policies;
-mod segmentation;
 mod speakers;
 mod timeline;
 mod trials;
@@ -69,15 +66,12 @@ mod voice_vectors;
 use std::io::Write;
 use std::path::PathBuf;
 
-pub use adoption::{
-    AdoptionPopulations, CentroidPair, Declined, PairLabel, Side, adoption_populations,
-};
 pub use aec::{Cleaned, Cleaning, PassThrough, cancel_bleed};
 pub use align::{Alignment, NotMeasurable, measure_reference_lag};
 pub use asr::{AsrSegment, SpeechToText, WhisperEngine};
 pub use attribution::{Attribution, Naming, attributions, resolve_denials};
 pub use audio::{TARGET_RATE, read_track_16k_mono};
-pub use diarize::{Diarization, Diarize, OnnxDiarizer, SpeakerTurn};
+pub use diarize::{Diarization, Diarize, SpeakerTurn};
 pub use gpu::{CPU_ENV_VAR, NoMetalDevice};
 pub use identify::{
     IDENTIFY_DISTANCE, Identification, Resemblance, TENTATIVE_DISTANCE, TENTATIVE_FLOOR_SECONDS,
@@ -97,8 +91,7 @@ pub use loudness::integrated_lufs;
 pub use merge::merge;
 pub use models::{
     EMBEDDING_MODEL, FIRERED_VAD_MODEL, NEMOTRON_DIARIZATION_DATA, NEMOTRON_DIARIZATION_GRAPH,
-    NEMOTRON_DIARIZATION_MODELS, SEGMENTATION_MODEL, VOICE_ISOLATOR_MLX_MODEL,
-    VOICE_ISOLATOR_MODEL, WHISPER_MODEL,
+    NEMOTRON_DIARIZATION_MODELS, VOICE_ISOLATOR_MLX_MODEL, VOICE_ISOLATOR_MODEL, WHISPER_MODEL,
 };
 pub use nemotron_diarize::NemotronDiarizer;
 pub use nemotron_graph::{NemotronGraph, StepOutput, encoder_valid};
@@ -106,18 +99,11 @@ pub use nemotron_mel::NemotronMel;
 pub use nemotron_stream::{SpeakerStep, speaker_probabilities};
 pub use nemotron_turns::{SlotTurn, slot_turns};
 pub use onnx::{Loaded, open_session};
-pub use reference::{
-    Decline, DeclinedPoint, FragmentProbe, ORIGIN_DISTANCE, Sampling, StoredReference, Sweep,
-    SweepPoint, Verdict, fragment_probe, reference_duration_sweep, stored_reference_distances,
-};
 pub use reference_policies::{
     ArmReport, ClosedSet, Misattribution, PolicyItem, PolicyReport, PolicySweep, PolicyVerdict,
     ReferencePolicy, policy_references, policy_sweep,
 };
-pub use segmentation::{LocalTurn, segment_speaker_track};
-pub use speakers::{
-    ADOPTION_DISTANCE, Clustering, MERGE_DISTANCE, SPEAKER_FLOOR_SECONDS, cluster_speaker_turns,
-};
+pub use speakers::SPEAKER_FLOOR_SECONDS;
 pub use timeline::{mic_offset_seconds, speaker_offset_seconds};
 pub use trials::{
     EqualError, Spread, Trial, TrialReport, ZeroFalseAccept, score_trials, wilson_interval,
@@ -185,14 +171,9 @@ pub enum Error {
         denom: u32,
     },
 
-    /// Everything that can go wrong once the segmentation graph is already loaded:
-    /// inference itself, and an output that does not match the shape the decoder reads.
-    /// Loading is [`Error::Onnx`].
-    #[error("speaker segmentation failed: {0}")]
-    Segmentation(String),
-
-    /// The same, one graph later: inference through the embedding model, or an output that
-    /// is not the 256-dimensional vector clustering compares.
+    /// Everything that can go wrong once the embedding graph is loaded: inference through the
+    /// embedding model, or an output that is not the 256-dimensional vector speakers are
+    /// compared by.
     #[error("speaker embedding failed: {0}")]
     Embedding(String),
 
@@ -1551,8 +1532,8 @@ mod tests {
         }
     }
 
-    /// The two real diarizers (pyannote and Nemotron) number their clusters differently, but
-    /// both feed the same files. A fake diarizer stands in for either: the schema versions in
+    /// Diarizers number their clusters differently, but
+    /// all feed the same files. A fake diarizer stands in for any of them: the schema versions in
     /// the files a session carries are the constants, whoever produced the clusters.
     #[test]
     fn the_session_files_keep_their_schema_versions_whatever_the_diarizer() {
@@ -1586,7 +1567,7 @@ mod tests {
 
     /// A name given by hand survives a `--force` re-run by a different diarizer, as long as
     /// the voice is the same. The second fake numbers the same two voices the other way round,
-    /// which is what switching between pyannote and Nemotron does to cluster ids.
+    /// which is what switching diarizers does to cluster ids.
     #[test]
     fn a_hand_given_name_survives_a_re_run_with_a_differently_numbered_diarizer() {
         let root = tempfile::tempdir().unwrap();

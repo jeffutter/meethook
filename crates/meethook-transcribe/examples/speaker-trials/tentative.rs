@@ -14,9 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use meethook_session::{EnrolledSpeaker, EnrolledSpeakers, Paths, SpeakerCluster};
 use meethook_transcribe::{
-    Spread, TARGET_RATE, TENTATIVE_DISTANCE, TENTATIVE_FLOOR_SECONDS, build_session,
-    cluster_speaker_turns, identify_clusters, rank_enrolled, read_track_16k_mono,
-    segment_speaker_track, tentative_identifications, tentative_pairs,
+    Diarize, Spread, TARGET_RATE, TENTATIVE_DISTANCE, TENTATIVE_FLOOR_SECONDS, build_session,
+    identify_clusters, rank_enrolled, read_track_16k_mono, tentative_identifications,
+    tentative_pairs,
 };
 
 use super::Args;
@@ -88,17 +88,8 @@ pub fn report_tentative(paths: &Paths, args: &Args, items: &[Item], voices: &[Vo
         let wanted = (args.seconds * f64::from(TARGET_RATE)) as usize;
         let audio = &track[..wanted.min(track.len())];
 
-        let (segmenter, embedder) = models.graphs();
-        let turns = match segment_speaker_track(audio, segmenter) {
-            Ok(turns) => turns,
-            Err(e) => {
-                println!("  skipped: {e}");
-                drop(built);
-                continue;
-            }
-        };
-        let clustering = match cluster_speaker_turns(audio, &turns, embedder) {
-            Ok(clustering) => clustering,
+        let diarization = match models.diarizer().diarize(audio) {
+            Ok(diarization) => diarization,
             Err(e) => {
                 println!("  skipped: {e}");
                 drop(built);
@@ -109,7 +100,7 @@ pub fn report_tentative(paths: &Paths, args: &Args, items: &[Item], voices: &[Vo
             let _ = std::fs::remove_dir_all(built.paths.dir());
         }
 
-        let clusters = clustering.clusters;
+        let clusters = diarization.clusters;
         // The populations the cut is priced from, measured through the same function the
         // constant's documentation names: labelled negatives, and the unlabelled side carried
         // beside them so its shape shows up instead of hiding.

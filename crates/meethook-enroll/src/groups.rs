@@ -49,7 +49,7 @@
 //!
 //! **The window, and 0.40 inside it.** Upper edge: **0.429**, the closest ear-confirmed
 //! different-person centroid pair on record -- carried secondhand from
-//! [`meethook_transcribe::MERGE_DISTANCE`]'s documentation of session `20260810-093047`, a
+//! [`meethook_transcribe::IDENTIFY_DISTANCE`]'s documentation of session `20260810-093047`, a
 //! directory not on this machine, cited as what that doc records rather than as something the
 //! command reproduces. A cut at or past it admits the geometry that files one real person's
 //! speech under another's name. Lower edge: **0.3240**, the closest below-floor pair anywhere
@@ -60,7 +60,7 @@
 //! 132033's twelve pairs under 0.40 -- one guarded heard-at-once pair and eleven unlabelled
 //! ones -- chain into six bundled questions covering seventeen fragments. Rejected
 //! alternatives:
-//! 0.45 (`MERGE_DISTANCE`'s value) is at or past the 0.429 ceiling and lets a second
+//! 0.45 is at or past the 0.429 ceiling and lets a second
 //! provably-different pair in at 0.4196, separated only by the veto; anything at or below
 //! 0.3240 asks nothing together anywhere; and widening on the unlabelled distribution cannot
 //! be done at all until TASK-072 labels it, since an unlabelled pair scored either way is a
@@ -83,8 +83,8 @@
 //! `7bb2f06e…` and 256-dimensional output, and a model swap at the *same dimension* is
 //! invisible to every existing guard, so the pinned hash is the thing to check against the
 //! centroids stored in each `speaker_clusters.json`. Also: `PROMPT_FLOOR_SECONDS` here (it
-//! selects the pool), the 0.5 s embeddable-turn minimum in transcribe's clustering (it shapes
-//! what becomes a fragment), [`meethook_transcribe::MERGE_DISTANCE`] (the outer ceiling), the
+//! selects the pool), the 0.5 s embeddable-turn minimum in transcribe's diarizer (it shapes
+//! what becomes a fragment), the 0.429 ceiling above, the
 //! mean-then-normalize pooling in `voice_vectors::group_mean` that produced these centroids,
 //! and any weakening of the heard-at-once veto -- the negatives are guarded by it, so a weaker
 //! veto means re-pricing directly against 0.2074. Re-checking costs a re-run of the command

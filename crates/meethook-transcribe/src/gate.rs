@@ -7,7 +7,7 @@
 //! every turn in it is timed wrongly, which [`crate::merge()`] then interleaves against the
 //! speaker track in the wrong order. Keeping the policy as pure functions over region lists
 //! means it is exercised in microseconds by the tests at the bottom of this file, the way
-//! `segmentation::decode_powerset` and [`crate::merge()`] already are.
+//! `nemotron_turns::slot_turns` and [`crate::merge()`] already are.
 //!
 //! # Why splice rather than decode each region
 //!

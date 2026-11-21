@@ -23,17 +23,11 @@ use serde::Serialize;
 /// centroid on one side, an enrolled reference on the other. 0 is the same direction, 1 is
 /// orthogonal. Nothing is averaged over pairs on either side.
 ///
-/// # It is not `speakers::MERGE_DISTANCE`, and not merely because it is calibrated separately
+/// # A centroid cut, not an average-linkage cut
 ///
-/// A reader arriving from `speakers.rs` expects two constants that are both cosine distances,
-/// both about "same voice or not", to be the same measurement applied in two places. They are
-/// not, and that reader is the one these paragraphs exist to stop.
-///
-/// `MERGE_DISTANCE` thresholds **average linkage**: the mean over every cross-group pair of
-/// turn embeddings, one distance per pair of turns, averaged. This constant thresholds the
-/// distance between the two sides' *means*. Averaging distances is not the distance of
-/// averages, and for unit-length members [`crate::group_distance`] gives the exact relation
-/// between the two, word for word as it states it there:
+/// Averaging distances is not the distance of averages. For unit-length members
+/// [`crate::group_distance`] gives the exact relation between the two, word for word as it
+/// states it there:
 ///
 /// ```text
 /// average_linkage = 1 - shrinkage * (1 - centroid)
@@ -41,31 +35,24 @@ use serde::Serialize;
 ///
 /// `shrinkage` is the product of the two *unnormalized* group-mean lengths: at most 1, and
 /// falling as either group grows or spreads out. So average linkage is centroid distance
-/// inflated by the shrinkage of the two means -- always the larger of the two numbers, with a
-/// gap that widens as either group gets less coherent. Two constants set to one value are
-/// therefore two different cuts, and a pair of voices can sit on opposite sides of both.
+/// inflated by the shrinkage of the two means -- always the larger of the two numbers. A cut
+/// calibrated on one of them is a different cut on the other, and this one is calibrated on
+/// the centroid distance, which is what is compared here.
 ///
-/// A pair that did. On clusters 1 and 3 of session `20260810-093047` the two group distances
-/// read **0.604** linkage and **0.429** centroid, putting the shrinkage at **0.693**. Both
-/// clusters were confirmed by ear to be two different people (Andrew, and Ryan). At a
-/// shared 0.45, clustering correctly declined the merge at 0.604 while identification accepted
-/// at 0.429 and filed 124.1 s of Ryan -- 9% of the speech on that track -- under Andrew.
-/// See TASK-020.
+/// The case that showed the difference: on clusters 1 and 3 of session `20260810-093047` the
+/// two group distances read **0.604** linkage and **0.429** centroid. Both clusters were
+/// confirmed by ear to be two different people (Andrew, and Ryan). A centroid cut of 0.45
+/// accepted at 0.429 and filed 124.1 s of Ryan -- 9% of the speech on that track -- under
+/// Andrew. See TASK-020.
 ///
-/// Those three numbers are the ones the defect was found at, on the clustering that shipped
-/// before TASK-018. Re-measured on the clustering that ships now -- where the same two voices
-/// hold 423.7 s and 119.5 s rather than 396.7 s and 124.1 s -- that pair reads **0.656**
-/// linkage, **0.429** centroid, shrinkage **0.603**, which `cluster-speaker-track` prints in
-/// its speaker-vs-speaker block. Both restatements satisfy the identity above, the centroid is
-/// unchanged to three figures, and the gap between the quantities has *widened* rather than
-/// closed, so nothing here rests on the older grouping. Two constants, 0.45 and 0.40, now sit
-/// either side of that pair rather than both above it -- by 0.029 on this side, where it was
-/// 0.079 while this constant was 0.35. That margin is the tightest constraint on this value and
-/// is what puts a hard ceiling below 0.429 on any further loosening.
+/// The centroid distance between those two is **0.429** on the clusters that shipped later too,
+/// so the margin of this constant below it is the tightest constraint on its value: 0.029 at
+/// 0.40, where it was 0.079 while this constant was 0.35. It is what puts a hard ceiling below
+/// 0.429 on any further loosening.
 ///
 /// # Where the value comes from
 ///
-/// From the two measured populations below, not from `MERGE_DISTANCE`.
+/// From the two measured populations below.
 ///
 /// **Cross-session corpus (TASK-014.04):** LibriSpeech dev-clean, 40 speakers, 67 items,
 /// grouped so every same-speaker pair spans different recording occasions. Same-speaker 36
@@ -138,8 +125,8 @@ use serde::Serialize;
 /// by the dozen, and "ten seconds" was a claim about answering one of them.
 ///
 /// Public so that the measurement can name the cut it is measuring against: the
-/// `cluster-speaker-track` example prints every cluster-to-reference distance alongside this
-/// value, and a calibration constant a diagnostic has to hard-code a copy of is a constant
+/// `speaker-trials` example prints its distances alongside this value, and a calibration
+/// constant a diagnostic has to hard-code a copy of is a constant
 /// that drifts out of agreement with the code it claims to describe. Exported for reading,
 /// not for deciding -- [`identify_clusters`] is argmax *then* threshold, so anything that
 /// compares against this on its own will call a reference that clears the cut but is not the
@@ -344,22 +331,18 @@ pub struct Resemblance {
 /// to two distant clusters in preference to one near one, which is the wrong bias -- and it is
 /// NP-hard besides. This is not an oversight to improve on.
 ///
-/// **No fallback to a second reference,** here or in the leftover-adoption pass. The
+/// **No fallback to a second reference,** here. The
 /// second-nearest reference is by construction the one that already lost the argmax, and
 /// awarding it is the same operation that filed 124.1 s of one person under another's name in
 /// session `20260810-093047` (TASK-020). It also cascades: a fallback can contest a third
 /// name, whose loser can contest a fourth, turning a per-name decision into a global
 /// assignment problem with no evidence behind it.
 ///
-/// # Why this is not the shape the adoption pass uses, which is not a divergence
+/// # The veto applies to decisions, not candidates
 ///
-/// The leftover-adoption pass in `speakers.rs` applies the same constraint *before* its
-/// argmax -- a blocked target is simply not a candidate. This applies it after. The two are
-/// answers to differently-shaped questions rather than two answers to one: adoption's
-/// constraint holds between a fragment and each candidate target, so it is known before the
-/// choice is made; identification's holds between two clusters, and no reference is blocked
-/// for a cluster a priori -- the conflict does not exist until some *other* cluster has taken
-/// the name. Adoption vetoes candidates. Identification vetoes decisions. See TASK-018.02.02.
+/// The heard-at-once constraint holds between two clusters, and no reference is blocked for a
+/// cluster a priori -- the conflict does not exist until some *other* cluster has taken the
+/// name. So identification vetoes decisions after the argmax rather than candidates before it.
 pub fn identify_clusters(
     clusters: &[SpeakerCluster],
     enrolled: &EnrolledSpeakers,
@@ -589,7 +572,7 @@ fn best_match(embedding: &[f32], enrolled: &EnrolledSpeakers) -> Option<Identifi
 ///   reads as "orthogonal" -- a measurement -- when nothing was measured. `best_match` can
 ///   afford to let its threshold reject that one line later; a ranking has no threshold to hide
 ///   behind, so the refusal is made here and both callers get it. This is the same rule
-///   [`crate::stored_reference_distances`] already applies to a pair of references.
+///   `best_match` applies to a pair of references.
 fn comparable_cosine(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.len() != b.len() || a.is_empty() {
         return None;
@@ -730,8 +713,8 @@ pub struct TentativePair {
 /// This function measures; it picks no threshold and holds no constant beyond the floor that
 /// selects its fragments. Scoring belongs to [`crate::score_trials`], presentation to
 /// `examples/speaker-trials`. The arithmetic is in the crate rather than the example for the
-/// reason [`crate::adoption_populations`] gives: a diagnostic whose conventions nobody can
-/// test is a number to believe rather than evidence.
+/// reason a diagnostic's conventions belong where they can be tested: otherwise it is a number
+/// to believe rather than evidence.
 ///
 /// Pairs whose embeddings differ in length, or are empty, take part in no distance: a cosine
 /// between unrelated spaces or across nothing is the fabricated comparison

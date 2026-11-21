@@ -10,12 +10,11 @@
 //! used as given.
 //!
 //! Run this in the ten seconds after a call ends, before anyone disperses. It needs no ONNX
-//! models, does no segmentation and no embedding, and touches nothing but the two wav files,
+//! models, does no diarization and no embedding, and touches nothing but the two wav files,
 //! so it works on a fresh checkout where `fetch-onnx-models` has never run. That is the
-//! whole point: `cluster-speaker-track` and `segment-speaker-track` can answer "is there
-//! anything here" only after a full model download and a segmentation pass, and they answer
-//! it as "0 turns", which is what a dead track and a track the model found nothing in both
-//! look like.
+//! whole point: the diarizer can answer "is there anything here" only after a full model
+//! download and a diarization pass, and it answers it as "0 turns", which is what a dead track and a track the model found
+//! nothing in both look like.
 //!
 //! What to read:
 //!

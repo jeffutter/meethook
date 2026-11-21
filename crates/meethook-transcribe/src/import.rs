@@ -1,6 +1,6 @@
 //! Turning wav files meethook did not record into a session directory it will accept.
 //!
-//! Everything downstream of `record` -- `transcribe`, `enroll`, `cluster-speaker-track` --
+//! Everything downstream of `record` -- `transcribe`, `enroll`, `speaker-trials` --
 //! works from a session directory, so until now the only way to get a voice into
 //! `speakers.json` was to hold a meeting. That makes measuring the thing the enrolled-speaker
 //! threshold is calibrated against (one person's stored reference versus that same person in
@@ -11,7 +11,7 @@
 //! directory that classifies as [`Classification::Valid`](meethook_session::Classification)
 //! and that the real `transcribe` and `enroll` code paths then treat like any other
 //! recording. Nothing here is a shortcut around those paths: the point is that the reference
-//! which comes out the far end was produced by the same diarization, clustering and
+//! which comes out the far end was produced by the same diarization and
 //! enrollment a meeting goes through, rather than hand-written into JSON.
 //!
 //! # The shape of a constructed session
@@ -20,8 +20,8 @@
 //! files must exist -- [`crate::transcribe_session`] treats an unreadable `mic.wav` as fatal
 //! while an absent `speaker.wav` merely degrades to a mic-only transcript -- but only one of
 //! them can carry a measurement, because diarization and embedding are run over the speaker
-//! track and nothing else. Audio placed on the mic track could never reach clustering,
-//! enrollment or `cluster-speaker-track`.
+//! track and nothing else. Audio placed on the mic track could never reach diarization
+//! or enrollment.
 //!
 //! `session.json` records the same `host_ticks` for both tracks, which makes both of
 //! `transcribe`'s offsets zero, so transcript timestamps are audio timestamps with nothing
@@ -29,9 +29,7 @@
 //! capture clock here to be offset from.
 //!
 //! Several sources are concatenated in the order given, separated by [`SPLICE_GAP_S`] of
-//! silence. The gap is not decoration -- it is wider than segmentation's own
-//! [`MAX_GAP_IN_TURN_S`], without which a splice between two people would be read as one
-//! continuous turn spanning both and quietly corrupt the clustering that follows.
+//! silence.
 
 use std::path::{Path, PathBuf};
 
@@ -43,16 +41,16 @@ use meethook_session::{
 
 use crate::audio::{self, TARGET_RATE};
 use crate::levels::LevelSummary;
-use crate::segmentation::MAX_GAP_IN_TURN_S;
 use crate::{Error, Result};
 
 /// Silence spliced between two consecutive source files, in seconds.
 ///
-/// Written against `MAX_GAP_IN_TURN_S` rather than as a loose number, because the only
-/// thing that matters about it is that it is comfortably the larger of the two: a shorter
-/// gap lets segmentation join the last turn of one file to the first turn of the next, and
-/// two different people merged into one turn produce an embedding of neither.
-pub const SPLICE_GAP_S: f64 = MAX_GAP_IN_TURN_S * 2.0;
+/// 0.5 s is the value this had while it was derived from the removed pyannote segmentation
+/// (twice its 0.25 s in-turn gap), kept as it was so imported sessions build the same as
+/// before. It is shorter than the Nemotron turn decoder's own merge gap
+/// (`nemotron_turns::MERGE_GAP_S`, 1.0 s), so the last turn of one file can be joined to the
+/// first turn of the next.
+pub const SPLICE_GAP_S: f64 = 0.5;
 
 /// How much digital silence `mic.wav` gets when the caller supplies no local track.
 ///
@@ -406,7 +404,7 @@ mod tests {
     }
 
     /// Three sources means three clips and two gaps, and the gap has to be the one
-    /// segmentation will not join across.
+    /// the diarizer will not join across.
     #[test]
     fn sources_are_concatenated_in_order_with_a_splice_gap_between_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -426,15 +424,10 @@ mod tests {
         let built = build_session(&Paths::new(root.path()), &sources, &[]).unwrap();
 
         let gap = (f64::from(TARGET_RATE) * SPLICE_GAP_S) as usize;
-        // The property that makes the gap worth writing at all, checked at compile time so
-        // that narrowing either constant fails the build rather than one test: a splice no
-        // wider than segmentation's own tolerance would be read as one continuous turn
-        // spanning both sources, and embed as neither speaker.
-        const { assert!(SPLICE_GAP_S > MAX_GAP_IN_TURN_S) };
 
         let speaker = audio::read_track_16k_mono(&built.paths.speaker_wav()).unwrap();
         assert_eq!(speaker.len(), TARGET_RATE as usize * 3 + gap * 2);
-        // The gaps land exactly where the arithmetic says, which is the part clustering
+        // The gaps land exactly where the arithmetic says, which is the part diarization
         // depends on.
         for splice in 1..3 {
             let start = splice * (TARGET_RATE as usize + gap) - gap;

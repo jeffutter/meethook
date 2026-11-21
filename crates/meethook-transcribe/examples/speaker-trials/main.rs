@@ -10,8 +10,8 @@
 //!   --threshold 0.55 trials.tsv
 //! ```
 //!
-//! Why this exists: `cluster-speaker-track` prints every cluster-to-reference distance for
-//! *one* session, which is the right arithmetic at the wrong scale. Deciding whether
+//! Why this exists: one session's cluster-to-reference distances are the right arithmetic at
+//! the wrong scale. Deciding whether
 //! `IDENTIFY_DISTANCE` is in the right place needs error rates over hundreds of pairs -- a
 //! false-accept rate, a false-reject rate, an equal-error rate, and whether the two
 //! distributions overlap at all -- and none of those are obtainable by reading a table by eye.
@@ -31,15 +31,15 @@
 //!
 //! The item -- one person as they sounded in one recording session -- is the unit here because
 //! that is what an enrolled reference *is*. Each becomes exactly one voice, through the same
-//! `build_session` -> `segment_speaker_track` -> `cluster_speaker_turns` path a real session
+//! `build_session` -> `NemotronDiarizer` path a real session
 //! takes, and the voice is the dominant cluster rather than a mean over clusters: `enroll`
 //! copies one cluster's embedding verbatim, so averaging here would be calibrating an
 //! algorithm meethook does not run.
 //!
 //! # Two rules that make the numbers mean what they claim
 //!
-//! **No pair drawn from a single session is a trial.** That is `MERGE_DISTANCE`'s question,
-//! and including such pairs would flatter the same-speaker side with exactly the within-session
+//! **No pair drawn from a single session is a trial.** That is a question about within-session
+//! variation, and including such pairs would flatter the same-speaker side with exactly the within-session
 //! variation `IDENTIFY_DISTANCE` does not govern. Excluded pairs are counted and printed, so
 //! the rule is visible rather than trusted.
 //!
@@ -191,8 +191,7 @@ pub struct Args {
 /// Hand-rolled rather than clap, matching the other examples in this crate: a diagnostic must
 /// never be the reason a build breaks.
 ///
-/// There is deliberately no `~/meethook` fallback for the root, unlike `cluster-speaker-track`
-/// and like `build-session`: this tool *creates* session directories, and it must not be able
+/// There is deliberately no `~/meethook` fallback for the root, like `build-session`: this tool *creates* session directories, and it must not be able
 /// to create a hundred of them among somebody's real recordings because a variable was unset.
 fn parse() -> Result<Args, String> {
     let mut root = std::env::var_os("MEETHOOK_ROOT").map(PathBuf::from);

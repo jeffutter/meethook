@@ -4,7 +4,7 @@
 //! the one tree they pull in through `#[path]` instead. What lives here is the small set of
 //! helpers the examples carried word for word -- a failure exit, a rate formatter, the model
 //! load with its CoreML-declined note, and the trial-report lines `speaker-trials` and
-//! `cluster-speaker-track` both print. The arithmetic those lines report on stays in the
+//! the other examples print. The arithmetic those lines report on stays in the
 //! library; only the printing is shared, because pushing presentation into the crate would
 //! make the library depend on diagnostic formatting.
 //!
@@ -67,12 +67,9 @@ pub fn load(root: &Path, file_name: &str) -> ort::session::Session {
 // ---------------------------------------------------------------------------------------
 // Trial-report lines
 //
-// `speaker-trials` reports a whole trial list; `cluster-speaker-track` scores one session's
-// adoption populations. Wherever the two print the same arithmetic they now call the same
-// printers below, indented to their own section rather than re-spelling the lines. The
-// headers stay at each call site: they differ (one says "separation", the other
-// "  separation:"), and the callers keep the surrounding prose that only makes sense in
-// context.
+// Printers shared by the trial reports, indented to each caller's own section rather than
+// re-spelling the lines. The headers stay at each call site, and the callers keep the
+// surrounding prose that only makes sense in context.
 // ---------------------------------------------------------------------------------------
 
 /// The false-accept / false-reject pair at one cut, in the wording both tools use for the

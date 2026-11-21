@@ -114,7 +114,7 @@ pub fn policy_references(policy: ReferencePolicy, confirmed: &[&[f32]]) -> Vec<V
 
 /// What [`crate::identify_clusters`] decided about one probe in one simulated database.
 ///
-/// The same three outcomes [`crate::Verdict`] names, and deliberately not that type: names
+/// The same outcomes [`crate::identify_clusters`] distinguishes, and deliberately not a shared type: names
 /// here are the corpus's own speaker labels rather than cluster ids, and a `String` in a
 /// `Misattributed` is the whole value of reading it. Its fourth outcome cannot arise here --
 /// each simulation identifies exactly one cluster, so there is nobody for the heard-at-once
@@ -704,8 +704,8 @@ fn nearest(probe: &[f32], references: &[Vec<f32>]) -> Option<f32> {
 /// distance printed beside a verdict cannot disagree with it.
 ///
 /// Different lengths or an empty vector give [`f32::INFINITY`] rather than a truncated `zip`'s
-/// plausible cosine -- the same refusal `best_match` and [`crate::reference_duration_sweep`]
-/// make, for the same reason: two spaces are not comparable at all.
+/// plausible cosine -- the same refusal `best_match`
+/// makes, for the same reason: two spaces are not comparable at all.
 fn distance(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return f32::INFINITY;
@@ -723,8 +723,8 @@ mod tests {
     // -----------------------------------------------------------------------------------
 
     /// A unit vector `degrees` off the first axis, so a test names the distance it means --
-    /// `1 - cos(degrees)` -- rather than a pile of decimals. The same helper `speakers.rs`,
-    /// `adoption.rs` and `reference.rs` state their fixtures with.
+    /// `1 - cos(degrees)` -- rather than a pile of decimals. The same helper `speakers.rs`
+    /// states its fixtures with.
     fn at(degrees: f32) -> Vec<f32> {
         let radians = degrees.to_radians();
         vec![radians.cos(), radians.sin(), 0.0, 0.0]

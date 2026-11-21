@@ -1,26 +1,23 @@
-//! Installs the ONNX graphs diarization needs, so the smoke test has weights to load.
+//! Installs the ONNX graphs diarization and speaker embedding need, so model-gated tests have weights to load.
 //!
 //! ```text
 //! cargo run --example fetch-onnx-models
 //! MEETHOOK_ROOT=/tmp/meethook cargo run --example fetch-onnx-models
 //! ```
 //!
-//! Until diarization is wired into `meethook transcribe`, nothing on the normal path
-//! acquires these files, and the graph-contract test in `onnx.rs` skips without them. This
-//! is that acquisition, on demand: the same [`ensure_model`] call the real command will
-//! make, against the same [`ModelSpec`] constants, so what gets installed here is byte for
-//! byte what the tool will install later -- verified against the embedded sha256, not
-//! merely downloaded.
+//! `cargo test` skips the graph-contract and model-gated tests when the weights are not
+//! installed. This installs them on demand: the same [`ensure_model`] call the real command
+//! makes, against the same [`ModelSpec`] constants, so what gets installed here is byte for
+//! byte what the tool installs -- verified against the embedded sha256, not merely downloaded.
 //!
-//! Together they are about 491 MB (the Nemotron weights are 199 MB and the voice isolator 261 MB of that), which is why this is a deliberate invocation rather than
+//! Together they are several hundred MB (the Nemotron weights are 199 MB and the voice
+//! isolator 261 MB of that), which is why this is a deliberate invocation rather than
 //! something `cargo test` does behind the user's back.
 
 use std::io::Write;
 
 use meethook_models::{ModelSpec, ensure_model};
-use meethook_transcribe::{
-    EMBEDDING_MODEL, NEMOTRON_DIARIZATION_MODELS, SEGMENTATION_MODEL, VOICE_ISOLATOR_MODEL,
-};
+use meethook_transcribe::{EMBEDDING_MODEL, NEMOTRON_DIARIZATION_MODELS, VOICE_ISOLATOR_MODEL};
 
 fn main() {
     let root = match std::env::var_os("MEETHOOK_ROOT") {
@@ -31,7 +28,7 @@ fn main() {
     };
     let models_dir = root.join("models");
 
-    for spec in [&SEGMENTATION_MODEL, &EMBEDDING_MODEL, &VOICE_ISOLATOR_MODEL]
+    for spec in [&EMBEDDING_MODEL, &VOICE_ISOLATOR_MODEL]
         .into_iter()
         .chain(&NEMOTRON_DIARIZATION_MODELS)
     {

@@ -5,16 +5,16 @@ use std::path::{Path, PathBuf};
 
 use meethook_session::Paths;
 use meethook_transcribe::{
-    EMBEDDING_MODEL, SEGMENTATION_MODEL, SPLICE_GAP_S, TARGET_RATE, build_session,
-    cluster_speaker_turns, read_track_16k_mono, segment_speaker_track,
+    Diarize, EMBEDDING_MODEL, NemotronDiarizer, SPLICE_GAP_S, TARGET_RATE, build_session,
+    read_track_16k_mono,
 };
 use serde::{Deserialize, Serialize};
 
 use super::Args;
 use super::cache::read_cache;
 use super::manifest::Item;
+use super::support::fail;
 use super::support::session_prep::{converted, levels};
-use super::support::{fail, load};
 
 /// One item's voice: the dominant cluster of the session built from its audio.
 #[derive(Clone, Serialize, Deserialize)]
@@ -29,34 +29,35 @@ pub struct Voice {
     pub embedding: Vec<f32>,
 }
 
-/// The two ONNX graphs, opened at most once and only if some item actually needs measuring.
+/// The diarizer, opened at most once and only if some item actually needs measuring.
 ///
 /// A run that re-scores a cache at a new threshold should not need the models on disk at all
 /// -- that is the whole point of the cache -- so loading is lazy rather than up front.
 pub struct Models {
     root: PathBuf,
-    segmenter: Option<ort::session::Session>,
-    embedder: Option<ort::session::Session>,
+    diarizer: Option<NemotronDiarizer>,
 }
 
 impl Models {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            segmenter: None,
-            embedder: None,
+            diarizer: None,
         }
     }
 
-    pub fn graphs(&mut self) -> (&mut ort::session::Session, &mut ort::session::Session) {
+    pub fn diarizer(&mut self) -> &mut NemotronDiarizer {
         let root = &self.root;
-        let segmenter = self
-            .segmenter
-            .get_or_insert_with(|| load(root, SEGMENTATION_MODEL.file_name));
-        let embedder = self
-            .embedder
-            .get_or_insert_with(|| load(root, EMBEDDING_MODEL.file_name));
-        (segmenter, embedder)
+        self.diarizer.get_or_insert_with(|| {
+            let models = root.join("models");
+            NemotronDiarizer::load(&models, &models.join(EMBEDDING_MODEL.file_name)).unwrap_or_else(
+                |e| {
+                    fail(&format!(
+                        "{e}\nrun `cargo run --release --example fetch-onnx-models` first"
+                    ))
+                },
+            )
+        })
     }
 }
 
@@ -163,20 +164,20 @@ fn measure_built(
         track.len() as f64 / f64::from(TARGET_RATE)
     );
 
-    let (segmenter, embedder) = models.graphs();
-    let turns = segment_speaker_track(audio, segmenter).map_err(|e| e.to_string())?;
-    let clustering = cluster_speaker_turns(audio, &turns, embedder).map_err(|e| e.to_string())?;
+    let diarization = models
+        .diarizer()
+        .diarize(audio)
+        .map_err(|e| e.to_string())?;
     println!(
-        "  {} turns, {} cluster(s), {} turn(s) too short to embed",
-        turns.len(),
-        clustering.clusters.len(),
-        clustering.skipped()
+        "  {} turns, {} cluster(s)",
+        diarization.turns.len(),
+        diarization.clusters.len()
     );
 
-    // Most talk time wins. `cluster_speaker_turns` already sorts groups that way, so this is
+    // Most talk time wins. The diarizer already sorts clusters that way, so this is
     // cluster 0 in practice -- taken by value rather than by position so that it stays the
     // documented rule rather than a dependency on an ordering stated elsewhere.
-    let dominant = clustering
+    let dominant = diarization
         .clusters
         .iter()
         .max_by(|a, b| a.speech_seconds.total_cmp(&b.speech_seconds))

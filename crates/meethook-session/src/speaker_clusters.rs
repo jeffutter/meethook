@@ -266,6 +266,24 @@ mod tests {
 
     /// The atomic write leaves no temp file behind, and lands on the one name the rest of
     /// the tool looks for.
+    /// A file a pre-Nemotron (pyannote-era) transcribe wrote, kept on disk as it was saved:
+    /// many-fragment clusters and a heard-at-once relation. The current reader must keep
+    /// reading it, because `enroll` opens sessions that were diarized before the switch.
+    #[test]
+    fn a_file_saved_before_the_nemotron_diarizer_still_reads() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/speaker_clusters_before_nemotron.json");
+
+        let read = SpeakerClusters::read(&path).unwrap();
+
+        assert_eq!(read.schema_version, SPEAKER_CLUSTERS_SCHEMA_VERSION);
+        assert_eq!(read.clusters.len(), 3);
+        assert_eq!(read.clusters[0].heard_at_once_with, [2]);
+        assert_eq!(read.clusters[2].heard_at_once_with, [0]);
+        assert_eq!(read.clusters[1].first_spoke_seconds, 41.0);
+        assert_eq!(read.clusters[0].representatives.len(), 2);
+    }
+
     #[test]
     fn writing_leaves_exactly_one_file_in_the_session_directory() {
         let dir = tempfile::tempdir().unwrap();

@@ -2,9 +2,10 @@
 id: doc-002
 title: Diarization and speaker-ID model/runtime evaluation
 type: other
-created_date: '2026-08-09 02:07'
-updated_date: '2026-08-09 02:08'
+created_date: 2026-08-09 02:07
+updated_date: '2026-11-21T06:07:00Z'
 ---
+> **Superseded for diarization.** The segmentation choice in section 4 was replaced by Nemotron-3-Diarization with its streaming speaker cache; see decision-014. The WeSpeaker embedding choice for speaker identification still stands.
 ## Scope
 
 TASK-001.03: which diarization approach + speaker-embedding model should meethook use for named speaker-ID against a small fixed set of recurring speakers, with no external Python dependency, embeddable directly in the Rust binary (candle / ONNX runtime bindings / similar) on Apple Silicon, batch (non-real-time) processing.

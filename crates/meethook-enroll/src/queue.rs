@@ -65,9 +65,9 @@ use meethook_session::unknown_labels;
 ///
 /// Same units, three different questions, and they do not imply one another:
 ///
-/// - `SPEAKER_FLOOR_SECONDS` (30 s) decides **which clusters are solid enough to adopt
-///   fragments into** -- how much evidence a centroid rests on before it is allowed to claim
-///   somebody else's turns. It is necessarily the larger: at 30 s the seventh participant
+/// - `SPEAKER_FLOOR_SECONDS` (30 s) decides **which clusters are solid
+///   speakers rather than fragments** -- how much evidence a centroid rests on before it is
+///   trusted. It is necessarily the larger: at 30 s the seventh participant
 ///   would not be asked about at all.
 /// - This one decides **which voices are worth asking about**. Getting it wrong costs a
 ///   question, in one direction or the other, and nothing else.

@@ -1,6 +1,6 @@
 //! Opening ONNX Runtime sessions.
 //!
-//! Two graphs run through here -- pyannote segmentation and the WeSpeaker embedder -- and
+//! Two graphs run through here -- Nemotron diarization and the WeSpeaker embedder -- and
 //! both want the same thing: CoreML where the ops allow it (macOS), CPU everywhere else.
 //! That policy lives in one function rather than at each call site, so a future change to
 //! how this machine is driven is one edit rather than two.
@@ -52,7 +52,7 @@ fn environment() -> ort::Result<&'static ort::environment::Environment> {
 /// only whether *registering* the provider may fail; the interesting failures happen later,
 /// when ONNX Runtime hands a partition to CoreML and Apple's compiler refuses it -- which
 /// surfaces from `commit_from_file` as a hard error and takes the whole load down with it.
-/// pyannote's segmentation graph is exactly the kind of model that provokes this, so the
+/// A transformer graph with contrib ops is exactly the kind of model that provokes this, so the
 /// second attempt is what keeps a working slow path from becoming no path at all.
 ///
 /// Nothing about the successful CoreML path is assumed to be all-or-nothing: ONNX Runtime
@@ -146,27 +146,19 @@ mod tests {
     use ort::value::{TensorElementType, ValueType};
 
     use super::*;
-    use crate::{EMBEDDING_MODEL, SEGMENTATION_MODEL};
+    use crate::EMBEDDING_MODEL;
     use meethook_models::ModelSpec;
 
     /// One end of a graph: the name, element type and rank the rest of this slice decodes
     /// against. Concrete dimensions are deliberately absent -- every axis these two graphs
     /// care about is symbolic (batch, samples, frames), so pinning numbers would pin
-    /// nothing real. The one fixed extent that *is* meaningful (7 powerset classes, 256
+    /// nothing real. The one fixed extent that *is* meaningful (256
     /// embedding dimensions) is checked separately below.
     struct Contract {
         name: &'static str,
         rank: usize,
     }
 
-    const SEGMENTATION_INPUT: Contract = Contract {
-        name: "input_values",
-        rank: 3,
-    };
-    const SEGMENTATION_OUTPUT: Contract = Contract {
-        name: "logits",
-        rank: 3,
-    };
     const EMBEDDING_INPUT: Contract = Contract {
         name: "feats",
         rank: 3,
@@ -188,7 +180,7 @@ mod tests {
 
     /// Opens `spec`'s weights, or returns `None` if they are not installed.
     ///
-    /// Returning rather than downloading is the point: these two files are 32 MB, and a
+    /// Returning rather than downloading is the point: these files are up to 200 MB, and a
     /// `cargo test` that silently reaches for them fails on a plane, in CI, and on a machine
     /// that has never run the tool -- none of which are the failure this test exists to
     /// catch.
@@ -229,25 +221,6 @@ mod tests {
         );
         assert_eq!(shape.len(), contract.rank, "{} rank", contract.name);
         shape.to_vec()
-    }
-
-    /// The graph contract both sibling slices decode against. Cheapest possible place to
-    /// pin it: a rename or a re-export upstream shows up here rather than as a confusing
-    /// tensor-shape error three layers into inference.
-    #[test]
-    fn the_segmentation_graph_takes_raw_audio_and_emits_powerset_logits() {
-        let Some(session) = open_if_installed(&SEGMENTATION_MODEL) else {
-            return;
-        };
-
-        assert_eq!(session.inputs().len(), 1);
-        assert_eq!(session.outputs().len(), 1);
-        check(&session.inputs()[0], &SEGMENTATION_INPUT);
-        let logits = check(&session.outputs()[0], &SEGMENTATION_OUTPUT);
-
-        // Silence, three single speakers, three pairs. Powerset decoding in the sibling
-        // slice reads these seven columns positionally.
-        assert_eq!(logits[2], 7, "powerset classes");
     }
 
     /// The Nemotron graph finds its weights by the literal name `model_fp16.onnx_data` beside

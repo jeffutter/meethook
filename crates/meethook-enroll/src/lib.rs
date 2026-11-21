@@ -162,8 +162,8 @@ use queue::PROMPT_FLOOR_SECONDS;
 /// None of them implies another, and they are deliberately not derived from each other:
 ///
 /// - [`meethook_transcribe::SPEAKER_FLOOR_SECONDS`] (30 s) decides **which clusters are solid
-///   enough to adopt fragments into**. Necessarily the largest: it is about a centroid being
-///   allowed to claim somebody else's turns.
+///   speakers rather than fragments**. Necessarily the largest: it is about how much evidence
+///   a centroid rests on before it is trusted.
 /// - [`PROMPT_FLOOR_SECONDS`] (5 s) decides **which voices are worth asking about**. Getting it
 ///   wrong costs a question in one direction or the other, and nothing on disk.
 /// - This one decides **which answers become references**. Naming somebody who spoke 8 s is

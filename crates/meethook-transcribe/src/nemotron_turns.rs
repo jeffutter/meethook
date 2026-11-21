@@ -25,7 +25,7 @@ const STAY_PROB: f32 = 0.25;
 /// (with the minimum length below) with no loss of agreement with pyannote's speech map
 /// (F1 about 0.84-0.93). On the 40 minute real track gap 0 / 0.5 / 1.0 / 1.5 s gave 598 / 485 /
 /// 378 / 308 turns: the gap is the knob that moves the count, and 1.0 s halves the 781 raw runs.
-const MERGE_GAP_S: f64 = 1.0;
+pub(crate) const MERGE_GAP_S: f64 = 1.0;
 
 /// Merged turns shorter than this many seconds are dropped (a turn of exactly this length is
 /// kept). Merging happens first, as in doc-015. On the 40 minute real track min 0 / 0.3 / 0.5 /

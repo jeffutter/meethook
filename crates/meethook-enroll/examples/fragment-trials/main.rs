@@ -21,7 +21,7 @@
 //!
 //! Each positional argument is a session directory (one holding `speaker_clusters.json`) or a
 //! parent whose subdirectories are sessions. There is deliberately **no `~/meethook`
-//! fallback**, unlike `cluster-speaker-track`: an operator-run measurement that silently
+//! fallback**, unlike older measurement tools: an operator-run measurement that silently
 //! picks a machine-local default prints numbers whose corpus nobody can name.
 //!
 //! The arithmetic is not here. Distances come from [`fragment_pairs`] (which also applies the
@@ -40,7 +40,7 @@ use meethook_transcribe::{
 
 /// Candidate cuts the population counts are printed against, ascending. A fixed list rather
 /// than a sweep because these are the values the constant's documentation argues between --
-/// vacuity below, `MERGE_DISTANCE`'s territory above -- and a table whose rows depend on the
+/// vacuity below, the 0.429 different-person ceiling above -- and a table whose rows depend on the
 /// data would make two corpora's tables unreadable side by side.
 const CANDIDATE_CUTS: [f32; 6] = [0.20, 0.30, 0.35, 0.40, 0.45, 0.50];
 
