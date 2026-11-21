@@ -16,6 +16,7 @@ mod record;
 #[cfg(any(target_os = "macos", test))]
 mod record_screen;
 mod screen;
+mod tui_kit;
 
 use std::path::PathBuf;
 
