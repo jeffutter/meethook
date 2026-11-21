@@ -147,6 +147,21 @@ xcodebuild -downloadComponent MetalToolchain
   `cd.yml`'s native `cargo build` in the dev shell, so they have MLX. `VoiceIsolator::required_model()`
   tells the caller which weights the build needs, so a package without MLX downloads the ONNX
   graph, not the MLX file.
+- **The macOS release is one file, and nothing links outside the system.** Three pieces:
+  the MLX shaders are embedded (below); ONNX Runtime is linked statically; and `libiconv` is
+  re-pointed at the system's. The dev shell has no onnxruntime on macOS on purpose
+  (`devShellBuildInputs` in `flake.nix`), so `ort-sys`'s pkg-config probe finds nothing and it
+  downloads pyke's hash-pinned static build (ONNX Runtime 1.31.0 with CoreML, 80 MB, cached in
+  `~/Library/Caches/ort.pyke.io`; the build needs network the first time). `ort`'s `download-binaries`
+  and `tls-native` features are enabled for macOS only, in `meethook-transcribe`'s manifest. nix's
+  Apple SDK has no `libiconv`, so its compiler wrapper links nix's copy by absolute `/nix/store`
+  path; `cd.yml`'s packaging step rewrites that one path to `/usr/lib/libiconv.2.dylib` with
+  `install_name_tool`, re-signs ad hoc, and fails the release if `otool -L` still shows anything
+  outside `/System/Library` and `/usr/lib`. That check is also what would catch a future regression
+  such as a dynamic library coming back. A dev-shell build run from inside another dev shell
+  inherits its `PKG_CONFIG_PATH`, so test this from a clean environment
+  (`env -i ... nix develop -c ...`), which is what CI is. The sandboxed `nix build` keeps
+  onnxruntime on its pkg-config path, so it links nix's dynamic 1.27 and downloads nothing.
 - **Shipping a binary: the shaders are inside it.** MLX will not start its GPU stack without a
   compiled `mlx.metallib`, and it can only read one from a file path (`device.cpp` creates libraries
   from a path or from source, never from memory; the default library is loaded in the `Device`

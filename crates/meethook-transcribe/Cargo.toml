@@ -51,8 +51,14 @@ libc = { workspace = true }
 # Solely for `MTLCreateSystemDefaultDevice`, the pre-flight device probe in `gpu`, without
 # which whisper.cpp's Metal path segfaults instead of failing.
 objc2-metal = { workspace = true }
-# The CoreML execution provider for the diarization and speaker-embedding graphs.
-ort = { workspace = true, features = ["coreml"] }
+# The CoreML execution provider for the diarization and speaker-embedding graphs, and a statically
+# linked ONNX Runtime: `download-binaries` fetches pyke's hash-pinned prebuilt (with CoreML) when
+# pkg-config finds no libonnxruntime, which is the case in the dev shell on macOS and anywhere
+# without one installed. The result links only system libraries, so the macOS release is a single
+# file (MLX.md). The sandboxed `nix build` has onnxruntime on its pkg-config path, so the probe
+# wins there and nothing is downloaded. macOS only: Linux keeps the pkg-config path alone, and
+# never compiles the TLS stack the download needs (`tls-native` is Security.framework here).
+ort = { workspace = true, features = ["coreml", "download-binaries", "tls-native"] }
 # `metal` (not `coreml`): Metal alone is fast enough for batch, non-real-time use, and
 # Core ML would need a one-time Python/coremltools conversion step this project exists to
 # avoid. This is what makes `WhisperContextParameters::use_gpu` default to true on macOS;

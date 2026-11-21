@@ -109,6 +109,18 @@
               pkgs.apple-sdk_26
             ];
 
+          # The dev shell's build inputs. On macOS it has no onnxruntime on purpose: `ort-sys` tries
+          # pkg-config first and only downloads its prebuilt, statically linked ONNX Runtime when
+          # the probe finds nothing, and a static runtime is what lets the macOS release be one
+          # file with no /nix/store libraries in it (the release tarballs are built in this shell;
+          # see MLX.md). The sandboxed `nix build` below keeps onnxruntime: it has no network, so
+          # it needs the probe to succeed. Linux keeps it in both: its CI and tests link the nix
+          # library dynamically, which is unchanged.
+          devShellBuildInputs =
+            if isMacos
+            then builtins.filter (input: input != pkgs.onnxruntime) commonBuildInputs
+            else commonBuildInputs;
+
           # ort-sys probes pkg-config for libonnxruntime at build time; the pkg-config
           # wrapper mkShell (or crane's build) generates from buildInputs is what makes the
           # probe find it.
@@ -191,7 +203,7 @@
             ];
 
             env = commonEnv;
-            buildInputs = commonBuildInputs;
+            buildInputs = devShellBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
 
             shellHook = nixpkgs.lib.optionalString isMacos ''

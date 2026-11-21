@@ -5,10 +5,12 @@
 //! That policy lives in one function rather than at each call site, so a future change to
 //! how this machine is driven is one edit rather than two.
 //!
-//! The ONNX Runtime itself is not vendored and not downloaded. `ort-sys` probes pkg-config
-//! for `libonnxruntime` and links the system's copy -- the flake's on macOS, a package such
-// as `libonnxruntime-dev` elsewhere -- see the `ort` entry in the workspace `Cargo.toml`
-//! for why that path was chosen over the (now deleted) dynamic-load one.
+//! The ONNX Runtime itself is not vendored. `ort-sys` probes pkg-config for `libonnxruntime` and
+//! links that when it finds one: the flake's copy in the sandboxed `nix build` and on Linux, a
+//! package such as `libonnxruntime-dev` elsewhere. When it finds none (the macOS dev shell, which
+//! has none on purpose) it downloads pyke's hash-pinned prebuilt and links it statically, which is
+//! what makes the macOS release a single file; see the `ort` entry in the workspace `Cargo.toml`
+//! and MLX.md for why that path was chosen over the (now deleted) dynamic-load one.
 
 use std::path::Path;
 

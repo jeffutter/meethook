@@ -72,6 +72,25 @@ jobs:
             # Reduce binary size by removing debug symbols.
             strip "$BIN"
 
+            if [ "${{ matrix.job.os-name }}" = macos ]; then
+              # The release must be one file that runs on any Mac. ONNX Runtime is linked
+              # statically (the dev shell has none to find, so ort-sys downloads its static
+              # build; see MLX.md), and the MLX shaders are embedded. What is left is libiconv:
+              # nix's Apple SDK has none, so its compiler wrapper links nix's copy, by absolute
+              # /nix/store path. macOS ships the same library at /usr/lib/libiconv.2.dylib, so
+              # point the binary there, re-sign (editing invalidates the signature, and arm64
+              # will not run an unsigned or broken binary), then fail the release if anything
+              # outside the system is still linked.
+              for lib in $(otool -L "$BIN" | awk '/\/nix\/store\/.*libiconv/ {print $1}'); do
+                install_name_tool -change "$lib" /usr/lib/libiconv.2.dylib "$BIN"
+              done
+              codesign --force --sign - "$BIN"
+              if otool -L "$BIN" | awk 'NR > 1 {print $1}' | grep -v -e '^/System/Library/' -e '^/usr/lib/'; then
+                echo "::error::$BIN links libraries outside the system (listed above); it would not run on a Mac without them"
+                exit 1
+              fi
+            fi
+
             RELEASE_NAME="${BIN}-${GITHUB_REF_NAME}-${{ matrix.job.os-name }}-${{ matrix.job.architecture }}"
             tar czvf "$RELEASE_NAME.tar.gz" "$BIN"
             shasum -a 256 "$RELEASE_NAME.tar.gz" > "$RELEASE_NAME.sha256"

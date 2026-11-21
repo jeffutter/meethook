@@ -237,9 +237,12 @@ whisper-rs = { version = "0.16", default-features = false }
 #
 # `pkg-config` is how the runtime is found: `ort-sys`'s build script probes for the module
 # named `libonnxruntime` before anything else and returns immediately on a hit, so the
-# flake's onnxruntime is what gets linked and nothing is downloaded. `download-binaries` is
-# not a default feature, so a missed probe surfaces as a link error rather than as a
-# silently different runtime.
+# flake's onnxruntime is what gets linked (dynamically) and nothing is downloaded. That is
+# the sandboxed `nix build` and Linux. On macOS meethook-transcribe also enables
+# `download-binaries`, so a missed probe (the macOS dev shell deliberately has no onnxruntime)
+# downloads pyke's hash-pinned static build instead of failing to link: the macOS release is
+# then one file with no nix store libraries. The download is ONNX Runtime 1.31.0 where the
+# flake's is 1.27.1; the ONNX-backed tests pass on both.
 #
 # `api-27` is the ceiling, not an arbitrary choice: `ort-sys` rejects a probed library whose
 # minor version is below the requested API level, and the flake's runtime is 1.27. Asking
