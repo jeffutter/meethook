@@ -18,7 +18,7 @@ use meethook_enroll::Refusal;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::Sounding;
-use super::state::{Event, Mode, View};
+use super::state::{Event, Focus, Mode, View};
 use crate::tui_kit::{Binding, Context, HelpRow, Hint, KeySpec, Keymap, Theme, key_label};
 
 pub const NORMAL: Context = Context("normal");
@@ -27,6 +27,8 @@ pub const FILTER: Context = Context("filter");
 /// The play key's hint when the voice has no samples.
 const PLAY_NO_AUDIO: &str = "play (no audio)";
 /// The play-the-line key's hint when the selected line has no samples.
+/// Enter's hint on the voice list while the cursor is off the voice being asked about.
+const WORK_ON: &str = "work on";
 const LINE_NO_AUDIO: &str = "line (no audio)";
 
 pub struct Keys {
@@ -103,6 +105,13 @@ fn table() -> Vec<Binding<Event>> {
             "Focus the candidates (alias)",
         ),
         // Answering.
+        b(
+            n,
+            key(KeyCode::Enter),
+            E::Choose,
+            WORK_ON,
+            "Work on the voice under the cursor (voice list, on another row)",
+        ),
         b(
             n,
             key(KeyCode::Enter),
@@ -248,7 +257,8 @@ fn live(view: &View<'_>, binding: &Binding<Event>) -> bool {
             .is_some_and(|s| s.audio.is_empty()),
         // Enter does nothing on a row refused for taking a name off another voice, and `o`
         // does nothing on any other, so the labels are swapped rather than both offered.
-        (Event::Choose, hint) => hint.is_empty() || !taken(view),
+        (Event::Choose, WORK_ON) => view.mode == Mode::Normal && cursor_elsewhere(view),
+        (Event::Choose, hint) => hint.is_empty() || (!cursor_elsewhere(view) && !taken(view)),
         (Event::Anyway, _) => taken(view),
         (Event::Confirm, _) => view
             .guess
@@ -258,6 +268,12 @@ fn live(view: &View<'_>, binding: &Binding<Event>) -> bool {
         (Event::ClearFilter, _) => !view.filter.is_empty(),
         _ => true,
     }
+}
+
+/// Whether Enter would go to another voice: the voice list has the focus and its cursor is off
+/// the row being asked about.
+fn cursor_elsewhere(view: &View<'_>) -> bool {
+    view.focus == Focus::Voices && view.rows.get(view.cursor).is_some_and(|row| !row.current)
 }
 
 fn taken(view: &View<'_>) -> bool {

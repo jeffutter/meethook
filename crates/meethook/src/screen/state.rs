@@ -816,6 +816,18 @@ impl Screen {
                 self.candidate = (self.candidate + 1).min(last);
             }
             Event::Choose => {
+                // Enter means "this row" in whichever list has the focus: on the voice list,
+                // away from the voice being asked about, it goes back to work on that voice.
+                if self.mode == Mode::Normal && self.focus == Focus::Voices {
+                    let rows = display_rows(view);
+                    let elsewhere = rows
+                        .get(self.cursor)
+                        .and_then(|display| view.queue.get(display.queue))
+                        .is_some_and(|row| row.number != view.number);
+                    if elsewhere {
+                        return self.answer(view, Event::Select, costs);
+                    }
+                }
                 let Some((name, refusal)) = self.chosen(view, costs) else {
                     // Unrecognised text, or nothing enrolled at all. Deliberately nothing: the
                     // only way to create somebody is the key that says so.
@@ -1899,6 +1911,33 @@ pub(crate) mod tests {
         assert_eq!(screen.arrive(&third), None);
         assert!(!screen.still_working());
         assert_eq!(screen.view(&third, &Free, Context::Reading).cursor, 2);
+    }
+
+    /// Enter on the voice list goes back to a voice: off the asked row it works on that voice,
+    /// on the asked row (or in the candidate pane) it still chooses.
+    #[test]
+    fn enter_on_another_voice_works_on_it() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false), ("Unknown 2", 60.0, false)]);
+        let queue = queue(&owned);
+        let mut screen = Screen::default();
+        let second = view(&session, "Unknown 2", 2, &queue, &[], &[], &[], &owned[1].1);
+        assert_eq!(screen.arrive(&second), None);
+
+        screen.answer(&second, Event::FocusCandidates, &Free);
+        screen.answer(&second, Event::Up, &Free);
+        assert_eq!(
+            screen.answer(&second, Event::Choose, &Free),
+            Step::Waiting,
+            "the candidate pane keeps Enter for choosing"
+        );
+
+        screen.answer(&second, Event::FocusVoices, &Free);
+        assert_eq!(
+            screen.answer(&second, Event::Choose, &Free),
+            Step::Answered(Answer::Later)
+        );
+        assert!(screen.still_working());
     }
 
     /// AC #3, backwards -- the case the sub-ticket exists for, asserted from this side. The pass
