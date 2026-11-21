@@ -387,6 +387,17 @@ pub(crate) fn enroll_session(
     let mut asserted_voices = 0;
     let mut vetoes_overridden = 0;
 
+    // Reopening, see [`Interviewer::steering_toward`]. `answered_solo` is every voice this run
+    // named through a plain single [`Answer::Named`], valued by whether that naming was
+    // session-only -- the one fact of the earlier answer the report needs to take it back.
+    // `settled` is the question each such voice was asked as, so it can be put back in the
+    // queue. Voices answered any other way (group, bundle, one-speaker, denial) are in neither:
+    // their counters are facts of the whole answer. `reopened` is the question numbers that are
+    // back in the queue, which bypass the already-answered filter below.
+    let mut answered_solo: BTreeMap<u32, bool> = BTreeMap::new();
+    let mut settled: Vec<(usize, Question<'_>)> = Vec::new();
+    let mut reopened: BTreeSet<usize> = BTreeSet::new();
+
     // Passes over a shrinking list rather than one walk, so that [`Answer::Later`] can put a
     // voice back. Each pass asks about whatever is still pending; anything deferred is asked
     // again on the next one.
@@ -420,14 +431,19 @@ pub(crate) fn enroll_session(
             // A bundle whose members are all settled is a question with nothing left in it:
             // skipped rather than compressed, the way a settled solo is, so the gap says work
             // disappeared and the end came closer.
+            //
+            // A reopened question is the exception: it was put back on purpose, so it is asked
+            // however it reads now.
+            let reopening = reopened.contains(nth);
             let live: Vec<&SpeakerCluster> = question
                 .members()
                 .iter()
                 .copied()
                 .filter(|c| {
-                    !(assertion.is_none()
-                        && (shown[&c.id].is_named() && shown[&c.id] != baseline[&c.id]
-                            || committed.iter().any(|done| done.id == c.id)))
+                    reopening
+                        || !(assertion.is_none()
+                            && (shown[&c.id].is_named() && shown[&c.id] != baseline[&c.id]
+                                || committed.iter().any(|done| done.id == c.id)))
                 })
                 .collect();
             if live.is_empty() {
@@ -660,12 +676,24 @@ pub(crate) fn enroll_session(
                                 .iter()
                                 .flat_map(|(_, q)| q.members().iter().copied()),
                         );
-                    let left = left_unanswered(rest, &shown, &baseline, report);
+                    let left = left_unanswered(
+                        rest.filter(|c| !answered_solo.contains_key(&c.id)),
+                        &shown,
+                        &baseline,
+                        report,
+                    );
                     about(notes, &session.id, SessionNote::Left { left })?;
                     return Ok(Outcome::Finished);
                 }
                 Answer::Skip => {
-                    left_unanswered(live.iter().copied(), &shown, &baseline, report);
+                    left_unanswered(
+                        live.iter()
+                            .copied()
+                            .filter(|c| !answered_solo.contains_key(&c.id)),
+                        &shown,
+                        &baseline,
+                        report,
+                    );
                     continue;
                 }
                 // Back into the queue with the number it already has, and counted as nothing:
@@ -711,7 +739,10 @@ pub(crate) fn enroll_session(
                         )?;
                         continue;
                     }
-                    commit_named(
+                    // `Some` exactly when this voice was answered earlier and is being asked
+                    // again; the commit replaces that answer's counters and records the new one.
+                    let mut contribution = answered_solo.get(&anchor.id).copied();
+                    let outcome = commit_named(
                         &clusters.clusters,
                         &unknown,
                         speakers,
@@ -734,7 +765,19 @@ pub(crate) fn enroll_session(
                         anyway,
                         under_assertion,
                         None,
+                        &mut contribution,
                     )?;
+                    if outcome == CommitOutcome::Committed
+                        && !under_assertion
+                        && matches!(question, Question::Solo(_))
+                    {
+                        if let Some(session_only) = contribution {
+                            answered_solo.insert(anchor.id, session_only);
+                        }
+                        if !settled.iter().any(|(settled_nth, _)| settled_nth == nth) {
+                            settled.push((*nth, question.clone()));
+                        }
+                    }
                     continue;
                 }
                 // Refusing the tentative guess this voice reads as: the same preview and
@@ -895,14 +938,35 @@ pub(crate) fn enroll_session(
         //
         // Still only about a pass that produced no answer: [`Answer::Leave`] is an answer and
         // returns above this, so leaving a session never reaches the question this asks.
-        if deferred.len() == asked && (asked == 0 || !interviewer.still_working()) {
+        //
+        // A voice the interviewer is steering back to, put at the head of the next pass so the
+        // answerer meets it before it gives up on the target. Counted as progress for the same
+        // reason an in-run naming is: the pass produced a question the user asked for.
+        let mut steered = false;
+        let steering = interviewer.steering_toward();
+        if let Some(target) = steering.as_deref() {
+            let wanted = settled.iter().find(|(nth, question)| {
+                !deferred.iter().any(|(held, _)| held == nth)
+                    && question
+                        .members()
+                        .iter()
+                        .any(|c| unknown.get(&c.id).is_some_and(|number| number == target))
+            });
+            if let Some((nth, question)) = wanted {
+                reopened.insert(*nth);
+                deferred.insert(0, (*nth, question.clone()));
+                steered = true;
+            }
+        }
+        if !steered && deferred.len() == asked && (asked == 0 || !interviewer.still_working()) {
             // Deferred with no later left is the skip -- or the kept identification -- it has
             // turned out to be, counted through the same rule every other unanswered voice goes
             // through so no two of them can disagree about which bucket a named voice is in.
             left_unanswered(
                 deferred
                     .iter()
-                    .flat_map(|(_, question)| question.members().iter().copied()),
+                    .flat_map(|(_, question)| question.members().iter().copied())
+                    .filter(|c| !answered_solo.contains_key(&c.id)),
                 &shown,
                 &baseline,
                 report,
@@ -979,6 +1043,12 @@ enum CommitOutcome {
 /// run never carries both. `anyway` overrides a `Taken` refusal only, and only the single-voice
 /// path ever sets it -- a group names its members at the veto (that is its authority) but never
 /// pays a third party's name to do it.
+///
+/// `contribution` is in and out. In, `Some(session_only)` says this voice was already named
+/// earlier in the run (a reopened voice) and what that naming added to the report, so the
+/// counters are corrected instead of counting the voice twice; `None` for a first naming. Out,
+/// it holds what the naming that just committed added. A refusal or a blank name leaves the
+/// earlier answer and its counters untouched.
 #[allow(clippy::too_many_arguments)]
 fn commit_named<'d, 'm>(
     clusters: &'d [SpeakerCluster],
@@ -1003,6 +1073,7 @@ fn commit_named<'d, 'm>(
     anyway: bool,
     under_assertion: bool,
     forced: Option<&BTreeMap<u32, String>>,
+    contribution: &mut Option<bool>,
 ) -> Result<CommitOutcome> {
     // Built here rather than held from the prompt above because the commit below needs
     // `speakers` mutably and a live `Preview` would keep it borrowed. It is the same six
@@ -1022,7 +1093,11 @@ fn commit_named<'d, 'm>(
     )
     .with_forced(forced)
     .of(&name) else {
-        left_unanswered(std::iter::once(cluster), shown, baseline, report);
+        // A reopened voice is already counted under `named`: a blank answer leaves that answer
+        // standing and counts nothing.
+        if contribution.is_none() {
+            left_unanswered(std::iter::once(cluster), shown, baseline, report);
+        }
         return Ok(CommitOutcome::Unanswered);
     };
     let name = name.trim();
@@ -1164,6 +1239,17 @@ fn commit_named<'d, 'm>(
     // A sub-count of `named`, and now read off the type rather than off the two arms of the
     // match that used to print those two sentences -- which is what `Consequence::session_only`
     // is documented to be.
+    //
+    // Reopening a voice answered earlier takes that answer's share back first, so the voice is
+    // counted once: the rename lands through this same path, which already unwinds what the
+    // old name wrote (see `Consequence`), and only the counters need correcting here.
+    if let Some(was_session_only) = *contribution {
+        report.named -= 1;
+        if was_session_only {
+            report.session_only -= 1;
+        }
+    }
+    *contribution = Some(consequence.session_only());
     if consequence.session_only() {
         report.session_only += 1;
     }
@@ -1194,6 +1280,7 @@ fn commit_named<'d, 'm>(
     }
     // Recorded after the writes, so the override report measures against voices whose names are
     // actually on disk, never against answers that were refused or skipped.
+    committed.retain(|done| done.id != cluster.id);
     committed.push(cluster);
 
     // Re-identified against the updated database rather than assumed: naming one voice can also
@@ -1423,6 +1510,7 @@ fn commit_group_walk<'d, 'm>(
             false,
             false,
             fref,
+            &mut None,
         )?;
         // A refused member is not committed, so it stops being a declared holder for the
         // members after it -- the state the run actually reaches, and the one the next member

@@ -25,6 +25,11 @@
 //! this pass and needs [`Screen::still_working`] to be true, or the session ends on the fixed
 //! point in `enroll_session`'s pass loop.
 //!
+//! A target may also be a voice answered earlier in the run: [`Screen::steering_toward`] hands
+//! it to the run, which puts that question back so the user decides it again with everything in
+//! front of them. Still no store-a-decision path: the new name is an ordinary answer, and it
+//! replaces the old one inside the run.
+//!
 //! There is deliberately **no** store-a-decision-for-another-voice path. It would be unusable:
 //! the frame has no candidate list, no snippets and no consequence for a voice it was not asked
 //! about, so there would be nothing for the user to decide *with*. Steering is the whole
@@ -467,6 +472,17 @@ pub struct Screen {
     /// actually has.
     snippet: usize,
     decided: BTreeMap<String, Mark>,
+    /// The voices whose answer was a plain single naming -- the only answer the run can take
+    /// back, see [`Screen::steering_toward`]. A voice answered in a group, a bundle, as the one
+    /// remote speaker, or by refusing a guess is `Answered` in `decided` and absent here, which
+    /// is how Enter on its row says why it cannot be reopened.
+    named_solo: BTreeSet<String>,
+    /// Whether the question on screen is a voice answered earlier and reopened. Set on arrival
+    /// and read by Skip, which keeps the earlier answer rather than recording a skip.
+    reopened: bool,
+    /// The one-line reminder that this question is a reopened voice: what it is called now and
+    /// what the keys do. Shown wherever `status` would be, and outranked by it.
+    reopen_hint: Option<String>,
     /// The voices the user has staged as one person, keyed by the stable "Unknown N" handle --
     /// the same keying and lifetime as `decided`: it persists across questions within the
     /// session and is wiped by the session-change reset.
@@ -612,6 +628,8 @@ impl Screen {
         }
         self.costs.clear();
         self.groups.clear();
+        self.reopened = false;
+        self.reopen_hint = None;
         // Reassigned rather than cleared-and-maybe-set: a session with no bundles arrives
         // with `None`, and the previous question's members must not outlive its question.
         self.bundle = view.bundle_members.map(|members| members.to_vec());
@@ -622,6 +640,11 @@ impl Screen {
             Some(number) if number == view.number => {
                 self.target = None;
                 self.awaited.clear();
+                // The run offers a settled voice again only because the user pointed at it, and
+                // the row it was pointed from was marked answered: both are true on arrival
+                // here and on no other path.
+                self.reopened = self.decided.get(view.number) == Some(&Mark::Answered)
+                    && self.named_solo.contains(view.number);
             }
             // Not reached, and the queue has come round to a voice already offered since the
             // target was set -- so the target is not in this pass at all and no number of further
@@ -649,6 +672,12 @@ impl Screen {
         self.focus = Focus::default();
         self.candidate = 0;
         self.snippet = 0;
+        if self.reopened {
+            self.reopen_hint = Some(format!(
+                "answered as {} - choose another name to change it, Skip keeps it",
+                view.attribution.label()
+            ));
+        }
         self.decided.remove(view.number);
         // A row answered or skipped this run can no longer join the group, and the invariant the
         // group answer relies on -- every marked row undecided within this question -- holds only
@@ -681,6 +710,13 @@ impl Screen {
     /// bounds the loop.
     pub fn still_working(&self) -> bool {
         self.target.is_some()
+    }
+
+    /// The voice the user is steering toward, for the run to put back in the queue if it was
+    /// answered earlier. See
+    /// [`Interviewer::steering_toward`](meethook_enroll::Interviewer::steering_toward).
+    pub fn steering_toward(&self) -> Option<String> {
+        self.target.clone()
     }
 
     /// Something the frame has to say about what just happened, shown until the next key.
@@ -723,6 +759,17 @@ impl Screen {
                 let Some(row) = view.queue.get(display.queue) else {
                     return Step::Waiting;
                 };
+                if self.decided.get(row.number) == Some(&Mark::Answered)
+                    && !self.named_solo.contains(row.number)
+                {
+                    // Answered together with other voices, or by refusing a guess. Taking that
+                    // answer back for one voice would leave the rest of it standing.
+                    self.status = Some(format!(
+                        "{} was answered as part of a group or an assertion, so it cannot be reopened",
+                        row.number
+                    ));
+                    return Step::Waiting;
+                }
                 if row.number == view.number {
                     // Already the question. Nothing to defer, and returning `Later` here would
                     // put the voice back only to be asked about it again.
@@ -862,6 +909,7 @@ impl Screen {
                     return Step::Waiting;
                 }
                 self.decided.insert(view.number.to_string(), Mark::Answered);
+                self.named_solo.insert(view.number.to_string());
                 return Step::Answered(Answer::Named { name, anyway: true });
             }
             Event::Confirm => {
@@ -953,6 +1001,7 @@ impl Screen {
                     return Step::Answered(Answer::Group { name, members });
                 }
                 self.decided.insert(view.number.to_string(), Mark::Answered);
+                self.named_solo.insert(view.number.to_string());
                 return Step::Answered(Answer::Named {
                     name,
                     anyway: false,
@@ -981,7 +1030,14 @@ impl Screen {
                     // Every cached preview was computed against a bigger group.
                     self.groups.clear();
                 }
-                self.decided.insert(view.number.to_string(), Mark::Skipped);
+                // A reopened voice keeps the answer it had: skipping it is declining to change
+                // it, not recording that it went unanswered.
+                let mark = if self.reopened {
+                    Mark::Answered
+                } else {
+                    Mark::Skipped
+                };
+                self.decided.insert(view.number.to_string(), mark);
                 return Step::Answered(Answer::Skip);
             }
             // No mark and no touching `target` or `awaited`: this session is never drawn again,
@@ -1073,6 +1129,7 @@ impl Screen {
             return Step::Waiting;
         }
         self.decided.insert(view.number.to_string(), Mark::Answered);
+        self.named_solo.insert(view.number.to_string());
         Step::Answered(Answer::Named {
             name,
             anyway: false,
@@ -1261,7 +1318,7 @@ impl Screen {
             clip_is_empty: view.clip_is_empty,
             mode: self.mode,
             focus: self.focus,
-            status: self.status.as_deref(),
+            status: self.status.as_deref().or(self.reopen_hint.as_deref()),
         }
     }
 
@@ -1962,6 +2019,99 @@ pub(crate) mod tests {
         let first = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
         assert_eq!(screen.arrive(&first), None);
         assert!(!screen.still_working());
+    }
+
+    /// A voice named on its own can be gone back to: Enter on its row steers to it, the run hands
+    /// the question back, and it arrives saying what it is called and that Skip keeps that.
+    #[test]
+    fn a_solo_answered_voice_can_be_reopened_and_skip_keeps_it() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 60.0, false), ("Unknown 2", 60.0, false)]);
+        let queue = queue(&owned);
+        let mut screen = Screen::default();
+
+        let first = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
+        assert_eq!(screen.arrive(&first), None);
+        for c in "Maya".chars() {
+            screen.answer(&first, Event::Filter(c), &Free);
+        }
+        assert!(matches!(
+            screen.answer(&first, Event::NewPerson, &Free),
+            Step::Answered(Answer::Named { .. })
+        ));
+        assert_eq!(screen.steering_toward(), None);
+
+        let second = view(&session, "Unknown 2", 2, &queue, &[], &[], &[], &owned[1].1);
+        assert_eq!(screen.arrive(&second), None);
+        screen.answer(&second, Event::Up, &Free);
+        assert_eq!(
+            screen.answer(&second, Event::Select, &Free),
+            Step::Answered(Answer::Later)
+        );
+        assert_eq!(screen.steering_toward().as_deref(), Some("Unknown 1"));
+
+        // The run hands the settled voice back, now reading as the name it was given.
+        let maya = Attribution::Assigned {
+            name: "Maya".to_string(),
+        };
+        let again = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &maya);
+        assert_eq!(screen.arrive(&again), None);
+        assert_eq!(screen.steering_toward(), None);
+        let status = screen.view(&again, &Free, Context::Reading).status;
+        assert!(
+            status.is_some_and(|s| s.contains("answered as Maya")),
+            "{status:?}"
+        );
+
+        assert_eq!(
+            screen.answer(&again, Event::Skip, &Free),
+            Step::Answered(Answer::Skip)
+        );
+        assert_eq!(
+            screen.view(&again, &Free, Context::Reading).rows[0].mark,
+            Some(Mark::Answered),
+            "skipping a reopened voice keeps its answer"
+        );
+    }
+
+    /// A voice answered as part of a group cannot be taken back alone: Enter on its row says so
+    /// and steers nowhere.
+    #[test]
+    fn a_group_answered_voice_is_not_reopened() {
+        let session = session();
+        let owned = rows(&[
+            ("Unknown 1", 60.0, false),
+            ("Unknown 2", 60.0, false),
+            ("Unknown 3", 60.0, false),
+        ]);
+        let queue = queue(&owned);
+        let mut screen = Screen::default();
+
+        let first = view(&session, "Unknown 1", 1, &queue, &[], &[], &[], &owned[0].1);
+        screen.arrive(&first);
+        screen.answer(&first, Event::Mark, &Free);
+        screen.answer(&first, Event::Down, &Free);
+        screen.answer(&first, Event::Down, &Free);
+        screen.answer(&first, Event::Mark, &Free);
+        for c in "Maya".chars() {
+            screen.answer(&first, Event::Filter(c), &Free);
+        }
+        assert!(matches!(
+            screen.answer(&first, Event::NewPerson, &Free),
+            Step::Answered(Answer::Group { .. })
+        ));
+
+        let second = view(&session, "Unknown 2", 2, &queue, &[], &[], &[], &owned[1].1);
+        assert_eq!(screen.arrive(&second), None);
+        screen.answer(&second, Event::Up, &Free);
+        assert_eq!(screen.answer(&second, Event::Select, &Free), Step::Waiting);
+        assert_eq!(screen.steering_toward(), None);
+        assert!(
+            screen
+                .view(&second, &Free, Context::Reading)
+                .status
+                .is_some_and(|s| s.contains("cannot be reopened"))
+        );
     }
 
     /// The bound on the steering. A target that is not in the pass at all -- narrowed away by

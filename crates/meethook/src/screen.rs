@@ -371,6 +371,11 @@ impl Interviewer for Interface {
         self.state.still_working()
     }
 
+    /// The settled-voice half of steering: which earlier voice, if any, the run should put back.
+    fn steering_toward(&self) -> Option<String> {
+        self.state.steering_toward()
+    }
+
     /// The frame is the one answerer with a surface for a composite row, so it is the one that
     /// asks the session loop to fold below-floor fragments into bundles.
     fn accepts_fragment_groups(&self) -> bool {

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -32,6 +32,7 @@ mod preview;
 mod prompts;
 mod references;
 mod refusals;
+mod reopen;
 mod selectors;
 
 /// One row of the queue a prompt was shown, owned so it can outlive the call.
@@ -143,6 +144,9 @@ struct Scripted {
     /// Whether this answerer wants below-floor fragments asked about as bundles. `false` by
     /// default, which is every answerer but the full-screen frame's stand-in today.
     accepts_fragment_groups: bool,
+    /// What [`Interviewer::steering_toward`] says at the end of each pass, one entry per call.
+    /// `None` once it runs out, which is an answerer with nothing to go back to.
+    steering: RefCell<VecDeque<Option<String>>>,
 }
 
 impl Scripted {
@@ -152,6 +156,16 @@ impl Scripted {
             seen: Vec::new(),
             working_passes: Cell::new(0),
             accepts_fragment_groups: false,
+            steering: RefCell::default(),
+        }
+    }
+
+    /// Steer toward these handles at the ends of the first passes, standing in for a cursor
+    /// that was pointed at an earlier voice.
+    fn steering(self, targets: &[Option<&str>]) -> Scripted {
+        Scripted {
+            steering: RefCell::new(targets.iter().map(|t| t.map(str::to_string)).collect()),
+            ..self
         }
     }
 
@@ -229,6 +243,10 @@ impl Interviewer for Scripted {
         let left = self.working_passes.get();
         self.working_passes.set(left.saturating_sub(1));
         left > 0
+    }
+
+    fn steering_toward(&self) -> Option<String> {
+        self.steering.borrow_mut().pop_front().flatten()
     }
 }
 

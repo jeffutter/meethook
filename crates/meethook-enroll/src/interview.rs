@@ -317,6 +317,24 @@ pub trait Interviewer {
     fn still_working(&self) -> bool {
         false
     }
+
+    /// The "Unknown N" handle of a voice this answerer wants to go *back* to, if any.
+    ///
+    /// The settled-voice twin of [`still_working`](Interviewer::still_working). A deferral can
+    /// only reach a voice the run still has open; a voice answered earlier in the run has left
+    /// the queue, so steering toward it would be abandoned as "not among this session's
+    /// questions". When this names a voice whose answer was a plain single naming, the session
+    /// loop puts that question back at the head of the next pass, and the answer given then
+    /// replaces the earlier one through the same dry run and fixed-order writes -- see
+    /// `commit_named`. A voice answered as part of a group, bundle or one-speaker assertion is
+    /// not offered again: its counters and its group's claim are facts of that whole answer, and
+    /// re-deciding one member would leave the others inconsistent. A handle that names no
+    /// settled voice is ignored, so the answerer's own bound on steering still applies.
+    ///
+    /// `None` for every answerer without a cursor.
+    fn steering_toward(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A name decided before the run started, for the one voice a [`Selection`] picked out.
