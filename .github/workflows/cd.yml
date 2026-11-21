@@ -54,7 +54,7 @@ jobs:
         if: runner.os == 'macOS'
         run: bash .github/scripts/ensure-metal-toolchain.sh
       - name: Evict stale native build caches
-        run: bash .github/scripts/evict-stale-nix-store-refs.sh
+        run: nix develop -c bash .github/scripts/evict-stale-nix-store-refs.sh
 
       - name: Cargo build
         run: |

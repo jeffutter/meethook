@@ -12,6 +12,14 @@
 # This scans every such cache file already on disk and deletes the ones referencing a
 # /nix/store path that isn't actually present, so the build script starts over from scratch
 # instead of tripping over a dangling reference.
+#
+# Run it inside `nix develop` (`nix develop -c bash <this script>`), never before it. On a fresh
+# runner the store holds nothing until the dev shell is realized, so "is this path present?" asked
+# earlier answers "no" for every path in the shell's own closure (cctools' install_name_tool, the
+# compiler wrapper, ...) and the script evicts caches that were perfectly good. That is how
+# mlx-sys's `out/build` (its libraries and mlx.metallib) was deleted from a warm cache while
+# cargo still considered the crate built, which no later step can notice until it links. Inside
+# the shell, a path is missing only if the cache really was made against an older store.
 set -euo pipefail
 
 # Search from the repo root rather than a hardcoded `target`: the meethook-record job caches
@@ -19,6 +27,8 @@ set -euo pipefail
 # first-ever run) would exit non-zero and, under `set -e`, kill this script before it does
 # anything.
 find . -type f \( -name CMakeCache.txt -o -name build.ninja \) 2>/dev/null | while IFS= read -r cache_file; do
+  # An earlier hit may have removed the whole target dir this file was in.
+  [[ -f "$cache_file" ]] || continue
   stale_path=""
   for store_path in $(grep -oE '/nix/store/[a-z0-9]{32}-[^"'"'"'[:space:]]*' "$cache_file" | sort -u); do
     if [[ ! -e "$store_path" ]]; then
@@ -28,9 +38,19 @@ find . -type f \( -name CMakeCache.txt -o -name build.ninja \) 2>/dev/null | whi
   done
 
   if [[ -n "$stale_path" ]]; then
-    stale_dir=$(dirname "$cache_file")
-    echo "evicting stale native build dir (references missing $stale_path): $stale_dir"
-    rm -rf "$stale_dir"
+    if [[ "$cache_file" == */target/* ]]; then
+      # Inside a cargo target/: deleting only the native build dir leaves cargo's fingerprints
+      # saying the build script already ran, so it never reruns, and whatever it produced there
+      # (mlx-sys links its libraries from out/build) is simply gone. Evict the whole target dir,
+      # as for a stale build-script executable below.
+      target_dir="${cache_file%%/target/*}/target"
+      echo "evicting stale target dir (native build cache $cache_file references missing $stale_path): $target_dir"
+      rm -rf "$target_dir"
+    else
+      stale_dir=$(dirname "$cache_file")
+      echo "evicting stale native build dir (references missing $stale_path): $stale_dir"
+      rm -rf "$stale_dir"
+    fi
   fi
 done
 

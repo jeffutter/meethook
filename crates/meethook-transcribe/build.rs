@@ -54,8 +54,9 @@ fn embed_metallib() {
 
     let raw = std::fs::read(&metallib).unwrap_or_else(|e| {
         panic!(
-            "cannot read {} ({e}): mlx-sys's output layout may have changed; DEP_MLX_INCLUDE \
-             starts with {}. See MLX.md.",
+            "cannot read {} ({e}). Either mlx-sys's output layout changed (DEP_MLX_INCLUDE \
+             starts with {}), or its build directory was deleted after it built, as a cache \
+             cleanup can do: `cargo clean -p mlx-sys` makes it build again. See MLX.md.",
             metallib.display(),
             mlx_src.display()
         )
