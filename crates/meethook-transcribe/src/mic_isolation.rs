@@ -44,7 +44,7 @@ use crate::{Result, asr};
 /// Seconds of surrounding audio given to the model on each side of a region.
 const CONTEXT_S: f64 = 1.0;
 /// Widened regions closer than this are merged into one span, so tiny regions do not each pay
-/// for a graph invocation (which always runs a whole 8 s window).
+/// for a graph invocation (which has fixed costs, and runs a window of up to 8 s).
 const MERGE_GAP_S: f64 = 3.0;
 /// Longest span (context included) sent to the isolator in one call. The span is held upsampled
 /// to 48 kHz, as the isolator's output, and decimated, so memory is bounded by this rather than by
@@ -99,16 +99,21 @@ pub enum Isolation {
 }
 
 /// What one isolation pass did.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IsolationReport {
     /// Speech regions the finder returned.
     pub regions: usize,
     /// Calls made to the isolator.
     pub batches: usize,
-    /// Seconds of audio sent through the isolator, context included.
+    /// Seconds of audio sent through the isolator successfully, context included.
     pub isolated_s: f64,
     /// Seconds in the whole track.
     pub total_s: f64,
+    /// Calls that failed even after the engine's own retries. Their spans were left exactly as
+    /// the cleaned track had them.
+    pub failed_batches: usize,
+    /// The first of those errors, for the line that reports them.
+    pub first_error: Option<String>,
 }
 
 impl std::fmt::Display for IsolationReport {
@@ -117,7 +122,15 @@ impl std::fmt::Display for IsolationReport {
             f,
             "mic isolation: {} regions, {:.0} s of {:.0} s processed in {} batches",
             self.regions, self.isolated_s, self.total_s, self.batches
-        )
+        )?;
+        if let Some(error) = &self.first_error {
+            write!(
+                f,
+                "; {} of them failed and were left un-isolated ({error})",
+                self.failed_batches
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -223,12 +236,23 @@ fn isolate_mic(
     let mut out = cleaned_16k.to_vec();
     let fade = to_samples(FADE_S, usize::MAX).max(1);
     let mut isolated_samples = 0usize;
+    let mut failed_batches = 0usize;
+    let mut first_error: Option<String> = None;
 
     for (index, span) in spans.iter().enumerate() {
         phase.at(index, spans.len());
         let audio = &cleaned_16k[span.start..span.end];
         let up = resample_between(audio, TARGET_RATE, ISOLATOR_RATE)?;
-        let voice_48k = isolator.isolate(&up)?;
+        // An engine error costs this span its isolation, not the session its transcript: the
+        // span keeps the cleaned audio it already has, and the report says so.
+        let voice_48k = match isolator.isolate(&up) {
+            Ok(voice) => voice,
+            Err(e) => {
+                failed_batches += 1;
+                first_error.get_or_insert_with(|| e.to_string());
+                continue;
+            }
+        };
         let voice = resample_between(&voice_48k, ISOLATOR_RATE, TARGET_RATE)?;
         isolated_samples += audio.len();
 
@@ -264,6 +288,8 @@ fn isolate_mic(
         batches: spans.len(),
         isolated_s: isolated_samples as f64 / f64::from(TARGET_RATE),
         total_s: cleaned_16k.len() as f64 / f64::from(TARGET_RATE),
+        failed_batches,
+        first_error,
     };
     Ok((out, report))
 }
@@ -281,6 +307,22 @@ mod tests {
         fn isolate(&mut self, audio: &[f32]) -> Result<Vec<f32>> {
             self.calls += 1;
             Ok(audio.iter().map(|s| s * self.gain).collect())
+        }
+    }
+
+    /// Fails every call after the first `ok` ones.
+    struct FlakyIsolator {
+        ok: usize,
+        calls: usize,
+    }
+
+    impl VoiceIsolation for FlakyIsolator {
+        fn isolate(&mut self, audio: &[f32]) -> Result<Vec<f32>> {
+            self.calls += 1;
+            if self.calls > self.ok {
+                return Err(crate::Error::VoiceIsolator("the GPU said no".into()));
+            }
+            Ok(audio.iter().map(|s| s * 0.5).collect())
         }
     }
 
@@ -418,6 +460,41 @@ mod tests {
         let audio = signal(60 * 16_000);
         let (_, _, calls) = run(1.0, vec![region(5.0, 6.0), region(30.0, 31.0)], &audio);
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn a_failing_batch_leaves_its_span_as_it_was_and_the_rest_isolated() {
+        // Two distant regions are two calls; the second fails.
+        let audio = signal(60 * 16_000);
+        let mut isolator = FlakyIsolator { ok: 1, calls: 0 };
+        let mut finder = FixedRegions(vec![region(5.0, 6.0), region(30.0, 31.0)]);
+        let (out, report) =
+            isolate_mic(&mut isolator, &mut finder, &audio, Phase::start("t")).unwrap();
+        assert_eq!((report.batches, report.failed_batches), (2, 1));
+        assert!(
+            report
+                .first_error
+                .as_deref()
+                .unwrap()
+                .contains("the GPU said no")
+        );
+        let (first, second) = (5 * 16_000 + 8_000, 30 * 16_000 + 8_000);
+        assert!(
+            (out[first] - 0.5 * audio[first]).abs() < 0.01,
+            "the first span is isolated"
+        );
+        assert_eq!(
+            out[second].to_bits(),
+            audio[second].to_bits(),
+            "the failed span is untouched"
+        );
+        assert!(report.to_string().contains("1 of them failed"), "{report}");
+        // Only what was isolated counts: one span of 1 s plus 1 s of context on each side.
+        assert!(
+            (report.isolated_s - 3.0).abs() < 0.1,
+            "{}",
+            report.isolated_s
+        );
     }
 
     #[test]

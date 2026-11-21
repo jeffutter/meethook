@@ -27,6 +27,9 @@ jobs:
         with:
           shared-key: test-v2-${{ matrix.os }}
           workspaces: ". -> target"
+      - name: Install the Metal Toolchain
+        if: runner.os == 'macOS'
+        run: bash .github/scripts/ensure-metal-toolchain.sh
       - name: Evict stale native build caches
         run: bash .github/scripts/evict-stale-nix-store-refs.sh
       - name: Run tests
@@ -76,6 +79,9 @@ jobs:
         with:
           shared-key: clippy-v2-${{ matrix.os }}
           workspaces: ". -> target"
+      - name: Install the Metal Toolchain
+        if: runner.os == 'macOS'
+        run: bash .github/scripts/ensure-metal-toolchain.sh
       - name: Evict stale native build caches
         run: bash .github/scripts/evict-stale-nix-store-refs.sh
       - name: Clippy check
@@ -100,6 +106,9 @@ jobs:
         with:
           shared-key: docs-v2-${{ matrix.os }}
           workspaces: ". -> target"
+      - name: Install the Metal Toolchain
+        if: runner.os == 'macOS'
+        run: bash .github/scripts/ensure-metal-toolchain.sh
       - name: Evict stale native build caches
         run: bash .github/scripts/evict-stale-nix-store-refs.sh
       - name: Check documentation

@@ -119,6 +119,11 @@
 
           craneLib = crane.mkLib pkgs;
 
+          # macOS only: an `xcrun` that finds the host Xcode's Metal compiler, for the `mlx-sys`
+          # build. Used by the dev shell below, which unlike a sandboxed `nix build` can reach
+          # the host Xcode. See nix/xcrun-metal-shim.sh.
+          xcrunMetalShim = pkgs.writeScriptBin "xcrun" (builtins.readFile ./nix/xcrun-metal-shim.sh);
+
           # Single source of truth for the package version -- read from the root workspace's
           # [workspace.package] table, which every crate here inherits via
           # `version.workspace = true` (see Cargo.toml), so the flake never drifts out of sync
@@ -138,6 +143,13 @@
             inherit src;
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
+            # `--no-default-features` turns off meethook-transcribe's `mlx` feature, the voice
+            # isolator's GPU engine, which is on by default on macOS. It compiles Metal shaders,
+            # which needs Xcode, and Xcode does not exist in a sandboxed build (nixpkgs' own MLX
+            # package sets MLX_BUILD_METAL=false for the same reason). A package built here runs
+            # the isolator on the ONNX CPU engine instead, about 15x slower; a `cargo build` in
+            # the dev shell, which is what the release tarballs use, has MLX.
+            cargoExtraArgs = "--locked --no-default-features";
           } // commonEnv;
 
           # version is deliberately NOT the release version here: buildDepsOnly's output only
@@ -157,7 +169,7 @@
             // {
               inherit cargoArtifacts version;
               pname = "meethook";
-              cargoExtraArgs = "--bin meethook";
+              cargoExtraArgs = "--locked --no-default-features --bin meethook";
               doCheck = false;
             }
           );
@@ -182,7 +194,10 @@
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
 
-            shellHook = ''
+            shellHook = nixpkgs.lib.optionalString isMacos ''
+              # Ahead of nix's xcrun stub, so `mlx-sys` can compile Metal; see the definition.
+              export PATH="${xcrunMetalShim}/bin:$PATH"
+            '' + ''
               # Rewrites .git/hooks/{pre-commit,pre-push} from lefthook.yml.
               # Idempotent and safe to re-run on every activation.
               lefthook install > /dev/null

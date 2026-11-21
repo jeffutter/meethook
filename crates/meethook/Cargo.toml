@@ -29,6 +29,13 @@ serde_json = { workspace = true }
 # part of a recording means writing that part out first.
 tempfile = { workspace = true }
 
+[features]
+# Passes through to `meethook-transcribe/mlx`: the voice isolator on the GPU. On by default; a
+# no-op off macOS. `--no-default-features` is for builds that cannot compile Metal (the flake's
+# sandboxed package).
+default = ["mlx"]
+mlx = ["meethook-transcribe/mlx"]
+
 [dev-dependencies]
 # The interrupt test drives the built binary through a real pty and kills it mid-commit.
 libc = { workspace = true }

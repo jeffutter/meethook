@@ -28,7 +28,7 @@ use meethook_transcribe::{
     Attribution, Diarize, EMBEDDING_MODEL, Engines, FIRERED_VAD_MODEL, FireRedVad,
     GateSpeechFinder, Isolation, IsolationStage, NEMOTRON_DIARIZATION_DATA,
     NEMOTRON_DIARIZATION_GRAPH, NemotronDiarizer, OnnxDiarizer, SEGMENTATION_MODEL,
-    VOICE_ISOLATOR_MODEL, VocabularyChoice, VoiceIsolator, WHISPER_MODEL, WhisperEngine, run_batch,
+    VocabularyChoice, VoiceIsolator, WHISPER_MODEL, WhisperEngine, run_batch,
 };
 
 /// Transcribes recorded sessions.
@@ -165,13 +165,15 @@ pub fn transcribe(
 /// Loads the voice-isolator stage, or reports why it cannot be had.
 fn open_isolation(models_dir: &Path, vad: &Path) -> Isolation {
     let load = || -> std::result::Result<IsolationStage, Box<dyn std::error::Error>> {
-        if !models_dir.join(VOICE_ISOLATOR_MODEL.file_name).is_file() {
+        let model = VoiceIsolator::required_model();
+        if !models_dir.join(model.file_name).is_file() {
             eprintln!(
-                "Note: first run with mic isolation downloads 260 MB of weights; later runs \
-                 do not. Pass --no-isolate to skip it."
+                "Note: first run with mic isolation downloads {} MB of weights; later runs \
+                 do not. Pass --no-isolate to skip it.",
+                model.size_bytes / 1_000_000
             );
         }
-        fetch(models_dir, &VOICE_ISOLATOR_MODEL)?;
+        fetch(models_dir, model)?;
         let isolator = VoiceIsolator::open(models_dir)?;
         let finder = GateSpeechFinder(FireRedVad::load(vad)?);
         Ok(IsolationStage {

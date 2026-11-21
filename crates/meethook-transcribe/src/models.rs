@@ -143,6 +143,19 @@ pub const VOICE_ISOLATOR_MODEL: ModelSpec = ModelSpec {
     size_bytes: 260_588_988,
 };
 
+/// The voice isolator's weights for the MLX engine (the `mlx` feature): the same Inworld model
+/// as [`VOICE_ISOLATOR_MODEL`], converted by `starkdmi/VoiceIsolatorMLX` (Apache-2.0) to fp16
+/// safetensors with the Mamba output projections folded and the ragged per-band layers packed
+/// into padded batched tensors, so it is not interchangeable with the ONNX graph. 152 MiB.
+/// The URL pins the repository revision; hash and size are the LFS pointer's.
+pub const VOICE_ISOLATOR_MLX_MODEL: ModelSpec = ModelSpec {
+    file_name: "voice-isolator-mlx-fp16.safetensors",
+    url: "https://huggingface.co/starkdmi/VoiceIsolator_v1_48K_MLX/resolve/\
+          0bf480815ac77bba0429a0aae96859759560f441/model_fp16.safetensors",
+    sha256: "ffb1f72732c430cab90228306a90f2bdc714eaa6f6ebab90196c60a6c1ee1d28",
+    size_bytes: 159_659_684,
+};
+
 /// Both Nemotron files; install every one before opening the graph.
 pub const NEMOTRON_DIARIZATION_MODELS: [ModelSpec; 2] =
     [NEMOTRON_DIARIZATION_GRAPH, NEMOTRON_DIARIZATION_DATA];
@@ -152,7 +165,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    const ALL: [&ModelSpec; 7] = [
+    const ALL: [&ModelSpec; 8] = [
         &WHISPER_MODEL,
         &SEGMENTATION_MODEL,
         &EMBEDDING_MODEL,
@@ -160,6 +173,7 @@ mod tests {
         &NEMOTRON_DIARIZATION_GRAPH,
         &NEMOTRON_DIARIZATION_DATA,
         &VOICE_ISOLATOR_MODEL,
+        &VOICE_ISOLATOR_MLX_MODEL,
     ];
 
     #[test]

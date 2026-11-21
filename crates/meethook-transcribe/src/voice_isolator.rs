@@ -10,36 +10,57 @@
 //! `[1, frames, 1025, 2]` and returns a complex `correction` of the same shape; the voice is
 //! `audio + istft(correction, length = len(audio))`. It was trained on 8 s windows (801
 //! frames), so longer audio runs as 8 s windows overlapped by 2 s and blended with a linear
-//! crossfade.
+//! crossfade, the last window ending at the end of the audio. Audio up to one window runs
+//! unpadded: the graph's frame axis is dynamic.
 //!
 //! No resampling is done here: the caller owns the rate. (`rubato` is already a dependency for
 //! that, in [`crate::audio`].)
 //!
-//! # CoreML, CPU and speed
+//! # Engines and speed
 //!
-//! Measured with `examples/isolate-voice` on `sample_14.wav` (10.77 s, which is two windows),
-//! release build, on a MacBook Pro 18,1 (Apple M1 Pro, 32 GB), macOS, ONNX Runtime from the
-//! flake:
+//! [`VoiceIsolator::open`] picks the engine this build has: the network on the GPU through MLX
+//! (the `mlx` cargo feature, on by default on macOS, `crate::mlx_isolator`) or the ONNX graph on the CPU.
+//! Both run the same STFT, windows and crossfades from this module and give the same output (the
+//! MLX engine is fp16, see Parity). Measured with `examples/isolate-voice` on a MacBook Pro 18,1
+//! (Apple M1 Pro, 32 GB), release build:
 //!
-//! | path | result |
+//! | engine | `sample_14.wav` (10.77 s, two windows) |
 //! |---|---|
-//! | CoreML ([`VoiceIsolator::open_coreml`], via [`crate::open_session`]) | **Accepted at load** (28.6 s; whether every node or only a partition went to CoreML was not inspected), **then unusable**: the first inference ran past 2 minutes without finishing one window and the process was killed for memory (peak footprint about 48 GB on a 32 GB machine; a second run was terminated at 150 s). |
-//! | CPU ([`VoiceIsolator::open`]) | Loads in 23 s. 10.77 s of audio in 40.3 s wall = **0.27x realtime** (audio seconds per wall second). Peak resident memory about 12.9 GB. |
-//! | Python package on PyTorch / Apple Metal (the earlier trial) | about 0.41x realtime |
+//! | MLX (`VoiceIsolator::open_mlx`) | **about 1.3 s per 8 s window warm; 129 s of audio in 31 s (4.2x realtime)**; loads in 0.04 s (lazily mapped), the first call takes about 3 s more while MLX compiles its Metal kernels; peak footprint 2 GB |
+//! | ONNX on the CPU ([`VoiceIsolator::open_onnx`]) | 31-33 s (0.33x realtime) on the 8 performance cores; 40 s on all 10 cores, where ONNX Runtime's default thread count includes the 2 efficiency cores the others then wait on; loads in 20 s; about 6 GB per window |
+//! | ONNX through CoreML ([`VoiceIsolator::open_coreml`]) | **unusable in every configuration tried**, below |
+//! | Python package on PyTorch / Apple Metal (an earlier trial) | about 0.41x realtime |
 //!
-//! Consequences for the caller (TASK-080): [`VoiceIsolator::open`] is CPU on purpose. At 0.27x
-//! realtime one hour of microphone track is about 3.7 hours of work, so isolating a whole track
-//! is not free: run it over speech regions only, and expect the 13 GB working set (the graph
-//! attends over the whole 801-frame window). Whether a different CoreML configuration (for
-//! example static shapes or `MLProgram` format) helps was not tried.
+//! Through the whole mic-isolation stage on the first 30 minutes of a real recording (117
+//! speech regions, 433 s of audio sent through the isolator in 41 batches): **106 s on MLX (17x
+//! realtime, 2.3 GB peak) against 1,191 s on the ONNX CPU engine (1.5x realtime, 12.3 GB peak)**,
+//! about 11x.
+//!
+//! **CoreML via ONNX Runtime.** The graph has 15,568 nodes, almost all of them the Mamba scans
+//! exported as a blocked scan for WebGPU. With ONNX Runtime's defaults CoreML takes 6,598 of
+//! them in 189 partitions, accepts the load and dies in the first inference. `MLProgram` with
+//! static input shapes fails to compile (`model.mil`, error -14). Pinning the `frames` axis to
+//! 801 (a free dimension override) and using `MLProgram` lets CoreML take 14,360 of 14,396 nodes
+//! in 13 partitions, but with every compute-unit setting (CPU only, CPU and GPU, CPU and Neural
+//! Engine) the footprint passed 16 GB within seconds of the first inference and the run was
+//! killed (the load alone took 154 s on the Neural Engine setting). So the partitioning is not
+//! the problem; CoreML's execution of this graph is. The MLX engine runs the same network with
+//! hand-written kernels for the scan and the attention head layout, which is why it fits in
+//! 2.3 GB.
+//!
+//! **Caching.** MLX keeps freed buffers for reuse, keyed by size, and every span of the mic
+//! stage is a different length, so `crate::mlx_isolator` clears that cache after each window.
+//! Without it a 30 minute track grew past 19 GB by 40%.
 //!
 //! # Parity
 //!
 //! `matches_the_official_python_package` (ignored: it needs the 260 MB download) compares the
 //! output on `testdata/voice-isolator/sample_14.wav` with the official `inworld-voice-isolation`
-//! 1.0.0 package's, produced by `scripts/voice_isolator_reference.py`. Measured SNR: 46.7 dB
-//! (required: 35 dB). The sample is Apache-2.0 from `inworld-ai/voice-isolator`; no meeting
-//! audio is used anywhere.
+//! 1.0.0 package's, produced by `scripts/voice_isolator_reference.py`. Measured SNR: 125.6 dB
+//! (required: 90 dB; before the last window was aligned to the end of the audio instead of
+//! zero-padded it was 46.7 dB). The MLX engine (fp16) measures 75.3 dB, required 70 dB, the same
+//! as the Swift package it is ported from (75.4 dB). The sample is Apache-2.0 from
+//! `inworld-ai/voice-isolator`; no meeting audio is used anywhere.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -50,6 +71,10 @@ use ort::value::TensorRef;
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+use crate::VOICE_ISOLATOR_MLX_MODEL;
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+use crate::mlx_isolator::MlxNetwork;
 use crate::onnx::{open_cpu_session_with_threads, open_session, performance_cores};
 use crate::{Error, Result, VOICE_ISOLATOR_MODEL};
 
@@ -66,37 +91,87 @@ const WINDOW: usize = 800 * HOP;
 const OVERLAP: usize = 2 * SAMPLE_RATE as usize;
 const STRIDE: usize = WINDOW - OVERLAP;
 
-/// A loaded voice-isolator graph and the FFT plans around it.
+/// What turns a window's spectrum into the complex correction: the ONNX graph on the CPU or,
+/// with the `mlx` feature on macOS, the same network on the GPU.
+enum Engine {
+    Onnx(Session),
+    #[cfg(all(feature = "mlx", target_os = "macos"))]
+    Mlx(Box<MlxNetwork>),
+}
+
+/// A loaded voice-isolator network and the FFT plans around it.
 pub struct VoiceIsolator {
-    session: Session,
-    /// True only for [`VoiceIsolator::open_coreml`] when CoreML took the graph.
+    engine: Engine,
+    /// True when the network runs on an accelerator: the MLX engine, or CoreML through
+    /// [`VoiceIsolator::open_coreml`] when it took the graph.
     pub accelerated: bool,
     stft: Stft,
 }
 
 impl VoiceIsolator {
-    /// Loads the graph from `models_dir`, the directory the registry installs into, on the CPU.
+    /// The model files [`VoiceIsolator::open`] needs in the models directory, for the caller to
+    /// install first: the MLX weights when this build has the MLX engine, else the ONNX graph.
+    pub fn required_model() -> &'static ModelSpec {
+        #[cfg(all(feature = "mlx", target_os = "macos"))]
+        {
+            &VOICE_ISOLATOR_MLX_MODEL
+        }
+        #[cfg(not(all(feature = "mlx", target_os = "macos")))]
+        {
+            &VOICE_ISOLATOR_MODEL
+        }
+    }
+
+    /// Loads the best engine this build has from `models_dir`, the directory the registry
+    /// installs into: MLX on the GPU with the `mlx` feature on macOS, otherwise the ONNX graph
+    /// on the CPU. [`VoiceIsolator::required_model`] says which file must be installed.
     ///
-    /// CPU rather than the CoreML-then-CPU policy of [`crate::open_session`], because on the
-    /// measured machine CoreML accepts this graph at load and then exhausts memory on the first
-    /// inference (see the module docs). A default that can take a machine down is not a default.
+    /// The ONNX path is CPU rather than the CoreML-then-CPU policy of [`crate::open_session`],
+    /// because on the measured machine CoreML accepts this graph at load and then exhausts
+    /// memory on the first inference (see the module docs). A default that can take a machine
+    /// down is not a default.
     pub fn open(models_dir: &Path) -> Result<Self> {
-        let path = installed(models_dir)?;
+        #[cfg(all(feature = "mlx", target_os = "macos"))]
+        {
+            Self::open_mlx(models_dir)
+        }
+        #[cfg(not(all(feature = "mlx", target_os = "macos")))]
+        {
+            Self::open_onnx(models_dir)
+        }
+    }
+
+    /// The ONNX graph on the CPU, whatever else this build has. Uses the performance cores only
+    /// where the machine has two kinds.
+    pub fn open_onnx(models_dir: &Path) -> Result<Self> {
+        let path = installed(models_dir, &VOICE_ISOLATOR_MODEL)?;
         Ok(Self {
-            session: open_cpu_session_with_threads(&path, performance_cores())?,
+            engine: Engine::Onnx(open_cpu_session_with_threads(&path, performance_cores())?),
             accelerated: false,
             stft: Stft::new(),
         })
     }
 
-    /// Loads the graph through [`crate::open_session`] (CoreML, then CPU). Kept for measuring
-    /// the accelerator; see [`VoiceIsolator::open`] for why it is not the default. Running it
-    /// can exhaust memory.
+    /// The MLX engine on the GPU: about 11x the ONNX CPU path through the whole mic stage on the
+    /// measured machine (see the module docs).
+    #[cfg(all(feature = "mlx", target_os = "macos"))]
+    pub fn open_mlx(models_dir: &Path) -> Result<Self> {
+        let path = installed(models_dir, &VOICE_ISOLATOR_MLX_MODEL)?;
+        Ok(Self {
+            engine: Engine::Mlx(Box::new(MlxNetwork::load(&path)?)),
+            accelerated: true,
+            stft: Stft::new(),
+        })
+    }
+
+    /// Loads the ONNX graph through [`crate::open_session`] (CoreML, then CPU). Kept for
+    /// measuring the accelerator; see [`VoiceIsolator::open`] for why it is not the default.
+    /// Running it can exhaust memory.
     pub fn open_coreml(models_dir: &Path) -> Result<Self> {
-        let path = installed(models_dir)?;
+        let path = installed(models_dir, &VOICE_ISOLATOR_MODEL)?;
         let loaded = open_session(&path)?;
         Ok(Self {
-            session: loaded.session,
+            engine: Engine::Onnx(loaded.session),
             accelerated: loaded.accelerated,
             stft: Stft::new(),
         })
@@ -104,49 +179,50 @@ impl VoiceIsolator {
 
     /// The isolated voice: same length and rate as `audio`, which must be 48 kHz mono.
     ///
-    /// Empty input returns empty without touching the graph. Input shorter than one window is
-    /// zero-padded to one, run, and cropped back.
+    /// Empty input returns empty without touching the graph. Audio up to one window runs as it
+    /// is (the graph's frame axis is dynamic). Longer audio runs as `WINDOW`-sample windows
+    /// every `STRIDE` samples with the last one ending at the end of the audio, blended by
+    /// their weights; this is the official package's plan, so the tail is never zero-padded.
     pub fn isolate(&mut self, audio: &[f32]) -> Result<Vec<f32>> {
-        let windows = plan_windows(audio.len());
-        let mut out = vec![0.0f32; audio.len()];
-        let mut chunk = vec![0.0f32; WINDOW];
-        for (index, window) in windows.iter().enumerate() {
-            let take = (audio.len() - window.start).min(WINDOW);
-            chunk[..take].copy_from_slice(&audio[window.start..window.start + take]);
-            chunk[take..].fill(0.0);
-
-            let voice = self.run_window(&chunk)?;
-
-            let first = index == 0;
-            let last = index + 1 == windows.len();
-            for j in 0..take {
-                let weight = crossfade_weight(j, first, last);
-                out[window.start + j] += weight * voice[j];
+        if audio.len() <= WINDOW {
+            return self.run_window(audio);
+        }
+        let mut total = vec![0.0f32; audio.len()];
+        let mut weight = vec![0.0f32; audio.len()];
+        for (start, w) in plan_windows(audio.len()) {
+            let voice = self.run_window(&audio[start..start + WINDOW])?;
+            for j in 0..WINDOW {
+                total[start + j] += voice[j] * w[j];
+                weight[start + j] += w[j];
             }
         }
-        Ok(out)
+        for (t, w) in total.iter_mut().zip(&weight) {
+            *t /= w.max(1e-6);
+        }
+        Ok(total)
     }
 
-    /// One full window through the graph: `audio + istft(correction)`.
+    /// One window of any length through the graph: `audio + istft(correction)`. Audio too short
+    /// for the STFT's reflect padding is zero-padded to the shortest length it accepts and
+    /// cropped back.
     fn run_window(&mut self, window: &[f32]) -> Result<Vec<f32>> {
-        debug_assert_eq!(window.len(), WINDOW);
-        let spec = self.stft.forward(window);
-        let frames = spec.len() / (BINS * 2);
-        let input = TensorRef::from_array_view(([1usize, frames, BINS, 2], &spec[..]))
-            .map_err(inference_failed)?;
-        let outputs = self
-            .session
-            .run(ort::inputs!["spec" => input])
-            .map_err(inference_failed)?;
-        let (shape, correction) = outputs["correction"]
-            .try_extract_tensor::<f32>()
-            .map_err(inference_failed)?;
-        if correction.len() != spec.len() {
-            return Err(Error::VoiceIsolator(format!(
-                "output `correction` has shape {shape:?}, expected [1, {frames}, {BINS}, 2]"
-            )));
+        if window.is_empty() {
+            return Ok(Vec::new());
         }
-        let mut voice = self.stft.inverse(correction, window.len());
+        if window.len() <= PAD {
+            let mut padded = window.to_vec();
+            padded.resize(PAD + 1, 0.0);
+            let mut voice = self.run_window(&padded)?;
+            voice.truncate(window.len());
+            return Ok(voice);
+        }
+        let spec = self.stft.forward(window);
+        let correction = match &mut self.engine {
+            Engine::Onnx(session) => onnx_correction(session, &spec)?,
+            #[cfg(all(feature = "mlx", target_os = "macos"))]
+            Engine::Mlx(network) => network.correction(&spec)?,
+        };
+        let mut voice = self.stft.inverse(&correction, window.len());
         for (v, a) in voice.iter_mut().zip(window) {
             *v += a;
         }
@@ -154,55 +230,89 @@ impl VoiceIsolator {
     }
 }
 
-fn installed(models_dir: &Path) -> Result<std::path::PathBuf> {
-    let spec: &ModelSpec = &VOICE_ISOLATOR_MODEL;
+fn installed(models_dir: &Path, spec: &ModelSpec) -> Result<std::path::PathBuf> {
     let path = models_dir.join(spec.file_name);
     if !path.is_file() {
         return Err(Error::VoiceIsolator(format!(
-            "{} is not installed; run `cargo run --example fetch-onnx-models`",
+            "{} is not installed; `meethook transcribe` downloads it, or run \
+             `cargo run --example isolate-voice` on a wav",
             path.display()
         )));
     }
     Ok(path)
 }
 
+/// The ONNX graph's correction of `spec`, flat `[frames][bin][re, im]`.
+fn onnx_correction(session: &mut Session, spec: &[f32]) -> Result<Vec<f32>> {
+    let frames = spec.len() / (BINS * 2);
+    let input =
+        TensorRef::from_array_view(([1usize, frames, BINS, 2], spec)).map_err(inference_failed)?;
+    let outputs = session
+        .run(ort::inputs!["spec" => input])
+        .map_err(inference_failed)?;
+    let (shape, correction) = outputs["correction"]
+        .try_extract_tensor::<f32>()
+        .map_err(inference_failed)?;
+    if correction.len() != spec.len() {
+        return Err(Error::VoiceIsolator(format!(
+            "output `correction` has shape {shape:?}, expected [1, {frames}, {BINS}, 2]"
+        )));
+    }
+    Ok(correction.to_vec())
+}
+
 fn inference_failed(source: ort::Error) -> Error {
     Error::VoiceIsolator(source.to_string())
 }
 
-/// One graph window: where it starts in the input. Every window is [`WINDOW`] samples long;
-/// the last is zero-padded.
-#[derive(Debug, PartialEq, Eq)]
-struct Window {
-    start: usize,
+/// `torch.linspace(start, end, steps)` in float32 as PyTorch's CPU kernel evaluates it: the first
+/// half counts up from `start`, the second half counts back from `end`, so both ends are exact.
+fn linspace(start: f32, end: f32, steps: usize) -> Vec<f32> {
+    if steps == 1 {
+        return vec![start];
+    }
+    let step = (end - start) / (steps - 1) as f32;
+    (0..steps)
+        .map(|i| {
+            if i < steps / 2 {
+                start + step * i as f32
+            } else {
+                end - step * (steps - i - 1) as f32
+            }
+        })
+        .collect()
 }
 
-/// The windows covering `len` samples: none for empty input, one up to a full window, then a
-/// window every [`STRIDE`] samples until one reaches the end.
-fn plan_windows(len: usize) -> Vec<Window> {
-    if len == 0 {
-        return Vec::new();
-    }
-    let mut windows = vec![Window { start: 0 }];
-    while windows.last().is_some_and(|w| w.start + WINDOW < len) {
-        let start = windows.last().map_or(0, |w| w.start) + STRIDE;
-        windows.push(Window { start });
-    }
-    windows
-}
-
-/// The blend weight of sample `j` of a window. The first window has no left neighbour and the
-/// last no right one, so those edges stay at 1; elsewhere a 2 s linear ramp that sums to 1
-/// with the neighbour's opposite ramp.
-fn crossfade_weight(j: usize, first: bool, last: bool) -> f32 {
-    let mut weight = 1.0;
-    if !first && j < OVERLAP {
-        weight *= (j as f32 + 0.5) / OVERLAP as f32;
-    }
-    if !last && j >= WINDOW - OVERLAP {
-        weight *= 1.0 - ((j - (WINDOW - OVERLAP)) as f32 + 0.5) / OVERLAP as f32;
-    }
-    weight
+/// The windows covering `len > WINDOW` samples, each as its start and a [`WINDOW`]-long weight.
+/// Starts are every [`STRIDE`] samples while that leaves more than a window, then one final
+/// window ending at `len`. A window's weight is 1 except at the edges it shares: the first
+/// `fade_in` samples (where the previous window is still at full weight) are 0, then a
+/// [`OVERLAP`] ramp up, and a ramp down over the last [`OVERLAP`] unless it is the last window.
+fn plan_windows(len: usize) -> Vec<(usize, Vec<f32>)> {
+    let mut starts: Vec<usize> = (0..len - WINDOW).step_by(STRIDE).collect();
+    starts.push(len - WINDOW);
+    let up = linspace(0.0, 1.0, OVERLAP);
+    let down = linspace(1.0, 0.0, OVERLAP);
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let mut w = vec![1.0f32; WINDOW];
+            if i > 0 {
+                let fade_in = starts[i - 1] + STRIDE - start;
+                w[..fade_in.min(WINDOW)].fill(0.0);
+                for (k, r) in up.iter().enumerate() {
+                    if fade_in + k < WINDOW {
+                        w[fade_in + k] = *r;
+                    }
+                }
+            }
+            if start + WINDOW < len {
+                w[WINDOW - OVERLAP..].copy_from_slice(&down);
+            }
+            (start, w)
+        })
+        .collect()
 }
 
 /// `torch.stft` / `torch.istft` with `n_fft` 2048, hop 480, a periodic Hann window and
@@ -376,39 +486,54 @@ mod tests {
     }
 
     #[test]
-    fn window_planning_covers_the_input() {
-        assert!(plan_windows(0).is_empty());
-        for len in [1, 1000, WINDOW - 1, WINDOW] {
-            assert_eq!(plan_windows(len), vec![Window { start: 0 }], "{len}");
+    fn windows_cover_the_input_and_the_last_ends_at_the_end() {
+        for len in [
+            WINDOW + 1,
+            WINDOW + STRIDE,
+            WINDOW + STRIDE + 1,
+            5 * SAMPLE_RATE as usize * 10,
+        ] {
+            let plan = plan_windows(len);
+            let (last, _) = plan.last().unwrap();
+            assert_eq!(last + WINDOW, len, "{len}: the last window ends at the end");
+            assert_eq!(plan[0].0, 0);
+            // Blending a constant must give the constant back: every sample is covered with
+            // positive total weight.
+            let mut weight = vec![0.0f32; len];
+            for (start, w) in &plan {
+                for (j, x) in w.iter().enumerate() {
+                    weight[start + j] += x;
+                }
+            }
+            assert!(
+                weight.iter().all(|&w| w > 0.5),
+                "{len}: a sample is under-covered"
+            );
         }
-        assert_eq!(
-            plan_windows(WINDOW + 1),
-            vec![Window { start: 0 }, Window { start: STRIDE }]
-        );
-        let len = 5 * SAMPLE_RATE as usize * 10;
-        let windows = plan_windows(len);
-        assert!(
-            windows
-                .windows(2)
-                .all(|p| p[1].start - p[0].start == STRIDE)
-        );
-        let end = windows.last().unwrap().start + WINDOW;
-        assert!(end >= len);
-        // The last window is needed: the one before it stops short of the end.
-        assert!(windows[windows.len() - 2].start + WINDOW < len);
     }
 
     #[test]
-    fn crossfades_sum_to_one_across_every_overlap() {
-        for j in (0..OVERLAP).step_by(997) {
-            let outgoing = crossfade_weight(WINDOW - OVERLAP + j, true, false);
-            let incoming = crossfade_weight(j, false, true);
-            assert!((outgoing + incoming - 1.0).abs() < 1e-6, "{j}");
-        }
-        assert_eq!(crossfade_weight(0, true, true), 1.0);
-        assert_eq!(crossfade_weight(WINDOW - 1, true, true), 1.0);
-        // The middle of a middle window is untouched.
-        assert_eq!(crossfade_weight(WINDOW / 2, false, false), 1.0);
+    fn a_window_that_overlaps_more_than_the_stride_fades_in_late() {
+        // len = WINDOW + 1: the second window starts at 1, so the first is at full weight until
+        // its own ramp, and the second must be silent where the first still is.
+        let plan = plan_windows(WINDOW + 1);
+        assert_eq!(plan.len(), 2);
+        let fade_in = plan[0].0 + STRIDE - plan[1].0;
+        assert!(plan[1].1[..fade_in].iter().all(|&w| w == 0.0));
+        assert_eq!(plan[1].1[fade_in], 0.0);
+        assert_eq!(plan[1].1[fade_in + OVERLAP - 1], 1.0);
+        assert!(
+            plan[1].1[WINDOW - 1] == 1.0,
+            "the last window never fades out"
+        );
+    }
+
+    #[test]
+    fn linspace_hits_both_ends_exactly() {
+        let up = linspace(0.0, 1.0, OVERLAP);
+        assert_eq!((up[0], up[OVERLAP - 1]), (0.0, 1.0));
+        assert!(up.windows(2).all(|p| p[1] >= p[0]));
+        assert_eq!(linspace(1.0, 0.0, 1), vec![1.0]);
     }
 
     // ---- need the 260 MB weights; run with `-- --ignored` ----
@@ -423,10 +548,18 @@ mod tests {
         root.join("models")
     }
 
+    /// The ONNX engine, downloading its graph first the way the real command does.
     fn open_installed() -> VoiceIsolator {
         let dir = models_dir();
-        // Same call the real command will make, so this downloads and verifies lazily.
         meethook_models::ensure_model(&dir, &VOICE_ISOLATOR_MODEL, &mut |_, _| {})
+            .expect("the voice isolator must download");
+        VoiceIsolator::open_onnx(&dir).expect("the voice isolator must load")
+    }
+
+    /// Whatever [`VoiceIsolator::open`] picks in this build, downloading its model first.
+    fn open_default() -> VoiceIsolator {
+        let dir = models_dir();
+        meethook_models::ensure_model(&dir, VoiceIsolator::required_model(), &mut |_, _| {})
             .expect("the voice isolator must download");
         VoiceIsolator::open(&dir).expect("the voice isolator must load")
     }
@@ -449,6 +582,10 @@ mod tests {
         }
     }
 
+    /// The MLX engine runs fp16: 75.3 dB measured against the reference, the same as the Swift
+    /// port it comes from (75.4 dB).
+    const MLX_FLOOR_DB: f64 = 70.0;
+
     fn testdata(name: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata/voice-isolator")
@@ -457,10 +594,16 @@ mod tests {
 
     #[test]
     #[ignore = "downloads the 260 MB voice isolator"]
+    #[allow(clippy::infallible_destructuring_match)] // two engines with the `mlx` feature
     fn the_graph_has_the_documented_contract() {
         let isolator = open_installed();
-        let inputs = isolator.session.inputs();
-        let outputs = isolator.session.outputs();
+        let session = match &isolator.engine {
+            Engine::Onnx(session) => session,
+            #[cfg(all(feature = "mlx", target_os = "macos"))]
+            Engine::Mlx(_) => panic!("open_installed opens the ONNX engine"),
+        };
+        let inputs = session.inputs();
+        let outputs = session.outputs();
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].name(), "spec");
         assert_eq!(outputs.len(), 1);
@@ -471,7 +614,7 @@ mod tests {
     #[test]
     #[ignore = "downloads the 260 MB voice isolator"]
     fn short_exact_and_empty_input_keep_their_length() {
-        let mut isolator = open_installed();
+        let mut isolator = open_default();
         for n in [0, 1, 4800, WINDOW - 1, WINDOW] {
             let out = isolator.isolate(&signal(n)).unwrap();
             assert_eq!(out.len(), n);
@@ -494,7 +637,13 @@ mod tests {
         }
         let audio = read_wav(&input);
         let want = read_wav(&reference);
-        let got = open_installed().isolate(&audio).unwrap();
+        let mut isolator = open_default();
+        let floor = if isolator.accelerated && cfg!(feature = "mlx") {
+            MLX_FLOOR_DB
+        } else {
+            90.0
+        };
+        let got = isolator.isolate(&audio).unwrap();
         assert_eq!(got.len(), want.len());
         let signal: f64 = want.iter().map(|&s| f64::from(s).powi(2)).sum();
         let noise: f64 = want
@@ -504,6 +653,6 @@ mod tests {
             .sum();
         let snr = 10.0 * (signal / noise.max(1e-30)).log10();
         eprintln!("SNR against the Python reference: {snr:.1} dB");
-        assert!(snr >= 35.0, "SNR {snr:.1} dB is below 35 dB");
+        assert!(snr >= floor, "SNR {snr:.1} dB is below {floor} dB");
     }
 }

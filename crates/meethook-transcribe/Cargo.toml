@@ -58,6 +58,17 @@ ort = { workspace = true, features = ["coreml"] }
 # avoid. This is what makes `WhisperContextParameters::use_gpu` default to true on macOS;
 # see the assertion in `asr` that keeps that honest.
 whisper-rs = { workspace = true, features = ["metal"] }
+# The voice isolator on the GPU through MLX. Optional only so that a sandboxed `nix build` can
+# turn it off (`--no-default-features`); see the workspace entry and MLX.md.
+mlx-rs = { workspace = true, optional = true }
+
+[features]
+# The voice isolator on Apple's GPU through MLX: about 11x the ONNX CPU path through the whole
+# mic stage on an M1 Pro (see the `voice_isolator` module docs). On by default, and a no-op off macOS, where the isolator
+# runs on the ONNX Runtime CPU provider. `--no-default-features` selects the ONNX engine on
+# macOS too, for builds that cannot compile Metal shaders.
+default = ["mlx"]
+mlx = ["dep:mlx-rs"]
 
 [dev-dependencies]
 # The `speaker-trials` example's `--embeddings` cache, and nothing else. The examples here

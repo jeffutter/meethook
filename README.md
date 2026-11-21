@@ -256,16 +256,23 @@ discovered session that doesn't already have a transcript is considered.
 **Mic isolation.** By default, before Whisper hears your microphone, a voice-isolator model
 removes background noise from the speech regions of the (echo-cancelled) mic track. Only the mic
 track is affected: `mic.cleaned.wav`, `meeting.opus` and the speaker track are never changed, and
-the speaker track is never isolated. The model is about 260 MB, downloaded once on first use (only
-when there is something to transcribe) into `models/`; `--no-isolate` avoids the download. If it
-cannot be fetched or loaded, `transcribe` says so and uses the plain mic track. What each run did
-is recorded in the session's `cleaning.json`. Cost: the isolator runs on the CPU at about 0.3x realtime (0.30x measured: 600 s of continuous
-speech in 2022 s wall, peak memory 8.9 GB, Apple M1 Pro with 32 GB, release build, through the
-whole stage with the real speech detector; `cargo run --release --example isolate-voice
-<48 kHz wav> --stage --minutes 10`). That is worst case, since only speech regions are isolated:
-a meeting with 20 minutes of your own speech in it adds roughly an hour. A one-hour continuous
-track was not run (it would take about 3.4 hours at that rate); cost is linear in speech
-duration, so the ten-minute figure extrapolates. Pass `--no-isolate` if you would rather not pay it.
+the speaker track is never isolated. The weights are downloaded once on first use (only when
+there is something to transcribe) into `models/`: 152 MiB on macOS, where the isolator runs on the
+GPU through MLX, or 260 MB where it runs on the CPU (Linux, or a macOS binary built without the
+`mlx` feature, such as `nix build`). `--no-isolate` avoids the download. If the model cannot be
+fetched or loaded, `transcribe` says so and uses the plain mic track; if the GPU refuses part of
+the work, that stretch is left as it was and the progress line says how many batches failed. What
+each run did is recorded in the session's `cleaning.json`.
+
+Cost, measured on an Apple M1 Pro (32 GB) with the real speech detector through the whole stage
+(`cargo run --release --example isolate-voice mic.cleaned.wav --stage --track --minutes 30`, on the
+first 30 minutes of a real recording, 117 speech regions, 433 s of audio sent through the
+isolator): **106 s on the GPU (17x realtime, 2.3 GB peak) against 1,191 s on the CPU (1.5x
+realtime, 12.3 GB peak)**, so about 11x. Only speech regions are isolated, so the cost follows
+how much you talk, not how long the meeting is; a track that is all speech from start to finish is
+the worst case, at about 4x realtime on the GPU and 0.33x on the CPU. How the GPU engine was
+ported and how to build it: [`MLX.md`](MLX.md). Pass `--no-isolate` if you would rather not pay
+it.
 
 **Vocabulary.** Whisper misspells names and jargon it has not seen. `~/meethook/vocabulary.toml`
 (under `--root` / `MEETHOOK_ROOT`, beside `speakers.json`; optional) lists the words to bias it

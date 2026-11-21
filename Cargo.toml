@@ -68,7 +68,7 @@ opt-level = 2
 meethook-enroll = { path = "crates/meethook-enroll" }
 meethook-models = { path = "crates/meethook-models" }
 meethook-session = { path = "crates/meethook-session" }
-meethook-transcribe = { path = "crates/meethook-transcribe" }
+meethook-transcribe = { path = "crates/meethook-transcribe", default-features = false }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -254,6 +254,17 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
   "pkg-config",
   "api-27",
 ] }
+
+# Rust bindings to Apple's MLX, for the voice isolator's GPU engine (`meethook-transcribe`'s `mlx`
+# feature, which is on by default and does nothing off macOS). It builds the MLX C++ library with
+# cmake and compiles its Metal shaders, which needs Xcode's Metal Toolchain (`xcodebuild
+# -downloadComponent MetalToolchain`) and an `xcrun` that can find it; the flake's dev shell
+# provides that (see `nix/xcrun-metal-shim.sh`) and CI installs the toolchain. A sandboxed
+# `nix build` cannot compile Metal at all (nixpkgs builds MLX with `MLX_BUILD_METAL=false` for
+# that reason), so the flake's package builds with `--no-default-features` and runs the ONNX
+# engine instead. Tilde pin: a 0.x crate. How the isolator was ported, and how to update it:
+# MLX.md.
+mlx-rs = "~0.34"
 
 # WebRTC AEC3 for the echo-cancellation pre-pass: a pure-Rust port of WebRTC's audio processing
 # module, so there is no C++ toolchain or system library to build or link. A 0.x crate, so a

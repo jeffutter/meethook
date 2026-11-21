@@ -27,8 +27,8 @@ use meethook_session::{
 };
 use meethook_transcribe::{
     AsrSegment, Diarization, Diarize, FIRERED_VAD_MODEL, FireRedVad, GateSpeechFinder, Isolation,
-    IsolationStage, SpeechToText, TARGET_RATE, VOICE_ISOLATOR_MODEL, VoiceIsolator, mixdown,
-    read_track_16k_mono, transcribe_session_isolating,
+    IsolationStage, SpeechToText, TARGET_RATE, VoiceIsolator, mixdown, read_track_16k_mono,
+    transcribe_session_isolating,
 };
 
 const RATE_48K: u32 = 48_000;
@@ -163,7 +163,7 @@ fn make_session(root: &Path) -> DiscoveredSession {
 
 fn real_stage() -> IsolationStage {
     let models = models_dir();
-    ensure_model(&models, &VOICE_ISOLATOR_MODEL, &mut |_, _| {})
+    ensure_model(&models, VoiceIsolator::required_model(), &mut |_, _| {})
         .expect("the voice isolator must download");
     let vad = ensure_model(&models, &FIRERED_VAD_MODEL, &mut |_, _| {})
         .expect("the VAD model must download");
