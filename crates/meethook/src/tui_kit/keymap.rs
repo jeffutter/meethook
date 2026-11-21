@@ -111,6 +111,12 @@ impl<A: Copy> Keymap<A> {
         Keymap { bindings }
     }
 
+    /// The table as declared, for a caller that has to look a key up by its action (the footer
+    /// while a clip plays names the restart key by what it does, not by where it sits).
+    pub fn bindings(&self) -> &[Binding<A>] {
+        &self.bindings
+    }
+
     fn in_context(&self, ctx: Context) -> impl Iterator<Item = &Binding<A>> {
         self.bindings.iter().filter(move |b| b.context == ctx)
     }

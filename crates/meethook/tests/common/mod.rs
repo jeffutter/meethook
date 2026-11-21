@@ -249,8 +249,13 @@ impl Driver {
     pub(crate) fn feed(&mut self, keys: &[&[u8]]) {
         for key in keys {
             self.master.write_all(key).unwrap();
-            self.pump();
-            std::thread::sleep(Duration::from_millis(150));
+            // Drained throughout the settle, not once: a key that repaints a whole pane writes
+            // more than a pty holds, and a child blocked in `write` reads no further keys.
+            let settled = Instant::now() + Duration::from_millis(150);
+            while Instant::now() < settled {
+                self.pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 

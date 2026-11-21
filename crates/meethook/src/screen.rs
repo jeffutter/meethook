@@ -1,10 +1,12 @@
 //! The full-screen answerer for `enroll`: terminal setup, the key map, the event loop, teardown.
 //!
-//! Three files, and the split is testability rather than tidiness:
+//! Four files, and the split is testability rather than tidiness:
 //!
 //! - [`state`] is the state machine -- the cursors, the filter, the deferrals, the derived view.
 //!   No terminal, no `ratatui`, no clock. That is where the tests are.
 //! - [`render`] is the panes, given that view. Exercised through `ratatui`'s `TestBackend`.
+//! - [`keys`] is the modal key table over the shared TUI kit: one table that drives dispatch, the
+//!   hint footer and the `?` help, with no Ctrl chord for any action but quit.
 //! - here: the parts that genuinely need a person in front of them, plus the two seams that let
 //!   the other two files exist -- [`Costs`] over
 //!   [`Preview`] and the key map.
@@ -22,12 +24,13 @@
 //! [`Interface::finish`] flushes the whole thing to stdout once the frame is down -- so a
 //! full-screen run leaves the same scrollback a plain one does.
 
+pub mod keys;
 pub mod render;
 pub mod state;
 pub mod who;
 
 use std::cell::RefCell;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -37,11 +40,11 @@ use std::time::Duration;
 use meethook_enroll::{Answer, GroupConsequence, Interviewer, Preview, Scan, Snippet, Voice};
 use meethook_session::Paths;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{
-    Event as Key, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
-};
+use ratatui::crossterm::event::{Event as Key, poll, read};
 
 use crate::clips::{Clips, Progress};
+use crate::tui_kit::{HelpOutcome, HelpOverlay, Theme};
+use keys::Keys;
 use state::{Context, Cost, Costs, Event, Screen, Step, VoiceView};
 
 /// How often a frame with a clip playing redraws itself, and so how fast the position moves and
@@ -54,7 +57,7 @@ const TICK: Duration = Duration::from_millis(250);
 
 /// How long the frame should wait for a key before redrawing -- `None` to block until one arrives.
 ///
-/// The whole of the rule, in a function next to [`event`] and for the same reason: it is then
+/// The whole of the rule, in a function next to [`keys::Keys::dispatch`] and for the same reason: it is then
 /// decidable in `cargo test` with no terminal in front of it. An idle frame has nothing that would
 /// redraw differently, so it blocks rather than waking four times a second to find that out.
 ///
@@ -235,6 +238,8 @@ impl Shared {
 /// The full-screen implementation of [`Interviewer`].
 pub struct Interface {
     state: Screen,
+    /// The key table and the theme the frame draws with; built once, since neither changes.
+    keys: Keys,
     narration: Shared,
     clips: Clips,
     /// What every enrolled name currently names, gathered off this thread.
@@ -259,6 +264,9 @@ impl Interface {
     pub fn new(narration: Shared, paths: Paths) -> Interface {
         Interface {
             state: Screen::default(),
+            keys: Keys::new(Theme::detect(io::stdout().is_terminal(), |name| {
+                std::env::var(name).ok()
+            })),
             narration,
             clips: Clips::default(),
             background: Background::new(paths),
@@ -377,6 +385,7 @@ impl Interface {
         // Field by field, so the state machine and the terminal can be borrowed at once.
         let Interface {
             state,
+            keys,
             narration,
             clips,
             background,
@@ -392,6 +401,9 @@ impl Interface {
         // a spawn, and this loop is exactly as long as a spawn is allowed to live: `clips.stop()`
         // runs the moment `ask` returns.
         let mut line: Option<usize> = None;
+        // The `?` overlay, open or not. A loop-local like `line`: it lives exactly as long as the
+        // question does, and while it is open it takes every key.
+        let mut help: Option<HelpOverlay> = None;
 
         loop {
             // Whether the clip played at all is only knowable here, once the child has been
@@ -413,9 +425,9 @@ impl Interface {
                 // `playing` is the poll's answer, so a clip that has finished takes the row's
                 // mark with it without anything having to clear `line`.
                 let sounding = playing.map(|progress| Sounding { progress, line });
-                if let Err(e) =
-                    terminal.draw(|frame| render::draw(frame, &derived, &lines, sounding))
-                {
+                if let Err(e) = terminal.draw(|frame| {
+                    render::draw(frame, &derived, &lines, sounding, keys, help.as_mut())
+                }) {
                     *trouble = Some(format!("the frame could not be drawn ({e})"));
                     return Answer::Quit;
                 }
@@ -448,9 +460,28 @@ impl Interface {
                     return Answer::Quit;
                 }
             };
-            let Some(event) = event(key) else {
+            if let Some(overlay) = help.as_mut() {
+                let rows = keys.help_rows(&state.view(view, &voice.preview, background.context()));
+                let page = terminal
+                    .size()
+                    .map(|size| HelpOverlay::page_height(size.into(), rows.len()))
+                    .unwrap_or(1);
+                if overlay.handle_key(key, rows.len(), page) == HelpOutcome::Close {
+                    help = None;
+                }
+                continue;
+            }
+            let event = {
+                let derived = state.view(view, &voice.preview, background.context());
+                keys.dispatch(&derived, &key)
+            };
+            let Some(event) = event else {
                 continue;
             };
+            if event == Event::Help {
+                help = Some(HelpOverlay::default());
+                continue;
+            }
             // Playback is intercepted here because the samples are the shell's: the state machine
             // deliberately holds no audio. Two keys, two sources of samples, and the same
             // say/hush tail -- deliberately not merged, because they differ in every other line:
@@ -505,7 +536,7 @@ impl Interface {
 /// Whether an answer can have moved what the "who is this" pane reports, and so whether the scan
 /// behind it is now one answer behind.
 ///
-/// A function beside [`wait`] and [`event`], for the same reason: a rule about which of the
+/// A function beside [`wait`] and [`keys::Keys::dispatch`], for the same reason: a rule about which of the
 /// answers costs a re-scan is then decidable in `cargo test` with no terminal in front of it.
 ///
 /// Names are the only answers that write to `speakers.json`; denials write to the session's
@@ -564,7 +595,7 @@ impl Costs for Preview<'_> {
 /// What the play-the-line key should do about the selection it found: hand these samples over, or
 /// say this instead.
 ///
-/// A function beside [`event`] rather than three cases inside the loop, and for the same reason:
+/// A function beside [`keys::Keys::dispatch`] rather than three cases inside the loop, and for the same reason:
 /// which sentence the key produces is then decidable in `cargo test`, with no terminal and no
 /// audio device. The middle case is the one that needs it most, because it cannot be seen from
 /// the outside at all -- [`Clips::start`] treats no samples as a successful no-op, so a line whose
@@ -580,109 +611,6 @@ fn line_to_play(selected: Option<(usize, Snippet<'_>)>) -> Result<(usize, &[f32]
     }
 }
 
-/// Which key means what.
-///
-/// Two cursors and a filter that swallows typing, so the queue, the candidates and the snippets
-/// each get their own pair and the two commitments -- go to that voice, answer with that name --
-/// are separate keys rather than one Enter that means different things in different places.
-///
-/// Ctrl-C and Ctrl-D are both `Quit`: raw mode means no SIGINT arrives, and the line prompt
-/// already treats end of input as stopping rather than as a failure.
-///
-/// Two play keys, because there are two things to hear: Ctrl-P is the whole voice and Ctrl-L is
-/// the selected transcript line ("l for line"). Ctrl-L is conventionally "redraw", which this
-/// frame does at the top of every iteration anyway, so nothing is being displaced.
-///
-/// Ctrl-O ("o for override") is this frame's `forget --yes`: it answers with a candidate the
-/// library would otherwise refuse for taking a name off a third voice, which is a decision the
-/// user can only have made because the cost pane named that voice first. A control key for the
-/// reason choosing and creating are -- printable characters go to the filter -- and its own key
-/// rather than Enter, because a key that means "and I know what it costs" must not be reachable
-/// by the reflex that means "that one".
-///
-/// Ctrl-G ("g for go on to the next meeting") leaves the rest of this session's voices. It is
-/// the middle of three scopes -- Ctrl-S is one voice, this is the session, Ctrl-C is the run --
-/// and it is placed where no reflex reaches it and it reaches nothing: `f`, `h`, `t`, `v`
-/// and `b` were all unbound when it was picked. Not Ctrl-X, which sits beside the key that ends
-/// the whole run; not Left, because Right is the harmless "work on that voice" and pairing the
-/// two by direction pairs them by accident too; and not Ctrl-E or Ctrl-K, since `e` is beside
-/// `s` and `k` beside both `l` and `o`.
-///
-/// Ctrl-A ("a for assert") names the whole session's speaker track as one person at once, with
-/// the highlighted candidate. Its own key because its *scope* outranks every other answer here:
-/// Enter and Ctrl-O decide one voice, and this decides the session, overriding the heard-at-once
-/// veto -- the refusal no answer overrides -- which is exactly what the consequence pane previews
-/// before the key exists to be pressed. The slot was held open for it: the filter guard below
-/// excludes control characters precisely so a terminal reporting Ctrl-A as `Char('\u{1}')` cannot
-/// type into the filter, and this is what that exclusion was reserved for.
-///
-/// Ctrl-K ("k for mark") stages the voice under the queue cursor as one of several who are all
-/// one person: the group's aggregate preview sits in the consequence pane before any key applies
-/// it, and choosing a name while a member is asked about commits the whole group in one
-/// confirmation. Its own key for the reason choosing and creating are -- printable characters go
-/// to the filter. The slot was meant to be Ctrl-M ("m for mark"), but every terminal sends the
-/// same byte for Ctrl-M and Enter -- carriage return, 0x0D -- so the decoder hands the press
-/// over as `Enter` and the advertised key would answer the question instead of marking; Ctrl-K
-/// is the nearest free letter with its own byte (checked against a live terminal through this
-/// very decoder), and the bare letter types into the filter as every other unbound one does.
-///
-/// Ctrl-Y ("y for yes") confirms the tentative guess the current voice carries: the highlight
-/// moves onto the suggested name and the answer goes through exactly the path Enter takes --
-/// the same refusal gate, the same preview panes, the same Ctrl-O insistence behind it. Its own
-/// key rather than Enter because Enter answers whichever candidate happens to be highlighted,
-/// and confirming a guess must mean "that one" regardless of where the highlight sits. A
-/// control key for the reason choosing and creating are -- printable characters go to the
-/// filter -- and the bare letter types into the filter as every other unbound one does (checked
-/// against a live terminal through this very decoder).
-///
-/// Ctrl-R ("r for reject") refuses the same guess: the row goes back to the honest "Unknown N"
-/// its turns were written with, and the denial is written where a naming would have been. Its
-/// own key beside Ctrl-Y because the two are the two decisions a visible guess invites, and
-/// neither may ride the reflex keys -- Esc clears the filter and Enter chooses, so a guess
-/// action on either would reach by accident what a decision should not.
-///
-/// A free function taking a `KeyEvent` because a `KeyEvent` is constructible without a terminal,
-/// which is what makes this whole rule testable -- and it is where a stray Ctrl or a paste-shaped
-/// burst of characters would otherwise go wrong.
-fn event(key: KeyEvent) -> Option<Event> {
-    // A release is not a press. Terminals that report both would otherwise act on every key
-    // twice.
-    if key.kind == KeyEventKind::Release {
-        return None;
-    }
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match (key.code, ctrl) {
-        (KeyCode::Char('c' | 'd'), true) => Some(Event::Quit),
-        (KeyCode::Char('n'), true) => Some(Event::NewPerson),
-        (KeyCode::Char('p'), true) => Some(Event::Play),
-        (KeyCode::Char('l'), true) => Some(Event::PlaySnippet),
-        (KeyCode::Char('s'), true) => Some(Event::Skip),
-        (KeyCode::Char('g'), true) => Some(Event::Leave),
-        (KeyCode::Char('o'), true) => Some(Event::Anyway),
-        (KeyCode::Char('a'), true) => Some(Event::Assert),
-        (KeyCode::Char('k'), true) => Some(Event::Mark),
-        (KeyCode::Char('y'), true) => Some(Event::Confirm),
-        (KeyCode::Char('r'), true) => Some(Event::Deny),
-        (KeyCode::Up, false) => Some(Event::Up),
-        (KeyCode::Down, false) => Some(Event::Down),
-        (KeyCode::Right, false) => Some(Event::Select),
-        (KeyCode::PageUp, false) => Some(Event::SnippetUp),
-        (KeyCode::PageDown, false) => Some(Event::SnippetDown),
-        (KeyCode::Tab, false) => Some(Event::CandidateDown),
-        // Shift-Tab arrives as its own code, with the Shift modifier set, so the modifier is not
-        // examined here.
-        (KeyCode::BackTab, _) => Some(Event::CandidateUp),
-        (KeyCode::Enter, false) => Some(Event::Choose),
-        (KeyCode::Backspace, false) => Some(Event::Backspace),
-        (KeyCode::Esc, false) => Some(Event::ClearFilter),
-        // Everything else printable goes to the filter, which is why choosing and creating are
-        // control keys. Control characters are excluded so a terminal reporting Ctrl-A as
-        // `Char('\u{1}')` cannot type into the filter.
-        (KeyCode::Char(c), false) if !c.is_control() => Some(Event::Filter(c)),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -693,22 +621,10 @@ mod tests {
 
     use meethook_enroll::{Answer, Interviewer, Scan};
     use meethook_session::Paths;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
+    use super::state::Context;
     use super::state::tests::heard;
-    use super::state::{Context, Event};
-    use super::{
-        Background, Interface, Progress, Shared, TICK, event, line_to_play, rewrites, wait,
-    };
-
-    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }
-    }
+    use super::{Background, Interface, Progress, Shared, TICK, line_to_play, rewrites, wait};
 
     /// A scan that costs nothing and counts how often it was asked for. The root is never read,
     /// which is the point: what is being measured is how many times the frame asks.
@@ -754,53 +670,6 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("{what}");
-    }
-
-    /// Every key this frame binds, in one table, so a rebinding that drops one fails here rather
-    /// than in front of a user.
-    #[test]
-    fn every_bound_key_means_what_the_footer_says() {
-        let bound = [
-            (KeyCode::Up, KeyModifiers::NONE, Event::Up),
-            (KeyCode::Down, KeyModifiers::NONE, Event::Down),
-            (KeyCode::Right, KeyModifiers::NONE, Event::Select),
-            (KeyCode::PageUp, KeyModifiers::NONE, Event::SnippetUp),
-            (KeyCode::PageDown, KeyModifiers::NONE, Event::SnippetDown),
-            (KeyCode::Tab, KeyModifiers::NONE, Event::CandidateDown),
-            (KeyCode::BackTab, KeyModifiers::SHIFT, Event::CandidateUp),
-            (KeyCode::Enter, KeyModifiers::NONE, Event::Choose),
-            (KeyCode::Backspace, KeyModifiers::NONE, Event::Backspace),
-            (KeyCode::Esc, KeyModifiers::NONE, Event::ClearFilter),
-            (KeyCode::Char('n'), KeyModifiers::CONTROL, Event::NewPerson),
-            (KeyCode::Char('p'), KeyModifiers::CONTROL, Event::Play),
-            (
-                KeyCode::Char('l'),
-                KeyModifiers::CONTROL,
-                Event::PlaySnippet,
-            ),
-            (KeyCode::Char('s'), KeyModifiers::CONTROL, Event::Skip),
-            (KeyCode::Char('g'), KeyModifiers::CONTROL, Event::Leave),
-            (KeyCode::Char('o'), KeyModifiers::CONTROL, Event::Anyway),
-            (KeyCode::Char('a'), KeyModifiers::CONTROL, Event::Assert),
-            (KeyCode::Char('k'), KeyModifiers::CONTROL, Event::Mark),
-            (KeyCode::Char('y'), KeyModifiers::CONTROL, Event::Confirm),
-            (KeyCode::Char('r'), KeyModifiers::CONTROL, Event::Deny),
-            (KeyCode::Char('a'), KeyModifiers::NONE, Event::Filter('a')),
-            (KeyCode::Char(' '), KeyModifiers::NONE, Event::Filter(' ')),
-            // The non-regression that matters for a new letter key: without the modifier it is
-            // still text, because printable characters type into the candidate filter.
-            (KeyCode::Char('g'), KeyModifiers::NONE, Event::Filter('g')),
-            (KeyCode::Char('k'), KeyModifiers::NONE, Event::Filter('k')),
-            (KeyCode::Char('y'), KeyModifiers::NONE, Event::Filter('y')),
-            (KeyCode::Char('r'), KeyModifiers::NONE, Event::Filter('r')),
-        ];
-        for (code, modifiers, expected) in bound {
-            assert_eq!(
-                event(key(code, modifiers)),
-                Some(expected),
-                "{code:?} with {modifiers:?}"
-            );
-        }
     }
 
     /// AC #4, the no-stall half: an outstanding scan wakes the frame, so the "who is this" pane
@@ -955,35 +824,6 @@ mod tests {
             line_to_play(None),
             Err("nothing was transcribed for this voice".to_string())
         );
-    }
-
-    /// Both ways out. Raw mode means no SIGINT arrives, so Ctrl-C has to be bound or the frame
-    /// cannot be left by the key everybody reaches for first.
-    #[test]
-    fn control_c_and_control_d_both_quit() {
-        for c in ['c', 'd'] {
-            assert_eq!(
-                event(key(KeyCode::Char(c), KeyModifiers::CONTROL)),
-                Some(Event::Quit)
-            );
-        }
-    }
-
-    /// An unbound key does nothing at all, and a release is not a press.
-    #[test]
-    fn an_unbound_key_and_a_release_are_both_ignored() {
-        assert_eq!(event(key(KeyCode::F(5), KeyModifiers::NONE)), None);
-        assert_eq!(event(key(KeyCode::Left, KeyModifiers::NONE)), None);
-        assert_eq!(
-            event(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
-            None,
-            "an unbound control key must not type into the filter"
-        );
-        let released = KeyEvent {
-            kind: KeyEventKind::Release,
-            ..key(KeyCode::Enter, KeyModifiers::NONE)
-        };
-        assert_eq!(event(released), None);
     }
 
     /// The one line that makes fragment bundling reach a user at all: the session loop folds

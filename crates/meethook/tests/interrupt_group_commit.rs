@@ -197,6 +197,17 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 
 // --- the attempt ---------------------------------------------------------------------------
 
+/// The gesture: focus the voice list, mark each row, type the name into the filter, leave the
+/// filter, and press the new-person key that commits the staged group. The settles matter: each
+/// mark must land on its own row, and Esc must not share a read with the key after it or the
+/// terminal decoder reports the pair as Alt-n. Only the final key goes out without a settle, so
+/// the walk's first write races the caller's first poll and nothing in between.
+fn mark_all_and_name(driver: &mut Driver) {
+    driver.feed(&[b"h", b"m", b"j", b"m", b"j", b"m", b"/"]);
+    driver.feed(&[NAME.as_bytes(), b"\x1b"]);
+    driver.write_now(b"n");
+}
+
 /// An attempt that caught nothing: the process finished before the kill, or the kill landed
 /// after the last member. The fixture is rebuilt and the geometry retried.
 struct Missed;
@@ -219,9 +230,7 @@ fn interrupt_once(root: &Path) -> Result<BTreeSet<u32>, Missed> {
     // its name through the typed-name door, which commits the whole staged group at once. The
     // name and the confirming key go out in one breath: from that byte on disk, the walk's
     // first write is racing this test's first poll, and there is nothing to settle.
-    driver.feed(&[b"\x0b", b"\x1b[B", b"\x0b", b"\x1b[B", b"\x0b"]);
-    driver.write_now(NAME.as_bytes());
-    driver.write_now(b"\x0e");
+    mark_all_and_name(&mut driver);
     let t_apply = Instant::now();
 
     // The first member's database row is the walk's first write: from its appearance on disk
@@ -232,6 +241,9 @@ fn interrupt_once(root: &Path) -> Result<BTreeSet<u32>, Missed> {
     let mut killed = false;
     let mut detected_at: Option<Duration> = None;
     while Instant::now() < deadline {
+        // Drained on every turn: each key now redraws the frame, and a child blocked writing
+        // into a full pty never gets as far as the commit this loop is watching for.
+        driver.pump();
         if std::fs::read(&db_file)
             .map(|bytes| bytes.windows(NAME.len()).any(|w| w == NAME.as_bytes()))
             .unwrap_or(false)
@@ -245,8 +257,11 @@ fn interrupt_once(root: &Path) -> Result<BTreeSet<u32>, Missed> {
         std::thread::sleep(Duration::from_micros(200));
     }
     if !killed && Instant::now() >= deadline {
+        // The wait above never drained the pty, so the tail would be as old as the last key.
+        driver.pump();
         panic!(
-            "the run never reached the first commit; output:\n{}",
+            "the run never reached the first commit (child: {:?}); output:\n{}",
+            driver.child.try_wait(),
             driver.tail()
         );
     }
@@ -330,9 +345,7 @@ fn complete_and_verify(root: &Path, db: &BTreeSet<u32>) {
         // stranded member: since TASK-055 it keeps -- rather than forgets -- the names-file row
         // when the database already holds the reference, so the natural recovery gesture no
         // longer leaves the voice demoted. The group door remains the canonical recovery.)
-        driver.feed(&[b"\x0b", b"\x1b[B", b"\x0b", b"\x1b[B", b"\x0b"]);
-        driver.write_now(NAME.as_bytes());
-        driver.write_now(b"\x0e");
+        mark_all_and_name(&mut driver);
         let status = driver.wait_exit(Duration::from_secs(30));
         assert!(
             status.success(),

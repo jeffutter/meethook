@@ -98,6 +98,34 @@ pub struct VoiceView<'a> {
     pub clip_is_empty: bool,
 }
 
+/// Whether printable keys are commands or text.
+///
+/// The enroll frame used to type every printable key into the filter, which is why every action
+/// lived on a Ctrl chord. Typing is now a mode you enter on purpose, so the plain keys are free to
+/// be the actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Normal,
+    Filter,
+}
+
+/// Which list the movement keys act on.
+///
+/// Defaults to the candidates: a question has just been put, and answering it is what the next
+/// keys are for. The voice list is one `h` away, and the cursor already starts on the voice being
+/// asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    Voices,
+    #[default]
+    Candidates,
+}
+
+/// How many rows a page key moves. A fixed step because the state machine knows nothing of the
+/// terminal's height; half a page is half of it.
+const PAGE: isize = 10;
+
 /// What one key did: nothing the caller has to act on, or the answer to this voice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -112,7 +140,7 @@ pub enum Step {
 /// `KeyEvent` is constructible without a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    /// Move the queue cursor.
+    /// Move the queue cursor, whichever pane has the focus.
     Up,
     Down,
     /// Work on the voice the queue cursor is on. A no-op when that is the voice being asked
@@ -203,6 +231,32 @@ pub enum Event {
     /// the voice back, so nothing here waits to be asked again.
     Leave,
     Quit,
+    /// Start typing into the candidate filter: from here printable keys go to
+    /// [`Event::Filter`] rather than meaning anything of their own. Also puts the focus on the
+    /// candidates, which is the thing being narrowed.
+    EnterFilter,
+    /// Stop typing. The text stays, so the narrowed list stays; [`Event::ClearFilter`] is what
+    /// takes it away.
+    LeaveFilter,
+    /// Move the focus between the voice list and the candidate pane. There are two, so next and
+    /// previous land on the same pane; they are separate events only so the keys read naturally.
+    FocusNext,
+    FocusPrev,
+    FocusVoices,
+    FocusCandidates,
+    /// One row up or down in whichever list has the focus.
+    MoveUp,
+    MoveDown,
+    /// First and last row, a page and half a page, in whichever list has the focus.
+    Top,
+    Bottom,
+    PageUp,
+    PageDown,
+    HalfUp,
+    HalfDown,
+    /// Open the key help. Handled by the shell, which owns the overlay; here for the sake of one
+    /// total `match`.
+    Help,
 }
 
 /// What answering one candidate would cost, as much of it as this module is allowed to see.
@@ -367,6 +421,8 @@ pub struct View<'a> {
     /// [`Screen::selected`] returns, because both come off `selected_index`.
     pub snippet: usize,
     pub clip_is_empty: bool,
+    pub mode: Mode,
+    pub focus: Focus,
     /// One line about what just happened -- a clip that would not play, a voice that turned out
     /// not to be reachable. Cleared by the next key.
     pub status: Option<&'a str>,
@@ -449,6 +505,10 @@ pub struct Screen {
     /// run after this frame has gone, and the bundle's members ride in it.
     bundle: Option<Vec<String>>,
     status: Option<String>,
+    /// Whether printable keys type into the filter. Only the key map reads it to choose a context;
+    /// the state machine itself acts on whatever event it is handed.
+    mode: Mode,
+    focus: Focus,
 }
 
 /// One row the queue pane renders: one voice, or a still-open bundle collapsed into its
@@ -585,6 +645,8 @@ impl Screen {
         // A filter, a candidate highlight and a line selection are all about the voice that was on
         // the screen, so none of them survives the question changing.
         self.filter.clear();
+        self.mode = Mode::Normal;
+        self.focus = Focus::default();
         self.candidate = 0;
         self.snippet = 0;
         self.decided.remove(view.number);
@@ -809,7 +871,7 @@ impl Screen {
                     return Step::Waiting;
                 };
                 // Onto the guess, so the cost and consequence panes preview what the confirm
-                // commits, and a subsequent Ctrl-O insists on the guess rather than whatever
+                // commits, and a subsequent `o` insists on the guess rather than whatever
                 // happened to be highlighted.
                 self.candidate = index;
                 // From here it is Enter verbatim: the same lookup, the same tail.
@@ -919,8 +981,58 @@ impl Screen {
             // no target set.
             Event::Leave => return Step::Answered(Answer::Leave),
             Event::Quit => return Step::Answered(Answer::Quit),
+            Event::EnterFilter => {
+                self.mode = Mode::Filter;
+                self.focus = Focus::Candidates;
+            }
+            Event::LeaveFilter => self.mode = Mode::Normal,
+            Event::FocusNext | Event::FocusPrev => {
+                self.focus = match self.focus {
+                    Focus::Voices => Focus::Candidates,
+                    Focus::Candidates => Focus::Voices,
+                };
+            }
+            Event::FocusVoices => self.focus = Focus::Voices,
+            Event::FocusCandidates => self.focus = Focus::Candidates,
+            // The two single-row events, aimed by the focus. `Up`/`Down` stay as the queue cursor
+            // and `CandidateUp`/`CandidateDown` as the highlight, for the keys that mean one of
+            // them whichever pane is focused (filter mode moves the highlight, always).
+            Event::MoveUp | Event::MoveDown => {
+                let down = event == Event::MoveDown;
+                let aimed = match (self.focus, down) {
+                    (Focus::Voices, false) => Event::Up,
+                    (Focus::Voices, true) => Event::Down,
+                    (Focus::Candidates, false) => Event::CandidateUp,
+                    (Focus::Candidates, true) => Event::CandidateDown,
+                };
+                return self.answer(view, aimed, costs);
+            }
+            Event::Top => self.shift(view, isize::MIN),
+            Event::Bottom => self.shift(view, isize::MAX),
+            Event::PageUp => self.shift(view, -PAGE),
+            Event::PageDown => self.shift(view, PAGE),
+            Event::HalfUp => self.shift(view, -PAGE / 2),
+            Event::HalfDown => self.shift(view, PAGE / 2),
+            // The shell owns the overlay.
+            Event::Help => {}
         }
         Step::Waiting
+    }
+
+    /// Moves the cursor of the focused list by `by` rows, clamped to the list. The extremes
+    /// (`isize::MIN`, `isize::MAX`) are how the first and last row are reached.
+    fn shift(&mut self, view: &VoiceView<'_>, by: isize) {
+        let len = match self.focus {
+            Focus::Voices => display_rows(view).len(),
+            Focus::Candidates => self.candidates(view).len(),
+        };
+        let last = len.saturating_sub(1);
+        let slot = match self.focus {
+            Focus::Voices => &mut self.cursor,
+            Focus::Candidates => &mut self.candidate,
+        };
+        let moved = (*slot).min(last) as isize;
+        *slot = moved.saturating_add(by).clamp(0, last as isize) as usize;
     }
 
     /// What answering with a resolved name does -- or whether it may not.
@@ -1135,6 +1247,8 @@ impl Screen {
             snippets: view.snippets,
             snippet: self.selected_index(view),
             clip_is_empty: view.clip_is_empty,
+            mode: self.mode,
+            focus: self.focus,
             status: self.status.as_deref(),
         }
     }
@@ -1299,7 +1413,7 @@ pub(crate) mod tests {
     use meethook_session::SessionId;
     use meethook_transcribe::{Attribution, Resemblance};
 
-    use super::{Context, Cost, Costs, Event, Mark, Screen, Step, VoiceView};
+    use super::{Context, Cost, Costs, Event, Focus, Mark, Mode, Screen, Step, VoiceView};
     use meethook_enroll::GroupConsequence;
 
     /// Nothing costs anything, which is what every test that is not about the memo wants.
@@ -2343,7 +2457,7 @@ pub(crate) mod tests {
 
     /// Confirming is Enter after Tabbing to the guess: the highlight moves onto the suggested
     /// name, so the consequence pane previews what the confirm commits -- and a subsequent
-    /// Ctrl-O would insist on the guess rather than whatever was highlighted.
+    /// `o` would insist on the guess rather than whatever was highlighted.
     #[test]
     fn a_confirmed_guess_moves_the_highlight_onto_itself() {
         let (session, owned, similar, enrolled) = guessed_voice();
@@ -3995,6 +4109,200 @@ pub(crate) mod tests {
         assert!(
             !screen.decided.contains_key("Unknown 3"),
             "nothing was marked answered"
+        );
+    }
+
+    type Owned = Vec<(String, Attribution, f64, bool)>;
+
+    /// Fifteen voices and three candidates: enough rows for the page keys to have somewhere to
+    /// go, and a candidate list to tell the two panes apart by.
+    fn long_queue() -> (Owned, Vec<Resemblance>) {
+        let numbers: Vec<String> = (1..=15).map(|n| format!("Unknown {n}")).collect();
+        let spec: Vec<(&str, f64, bool)> =
+            numbers.iter().map(|n| (n.as_str(), 60.0, false)).collect();
+        (
+            rows(&spec),
+            resembles(&[("Milo", 0.7, 1), ("Ivan", 0.5, 1), ("Maya", 0.4, 1)]),
+        )
+    }
+
+    /// Typing is a mode you enter on purpose, which takes the focus to the candidates, and Esc
+    /// leaves keeping the text; a new question starts over in normal mode on the candidates.
+    #[test]
+    fn filter_mode_is_entered_and_left_and_reset_by_a_new_session() {
+        let session = session();
+        let (owned, similar) = long_queue();
+        let queue = queue(&owned);
+        let enrolled = ["Milo", "Ivan", "Maya"];
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert_eq!(
+            (derived.mode, derived.focus),
+            (Mode::Normal, Focus::Candidates)
+        );
+
+        screen.answer(&voice, Event::FocusVoices, &Free);
+        screen.answer(&voice, Event::EnterFilter, &Free);
+        screen.answer(&voice, Event::Filter('m'), &Free);
+        screen.answer(&voice, Event::LeaveFilter, &Free);
+        let derived = screen.view(&voice, &Free, Context::Reading);
+        assert_eq!(
+            (derived.mode, derived.focus),
+            (Mode::Normal, Focus::Candidates)
+        );
+        assert_eq!(
+            derived.filter, "m",
+            "leaving keeps the text, and so the narrowed list"
+        );
+
+        screen.answer(&voice, Event::EnterFilter, &Free);
+        screen.answer(&voice, Event::FocusVoices, &Free);
+        let other = other_session();
+        let elsewhere = view(
+            &other,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &enrolled,
+            &owned[0].1,
+        );
+        screen.arrive(&elsewhere);
+        let derived = screen.view(&elsewhere, &Free, Context::Reading);
+        assert_eq!(
+            (derived.mode, derived.focus),
+            (Mode::Normal, Focus::Candidates)
+        );
+        assert_eq!(derived.filter, "");
+    }
+
+    /// Tab and Shift-Tab, h and l: with two panes, next and previous land on the same one.
+    #[test]
+    fn the_focus_moves_between_the_two_panes() {
+        let session = session();
+        let (owned, similar) = long_queue();
+        let queue = queue(&owned);
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &[],
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let focus = |screen: &mut Screen| screen.view(&voice, &Free, Context::Reading).focus;
+        screen.answer(&voice, Event::FocusNext, &Free);
+        assert_eq!(focus(&mut screen), Focus::Voices);
+        screen.answer(&voice, Event::FocusPrev, &Free);
+        assert_eq!(focus(&mut screen), Focus::Candidates);
+        screen.answer(&voice, Event::FocusVoices, &Free);
+        screen.answer(&voice, Event::FocusVoices, &Free);
+        assert_eq!(focus(&mut screen), Focus::Voices);
+        screen.answer(&voice, Event::FocusCandidates, &Free);
+        assert_eq!(focus(&mut screen), Focus::Candidates);
+    }
+
+    /// The movement keys act on the focused list only: j/k on the candidates leave the queue
+    /// cursor alone, and on the voices leave the candidate highlight alone.
+    #[test]
+    fn single_row_movement_follows_the_focus() {
+        let session = session();
+        let (owned, similar) = long_queue();
+        let queue = queue(&owned);
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &[],
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        let at = |screen: &mut Screen| {
+            let v = screen.view(&voice, &Free, Context::Reading);
+            (v.cursor, v.candidate)
+        };
+        screen.answer(&voice, Event::MoveDown, &Free);
+        assert_eq!(at(&mut screen), (0, Some(1)), "candidates have the focus");
+        screen.answer(&voice, Event::FocusVoices, &Free);
+        screen.answer(&voice, Event::MoveDown, &Free);
+        screen.answer(&voice, Event::MoveDown, &Free);
+        assert_eq!(at(&mut screen), (2, Some(1)), "now the voices do");
+        screen.answer(&voice, Event::MoveUp, &Free);
+        assert_eq!(at(&mut screen), (1, Some(1)));
+    }
+
+    /// Top, bottom, page and half page on the voice list, clamped at both ends rather than
+    /// wandering off a row that is not drawn.
+    #[test]
+    fn jump_and_page_keys_move_the_focused_list_and_clamp() {
+        let session = session();
+        let (owned, similar) = long_queue();
+        let queue = queue(&owned);
+        let voice = view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &similar,
+            &[],
+            &owned[0].1,
+        );
+        let mut screen = Screen::default();
+        screen.arrive(&voice);
+        screen.answer(&voice, Event::FocusVoices, &Free);
+        let cursor = |screen: &mut Screen| screen.view(&voice, &Free, Context::Reading).cursor;
+
+        screen.answer(&voice, Event::PageDown, &Free);
+        assert_eq!(cursor(&mut screen), 10);
+        screen.answer(&voice, Event::HalfDown, &Free);
+        assert_eq!(
+            cursor(&mut screen),
+            14,
+            "clamped to the last of fifteen rows"
+        );
+        screen.answer(&voice, Event::Bottom, &Free);
+        assert_eq!(cursor(&mut screen), 14);
+        screen.answer(&voice, Event::HalfUp, &Free);
+        assert_eq!(cursor(&mut screen), 9);
+        screen.answer(&voice, Event::PageUp, &Free);
+        screen.answer(&voice, Event::PageUp, &Free);
+        assert_eq!(cursor(&mut screen), 0, "clamped to the first row");
+        screen.answer(&voice, Event::Bottom, &Free);
+        screen.answer(&voice, Event::Top, &Free);
+        assert_eq!(cursor(&mut screen), 0);
+
+        // The same keys on the candidates: three of them, so the extremes are 0 and 2.
+        screen.answer(&voice, Event::FocusCandidates, &Free);
+        screen.answer(&voice, Event::PageDown, &Free);
+        assert_eq!(
+            screen.view(&voice, &Free, Context::Reading).candidate,
+            Some(2)
+        );
+        screen.answer(&voice, Event::Top, &Free);
+        assert_eq!(
+            screen.view(&voice, &Free, Context::Reading).candidate,
+            Some(0)
         );
     }
 }

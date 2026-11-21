@@ -14,7 +14,7 @@
 //! thing a run has to say". So the consequence lines come off
 //! [`Consequence::would_do`](meethook_enroll::Consequence) in `super` (the only place able to
 //! read a `Consequence`) and the refusal sentence comes off the fully public
-//! [`Refusal::sentence`] here.
+//! [`meethook_enroll::Refusal::sentence`] here.
 //!
 //! The other exception is the "and N more session(s)" line in [`who`], which is layout rather than
 //! domain prose -- how much of a list fits in a pane is not a fact about enrolment -- but it is
@@ -30,89 +30,195 @@
 //! [`meethook_enroll::Assertion`] or [`meethook_enroll::GroupConsequence`] the commit reports from,
 //! so a preview and its write cannot disagree about what they counted.
 
-use meethook_enroll::{Assertion, GroupConsequence, Refusal, Resolution, incomplete, speech};
+use meethook_enroll::{Assertion, GroupConsequence, Resolution, incomplete, speech};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::Sounding;
-use super::state::{Candidate, Mark, Row, View, Who};
+use super::keys::Keys;
+use super::state::{Candidate, Focus, Mark, Mode, Row, View, Who};
 use crate::clips::Progress;
+use crate::tui_kit::{HelpOverlay, Hint, Theme, bordered_pane, footer_height, render_footer};
+
+/// Width at and above which the panes sit side by side. Below it they stack: at 80 columns two
+/// half-width panes clip the voice rows and candidate names that the whole frame exists to show.
+const WIDE: u16 = 100;
+
+/// Where every pane goes for one frame. `None` is a pane that yields when the terminal is too
+/// short to give it a useful height, never one that is squeezed to nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Panes {
+    pub banner: Option<Rect>,
+    pub voices: Rect,
+    pub question: Rect,
+    pub candidates: Rect,
+    pub consequence: Rect,
+    pub who: Option<Rect>,
+    pub said: Rect,
+    pub log: Option<Rect>,
+}
+
+/// The side-by-side layout: voices left; question, candidates, consequence and who right; the
+/// snippets and the run's log underneath.
+///
+/// Four bands in the right column. At the 100x24 floor of this layout the top band is 12 to 13
+/// rows with a two-row footer, so `1 + 3 + 4 + 5` just fits with the candidate list down to a row
+/// or two; at 120x40 the candidates get 19. The "who" pane is adjacent to the candidate it
+/// describes, which is the whole point of it -- a horizontal split of the `run` band was
+/// considered and rejected, because `log` clips rather than wraps and halving its width would cut
+/// narration sentences mid-word.
+///
+/// The banner row exists only when this session carries a meeting: reserving it either way would
+/// cost a session without one a row it has nothing to say.
+fn wide_layout(body: Rect, meeting: bool) -> Panes {
+    let (banner, top, said, run) = if meeting {
+        let whole = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(6),
+            Constraint::Length(4),
+            Constraint::Length(4),
+        ])
+        .split(body);
+        (Some(whole[0]), whole[1], whole[2], whole[3])
+    } else {
+        let whole = Layout::vertical([
+            Constraint::Min(6),
+            Constraint::Length(5),
+            Constraint::Length(5),
+        ])
+        .split(body);
+        (None, whole[0], whole[1], whole[2])
+    };
+    let columns =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(top);
+    let right = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(4),
+        Constraint::Length(5),
+    ])
+    .split(columns[1]);
+    Panes {
+        banner,
+        voices: columns[0],
+        question: right[0],
+        candidates: right[1],
+        consequence: right[2],
+        who: Some(right[3]),
+        said,
+        log: Some(run),
+    }
+}
+
+/// The stacked layout: one column, top to bottom in the order the eye works through a question.
+///
+/// What has to be there -- banner, the voices, the question, the candidates, the consequence, the
+/// snippets -- is sized first; "who" and then the run log are added only while rows are left over
+/// (drop order: log first, then who, so the log never appears without "who"), and whatever remains after that goes to the voices and the
+/// candidates, a third and two thirds. A pane that cannot have a useful height yields entirely
+/// rather than being squeezed to nothing.
+fn narrow_layout(body: Rect, meeting: bool) -> Panes {
+    const VOICES_MIN: u16 = 4;
+    const CANDIDATES_MIN: u16 = 4;
+    const CONSEQUENCE: u16 = 4;
+    const SAID: u16 = 4;
+    const WHO: u16 = 5;
+    const LOG: u16 = 4;
+
+    let banner = u16::from(meeting);
+    let required = banner + 1 + CONSEQUENCE + SAID + VOICES_MIN + CANDIDATES_MIN;
+    let mut spare = body.height.saturating_sub(required);
+    let who = (spare >= WHO).then_some(WHO);
+    spare -= who.unwrap_or(0);
+    let log = (who.is_some() && spare >= LOG).then_some(LOG);
+    spare -= log.unwrap_or(0);
+    let voices = VOICES_MIN + spare / 3;
+    let candidates = CANDIDATES_MIN + spare - spare / 3;
+
+    let mut heights = Vec::new();
+    if meeting {
+        heights.push(1);
+    }
+    heights.extend([voices, 1, candidates, CONSEQUENCE]);
+    heights.extend(who);
+    heights.push(SAID);
+    heights.extend(log);
+    let rects = Layout::vertical(heights.iter().map(|h| Constraint::Length(*h))).split(body);
+    let mut next = rects.iter().copied();
+    Panes {
+        banner: meeting.then(|| next.next().expect("a banner row")),
+        voices: next.next().expect("a voices row"),
+        question: next.next().expect("a question row"),
+        candidates: next.next().expect("a candidates row"),
+        consequence: next.next().expect("a consequence row"),
+        who: who.map(|_| next.next().expect("a who row")),
+        said: next.next().expect("a snippets row"),
+        log: log.map(|_| next.next().expect("a log row")),
+    }
+}
+
+/// Chosen from the body's width on every call, so a resize re-chooses with nothing stored.
+pub fn layout(body: Rect, meeting: bool) -> Panes {
+    if body.width >= WIDE {
+        wide_layout(body, meeting)
+    } else {
+        narrow_layout(body, meeting)
+    }
+}
 
 /// Places every pane for one frame.
 ///
 /// `sounding` is a parameter rather than a [`View`] field on purpose: it is derived from a clock
 /// and from what the shell handed to the player, and [`state`](super::state) is documented as
 /// having neither in it. A fourth argument says in the signature that the shell computed this and
-/// the state machine did not.
-pub fn draw(frame: &mut Frame, view: &View<'_>, narration: &[String], sounding: Option<Sounding>) {
-    // The banner row exists only when this session carries a meeting: reserving it either way
-    // would cost a session without one a row it has nothing to say, and an absent title must
-    // reserve no space at all. Present, the snippets and log bands each give up one row and
-    // the flexible top band absorbs the remainder -- at the 80x24 floor the candidate list
-    // gains an inner row (1 -> 2) instead of losing its last one.
-    let (banner, top, said, run, keys) = match view.meeting {
-        Some(_) => {
-            let whole = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Min(6),
-                    Constraint::Length(4),
-                    Constraint::Length(4),
-                    Constraint::Length(1),
-                ])
-                .split(frame.area());
-            (Some(whole[0]), whole[1], whole[2], whole[3], whole[4])
-        }
-        None => {
-            let whole = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(6),
-                    Constraint::Length(5),
-                    Constraint::Length(5),
-                    Constraint::Length(1),
-                ])
-                .split(frame.area());
-            (None, whole[0], whole[1], whole[2], whole[3])
-        }
+/// the state machine did not. `keys` is the table the footer and the help overlay read, and
+/// `help` the overlay itself when it is open.
+pub fn draw(
+    frame: &mut Frame,
+    view: &View<'_>,
+    narration: &[String],
+    sounding: Option<Sounding>,
+    keys: &Keys,
+    help: Option<&mut HelpOverlay>,
+) {
+    let theme = &keys.theme;
+    let area = frame.area();
+    // The footer's height is decided first, from the hints at this width, so a narrow terminal
+    // gets a taller footer and the panes give the rows back instead of the hints being clipped.
+    let hints = keys.hints(view, sounding);
+    let status_only = sounding.is_none() && view.status.is_some();
+    let lead = u16::from(sounding.is_some());
+    let wanted = match status_only {
+        true => 1,
+        false => lead + footer_height(&hints, area.width, theme),
     };
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(top);
-    // Four bands in the right column, and the sizes are pinned by the 80x24 floor the tests hold
-    // this frame to: there the top band is 13 rows and `1 + 3 + 4 + 5` fits it exactly, with the
-    // candidate list down to one visible row; at 120x40 it is 29 and the candidates get 19. With
-    // the meeting banner present the top band is one row taller -- 14 at the floor -- so the
-    // candidates gain their second inner row rather than the frame squeezing them. The "who"
-    // pane is adjacent to the candidate it describes, which is the whole point of it -- a
-    // horizontal split of the `run` band was considered and rejected, because `log` clips rather
-    // than wraps and halving its width would cut narration sentences mid-word.
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(4),
-            Constraint::Length(5),
-        ])
-        .split(top[1]);
+    let footer_rows = wanted.min(area.height / 2);
+    let split = Layout::vertical([Constraint::Min(0), Constraint::Length(footer_rows)]).split(area);
+    let panes = layout(split[0], view.meeting.is_some());
 
-    if let Some(banner) = banner {
+    if let Some(banner) = panes.banner {
         meeting_banner(frame, banner, view);
     }
-    voices(frame, top[0], view);
-    question(frame, right[0], view);
-    candidates(frame, right[1], view);
-    consequence(frame, right[2], view);
-    who(frame, right[3], view);
-    snippets(frame, said, view, sounding.and_then(|s| s.line));
-    log(frame, run, narration);
-    footer(frame, keys, view, sounding);
+    voices(frame, panes.voices, view, theme);
+    question(frame, panes.question, view);
+    candidates(frame, panes.candidates, view, theme);
+    consequence(frame, panes.consequence, view);
+    if let Some(area) = panes.who {
+        who(frame, area, view);
+    }
+    snippets(frame, panes.said, view, sounding.and_then(|s| s.line));
+    if let Some(area) = panes.log {
+        log(frame, area, narration);
+    }
+    footer(frame, split[1], view, sounding, &hints, theme);
+
+    if let Some(help) = help {
+        let rows = keys.help_rows(view);
+        help.render(frame.buffer_mut(), area, " keys ", &rows, theme);
+    }
 }
 
 /// The phrase the banner row begins with: the line prompt's `    meeting   ` minus its
@@ -186,7 +292,7 @@ fn within(text: &str, width: usize) -> String {
 ///
 /// A separator rather than a count at the end, because a user hunting for their own two-second
 /// fragment has to be able to see that it exists at all.
-fn voices(frame: &mut Frame, area: Rect, view: &View<'_>) {
+fn voices(frame: &mut Frame, area: Rect, view: &View<'_>, theme: &Theme) {
     let mut items: Vec<ListItem> = Vec::with_capacity(view.rows.len() + 1);
     let mut selected = view.cursor;
     let mut separated = false;
@@ -205,7 +311,7 @@ fn voices(frame: &mut Frame, area: Rect, view: &View<'_>) {
 
     let title = format!(" voices  {}  {} ", view.session, view.position);
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(bordered_pane(&title, view.focus == Focus::Voices, theme))
         .highlight_symbol("> ")
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default().with_selected(Some(selected));
@@ -302,7 +408,7 @@ fn question(frame: &mut Frame, area: Rect, view: &View<'_>) {
 }
 
 /// The candidates, narrowed as the user types, plus the always-present create-somebody entry.
-fn candidates(frame: &mut Frame, area: Rect, view: &View<'_>) {
+fn candidates(frame: &mut Frame, area: Rect, view: &View<'_>, theme: &Theme) {
     let mut items: Vec<ListItem> = view
         .candidates
         .iter()
@@ -312,12 +418,19 @@ fn candidates(frame: &mut Frame, area: Rect, view: &View<'_>) {
     // when text matches nothing.
     items.push(ListItem::new(Line::from(new_person(view))));
 
-    let title = match view.filter.is_empty() {
-        true => " resembles ".to_string(),
-        false => format!(" filter: {} ", view.filter),
+    // A trailing underscore is the cursor: it is what says printable keys are being typed rather
+    // than obeyed, which is the one thing about the mode that has to be visible.
+    let title = match (view.mode, view.filter.is_empty()) {
+        (Mode::Filter, _) => format!(" filter: {}_ ", view.filter),
+        (Mode::Normal, true) => " resembles ".to_string(),
+        (Mode::Normal, false) => format!(" filter: {} ", view.filter),
     };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(bordered_pane(
+            &title,
+            view.focus == Focus::Candidates,
+            theme,
+        ))
         .highlight_symbol("> ")
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default().with_selected(view.candidate);
@@ -435,7 +548,7 @@ fn consequence(frame: &mut Frame, area: Rect, view: &View<'_>) {
 /// cannot disagree about what they counted.
 fn assert_line(name: &str, assertion: &Assertion) -> String {
     format!(
-        "^A asserts one remote speaker: {voices} voice(s) will read as {name}, {vetoes} veto(s) overridden",
+        "[a] asserts one remote speaker: {voices} voice(s) will read as {name}, {vetoes} veto(s) overridden",
         voices = assertion.voices,
         vetoes = assertion.vetoes_overridden,
     )
@@ -447,7 +560,7 @@ fn assert_line(name: &str, assertion: &Assertion) -> String {
 /// [`GroupConsequence`] the commit reports from.
 fn group_line(group: &GroupConsequence) -> String {
     format!(
-        "^K marks {} voice(s) as {}: {} reference(s), {} veto(s) overridden",
+        "[m] marks {} voice(s) as {}: {} reference(s), {} veto(s) overridden",
         group.applied.len(),
         group.name,
         group.references_after,
@@ -581,10 +694,7 @@ fn listed(sessions: usize, budget: usize) -> (usize, bool) {
 fn snippets(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<usize>) {
     let title = match view.snippets.len() {
         0 => " said  (nothing was transcribed for this voice) ".to_string(),
-        total => format!(
-            " said  line {} of {total}  pgup/pgdn moves ",
-            view.snippet + 1
-        ),
+        total => format!(" said  line {} of {total}  [ ] moves ", view.snippet + 1),
     };
     let lines: Vec<Line> = view
         .snippets
@@ -629,100 +739,47 @@ fn log(frame: &mut Frame, area: Rect, narration: &[String]) {
     );
 }
 
-/// One line: how far through a clip playback has got, else whatever just happened, else the keys.
+/// The footer: how far through a clip playback has got, else whatever just happened, else the keys.
 ///
 /// Playback outranks the status because it is the only one of the three that changes on its own,
 /// and because the two cannot both be true: a play that failed clears the progress and sets the
-/// status in the same iteration.
+/// status in the same iteration. While a clip sounds, its position is the first row and the
+/// hints under it are only the four keys that mean something mid-clip. The position is spelled
+/// with [`speech`], which is already what the question and the queue use for a duration.
 ///
-/// The position is spelled with [`speech`], which is already what the question and the queue use
-/// for a duration, so "playing 12s of 1m 47s" reads the way the rest of the frame does and no
-/// second time formatter appears in this binary. Only the four keys that mean something mid-clip
-/// are kept: the full list -- now with both play keys on it -- passes 100 columns, and it was
-/// already wider than 80 before the second one was added. Leaving the session is on that short
-/// list because it is as meaningful with a clip sounding as skipping one voice is.
-///
-/// The restart key follows what is sounding rather than naming one of the two: saying "^P restart"
-/// while a line is playing would name a key that starts something else.
-///
-/// The choose key follows the highlighted candidate for the same reason: where that candidate is
-/// refused for taking a name off another voice, the key that works is Ctrl-O and Enter is the one
-/// that would do nothing.
-fn footer(frame: &mut Frame, area: Rect, view: &View<'_>, sounding: Option<Sounding>) {
-    let text = match (sounding, view.status) {
+/// The hints come from the key table, already filtered to the keys that work for this selection
+/// and wrapped to the width by the kit; the caller has sized `area` to fit them, so nothing is
+/// clipped.
+fn footer(
+    frame: &mut Frame,
+    area: Rect,
+    view: &View<'_>,
+    sounding: Option<Sounding>,
+    hints: &[Hint],
+    theme: &Theme,
+) {
+    match (sounding, view.status) {
         (
             Some(Sounding {
                 progress: Progress { elapsed, length },
-                line,
+                ..
             }),
             _,
-        ) => format!(
-            "playing {} of {}  {} restart  ^S skip  ^G leave  ^C quit",
-            speech(elapsed.as_secs_f64()),
-            speech(length.as_secs_f64()),
-            match line {
-                Some(_) => "^L",
-                None => "^P",
-            }
-        ),
-        (None, Some(status)) => status.to_string(),
-        (None, None) => {
-            let clip = match view.clip_is_empty {
-                true => "^P no audio",
-                false => "^P play",
-            };
-            // `view.snippet` is already clamped by `Screen::view`, so this is a lookup and not a
-            // bounds check. Both play keys say what they would do *now*, which is what stops ^L
-            // from looking like a key that did nothing.
-            let line = match view.snippets.get(view.snippet) {
-                Some(snippet) if !snippet.audio.is_empty() => "  ^L line",
-                Some(_) => "  ^L no audio",
-                // Nothing transcribed. The pane says so, and a key for it would be a key that
-                // cannot work.
-                None => "",
-            };
-            // Enter genuinely does nothing on a refused row, and Ctrl-O does nothing on any
-            // other, so the two are swapped rather than both offered: the frame's rule is that a
-            // key which cannot work is not advertised, and swapping also leaves the line the
-            // width it already was.
-            let choose = match view.highlighted().and_then(|c| c.refusal.as_ref()) {
-                Some(Refusal::Taken { .. }) => "^O anyway",
-                _ => "enter choose",
-            };
-            // The guess keys actuate the choosing act, so they sit beside the slot they
-            // interact with -- early enough to survive the clip at the pane edge, where a
-            // tail append would hide them entirely. Both advertised only while the question
-            // is about a guessed fragment, mirroring the gate the events carry in `state`;
-            // ^Y additionally only while the guess is still among the resolved candidates,
-            // because a confirm that could not be reached by Enter+Tab would be a key that
-            // cannot work.
-            let guess_keys = match view.guess {
-                Some(guess) => {
-                    let confirm = view
-                        .candidates
-                        .iter()
-                        .any(|candidate| candidate.name == guess)
-                        .then_some("^Y confirm");
-                    [confirm, Some("^R reject")]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                }
-                None => String::new(),
-            };
-            let guess_segment = if guess_keys.is_empty() {
-                String::new()
-            } else {
-                format!("  {guess_keys}")
-            };
-            format!(
-                "up/down voice  right work on it  tab candidate  {choose}{guess_segment}  \
-                 ^A assert  ^K mark  ^N new  {clip}{line}  ^S skip  ^G leave  ^C quit"
-            )
+        ) => {
+            let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+            let text = format!(
+                "playing {} of {}",
+                speech(elapsed.as_secs_f64()),
+                speech(length.as_secs_f64())
+            );
+            frame.render_widget(Paragraph::new(Line::from(text).dim()), rows[0]);
+            render_footer(frame.buffer_mut(), rows[1], hints, theme);
         }
-    };
-    frame.render_widget(Paragraph::new(Line::from(text).dim()), area);
+        (None, Some(status)) => {
+            frame.render_widget(Paragraph::new(Line::from(status.to_string()).dim()), area);
+        }
+        (None, None) => render_footer(frame.buffer_mut(), area, hints, theme),
+    }
 }
 
 #[cfg(test)]
@@ -736,13 +793,16 @@ mod tests {
     use meethook_transcribe::{Attribution, Resemblance};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
 
     use meethook_enroll::Snippet;
 
+    use super::super::keys::Keys;
     use super::super::state::tests::heard;
     use super::super::state::{Context, Cost, Costs, Event, Mark, Row, Screen, VoiceView};
     use super::super::who::tests::{holding, names, scanned};
-    use super::{Progress, Sounding, clause_within, draw, incomplete, listed, voice_line};
+    use super::{Progress, Sounding, clause_within, draw, incomplete, layout, listed, voice_line};
+    use crate::tui_kit::{HelpOverlay, Theme};
 
     use meethook_session::Displaced;
 
@@ -951,6 +1011,38 @@ mod tests {
         middle: Attribution,
         narration: Vec<String>,
     ) -> Vec<String> {
+        let buffer = frame_buffer(
+            width, height, costs, keys, snippets, sounding, status, context, meeting, middle,
+            narration, false,
+        );
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// [`frame`] as the buffer, so a test can look at styles as well as text, and with the help
+    /// overlay open when asked.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_buffer(
+        width: u16,
+        height: u16,
+        costs: &dyn Costs,
+        events: &[Event],
+        snippets: &[Snippet<'_>],
+        sounding: Option<Sounding>,
+        status: Option<&str>,
+        context: Context<'_>,
+        meeting: Option<&MeetingLabel>,
+        middle: Attribution,
+        narration: Vec<String>,
+        help_open: bool,
+    ) -> ratatui::buffer::Buffer {
         let session = SessionId::parse("20260819-100000").expect("a well-formed session id");
         let labels = [
             (
@@ -1010,8 +1102,8 @@ mod tests {
 
         let mut screen = Screen::default();
         screen.arrive(&voice);
-        for key in keys {
-            screen.answer(&voice, *key, costs);
+        for event in events {
+            screen.answer(&voice, *event, costs);
         }
         // After the keys: `answer` clears the status, which is the behaviour a caller asking for
         // one is working around.
@@ -1020,20 +1112,13 @@ mod tests {
         }
         let view = screen.view(&voice, costs, context);
 
+        let keys = Keys::new(Theme::default());
+        let mut help = help_open.then(HelpOverlay::default);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
         terminal
-            .draw(|frame| draw(frame, &view, &narration, sounding))
+            .draw(|frame| draw(frame, &view, &narration, sounding, &keys, help.as_mut()))
             .expect("drawing into a buffer cannot fail");
-        let buffer = terminal.backend().buffer().clone();
-        (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect()
+        terminal.backend().buffer().clone()
     }
 
     /// The six panes, at a comfortable size: the queue with its talk times and its separator for
@@ -1057,7 +1142,7 @@ mod tests {
         assert!(whole.contains("so where did we land"), "{whole}");
         assert!(whole.contains("3 voice(s) to ask about"), "{whole}");
         assert!(whole.contains("+ somebody new"), "{whole}");
-        assert!(whole.contains("^S skip"), "{whole}");
+        assert!(whole.contains("[s] skip"), "{whole}");
     }
 
     /// [`frame`], with the quiet tail folded into one open bundle: two above-floor voices, then
@@ -1163,7 +1248,16 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
         terminal
-            .draw(|frame| draw(frame, &view, &narration, None))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &view,
+                    &narration,
+                    None,
+                    &Keys::new(Theme::default()),
+                    None,
+                )
+            })
             .expect("drawing into a buffer cannot fail");
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -1243,9 +1337,9 @@ mod tests {
         )
         .join("\n");
         assert!(whole.contains("playing 12s of 1m 47s"), "{whole}");
-        assert!(whole.contains("^P restart"), "{whole}");
+        assert!(whole.contains("[p] restart"), "{whole}");
         assert!(
-            !whole.contains("right work on it"),
+            !whole.contains("[w] work on"),
             "the key list gives way to the position\n{whole}"
         );
     }
@@ -1260,7 +1354,7 @@ mod tests {
     #[test]
     fn the_footer_names_the_key_that_leaves_the_session() {
         let idle = painted(140, 30, &Free, &[]).join("\n");
-        assert!(idle.contains("^S skip  ^G leave  ^C quit"), "{idle}");
+        assert!(idle.contains("[s] skip | [x] leave"), "{idle}");
 
         let sounding = Some(Sounding {
             progress: Progress {
@@ -1282,7 +1376,7 @@ mod tests {
         )
         .join("\n");
         assert!(
-            playing.contains("^S skip  ^G leave  ^C quit"),
+            playing.contains("[s] skip | [x] leave | [q] quit"),
             "leaving is as meaningful with a clip sounding as skipping is\n{playing}"
         );
     }
@@ -1294,7 +1388,7 @@ mod tests {
     fn the_footer_advertises_the_assertion_key() {
         let idle = painted(130, 30, &Free, &[]).join("\n");
         assert!(
-            idle.contains("enter choose  ^A assert  ^K mark  ^N new"),
+            idle.contains("[Enter] choose | [a] assert | [m] mark"),
             "{idle}"
         );
     }
@@ -1316,7 +1410,7 @@ mod tests {
         );
         assert!(
             whole.contains(
-                "^A asserts one remote speaker: 4 voice(s) will read as Milo, 1 veto(s) overridden"
+                "[a] asserts one remote speaker: 4 voice(s) will read as Milo, 1 veto(s) overridden"
             ),
             "{whole}"
         );
@@ -1527,7 +1621,7 @@ mod tests {
         let painted = painted(200, 30, &StagesGroup, &[Event::Mark]);
         let whole = painted.join("\n");
         assert!(
-            whole.contains("^K marks 2 voice(s) as Milo: 2 reference(s), 1 veto(s) overridden"),
+            whole.contains("[m] marks 2 voice(s) as Milo: 2 reference(s), 1 veto(s) overridden"),
             "{whole}"
         );
         assert!(
@@ -1591,10 +1685,7 @@ mod tests {
     #[test]
     fn the_said_pane_marks_the_selected_line_and_when_it_was_said() {
         let first = painted(110, 30, &Free, &[]).join("\n");
-        assert!(
-            first.contains("said  line 1 of 2  pgup/pgdn moves"),
-            "{first}"
-        );
+        assert!(first.contains("said  line 1 of 2  [ ] moves"), "{first}");
         assert!(
             first.contains(">     12s  \"so where did we land"),
             "the selected row, marked and timed\n{first}"
@@ -1605,10 +1696,7 @@ mod tests {
         );
 
         let second = painted(110, 30, &Free, &[Event::SnippetDown]).join("\n");
-        assert!(
-            second.contains("said  line 2 of 2  pgup/pgdn moves"),
-            "{second}"
-        );
+        assert!(second.contains("said  line 2 of 2  [ ] moves"), "{second}");
         assert!(
             second.contains(">  1m 47s  \"right, next week\""),
             "the marker moved with the selection\n{second}"
@@ -1676,7 +1764,7 @@ mod tests {
     #[test]
     fn the_footer_names_the_key_that_plays_the_selected_line() {
         let with_audio = painted(120, 30, &Free, &[]).join("\n");
-        assert!(with_audio.contains("^L line"), "{with_audio}");
+        assert!(with_audio.contains("[P] line"), "{with_audio}");
 
         static NONE: [f32; 0] = [];
         let silent = [
@@ -1695,12 +1783,12 @@ mod tests {
             None,
         )
         .join("\n");
-        assert!(no_audio.contains("^L no audio"), "{no_audio}");
+        assert!(no_audio.contains("[P] line (no audio)"), "{no_audio}");
 
         let nothing_said =
             painted_with(120, 30, &Free, &[], &[], None, None, Context::Reading, None).join("\n");
         assert!(
-            !nothing_said.contains("^L"),
+            !nothing_said.contains("[P]"),
             "a key that cannot work is not offered\n{nothing_said}"
         );
         assert!(
@@ -1732,23 +1820,23 @@ mod tests {
             None,
         )
         .join("\n");
-        assert!(whole.contains("^L restart"), "{whole}");
+        assert!(whole.contains("[P] restart"), "{whole}");
         assert!(
-            !whole.contains("^P restart"),
-            "naming ^P would name a key that starts something else\n{whole}"
+            !whole.contains("[p] restart"),
+            "naming p would name a key that starts something else\n{whole}"
         );
     }
 
     /// The override key is advertised exactly where it would work, and the key it displaces is
-    /// not advertised where it would not. Enter does nothing on a refused row and Ctrl-O does
+    /// not advertised where it would not. Enter does nothing on a refused row and `o` does
     /// nothing on any other, so they are swapped rather than both shown -- the frame's rule being
     /// that a key which cannot work is not offered.
     #[test]
     fn the_override_key_is_offered_only_where_it_would_work() {
         let taken = painted(120, 30, &Takes, &[]).join("\n");
-        assert!(taken.contains("^O anyway"), "{taken}");
+        assert!(taken.contains("[o] anyway"), "{taken}");
         assert!(
-            !taken.contains("enter choose"),
+            !taken.contains("[Enter] choose"),
             "enter does nothing on a refused row\n{taken}"
         );
 
@@ -1757,9 +1845,9 @@ mod tests {
             ("the heard-at-once veto", &Vetoes),
         ] {
             let whole = painted(120, 30, costs, &[]).join("\n");
-            assert!(whole.contains("enter choose"), "{what}\n{whole}");
+            assert!(whole.contains("[Enter] choose"), "{what}\n{whole}");
             assert!(
-                !whole.contains("^O anyway"),
+                !whole.contains("[o] anyway"),
                 "the override is not offered where it would be refused: {what}\n{whole}"
             );
         }
@@ -1767,34 +1855,34 @@ mod tests {
 
     /// AC #4, the drawing side: the guess keys are advertised exactly where the state machine
     /// lets them work -- both while the question is about a guessed fragment whose guess is
-    /// still resolvable, only ^R once a divergent filter takes the guess out of the candidates,
+    /// still resolvable, only `r` once a divergent filter takes the guess out of the candidates,
     /// and neither on any other voice. Asserted adjacent to their neighbours rather than as a
     /// whole line, for the width reason the footer's stance documents.
     #[test]
     fn the_footer_offers_the_guess_keys_only_where_they_work() {
         let live = guessed(140, 30, &Free, &[]).join("\n");
         assert!(
-            live.contains("enter choose  ^Y confirm  ^R reject  ^A assert"),
+            live.contains("[Enter] choose | [y] confirm | [r] reject | [a] assert"),
             "beside the choose slot they interact with\n{live}"
         );
 
         // A divergent filter leaves the guess out of the resolved candidates: confirming could
         // not be reached by Enter+Tab, so the key that cannot work is not offered -- refusing
-        // the guess on screen stays unambiguous, so ^R remains.
+        // the guess on screen stays unambiguous, so `r` remains.
         let typing = guessed(140, 30, &Free, &[Event::Filter('z')]).join("\n");
         assert!(
-            typing.contains("enter choose  ^R reject  ^A assert"),
+            typing.contains("[Enter] choose | [r] reject | [n] new | [a] assert"),
             "{typing}"
         );
         assert!(
-            !typing.contains("^Y confirm"),
+            !typing.contains("[y] confirm"),
             "unreachable confirms are not advertised\n{typing}"
         );
 
         // Neither key on a voice nothing guessed about.
         let plain = painted(140, 30, &Free, &[]).join("\n");
-        assert!(!plain.contains("^Y confirm"), "{plain}");
-        assert!(!plain.contains("^R reject"), "{plain}");
+        assert!(!plain.contains("[y] confirm"), "{plain}");
+        assert!(!plain.contains("[r] reject"), "{plain}");
     }
 
     /// AC #3, the log-pane half: the denial note the run narrates lands in the pane through the
@@ -1829,9 +1917,12 @@ mod tests {
         );
     }
 
-    /// The minimum this frame claims to work at. Every pane still has a border and a title, which
-    /// is what says nothing was laid out at a negative height. Painted with each cost the footer
-    /// now varies on, since the override swaps the widest key on the line.
+    /// The minimum this frame claims to work at. At 80x24 the panes stack, and what has to be on
+    /// screen is the voices, the candidates, the consequence and the snippets: "who" and the
+    /// run's log are the two that yield (log first), because there are not rows for them to
+    /// have a useful height. Every pane that is drawn still has a border and a title, which is
+    /// what says nothing was laid out at a negative height. Painted with each cost the footer
+    /// varies on, since the override swaps a hint.
     #[test]
     fn every_pane_survives_eighty_by_twenty_four() {
         // The consequence pane is the one title that follows the cost: what an answer would do,
@@ -1840,36 +1931,25 @@ mod tests {
             let painted = painted(80, 24, costs, &[]);
             assert_eq!(painted.len(), 24);
             let whole = painted.join("\n");
-            for title in [
-                " voices ",
-                " resembles ",
-                consequence,
-                // The one title that names its subject, so "who" alone would also match the
-                // question line above it.
-                " who Milo is ",
-                " said ",
-                " run ",
-            ] {
+            for title in [" voices ", " resembles ", consequence, " said "] {
                 assert!(
                     whole.contains(title.trim()),
                     "{title} missing from\n{whole}"
                 );
             }
+            for yielded in [" who Milo is ", " run "] {
+                assert!(
+                    !whole.contains(yielded.trim()),
+                    "{yielded} should have yielded at 80x24\n{whole}"
+                );
+            }
         }
 
-        // And the guess context: the row carries its tag and the footer its two keys, which is
-        // the widest the idle line gets.
+        // And the guess context, which has two more hints and so a taller footer.
         let guessed = guessed(80, 24, &Free, &[]);
         assert_eq!(guessed.len(), 24);
         let whole = guessed.join("\n");
-        for title in [
-            " voices ",
-            " resembles ",
-            " would ",
-            " who ",
-            " said ",
-            " run ",
-        ] {
+        for title in [" voices ", " resembles ", " would ", " said "] {
             assert!(
                 whole.contains(title.trim()),
                 "{title} missing from\n{whole}"
@@ -1967,14 +2047,7 @@ mod tests {
             banner.contains("uncertain: the recording began after this meeting had started"),
             "the caveat is the safety device and never the half clipped off\n{banner}"
         );
-        for title in [
-            " voices ",
-            " resembles ",
-            " would ",
-            " who ",
-            " said ",
-            " run ",
-        ] {
+        for title in [" voices ", " resembles ", " would ", " said "] {
             assert!(
                 whole.contains(title.trim()),
                 "{title} missing from\n{whole}"
@@ -2151,5 +2224,247 @@ mod tests {
         assert_eq!(listed(4, 3), (2, true), "the count line costs a session");
         assert_eq!(listed(4, 1), (1, false), "one row says more than a count");
         assert_eq!(listed(4, 0), (0, false), "no room at all is not a panic");
+    }
+
+    /// The first row of the buffer that holds `needle`, so a test can find a pane by its title.
+    fn row_of(buffer: &ratatui::buffer::Buffer, needle: &str) -> u16 {
+        (0..buffer.area.height)
+            .find(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("{needle} is not on the frame"))
+    }
+
+    fn buffer_at(
+        width: u16,
+        height: u16,
+        events: &[Event],
+        help_open: bool,
+    ) -> ratatui::buffer::Buffer {
+        frame_buffer(
+            width,
+            height,
+            &Free,
+            events,
+            &said(),
+            None,
+            None,
+            Context::Reading,
+            None,
+            Attribution::Unknown("Unknown 2".to_string()),
+            vec!["20260819-100000  3 voice(s) to ask about".to_string()],
+            help_open,
+        )
+    }
+
+    /// Below the width threshold the panes stack in one column; at and above it they sit side by
+    /// side. Each draw chooses from the area it was given, so one view drawn at two sizes gets
+    /// both layouts with nothing carried between them.
+    #[test]
+    fn the_layout_stacks_below_the_threshold_and_re_chooses_on_every_draw() {
+        let wide = layout(Rect::new(0, 0, 120, 37), false);
+        assert!(wide.candidates.x > wide.voices.x, "side by side: {wide:?}");
+        assert_eq!(wide.voices.y, wide.question.y);
+
+        for (width, height) in [(80, 21), (60, 21), (99, 30)] {
+            let body = Rect::new(0, 0, width, height);
+            let stacked = layout(body, false);
+            assert_eq!(
+                stacked.voices.x, stacked.candidates.x,
+                "{width}: {stacked:?}"
+            );
+            assert_eq!(stacked.voices.width, width);
+            assert!(stacked.candidates.y > stacked.voices.y);
+            assert!(stacked.said.y > stacked.consequence.y);
+            for rect in [
+                stacked.voices,
+                stacked.question,
+                stacked.candidates,
+                stacked.consequence,
+                stacked.said,
+            ] {
+                assert!(
+                    rect.height > 0 && rect.bottom() <= body.bottom(),
+                    "{rect:?}"
+                );
+            }
+        }
+        assert!(layout(Rect::new(0, 0, 99, 40), false).voices.width == 99);
+        assert!(layout(Rect::new(0, 0, 100, 40), false).voices.width < 100);
+
+        // The same view at two sizes: stacked, then side by side, then stacked again.
+        let at = |width| {
+            let buffer = buffer_at(width, 30, &[], false);
+            let voices = row_of(&buffer, "voices");
+            let resembles = row_of(&buffer, "resembles");
+            (voices, resembles)
+        };
+        let (voices, resembles) = at(80);
+        assert!(resembles > voices, "stacked: candidates under voices");
+        let (voices, resembles) = at(140);
+        assert_eq!(
+            resembles,
+            voices + 1,
+            "side by side: the question sits above the candidates"
+        );
+        let (voices, resembles) = at(60);
+        assert!(resembles > voices);
+    }
+
+    /// When rows run out the log goes first and then "who", never the panes a question is
+    /// answered with; and the banner row, when there is one, takes its row from the panes.
+    #[test]
+    fn a_short_stack_drops_the_log_then_who() {
+        let at = |height, meeting| layout(Rect::new(0, 0, 80, height), meeting);
+        let tall = at(40, false);
+        assert!(tall.who.is_some() && tall.log.is_some());
+        let medium = at(24, false);
+        assert!(medium.who.is_some() && medium.log.is_none(), "{medium:?}");
+        let short = at(21, false);
+        assert!(short.who.is_none() && short.log.is_none(), "{short:?}");
+        assert!(at(21, true).banner.is_some());
+        assert!(at(21, false).banner.is_none());
+        // However short, the answering panes keep a useful height.
+        let tiny = at(17, false);
+        assert!(tiny.candidates.height >= 4 && tiny.voices.height >= 4);
+    }
+
+    /// 80x24 and a narrower 60x24 are stacked and complete; 120x40 is still side by side with all
+    /// six panes.
+    #[test]
+    fn the_frame_stacks_at_eighty_and_sixty_columns_and_not_at_one_twenty() {
+        for width in [80, 60] {
+            let rows = painted(width, 24, &Free, &[]);
+            assert_eq!(rows.len(), 24);
+            let whole = rows.join("\n");
+            for title in ["voices", "resembles", "would", "said"] {
+                assert!(whole.contains(title), "{title} at {width}\n{whole}");
+            }
+            let voices = rows.iter().position(|r| r.contains("voices")).unwrap();
+            let resembles = rows.iter().position(|r| r.contains("resembles")).unwrap();
+            assert!(resembles > voices, "stacked at {width}\n{whole}");
+            assert!(
+                rows.iter().all(|r| r.chars().count() <= width as usize),
+                "nothing outruns the width"
+            );
+        }
+        let rows = painted(120, 40, &Free, &[]);
+        let whole = rows.join("\n");
+        for title in ["voices", "resembles", "would", "who Milo is", "said", "run"] {
+            assert!(whole.contains(title), "{title}\n{whole}");
+        }
+        let voices = rows.iter().find(|r| r.contains("voices")).unwrap();
+        assert!(
+            voices.contains("resembles") || voices.contains("who is"),
+            "{voices}"
+        );
+    }
+
+    /// The active pane is the one with the marked border: bold where there is no colour, so the
+    /// mark does not depend on the terminal's palette. Focus moves it.
+    #[test]
+    fn the_focused_pane_has_the_marked_border() {
+        let bold = |buffer: &ratatui::buffer::Buffer, title: &str| {
+            let y = row_of(buffer, title);
+            buffer[(0, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        };
+        let candidates = buffer_at(80, 30, &[], false);
+        assert!(
+            bold(&candidates, "resembles"),
+            "the candidates start focused"
+        );
+        assert!(!bold(&candidates, "voices"));
+        let voices = buffer_at(80, 30, &[Event::FocusVoices], false);
+        assert!(bold(&voices, "voices"));
+        assert!(!bold(&voices, "resembles"));
+    }
+
+    /// Typing is visible: the candidates' title carries the text and a cursor while the mode is
+    /// on, and loses the cursor, keeping the text, when it is left.
+    #[test]
+    fn filter_mode_shows_a_cursor_in_the_candidates_title() {
+        let typing = painted(100, 30, &Free, &[Event::EnterFilter, Event::Filter('M')]).join("\n");
+        assert!(typing.contains("filter: M_"), "{typing}");
+        let left = painted(
+            100,
+            30,
+            &Free,
+            &[Event::EnterFilter, Event::Filter('M'), Event::LeaveFilter],
+        )
+        .join("\n");
+        assert!(left.contains("filter: M "), "{left}");
+        assert!(!left.contains("filter: M_"), "{left}");
+    }
+
+    /// The footer wraps rather than clips: at 60 columns every hint that is enabled is on the
+    /// screen whole, and the panes gave up the rows it took.
+    #[test]
+    fn a_narrow_footer_wraps_and_loses_no_hint() {
+        let rows = guessed(60, 24, &Free, &[]);
+        assert_eq!(rows.len(), 24);
+        let whole = rows.join("\n");
+        for hint in [
+            "[j] down",
+            "[k] up",
+            "[Tab] pane",
+            "[Enter] choose",
+            "[y] confirm",
+            "[r] reject",
+            "[a] assert",
+            "[m] mark",
+            "[w] work on",
+            "[s] skip",
+            "[x] leave",
+            "[p] play",
+            "[P] line",
+            "[/] filter",
+            "[?] help",
+            "[q] quit",
+        ] {
+            assert!(whole.contains(hint), "{hint} clipped from\n{whole}");
+        }
+        let footer_rows = rows.iter().rev().take_while(|r| r.contains('[')).count();
+        assert!(
+            footer_rows >= 3,
+            "60 columns need several footer rows: {footer_rows}"
+        );
+        let wide = painted(200, 24, &Free, &[]);
+        assert_eq!(
+            wide.iter().rev().take_while(|r| r.contains('[')).count(),
+            1,
+            "one row where it fits"
+        );
+    }
+
+    /// `?` draws the key table over the frame, dimming nothing it can do and listing aliases.
+    #[test]
+    fn the_help_overlay_lists_the_keys_over_the_frame() {
+        let buffer = buffer_at(100, 40, &[], true);
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let whole = rows.join("\n");
+        assert!(whole.contains(" keys "), "{whole}");
+        assert!(whole.contains("Quit"), "{whole}");
+        assert!(whole.contains("Type into the candidate filter"), "{whole}");
+        assert!(whole.contains("Move down in the focused pane"), "{whole}");
+        assert!(
+            !buffer_at(100, 40, &[], false)
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+                .contains(" keys "),
+            "closed it draws nothing"
+        );
     }
 }
