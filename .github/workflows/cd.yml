@@ -73,7 +73,18 @@ jobs:
             strip "$BIN"
 
             RELEASE_NAME="${BIN}-${GITHUB_REF_NAME}-${{ matrix.job.os-name }}-${{ matrix.job.architecture }}"
-            tar czvf "$RELEASE_NAME.tar.gz" "$BIN"
+            # The voice isolator's GPU engine (MLX) loads its compiled Metal shaders from
+            # `mlx.metallib` next to the executable, falling back to a path inside the build
+            # machine's home directory, which a downloaded binary does not have. Ship the file
+            # beside the binary; the two must be installed in the same directory. See MLX.md.
+            EXTRA=""
+            if [ "${{ matrix.job.os-name }}" = macos ]; then
+              METALLIB=$(find . -name mlx.metallib -path '*mlx-sys*' -print0 | xargs -0 ls -t | head -1)
+              test -n "$METALLIB" || { echo "mlx.metallib not found in the build tree"; exit 1; }
+              cp "$METALLIB" mlx.metallib
+              EXTRA="mlx.metallib"
+            fi
+            tar czvf "$RELEASE_NAME.tar.gz" "$BIN" $EXTRA
             shasum -a 256 "$RELEASE_NAME.tar.gz" > "$RELEASE_NAME.sha256"
           done
 

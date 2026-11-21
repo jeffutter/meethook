@@ -540,6 +540,22 @@ fn rope_tables(frames: i32) -> (Array, Array) {
     )
 }
 
+/// Runs `f`, turning a panic from the MLX bindings into an error. mlx-rs panics, rather than
+/// returning an error, where MLX cannot create its GPU stream.
+fn guarded<T>(f: impl FnOnce() -> R<T>) -> R<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("panic without a message");
+            Err(format!("panicked: {message}").into())
+        }
+    }
+}
+
 /// The loaded network: weights, the band index tables and the compiled kernels.
 pub(crate) struct MlxNetwork {
     kernels: Kernels,
@@ -566,8 +582,18 @@ pub(crate) struct MlxNetwork {
 
 impl MlxNetwork {
     /// Loads the fp16 weights of [`crate::VOICE_ISOLATOR_MLX_MODEL`].
+    ///
+    /// Starting MLX's GPU stack can fail where the Metal shaders cannot be found: MLX loads
+    /// `mlx.metallib` from beside the executable, else from a path baked in at build time (inside
+    /// the build machine's home directory), and when neither exists mlx-rs panics. That becomes
+    /// an error here, so the stage falls back to the un-isolated mic track instead of crashing
+    /// the run.
     pub(crate) fn load(path: &Path) -> Result<Self> {
-        Self::try_load(path).map_err(|e| Error::VoiceIsolator(format!("MLX: {e}")))
+        guarded(|| Self::try_load(path)).map_err(|e| {
+            Error::VoiceIsolator(format!(
+                "MLX could not start ({e}); is mlx.metallib installed next to the executable?"
+            ))
+        })
     }
 
     fn try_load(path: &Path) -> R<Self> {
@@ -660,7 +686,7 @@ impl MlxNetwork {
     pub(crate) fn correction(&self, spec: &[f32]) -> Result<Vec<f32>> {
         let mut failure = None;
         for attempt in 0..ATTEMPTS {
-            match self.try_correction(spec) {
+            match guarded(|| self.try_correction(spec)) {
                 Ok(correction) => return Ok(correction),
                 Err(e) => {
                     failure = Some(e);
@@ -789,6 +815,17 @@ mod tests {
         assert!(edges.windows(2).all(|p| p[0].1 == p[1].0));
         // The padded width the checkpoint's encoder was packed to is 2 * 85.
         assert_eq!(edges.iter().map(|(s, e)| e - s).max(), Some(85));
+    }
+
+    #[test]
+    fn a_panic_from_the_bindings_becomes_an_error() {
+        // mlx-rs panics where MLX cannot create its GPU stream (no mlx.metallib); the engine must
+        // report that instead of taking the run down.
+        let error = guarded::<()>(|| panic!("no stream"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("panicked: no stream"), "{error}");
+        assert_eq!(guarded(|| Ok(7)).unwrap(), 7);
     }
 
     #[test]

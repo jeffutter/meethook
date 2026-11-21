@@ -71,9 +71,9 @@ use ort::value::TensorRef;
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(mlx_engine)]
 use crate::VOICE_ISOLATOR_MLX_MODEL;
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(mlx_engine)]
 use crate::mlx_isolator::MlxNetwork;
 use crate::onnx::{open_cpu_session_with_threads, open_session, performance_cores};
 use crate::{Error, Result, VOICE_ISOLATOR_MODEL};
@@ -95,7 +95,7 @@ const STRIDE: usize = WINDOW - OVERLAP;
 /// with the `mlx` feature on macOS, the same network on the GPU.
 enum Engine {
     Onnx(Session),
-    #[cfg(all(feature = "mlx", target_os = "macos"))]
+    #[cfg(mlx_engine)]
     Mlx(Box<MlxNetwork>),
 }
 
@@ -112,11 +112,11 @@ impl VoiceIsolator {
     /// The model files [`VoiceIsolator::open`] needs in the models directory, for the caller to
     /// install first: the MLX weights when this build has the MLX engine, else the ONNX graph.
     pub fn required_model() -> &'static ModelSpec {
-        #[cfg(all(feature = "mlx", target_os = "macos"))]
+        #[cfg(mlx_engine)]
         {
             &VOICE_ISOLATOR_MLX_MODEL
         }
-        #[cfg(not(all(feature = "mlx", target_os = "macos")))]
+        #[cfg(not(mlx_engine))]
         {
             &VOICE_ISOLATOR_MODEL
         }
@@ -131,11 +131,11 @@ impl VoiceIsolator {
     /// memory on the first inference (see the module docs). A default that can take a machine
     /// down is not a default.
     pub fn open(models_dir: &Path) -> Result<Self> {
-        #[cfg(all(feature = "mlx", target_os = "macos"))]
+        #[cfg(mlx_engine)]
         {
             Self::open_mlx(models_dir)
         }
-        #[cfg(not(all(feature = "mlx", target_os = "macos")))]
+        #[cfg(not(mlx_engine))]
         {
             Self::open_onnx(models_dir)
         }
@@ -154,7 +154,7 @@ impl VoiceIsolator {
 
     /// The MLX engine on the GPU: about 11x the ONNX CPU path through the whole mic stage on the
     /// measured machine (see the module docs).
-    #[cfg(all(feature = "mlx", target_os = "macos"))]
+    #[cfg(mlx_engine)]
     pub fn open_mlx(models_dir: &Path) -> Result<Self> {
         let path = installed(models_dir, &VOICE_ISOLATOR_MLX_MODEL)?;
         Ok(Self {
@@ -219,7 +219,7 @@ impl VoiceIsolator {
         let spec = self.stft.forward(window);
         let correction = match &mut self.engine {
             Engine::Onnx(session) => onnx_correction(session, &spec)?,
-            #[cfg(all(feature = "mlx", target_os = "macos"))]
+            #[cfg(mlx_engine)]
             Engine::Mlx(network) => network.correction(&spec)?,
         };
         let mut voice = self.stft.inverse(&correction, window.len());
@@ -599,7 +599,7 @@ mod tests {
         let isolator = open_installed();
         let session = match &isolator.engine {
             Engine::Onnx(session) => session,
-            #[cfg(all(feature = "mlx", target_os = "macos"))]
+            #[cfg(mlx_engine)]
             Engine::Mlx(_) => panic!("open_installed opens the ONNX engine"),
         };
         let inputs = session.inputs();
@@ -638,7 +638,7 @@ mod tests {
         let audio = read_wav(&input);
         let want = read_wav(&reference);
         let mut isolator = open_default();
-        let floor = if isolator.accelerated && cfg!(feature = "mlx") {
+        let floor = if isolator.accelerated && cfg!(mlx_engine) {
             MLX_FLOOR_DB
         } else {
             90.0

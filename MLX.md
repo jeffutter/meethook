@@ -146,6 +146,15 @@ xcodebuild -downloadComponent MetalToolchain
   `cd.yml`'s native `cargo build` in the dev shell, so they have MLX. `VoiceIsolator::required_model()`
   tells the caller which weights the build needs, so a package without MLX downloads the ONNX
   graph, not the MLX file.
+- **Shipping a binary: `mlx.metallib` must travel with it.** `mlx-sys` compiles MLX's shaders into
+  `mlx.metallib` and bakes its location (`~/.mlx/lib/<key>/mlx.metallib` on the build machine) into
+  the binary. MLX looks for the file next to the executable first, so a binary built on one
+  machine only runs the GPU engine on another if `mlx.metallib` sits in the same directory. The
+  release tarball for macOS (`cd.yml`) includes it, and the two must be installed together.
+  Without it mlx-rs panics creating its GPU stream; `MlxNetwork::load` catches that and returns an
+  error, so `meethook transcribe` says "mic isolation unavailable" and uses the plain mic track
+  rather than crashing. `cargo install` and a local `cargo build` keep working because the baked
+  path exists on that machine.
 - **Outside nix.** A plain `cargo build` on a Mac with Xcode and the Metal Toolchain works. If it
   fails with `missing Metal Toolchain`, `xcrun -sdk macosx metal --version` is the test; with a
   nix-provided `DEVELOPER_DIR` in the environment, use the shim or unset it for the build.

@@ -26,9 +26,9 @@ mod levels;
 mod loudness;
 mod merge;
 mod mic_isolation;
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(mlx_engine)]
 mod mlx_isolator;
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(mlx_engine)]
 mod mlx_kernels;
 mod models;
 // Not called by production code until TASK-088.08 diarizes with Nemotron.

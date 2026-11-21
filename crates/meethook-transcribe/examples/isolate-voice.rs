@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use meethook_models::ensure_model;
-#[cfg(feature = "mlx")]
+#[cfg(mlx_engine)]
 use meethook_transcribe::VOICE_ISOLATOR_MLX_MODEL;
 use meethook_transcribe::{
     FIRERED_VAD_MODEL, FireRedVad, GateSpeechFinder, IsolationStage, VOICE_ISOLATOR_MODEL,
@@ -88,7 +88,7 @@ fn main() {
     let models = root.join("models");
     ensure_model(&models, &VOICE_ISOLATOR_MODEL, &mut |_, _| {})
         .unwrap_or_else(|e| fail(&format!("{e}")));
-    #[cfg(feature = "mlx")]
+    #[cfg(mlx_engine)]
     ensure_model(&models, &VOICE_ISOLATOR_MLX_MODEL, &mut |_, _| {})
         .unwrap_or_else(|e| fail(&format!("{e}")));
     println!("{}: {seconds:.2} s", input.display());
@@ -96,7 +96,7 @@ fn main() {
     // CoreML first so a run that is killed for memory still says so before it dies; it is
     // also the path to be careful with (see the module docs of `voice_isolator`).
     let mut engines = vec!["coreml", "cpu"];
-    #[cfg(feature = "mlx")]
+    #[cfg(mlx_engine)]
     engines.push("mlx");
     if let Some(only) = only.as_deref() {
         engines.retain(|e| *e == only);
@@ -110,7 +110,7 @@ fn main() {
         let opened_engine = match engine {
             "coreml" => VoiceIsolator::open_coreml(&models),
             "cpu" => VoiceIsolator::open_onnx(&models),
-            #[cfg(feature = "mlx")]
+            #[cfg(mlx_engine)]
             "mlx" => VoiceIsolator::open_mlx(&models),
             _ => unreachable!("engines are filtered above"),
         };
