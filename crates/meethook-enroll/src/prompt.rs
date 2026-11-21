@@ -239,8 +239,8 @@ pub struct Voice<'a> {
     pub fragment_groups: Vec<FragmentGroup>,
 
     /// The stable "Unknown N" handles the current question covers, in queue order -- or
-    /// `None` when the question is about one voice only, which is every question in a run that
-    /// does not group fragments.
+    /// `None` when the question is a solo, which is every question in a run that does not group
+    /// fragments. A bundle with one member left still carries its handle.
     ///
     /// Carried across the seam rather than re-derived on the far side, because the interface
     /// cannot see the clusters the bundle was built from: its rows carry attributions that move

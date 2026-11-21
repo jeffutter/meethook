@@ -523,8 +523,11 @@ pub(crate) fn enroll_session(
                     let fragment_groups = project_bundles(&bundles, &order, &unknown, speakers);
                     // The members this question covers, or `None` for a solo: the frame answers
                     // the bundle with these handles rather than re-deriving membership from rows
-                    // whose attributions move as the run names voices.
-                    let bundle_members = (live.len() > 1)
+                    // whose attributions move as the run names voices. Keyed on the question's
+                    // kind, not on how many members are left: a bundle with one member still
+                    // open is committed as a group and never offered for reopening, and the
+                    // frame has to know that.
+                    let bundle_members = matches!(question, Question::Group(_))
                         .then(|| live.iter().map(|c| unknown[&c.id].clone()).collect());
                     // A bundle plays its longest fragment: the members are near-duplicates of one
                     // voice, and nine clips in a row is nine times the listening for one answer.

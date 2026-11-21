@@ -475,7 +475,8 @@ pub struct Screen {
     /// The voices whose answer was a plain single naming -- the only answer the run can take
     /// back, see [`Screen::steering_toward`]. A voice answered in a group, a bundle, as the one
     /// remote speaker, or by refusing a guess is `Answered` in `decided` and absent here, which
-    /// is how Enter on its row says why it cannot be reopened.
+    /// is how Enter on its row says why it cannot be reopened. A bundle with one member left
+    /// still counts as a bundle: the engine says so through `bundle_members`.
     named_solo: BTreeSet<String>,
     /// Whether the question on screen is a voice answered earlier and reopened. Set on arrival
     /// and read by Skip, which keeps the earlier answer rather than recording a skip.
@@ -2099,6 +2100,50 @@ pub(crate) mod tests {
         assert!(matches!(
             screen.answer(&first, Event::NewPerson, &Free),
             Step::Answered(Answer::Group { .. })
+        ));
+
+        let second = view(&session, "Unknown 2", 2, &queue, &[], &[], &[], &owned[1].1);
+        assert_eq!(screen.arrive(&second), None);
+        screen.answer(&second, Event::Up, &Free);
+        assert_eq!(screen.answer(&second, Event::Select, &Free), Step::Waiting);
+        assert_eq!(screen.steering_toward(), None);
+        assert!(
+            screen
+                .view(&second, &Free, Context::Reading)
+                .status
+                .is_some_and(|s| s.contains("cannot be reopened"))
+        );
+    }
+
+    /// A bundle with one member left is still a bundle: the engine commits its answer as a
+    /// group and never offers it back, so Enter on its row says why rather than steering.
+    #[test]
+    fn a_voice_answered_through_a_one_member_bundle_is_not_reopened() {
+        let session = session();
+        let owned = rows(&[("Unknown 1", 1.5, true), ("Unknown 2", 60.0, false)]);
+        let queue = queue(&owned);
+        let members = vec!["Unknown 1".to_string()];
+        let mut screen = Screen::default();
+
+        let first = bundled_view(
+            &session,
+            "Unknown 1",
+            1,
+            &queue,
+            &[],
+            &[],
+            &[],
+            &owned[0].1,
+            &[],
+            Some(&members),
+        );
+        assert_eq!(screen.arrive(&first), None);
+        for c in "Maya".chars() {
+            screen.answer(&first, Event::Filter(c), &Free);
+        }
+        assert!(matches!(
+            screen.answer(&first, Event::NewPerson, &Free),
+            Step::Answered(Answer::FragmentGroup { .. })
         ));
 
         let second = view(&session, "Unknown 2", 2, &queue, &[], &[], &[], &owned[1].1);
