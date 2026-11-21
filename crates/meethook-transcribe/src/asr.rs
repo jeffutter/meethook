@@ -277,6 +277,86 @@ impl SpeechToText for WhisperEngine {
     /// tests running against a fake recogniser, and means both of a session's tracks are gated
     /// by one code path with no branch to get wrong.
     fn transcribe(&mut self, audio_16k_mono: &[f32]) -> Result<Vec<AsrSegment>> {
+        let segments = self.decode(audio_16k_mono)?;
+        self.repair_loops(audio_16k_mono, segments)
+    }
+}
+
+impl WhisperEngine {
+    /// Re-decodes every stretch where the decoder got stuck repeating itself.
+    ///
+    /// The visible effect is one sentence printed dozens of times across 30 s of a turn, in place
+    /// of what was said. whisper.cpp's greedy decoder falls into a loop it cannot leave, and its
+    /// own guards (`entropy_thold`, `logprob_thold`) pick the loop anyway because a loop scores as
+    /// highly confident. Measured on session `20261120-125850`'s speaker track: 17 runs of 3 or
+    /// more identical consecutive segments, the longest 31, and which windows loop differs from
+    /// run to run.
+    ///
+    /// The loop comes from the text carried between the 30 s windows of one call, so a span
+    /// decoded as its own call, with no preceding text, does not loop. `n_max_text_ctx = 0`
+    /// would remove the carry-over everywhere, but measured over the same track it left 159 long
+    /// segments with no punctuation and about 8% fewer words, so only the broken spans pay.
+    ///
+    /// A span that still loops on the second attempt is collapsed to one segment: the repeats
+    /// carry no information, and a single sentence is a smaller lie than thirty.
+    fn repair_loops(
+        &mut self,
+        audio_16k_mono: &[f32],
+        segments: Vec<AsrSegment>,
+    ) -> Result<Vec<AsrSegment>> {
+        /// Context on each side of a loop, so the fresh decode starts in silence or the
+        /// previous sentence rather than mid-word.
+        const MARGIN_S: f64 = 2.0;
+
+        let mut out = Vec::with_capacity(segments.len());
+        let mut i = 0;
+        while i < segments.len() {
+            let run = loop_run_len(&segments[i..]);
+            if run == 0 {
+                out.push(segments[i].clone());
+                i += 1;
+                continue;
+            }
+            let looped = &segments[i..i + run];
+            let (first, last) = (&looped[0], &looped[run - 1]);
+            // Stay inside the neighbours so the redo cannot duplicate a sentence that was
+            // already decoded correctly on either side.
+            let lo =
+                (first.start_s - MARGIN_S).max(out.last().map_or(0.0, |s: &AsrSegment| s.end_s));
+            let hi =
+                (last.end_s + MARGIN_S).min(segments.get(i + run).map_or(f64::MAX, |s| s.start_s));
+            let rate = f64::from(TARGET_RATE);
+            let from = ((lo * rate) as usize).min(audio_16k_mono.len());
+            let to = ((hi * rate) as usize).clamp(from, audio_16k_mono.len());
+            let mut redone = self.decode(&audio_16k_mono[from..to])?;
+            for s in &mut redone {
+                s.start_s += from as f64 / rate;
+                s.end_s += from as f64 / rate;
+            }
+            if (0..redone.len()).any(|k| loop_run_len(&redone[k..]) > 0) {
+                eprintln!(
+                    "repeat guard: {:.1}-{:.1} s still repeats after a fresh decode; keeping one",
+                    first.start_s, last.end_s
+                );
+                out.push(AsrSegment {
+                    start_s: first.start_s,
+                    end_s: last.end_s,
+                    text: first.text.clone(),
+                });
+            } else {
+                eprintln!(
+                    "repeat guard: {:.1}-{:.1} s repeated one sentence {run} times; re-decoded",
+                    first.start_s, last.end_s
+                );
+                out.extend(redone);
+            }
+            i += run;
+        }
+        Ok(out)
+    }
+
+    /// The gated decode of one buffer; see [`SpeechToText::transcribe`].
+    fn decode(&mut self, audio_16k_mono: &[f32]) -> Result<Vec<AsrSegment>> {
         // Opens the bracket the detector's own heartbeat ticks inside (a `Phase`, silent unless
         // the scan is slow) and the `report` line below closes with the answer.
         eprintln!(
@@ -424,6 +504,36 @@ impl SpeechToText for WhisperEngine {
     }
 }
 
+/// Length of the run of identical consecutive segments at the start of `segments`, or 0 when it
+/// is too short to be a decoder loop.
+///
+/// Three or more of a sentence of three or more words, or five or more of anything: a real
+/// speaker says "Yeah." twice, and the loops seen in practice are twelve to thirty-one long.
+/// Text is compared lowercased with punctuation dropped, because the repeats are not always
+/// byte-identical ("Yeah" / "Yeah.").
+fn loop_run_len(segments: &[AsrSegment]) -> usize {
+    fn key(text: &str) -> String {
+        text.chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    let Some(first) = segments.first() else {
+        return 0;
+    };
+    let k = key(&first.text);
+    let run = segments.iter().take_while(|s| key(&s.text) == k).count();
+    let words = k.split(' ').count();
+    if (run >= 3 && words >= 3) || run >= 5 {
+        run
+    } else {
+        0
+    }
+}
+
 /// Says how much of the track the gate is about to decode, one line per call on stderr.
 ///
 /// A track with nothing to decode gets a line too, rather than silence: "no speech detected" is
@@ -480,6 +590,44 @@ mod vocabulary_tests {
         let p = build_vocabulary_prompt(&v(&["Brog", "Roll20", "D&D"]));
         assert_eq!(p.text.as_deref(), Some("Meeting notes: Brog, Roll20, D&D."));
         assert_eq!(p.dropped, 0);
+    }
+
+    fn seg(text: &str) -> AsrSegment {
+        AsrSegment {
+            start_s: 0.0,
+            end_s: 1.0,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_decoder_loop_is_a_run_of_the_same_sentence() {
+        let run: Vec<_> = (0..4)
+            .map(|_| seg("So, we're going to be at least."))
+            .collect();
+        assert_eq!(loop_run_len(&run), 4);
+    }
+
+    #[test]
+    fn punctuation_and_case_do_not_hide_a_loop() {
+        let run: Vec<_> = ["Yeah", "yeah.", "Yeah.", "YEAH", "yeah!"].map(seg).into();
+        assert_eq!(loop_run_len(&run), 5);
+    }
+
+    #[test]
+    fn ordinary_backchannel_is_not_a_loop() {
+        let run: Vec<_> = (0..3).map(|_| seg("Yeah.")).collect();
+        assert_eq!(loop_run_len(&run), 0);
+        let two: Vec<_> = (0..2).map(|_| seg("So you can see it.")).collect();
+        assert_eq!(loop_run_len(&two), 0);
+    }
+
+    #[test]
+    fn a_run_is_counted_from_the_start_only() {
+        let mut v = vec![seg("Hello there friend.")];
+        v.extend((0..4).map(|_| seg("Same words here.")));
+        assert_eq!(loop_run_len(&v), 0);
+        assert_eq!(loop_run_len(&v[1..]), 4);
     }
 
     #[test]
