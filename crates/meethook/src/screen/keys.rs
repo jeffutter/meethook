@@ -307,9 +307,10 @@ impl Keys {
     }
 
     /// The footer's items: while a clip plays the four keys that mean something mid-clip, else
-    /// every enabled hint for the current mode.
+    /// every enabled hint for the current mode. In filter mode the plain letters type into the
+    /// filter even mid-clip, so the filter's own hints stand.
     pub fn hints(&self, view: &View<'_>, sounding: Option<Sounding>) -> Vec<Hint> {
-        if let Some(sounding) = sounding {
+        if let Some(sounding) = sounding.filter(|_| Self::context(view) == NORMAL) {
             let restart = match sounding.line {
                 Some(_) => Event::PlaySnippet,
                 None => Event::Play,
@@ -706,6 +707,30 @@ pub mod tests {
             assert_eq!(whole, ["p restart", "s skip", "x leave", "q quit"]);
             let line = keys().hints(view, Some(sounding(Some(0))));
             assert_eq!(line[0].key, "P");
+        });
+    }
+
+    /// In filter mode the letters type, so a sounding clip must not bring the normal-mode keys
+    /// back into the footer.
+    #[test]
+    fn the_playing_footer_in_filter_mode_lists_no_plain_letters() {
+        use crate::clips::Progress;
+        use std::time::Duration;
+        let sounding = Sounding {
+            progress: Progress {
+                elapsed: Duration::from_secs(1),
+                length: Duration::from_secs(9),
+            },
+            line: None,
+        };
+        viewed(&Free, false, true, &[Event::EnterFilter], |view| {
+            let hints = keys().hints(view, Some(sounding));
+            let keys_shown: Vec<_> = hints.iter().map(|h| h.key.as_str()).collect();
+            for letter in ["s", "x", "q", "p"] {
+                assert!(!keys_shown.contains(&letter), "{letter} in {keys_shown:?}");
+            }
+            assert!(keys_shown.contains(&"Esc"), "{keys_shown:?}");
+            assert!(keys_shown.contains(&"^C"), "{keys_shown:?}");
         });
     }
 
