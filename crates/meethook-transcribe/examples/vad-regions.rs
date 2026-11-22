@@ -20,7 +20,7 @@
 //! # What to read
 //!
 //! ```text
-//! mic.cleaned.wav
+//! mic.cleaned.flac
 //!   duration:     2603.4 s
 //!   regions:      64
 //!   speech:       171.2 s (6.6% of the track)
@@ -254,13 +254,13 @@ fn windows(seconds: f64) -> usize {
 
 /// The tracks a target names.
 ///
-/// A session directory means three: raw `mic.wav`, the `mic.cleaned.wav` recognition actually
+/// A session directory means three: raw `mic.wav`, the `mic.cleaned.flac` recognition actually
 /// reads, and `speaker.wav`. Any other path is used as given.
 fn tracks_of(target: &Path) -> Vec<PathBuf> {
     if target.is_dir() {
         vec![
             target.join("mic.wav"),
-            target.join("mic.cleaned.wav"),
+            target.join("mic.cleaned.flac"),
             target.join("speaker.wav"),
         ]
     } else {

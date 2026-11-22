@@ -187,7 +187,7 @@ fn time_stage(input: &std::path::Path, minutes: f64, real_track: bool, only: Opt
         .unwrap_or_else(|e| fail(&format!("{e}")));
     let target = (minutes * 60.0 * 16_000.0) as usize;
     let (track, seconds) = if real_track {
-        // A recorder track: 16 kHz mono float, such as a session's `mic.cleaned.wav`. Only the
+        // A recorder track: 16 kHz mono float, such as a pre-FLAC session's `mic.cleaned.wav` (the example reads WAV only). Only the
         // first `minutes` are read, and nothing is written.
         let mut reader = hound::WavReader::open(input).unwrap_or_else(|e| fail(&format!("{e}")));
         let spec = reader.spec();

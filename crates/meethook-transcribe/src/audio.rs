@@ -29,6 +29,13 @@ const TRACK_SPEC: WavSpec = WavSpec {
     sample_format: SampleFormat::Float,
 };
 
+/// 16-bit full scale: the divisor from FLAC samples to `f32`, the multiplier back.
+const FLAC_SCALE: f32 = 32_768.0;
+
+/// Samples per FLAC frame. One size throughout, because afconvert needs STREAMINFO's minimum
+/// and maximum block sizes to agree.
+const FLAC_BLOCK_SAMPLES: usize = 4096;
+
 /// Input frames handed to the resampler at a time.
 ///
 /// Together with `SUB_CHUNKS` this sets the internal FFT size, and therefore both the
@@ -38,15 +45,25 @@ const TRACK_SPEC: WavSpec = WavSpec {
 const CHUNK_FRAMES: usize = 4096;
 const SUB_CHUNKS: usize = 16;
 
-/// Reads a mono float WAV and returns it as 16 kHz mono `f32`.
+/// Reads a mono float WAV or a mono 16-bit FLAC and returns it as 16 kHz mono `f32`.
 ///
-/// A file that is not mono 32-bit float is rejected by name and header rather than
-/// reinterpreted: silently misreading a stereo or integer WAV produces audio that sounds
-/// like noise to the model and like a transcription bug to everyone else.
+/// Which one is decided by the file's first four bytes (`fLaC`), not its extension, so a
+/// session keeps working whichever format its tracks were written in. FLAC samples map to
+/// `f32` as `sample / 32768`, the same grid a 16-bit WAV would use.
+///
+/// A file that is not mono 32-bit float (WAV) or mono 16-bit (FLAC) is rejected by name and
+/// header rather than reinterpreted: silently misreading a stereo or integer WAV produces
+/// audio that sounds like noise to the model and like a transcription bug to everyone else.
+///
+/// A FLAC cut off inside its last frame (a recorder killed mid-write) yields the samples of
+/// the frames that are whole; only a file with no whole frame at all is an error.
 ///
 /// A zero-length track is not an error. A session where nobody spoke is a real session, and
 /// it still has to produce transcript files so a rerun skips it.
 pub fn read_track_16k_mono(path: &Path) -> Result<Vec<f32>> {
+    if is_flac(path)? {
+        return read_flac_16k_mono(path);
+    }
     let reader = WavReader::open(path).map_err(|e| Error::wav(path, e))?;
     let spec = reader.spec();
 
@@ -86,6 +103,93 @@ pub fn read_track_16k_mono(path: &Path) -> Result<Vec<f32>> {
     let samples = resample.finish();
     phase.done();
     samples
+}
+
+/// Whether the file starts with the FLAC marker. A file too short to hold one is not FLAC;
+/// the WAV reader then says what is wrong with it.
+fn is_flac(path: &Path) -> Result<bool> {
+    use std::io::Read;
+
+    let mut marker = [0u8; 4];
+    let mut file = std::fs::File::open(path).map_err(|e| Error::Flac {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    })?;
+    match file.read_exact(&mut marker) {
+        Ok(()) => Ok(&marker == b"fLaC"),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(Error::Flac {
+            path: path.to_path_buf(),
+            detail: e.to_string(),
+        }),
+    }
+}
+
+/// The FLAC half of [`read_track_16k_mono`].
+///
+/// The whole file is held (about 70 MB for a 79 minute track) because the decoder works on a
+/// byte slice, but frames are decoded one at a time into the same push-shaped resampler the
+/// WAV path uses, so the decoded `f32` track is never held beside its resampled twin.
+fn read_flac_16k_mono(path: &Path) -> Result<Vec<f32>> {
+    let flac_err = |detail: String| Error::Flac {
+        path: path.to_path_buf(),
+        detail,
+    };
+    let bytes = std::fs::read(path).map_err(|e| Error::Flac {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    })?;
+    let mut decoder = rusty_flac::Decoder::new(&bytes).map_err(|e| flac_err(e.to_string()))?;
+    let info = decoder.streaminfo().clone();
+
+    if info.channels != 1 || info.bits_per_sample != 16 {
+        return Err(Error::UnsupportedAudio {
+            path: path.to_path_buf(),
+            detail: format!(
+                "expected mono 16-bit FLAC, found {} channel(s), {}-bit",
+                info.channels, info.bits_per_sample
+            ),
+        });
+    }
+
+    // Zero in STREAMINFO means "unknown", which is what a killed recorder leaves behind. It
+    // only sizes the output and paces the progress line, so it is allowed to be wrong.
+    let frames = info.total_samples as usize;
+    let mut phase = Phase::start(format!("reading {}", file_name(path)));
+    let mut resample = if info.sample_rate == TARGET_RATE {
+        None
+    } else {
+        Some(Resample::new(info.sample_rate, TARGET_RATE, frames)?)
+    };
+    let mut samples = Vec::with_capacity(if resample.is_none() { frames } else { 0 });
+    let mut block: Vec<i32> = Vec::new();
+    let mut read = 0usize;
+    loop {
+        block.clear();
+        match decoder.next_frame_interleaved::<i32>(&mut block) {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            // The frames before a cut one are intact; an empty result means the file never
+            // had a whole frame, which is damage rather than a short recording.
+            Err(rusty_flac::DecodeError::Truncated) if read > 0 => break,
+            Err(e) => return Err(flac_err(e.to_string())),
+        }
+        for &sample in &block {
+            phase.at(read, frames.max(read + 1));
+            read += 1;
+            let value = sample as f32 / FLAC_SCALE;
+            match resample.as_mut() {
+                Some(resample) => resample.push(value)?,
+                None => samples.push(value),
+            }
+        }
+    }
+    let samples = match resample {
+        Some(resample) => resample.finish()?,
+        None => samples,
+    };
+    phase.done();
+    Ok(samples)
 }
 
 /// A path's file name for a progress label, falling back to the whole path.
@@ -153,6 +257,114 @@ pub(crate) fn write_track_16k_mono(path: &Path, audio: &[f32]) -> Result<()> {
         phase.done();
         finalized
     })
+}
+
+/// Snaps a float track to the 16-bit grid a FLAC holds, in place.
+///
+/// Applied to the in-memory cleaned track before it is written, so recognition hears exactly
+/// the samples a later run reads back from `mic.cleaned.flac`, rather than a float original
+/// that exists only until the process exits. Idempotent.
+pub(crate) fn quantize_to_16_bit(audio: &mut [f32]) {
+    for sample in audio {
+        *sample = quantize_sample(*sample) as f32 / FLAC_SCALE;
+    }
+}
+
+/// One sample on the 16-bit grid, as the integer FLAC stores. NaN clamps to NaN and casts to
+/// 0, which is silence: the right reading of a sample that carries no signal.
+fn quantize_sample(sample: f32) -> i32 {
+    (sample.clamp(-1.0, 1.0) * FLAC_SCALE)
+        .round()
+        .clamp(-32768.0, 32767.0) as i32
+}
+
+/// Writes the cleaned mic track as 16 kHz mono 16-bit FLAC, atomically.
+///
+/// This is where a float track is quantised to 16 bits: samples are clamped to [-1, 1],
+/// scaled by 32768 and rounded, so a track that is already on the 16-bit grid (anything
+/// [`read_track_16k_mono`] returned from a FLAC) round-trips exactly. Whisper's own input
+/// is far coarser than that, but the cost is measured per session rather than assumed -- see
+/// MH-40.2.
+///
+/// Atomic for the same reason as [`write_track_16k_mono`]: `mic.cleaned.flac` is what the
+/// next run reads, and it must be a whole track or no file.
+pub(crate) fn write_cleaned_track_flac(path: &Path, audio: &[f32]) -> Result<()> {
+    use flacenc::component::BitRepr;
+
+    let flac_err = |detail: String| Error::Flac {
+        path: path.to_path_buf(),
+        detail,
+    };
+    let config = flacenc::error::Verify::into_verified(flacenc::config::Encoder::default())
+        .map_err(|(_, e)| flac_err(e.to_string()))?;
+
+    let mut stream = flacenc::encode_with_fixed_block_size(
+        &config,
+        QuantizedTrack { audio, head: 0 },
+        FLAC_BLOCK_SAMPLES,
+    )
+    .map_err(|e| flac_err(e.to_string()))?;
+
+    // The encoder records the short final block as the minimum block size, which makes the
+    // stream variable-block-size on paper. macOS `afconvert` then decodes it as zero frames
+    // (MH-40.1), so the header states what the frames actually are: all one size, bar a tail.
+    let block = FLAC_BLOCK_SAMPLES.min(audio.len().max(16));
+    stream
+        .stream_info_mut()
+        .set_block_sizes(block, block)
+        .map_err(|e| flac_err(e.to_string()))?;
+
+    let mut sink = flacenc::bitsink::ByteSink::new();
+    stream
+        .write(&mut sink)
+        .map_err(|e| flac_err(e.to_string()))?;
+    write_atomic_with(path, |file| {
+        use std::io::Write;
+        file.write_all(sink.as_slice()).map_err(|e| Error::Flac {
+            path: path.to_path_buf(),
+            detail: e.to_string(),
+        })
+    })
+}
+
+/// A float track presented to the FLAC encoder as 16-bit samples, a block at a time, so the
+/// quantised copy is never held whole.
+struct QuantizedTrack<'a> {
+    audio: &'a [f32],
+    head: usize,
+}
+
+impl flacenc::source::Source for QuantizedTrack<'_> {
+    fn channels(&self) -> usize {
+        1
+    }
+
+    fn bits_per_sample(&self) -> usize {
+        16
+    }
+
+    fn sample_rate(&self) -> usize {
+        TARGET_RATE as usize
+    }
+
+    fn read_samples<F: flacenc::source::Fill>(
+        &mut self,
+        block_size: usize,
+        dest: &mut F,
+    ) -> std::result::Result<usize, flacenc::error::SourceError> {
+        let end = (self.head + block_size).min(self.audio.len());
+        let block: Vec<i32> = self.audio[self.head..end]
+            .iter()
+            .map(|s| quantize_sample(*s))
+            .collect();
+        dest.fill_interleaved(&block)?;
+        self.head = end;
+        Ok(block.len())
+    }
+
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.audio.len())
+    }
 }
 
 /// A fixed-ratio sample-rate conversion, fed one sample at a time.
@@ -441,7 +653,7 @@ mod tests {
     #[test]
     fn a_written_track_reads_back_sample_for_sample_through_the_strict_reader() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mic.cleaned.wav");
+        let path = dir.path().join("track.wav");
         let samples = tone(16_000, 0.5, 440.0);
 
         write_track_16k_mono(&path, &samples).unwrap();
@@ -449,12 +661,12 @@ mod tests {
         assert_eq!(read_track_16k_mono(&path).unwrap(), samples);
     }
 
-    /// One writer covers `mic.cleaned.wav` and every track [`crate::import`] builds, so this
-    /// one assertion is every WAV the transcribe side produces.
+    /// One writer covers every WAV track [`crate::import`] builds, so this one assertion is
+    /// every WAV the transcribe side produces.
     #[test]
     fn a_written_track_is_tagged_mono_rather_than_front_left() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mic.cleaned.wav");
+        let path = dir.path().join("track.wav");
 
         write_track_16k_mono(&path, &tone(16_000, 0.1, 440.0)).unwrap();
 
@@ -463,6 +675,157 @@ mod tests {
             meethook_session::wav::channel_mask_of(&wav),
             Some(meethook_session::wav::MONO_CHANNEL_MASK)
         );
+    }
+
+    /// Audio already on the 16-bit grid, which is what a FLAC holds.
+    fn on_grid(samples: &[f32]) -> Vec<f32> {
+        samples
+            .iter()
+            .map(|s| (s * FLAC_SCALE).round() / FLAC_SCALE)
+            .collect()
+    }
+
+    /// Criterion: a WAV and a FLAC of the same audio read back as the same samples.
+    #[test]
+    fn a_wav_and_a_flac_of_the_same_audio_read_back_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples = on_grid(&tone(16_000, 1.5, 440.0));
+        let wav = dir.path().join("a.wav");
+        let flac = dir.path().join("a.flac");
+        write_wav(&wav, 16_000, &samples);
+        write_cleaned_track_flac(&flac, &samples).unwrap();
+
+        assert_eq!(read_track_16k_mono(&flac).unwrap(), samples);
+        assert_eq!(
+            read_track_16k_mono(&flac).unwrap(),
+            read_track_16k_mono(&wav).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_flac_reader_goes_by_content_not_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples = on_grid(&tone(16_000, 0.3, 300.0));
+        let path = dir.path().join("mic.wav");
+        write_cleaned_track_flac(&path, &samples).unwrap();
+
+        assert_eq!(read_track_16k_mono(&path).unwrap(), samples);
+    }
+
+    #[test]
+    fn a_float_track_is_quantised_to_within_one_16_bit_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mic.cleaned.flac");
+        let samples = tone(16_000, 1.0, 440.0);
+        write_cleaned_track_flac(&path, &samples).unwrap();
+
+        let back = read_track_16k_mono(&path).unwrap();
+        assert_eq!(back.len(), samples.len());
+        let worst = back
+            .iter()
+            .zip(&samples)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst <= 0.5 / FLAC_SCALE + f32::EPSILON, "worst {worst}");
+    }
+
+    #[test]
+    fn out_of_range_and_nan_samples_are_clamped_not_wrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.flac");
+        write_cleaned_track_flac(&path, &[2.0, -2.0, f32::NAN, 1.0, -1.0]).unwrap();
+
+        assert_eq!(
+            read_track_16k_mono(&path).unwrap(),
+            vec![32767.0 / FLAC_SCALE, -1.0, 0.0, 32767.0 / FLAC_SCALE, -1.0]
+        );
+    }
+
+    /// Lengths around the block size and the encoder's 16-sample minimum, including none.
+    #[test]
+    fn flac_tracks_of_awkward_lengths_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.flac");
+        for len in [0usize, 1, 15, 16, 17, 4095, 4096, 4097, 8192, 8193] {
+            let samples = on_grid(&tone(16_000, len as f32 / 16_000.0 + 0.0001, 220.0)[..len]);
+            write_cleaned_track_flac(&path, &samples).unwrap();
+            assert_eq!(read_track_16k_mono(&path).unwrap(), samples, "len {len}");
+        }
+    }
+
+    #[test]
+    fn a_flac_track_states_one_block_size_so_afconvert_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.flac");
+        write_cleaned_track_flac(&path, &on_grid(&tone(16_000, 1.0, 440.0))).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let info = rusty_flac::Decoder::new(&bytes)
+            .unwrap()
+            .streaminfo()
+            .clone();
+        assert_eq!((info.min_block_size, info.max_block_size), (4096, 4096));
+        assert_eq!(info.total_samples, 16_000);
+        assert_eq!((info.channels, info.bits_per_sample), (1, 16));
+    }
+
+    #[test]
+    fn a_flac_cut_inside_its_last_frame_keeps_the_whole_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.flac");
+        let samples = on_grid(&tone(16_000, 1.0, 440.0));
+        write_cleaned_track_flac(&path, &samples).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 5);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let back = read_track_16k_mono(&path).unwrap();
+        // 16000 = 3 whole blocks of 4096 plus a tail of 3712, which is the cut frame.
+        assert_eq!(back, samples[..3 * 4096]);
+    }
+
+    #[test]
+    fn a_flac_with_no_whole_frame_is_an_error_not_an_empty_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.flac");
+        write_cleaned_track_flac(&path, &on_grid(&tone(16_000, 0.1, 440.0))).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 5);
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(read_track_16k_mono(&path).is_err());
+    }
+
+    #[test]
+    fn a_stereo_or_non_16_bit_flac_is_rejected_by_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.flac");
+        write_cleaned_track_flac(&path, &on_grid(&tone(16_000, 0.1, 440.0))).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        // STREAMINFO bytes 12..: rate(20) channels-1(3) bits-1(5). Rewrite to 2 channels, 24 bit.
+        let at = 8 + 10;
+        let rate = ((bytes[at] as u32) << 12)
+            | ((bytes[at + 1] as u32) << 4)
+            | (bytes[at + 2] as u32 >> 4);
+        assert_eq!(rate, 16_000);
+        bytes[at + 2] = (bytes[at + 2] & 0xF0) | (1 << 1) | 1;
+        bytes[at + 3] = (bytes[at + 3] & 0x0F) | (7 << 4);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = read_track_16k_mono(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("2 channel(s)") && err.contains("24-bit"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_non_audio_file_is_still_refused_as_a_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.wav");
+        std::fs::write(&path, b"no").unwrap();
+
+        assert!(matches!(read_track_16k_mono(&path), Err(Error::Wav { .. })));
     }
 
     /// The in-memory conversion is the file one, so audio imported from a foreign wav is the

@@ -53,7 +53,7 @@ const SAMPLES_PER_FRAME: usize = 160;
 /// to it and it is zero with the echo canceller off, so it belongs to AEC3's own capture
 /// buffering.
 ///
-/// It is compensated rather than tolerated. `mic.cleaned.wav` must sit sample-for-sample on
+/// It is compensated rather than tolerated. `mic.cleaned.flac` must sit sample-for-sample on
 /// `mic.wav`'s timeline, because the caller adds an offset describing `mic.wav` to every ASR
 /// timestamp; letting the track slip 8 ms late would skew the whole transcript by an amount
 /// small enough that nobody would ever catch it. `the_processor_delay_constant_still_matches
@@ -125,7 +125,7 @@ pub enum Cleaning {
 
 /// Why cancellation did not run. Every variant is a normal outcome of a real recording.
 ///
-/// None of them is an error, and none of them means a missing file: `mic.cleaned.wav` is
+/// None of them is an error, and none of them means a missing file: `mic.cleaned.flac` is
 /// written on every path, so the rest of the pipeline has exactly one input to read and no
 /// branch to get wrong. That also protects the headphones case, where there is nothing to
 /// cancel and AEC3 handed a reference it cannot align is reported to flatten or mute the
@@ -819,7 +819,7 @@ mod tests {
     }
 
     /// Pins the measured capture-path delay the code compensates for. If a library update
-    /// moves it, `mic.cleaned.wav` would silently drift off `mic.wav`'s timeline and take
+    /// moves it, `mic.cleaned.flac` would silently drift off `mic.wav`'s timeline and take
     /// every transcript timestamp with it, so it is worth re-measuring rather than trusting.
     #[test]
     fn the_processor_delay_constant_still_matches_the_library() {

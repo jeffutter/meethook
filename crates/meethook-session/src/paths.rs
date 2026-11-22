@@ -9,7 +9,7 @@ use crate::SessionId;
 /// name that is first spelled in the slice that needs it will be spelled twice by the time
 /// two slices need it.
 const MIC_WAV: &str = "mic.wav";
-const MIC_CLEANED_WAV: &str = "mic.cleaned.wav";
+const MIC_CLEANED_FLAC: &str = "mic.cleaned.flac";
 const SPEAKER_WAV: &str = "speaker.wav";
 const MEETING_OPUS: &str = "meeting.opus";
 const SESSION_JSON: &str = "session.json";
@@ -133,8 +133,8 @@ impl SessionPaths {
     }
 
     /// The echo-cancelled derivative of [`Self::mic_wav`], written by `transcribe`.
-    pub fn mic_cleaned_wav(&self) -> PathBuf {
-        self.dir.join(MIC_CLEANED_WAV)
+    pub fn mic_cleaned_flac(&self) -> PathBuf {
+        self.dir.join(MIC_CLEANED_FLAC)
     }
 
     pub fn speaker_wav(&self) -> PathBuf {

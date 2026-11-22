@@ -1153,8 +1153,8 @@ fn paths_are_derived_from_the_root_alone() {
         "transcript.vtt"
     );
     assert_eq!(
-        session.mic_cleaned_wav().file_name().unwrap(),
-        "mic.cleaned.wav"
+        session.mic_cleaned_flac().file_name().unwrap(),
+        "mic.cleaned.flac"
     );
     assert_eq!(
         session.speaker_clusters_json().file_name().unwrap(),

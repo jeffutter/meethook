@@ -136,6 +136,11 @@ pub enum Error {
         source: hound::Error,
     },
 
+    /// A FLAC track that would not decode, or a track that would not encode. One variant for
+    /// both directions because the only thing a reader wants is the path and the sentence.
+    #[error("FLAC error on {path}: {detail}")]
+    Flac { path: PathBuf, detail: String },
+
     #[error("{path} is not a track this tool can read: {detail}")]
     UnsupportedAudio { path: PathBuf, detail: String },
 
@@ -289,7 +294,7 @@ pub struct BatchReport {
 ///
 /// Not writing the *transcript* is deliberate: the caller decides, which is what keeps skip
 /// and `--force` logic in one place instead of spread between here and there. The two files
-/// that *are* written here -- `mic.cleaned.wav` and `speaker_clusters.json` -- are not
+/// that *are* written here -- `mic.cleaned.flac` and `speaker_clusters.json` -- are not
 /// results the caller chooses to keep but by-products of the work: one is the audio
 /// recognition actually ran on, the other is what spares `enroll` from re-running diarization
 /// over the whole meeting later. `speaker_clusters.json` lands before this returns, so a
@@ -334,7 +339,7 @@ pub fn transcribe_session(
 ///
 /// With [`Isolation::Ready`], the voice isolator runs over the speech regions of the AEC-cleaned mic track
 /// after the cleaned track and the mixdown are written and before recognition, and recognition
-/// hears the isolated track (same length and timeline). `mic.cleaned.wav` and `meeting.opus`
+/// hears the isolated track (same length and timeline). `mic.cleaned.flac` and `meeting.opus`
 /// stay pre-isolation: isolating regions only would make background noise step on and off in
 /// the mix, and the files keep one meaning with the stage on or off. The speaker track, the
 /// echo canceller's reference, diarization's input and the speaker pass are never touched.
@@ -663,7 +668,7 @@ fn transcribe_and_write(
     Ok(transcript.turns.len())
 }
 
-/// Removes speaker bleed from the mic track, writes the result to `mic.cleaned.wav`, and
+/// Removes speaker bleed from the mic track, writes the result to `mic.cleaned.flac`, and
 /// returns it for recognition.
 ///
 /// The cleaned track is written on every path, including the ones where nothing was
@@ -682,9 +687,12 @@ fn clean_mic_track(
 ) -> Result<(Vec<f32>, meethook_session::Cleaning)> {
     let mic = audio::read_track_16k_mono(&session.paths.mic_wav())?;
 
-    let cleaned = aec::cancel_bleed(&mic, speaker, mic_minus_speaker_s);
+    let mut cleaned = aec::cancel_bleed(&mic, speaker, mic_minus_speaker_s);
     writeln!(progress, "{}  {}", session.id, cleaned.cleaning)?;
-    audio::write_track_16k_mono(&session.paths.mic_cleaned_wav(), &cleaned.audio)?;
+    // The file holds 16-bit samples, so recognition is handed the same ones rather than the
+    // float original: a rerun then hears exactly what this run did.
+    audio::quantize_to_16_bit(&mut cleaned.audio);
+    audio::write_cleaned_track_flac(&session.paths.mic_cleaned_flac(), &cleaned.audio)?;
     let record = meethook_session::Cleaning::from(cleaned.cleaning);
     // Written now with the isolation choice still unknown, so a crash in the (long) isolation
     // pass leaves the AEC outcome behind; the caller rewrites it once the choice is settled.
@@ -712,7 +720,7 @@ fn clean_mic_track(
 /// reading for a band a far end already through a conferencing codec may not even have.
 ///
 /// *Before recognition, not after.* An hour of Whisper interrupted halfway still leaves a
-/// listenable recording behind, which is the same argument that puts `mic.cleaned.wav` where
+/// listenable recording behind, which is the same argument that puts `mic.cleaned.flac` where
 /// it is.
 ///
 /// The offsets are the ones `merge` puts into the transcript, taken from the recorded host
@@ -1240,7 +1248,7 @@ mod tests {
         assert_eq!(off_asr[1], speaker);
 
         // AC 1/2: the mic pass heard the isolated track, on the cleaned track's timeline.
-        let cleaned = audio::read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap();
+        let cleaned = audio::read_track_16k_mono(&session.paths.mic_cleaned_flac()).unwrap();
         assert_eq!(off_asr[0], cleaned);
         assert_eq!(on_asr[0].len(), cleaned.len());
         assert_ne!(on_asr[0], cleaned);
@@ -1850,7 +1858,7 @@ mod tests {
         let mut asr = FakeAsr::default();
         mic_only(&session, &mut asr).unwrap();
 
-        assert!(session.paths.mic_cleaned_wav().is_file());
+        assert!(session.paths.mic_cleaned_flac().is_file());
         assert_eq!(
             std::fs::read(session.paths.mic_wav()).unwrap(),
             before,
@@ -1870,14 +1878,14 @@ mod tests {
         let paths = Paths::new(root.path());
         let session = make_bleeding_session(&paths, "20260809-052600");
 
-        // Transcribed once so `mic.cleaned.wav` exists to be compared across the second run.
+        // Transcribed once so `mic.cleaned.flac` exists to be compared across the second run.
         let mut asr = FakeAsr::default();
         mic_only(&session, &mut asr).unwrap();
 
         let tracks = [
             session.paths.mic_wav(),
             session.paths.speaker_wav(),
-            session.paths.mic_cleaned_wav(),
+            session.paths.mic_cleaned_flac(),
         ];
         let before: Vec<Vec<u8>> = tracks.iter().map(|p| std::fs::read(p).unwrap()).collect();
 
@@ -2190,8 +2198,8 @@ mod tests {
         mic_only(&session, &mut asr).unwrap();
 
         let raw = audio::read_track_16k_mono(&session.paths.mic_wav()).unwrap();
-        let cleaned = audio::read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap();
-        assert_eq!(asr.heard[0], cleaned, "ASR must read mic.cleaned.wav");
+        let cleaned = audio::read_track_16k_mono(&session.paths.mic_cleaned_flac()).unwrap();
+        assert_eq!(asr.heard[0], cleaned, "ASR must read mic.cleaned.flac");
         assert_ne!(
             asr.heard[0], raw,
             "on a session with real bleed the cleaned track must differ from the raw one, \
@@ -2233,7 +2241,7 @@ mod tests {
         );
         // Still written, and still what ASR read: one input file, no branch downstream.
         assert_eq!(
-            audio::read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap(),
+            audio::read_track_16k_mono(&session.paths.mic_cleaned_flac()).unwrap(),
             raw
         );
         let progress = String::from_utf8(progress).unwrap();
@@ -2423,7 +2431,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path());
         let session = make_session(&paths, "20260809-052600", 1_000_000);
-        let cleaned = || audio::read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap();
+        let cleaned = || audio::read_track_16k_mono(&session.paths.mic_cleaned_flac()).unwrap();
 
         let (_, heard) = transcribe_under(&session, &mut Isolation::Off);
         assert_eq!(

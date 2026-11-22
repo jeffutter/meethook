@@ -72,7 +72,7 @@ const BLANK_AUDIO: &str = "[BLANK_AUDIO]";
 /// The detector settings the speech gate runs at.
 ///
 /// `min_silence_s` is raised from the detector's 0.1 s default. Measured with
-/// `examples/vad-regions` on `20260810-093047`'s `mic.cleaned.wav` under the previous detector
+/// `examples/vad-regions` on `20260810-093047`'s `mic.cleaned.flac` under the previous detector
 /// (Silero): 0.1 s gave 463 regions holding 713.4 s of speech, 0.5 s gave 315 regions holding
 /// 791.6 s. That is 148 fewer seams for 78 s more audio -- roughly three more 30 s decoder
 /// windows -- and a seam is the only place rule 4 of [`gate::Splice::to_original`] can fire, so

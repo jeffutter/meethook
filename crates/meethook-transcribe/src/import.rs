@@ -57,7 +57,7 @@ pub const SPLICE_GAP_S: f64 = 0.5;
 /// One second rather than zero: below the `asr` module's minimum, whisper.cpp pads the buffer
 /// itself, and a track that exists is the difference between a session `transcribe` reads and
 /// one it refuses. A silent mic against a real speaker track makes the echo-cancellation
-/// pre-pass find no measurable lag and write `mic.cleaned.wav` as a pass-through, which is
+/// pre-pass find no measurable lag and write `mic.cleaned.flac` as a pass-through, which is
 /// the correct and boring outcome.
 pub const MIC_SILENCE_S: f64 = 1.0;
 

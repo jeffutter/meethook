@@ -20,7 +20,8 @@
 //!   sessions/
 //!     <YYYYMMDD-HHMMSS>[-N]/      local-time id, numeric suffix on same-second collision
 //!       mic.wav                   raw microphone track (never modified after recording)
-//!       mic.cleaned.wav           echo-cancelled derivative, written by transcribe
+//!       mic.cleaned.flac          echo-cancelled derivative (16 kHz, 16-bit FLAC), written by transcribe
+//!                                   (a session transcribed before FLAC may still hold mic.cleaned.wav)
 //!       speaker.wav               system/speaker track
 //!       session.json              presence == "valid/complete session"
 //!       speaker_clusters.json     diarization output reused by enroll

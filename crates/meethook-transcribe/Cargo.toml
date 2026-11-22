@@ -11,7 +11,11 @@ license.workspace = true
 meethook-models = { workspace = true }
 meethook-session = { workspace = true }
 
+# The FLAC pair behind `mic.cleaned.flac`: flacenc writes it (not rusty_flac's encoder, whose
+# frames macOS afconvert reads as empty), rusty_flac reads it. See the MH-40.1 decision.
+flacenc = { workspace = true }
 hound = { workspace = true }
+rusty_flac = { workspace = true }
 # For the session directories `import` builds: `create_session_dir` takes a `ZonedDateTime` and
 # `SessionMetadata` a `Timestamp`. A normal dependency rather than a dev one since that path
 # is compiled into the library.
@@ -21,7 +25,7 @@ jiff = { workspace = true }
 # gate below; elsewhere the graphs run on the CPU EP and the type is not compiled at all.
 ort = { workspace = true }
 # The Ogg container and the Opus codec behind `meeting.opus`. Normal dependencies, not dev
-# ones: the mixdown is written on the real transcribe path, next to `mic.cleaned.wav`.
+# ones: the mixdown is written on the real transcribe path, next to `mic.cleaned.flac`.
 ogg = { workspace = true }
 realfft = { workspace = true }
 # A normal dependency: `Resemblance` serializes for the headless `enroll --list` document,

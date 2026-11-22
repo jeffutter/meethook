@@ -125,7 +125,7 @@ session directory.** That contract is the thing to understand before touching an
   speaker track is diarized and each turn attributed to a distinct voice.
   A mic-isolation stage (`mic_isolation`, `Engines::isolation: Isolation`) runs the voice isolator
   over the VAD speech regions of the AEC-cleaned mic track just before ASR. It is on by default for
-  `transcribe`; `--no-isolate` turns it off for a run. `mic.cleaned.wav` and the mixdown stay
+  `transcribe`; `--no-isolate` turns it off for a run. `mic.cleaned.flac` and the mixdown stay
   pre-isolation; the speaker track is never isolated. Pipeline position: AEC pre-pass, then the
   mixdown is written, then VAD finds the speech regions of the *cleaned* mic track, then the
   isolator runs over those regions only, then ASR hears the result. It is mic only because the
@@ -133,7 +133,7 @@ session directory.** That contract is the thing to understand before touching an
   keeps one dominant voice) is not meant to clean: isolating it would delete exactly the other
   voices diarization must tell apart. `tests/mic_isolation_e2e.rs` proves the model ran
   (noise floor in speech regions at least 6 dB lower, `--no-isolate` identical to
-  `mic.cleaned.wav`, outcome recorded, two runs identical); it is `#[ignore]` because it loads the
+  `mic.cleaned.flac`, outcome recorded, two runs identical); it is `#[ignore]` because it loads the
   real model: `cargo test --release -p meethook-transcribe --test mic_isolation_e2e -- --ignored`.
   `examples/isolate-voice.rs --stage` times the whole stage (`--track` on a real recorder track).
   `VoiceIsolator` owns the STFT, the 8 s windows (the last one ends at the end of the audio,

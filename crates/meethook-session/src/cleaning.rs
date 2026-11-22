@@ -15,7 +15,7 @@ use crate::{Error, Result, SessionId, SessionPaths, write_atomic};
 pub const CLEANING_SCHEMA_VERSION: u32 = 2;
 
 /// Why cancellation did not run. Every variant is a normal outcome of a real recording, not an
-/// error -- `mic.cleaned.wav` is written on every one of these paths, so the rest of the
+/// error -- `mic.cleaned.flac` is written on every one of these paths, so the rest of the
 /// pipeline has exactly one input to read and no branch to get wrong.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PassThrough {

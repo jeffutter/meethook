@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn lines_are_plain_text_so_they_survive_being_redirected_to_a_file() {
         let clock = FakeClock::new();
-        let mut phase = Phase::started_at("writing mic.cleaned.wav", clock.base);
+        let mut phase = Phase::started_at("writing mic.cleaned.flac", clock.base);
         clock.advance(INTERVAL);
         let line = phase.tick(1, 2, || clock.now()).unwrap();
 

@@ -121,7 +121,7 @@ fn write_wav_48k(path: &Path, samples: &[f32]) {
 
 /// A session whose mic track is the sample plus broadband noise and whose speaker track is a
 /// few seconds of a quiet tone: unrelated to the mic, so the echo canceller has nothing to
-/// remove and `mic.cleaned.wav` is the noisy mic.
+/// remove and `mic.cleaned.flac` is the noisy mic.
 fn make_session(root: &Path) -> DiscoveredSession {
     let id = SessionId::parse("20260809-052600").unwrap();
     let paths = Paths::new(root).session(&id);
@@ -191,7 +191,7 @@ fn run(isolation: &mut Isolation) -> (Vec<f32>, Vec<f32>, IsolationOutcome) {
     .expect("transcribe must succeed");
 
     let mic_heard = heard.borrow()[0].clone();
-    let cleaned = read_track_16k_mono(&session.paths.mic_cleaned_wav()).unwrap();
+    let cleaned = read_track_16k_mono(&session.paths.mic_cleaned_flac()).unwrap();
     let outcome = CleaningRecord::read_if_present(&session.paths)
         .unwrap()
         .expect("cleaning.json must exist")
@@ -267,7 +267,7 @@ fn isolation_lowers_the_noise_floor_and_the_flag_turns_it_off() {
     assert_eq!(outcome_off, IsolationOutcome::DisabledByFlag);
     assert_eq!(
         heard_off, cleaned_off,
-        "with --no-isolate recognition must hear mic.cleaned.wav unchanged"
+        "with --no-isolate recognition must hear mic.cleaned.flac unchanged"
     );
     // The cleaned track itself does not depend on the flag.
     assert_eq!(cleaned_off, cleaned);

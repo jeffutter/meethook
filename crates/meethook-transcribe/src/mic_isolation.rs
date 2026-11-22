@@ -6,13 +6,13 @@
 //!
 //! # What goes in and what comes out
 //!
-//! The input is the AEC-cleaned 16 kHz mic track (`mic.cleaned.wav`), not the raw `mic.wav`:
+//! The input is the AEC-cleaned 16 kHz mic track (`mic.cleaned.flac`), not the raw `mic.wav`:
 //! the raw track still holds the far end that [`crate::cancel_bleed`] removed, the isolator
 //! keeps voices, and remote speech would come back into the transcript. Each span is upsampled
 //! to the isolator's 48 kHz, isolated, and decimated back. The 16 kHz result is spliced into a
 //! *copy* of the cleaned track, inside the speech regions only, so the output has the cleaned
 //! track's length and timeline by construction and every sample outside a region is bit for bit
-//! the input's. The result is held in memory and handed to recognition; `mic.cleaned.wav` and
+//! the input's. The result is held in memory and handed to recognition; `mic.cleaned.flac` and
 //! the mixdown keep the pre-isolation track (see `write_mixdown`).
 //!
 //! # Context, batching and edges

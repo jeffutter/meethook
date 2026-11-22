@@ -79,6 +79,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # it roots its own workspace and is excluded from this one -- so this declaration is the
 # only thing deciding what the shipped binary links.
 ctrlc = { version = "3", features = ["termination"] }
+# Pinned exactly: the FLAC tracks are read back by rusty_flac and by macOS afconvert, and the
+# MH-40.1 spike measured these two versions.
+flacenc = { version = "=0.5.1", default-features = false }
 hound = "3.5"
 jiff = "1"
 # Two raw syscalls that no std or wrapper API covers the way this project wants them covered:
@@ -186,6 +189,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # used internally, keeping the anti-aliasing filter -- and the timestamps measured against
 # it -- unchanged across the bump.
 rubato = "5"
+rusty_flac = "=0.5.1"
 
 # Real-input FFT, for the GCC-PHAT delay estimate in meethook-transcribe::align. It wraps
 # rustfft, which rubato already pulls in, so this adds a thin layer rather than a second FFT

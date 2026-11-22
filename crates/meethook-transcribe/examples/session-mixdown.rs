@@ -123,10 +123,10 @@ fn main() {
     // The cleaned track if `transcribe` has already run over this session, the raw one
     // otherwise -- and say which, because the whole source arm below is about that difference.
     let raw_mic = read_track_16k_mono(&paths.mic_wav()).unwrap();
-    let cleaned_mic = match read_track_16k_mono(&paths.mic_cleaned_wav()) {
+    let cleaned_mic = match read_track_16k_mono(&paths.mic_cleaned_flac()) {
         Ok(track) => track,
         Err(e) => {
-            println!("note: no mic.cleaned.wav ({e}); the `cleaned` arm repeats the raw track");
+            println!("note: no mic.cleaned.flac ({e}); the `cleaned` arm repeats the raw track");
             raw_mic.clone()
         }
     };
@@ -255,7 +255,7 @@ fn main() {
                 ),
                 rate,
             );
-            // The raw mic track, necessarily: `mic.cleaned.wav` only exists at 16 kHz, so this
+            // The raw mic track, necessarily: `mic.cleaned.flac` only exists at 16 kHz, so this
             // arm answers "is the extra band worth it" with the echo still in. Read it as an
             // upper bound on what a native-rate mix would sound like, not as a candidate.
             for kbps in [REFERENCE_KBPS, 48] {

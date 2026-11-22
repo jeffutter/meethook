@@ -258,7 +258,7 @@ discovered session that doesn't already have a transcript is considered.
 
 **Mic isolation.** By default, before Whisper hears your microphone, a voice-isolator model
 removes background noise from the speech regions of the (echo-cancelled) mic track. Only the mic
-track is affected: `mic.cleaned.wav`, `meeting.opus` and the speaker track are never changed, and
+track is affected: `mic.cleaned.flac`, `meeting.opus` and the speaker track are never changed, and
 the speaker track is never isolated. The weights are downloaded once on first use (only when
 there is something to transcribe) into `models/`: 152 MiB on macOS, where the isolator runs on the
 GPU through MLX, or 260 MB where it runs on the CPU (Linux, or a macOS binary built without the

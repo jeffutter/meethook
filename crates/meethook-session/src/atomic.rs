@@ -25,7 +25,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// over as a `&[u8]`.
 ///
 /// `fill` is given an empty file positioned at its start and may write and seek freely; an
-/// hour of `mic.cleaned.wav` is ~230 MB, so buffering it in memory just to reuse the byte
+/// hour of a 16 kHz float WAV is ~230 MB, so buffering it in memory just to reuse the byte
 /// API would be a waste this exists to avoid. The file is not visible under `path` until
 /// `fill` returns `Ok`, so a `fill` that fails partway leaves whatever was already there
 /// untouched.
