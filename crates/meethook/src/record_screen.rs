@@ -33,6 +33,8 @@
 //! [`render`]; this file only moves things between threads and restores a terminal.
 
 mod keys;
+#[cfg(target_os = "macos")]
+mod pacing;
 mod render;
 mod state;
 
@@ -69,6 +71,8 @@ use crate::record::{Event, Narration, Note, Reporter};
 use crate::tui_kit::{HelpOutcome, HelpOverlay, Theme};
 #[cfg(target_os = "macos")]
 use keys::{Action, Keys};
+#[cfg(target_os = "macos")]
+use pacing::NotePacer;
 #[cfg(target_os = "macos")]
 use state::{EditingField, Phase, State};
 
@@ -284,6 +288,10 @@ fn run(
         std::env::var(name).ok()
     }));
     let mut help: Option<HelpOverlay> = None;
+    // Notes pass through the pacer so an end-of-session notice stays up long enough to read;
+    // the run's loop is never slowed by it. See `pacing`.
+    let mut pacer = NotePacer::default();
+    let origin = Instant::now();
     loop {
         if stop.try_recv().is_ok() {
             break;
@@ -411,10 +419,13 @@ fn run(
             }
         }
 
-        let mut got_note = false;
         while let Ok(note) = notes.try_recv() {
-            state.apply(&note);
-            got_note = true;
+            pacer.push(note);
+        }
+        let released = pacer.release(origin.elapsed());
+        let got_note = !released.is_empty();
+        for note in &released {
+            state.apply(note);
         }
 
         *recording_since = match state.phase {
@@ -447,6 +458,9 @@ fn run(
     // everything, so whatever is still queued is the tail of the run and belongs in the
     // narration the teardown will flush.
     while let Ok(note) = notes.try_recv() {
+        pacer.push(note);
+    }
+    for note in pacer.drain() {
         state.apply(&note);
     }
     Ok(())
