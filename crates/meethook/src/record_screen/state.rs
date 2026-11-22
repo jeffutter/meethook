@@ -42,8 +42,8 @@ use meethook_enroll::{MeetingLabel, MeetingOffer};
 use meethook_session::{Attendee, Paths, RosterEdit, SessionId};
 
 use crate::record::{
-    ALREADY_ACTIVE, DEVICE_CHANGED, MIC_STALLED, NO_NEW_SESSION, Note, STOPPING, WATCHING,
-    giving_up_line,
+    ALREADY_ACTIVE, DEVICE_CHANGED, MIC_STALLED, MicHolderText, NO_NEW_SESSION, Note, STOPPING,
+    WATCHING, giving_up_line,
 };
 
 /// Which phase of the run the frame is showing.
@@ -109,6 +109,18 @@ pub struct FinishedSession {
     pub cleared: bool,
 }
 
+/// What the frame needs to say, on every draw, that its live session has outrun its meeting.
+///
+/// The inputs rather than the sentence: the figure must tick with the shell's clock, and this
+/// state machine has none, so the shell recomposes the block from these through the same
+/// composer the plain run uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverrunView {
+    pub title: String,
+    pub end: jiff::Timestamp,
+    pub holders: Vec<MicHolderText>,
+}
+
 /// Everything the frame draws, derived from the notes the run has said so far.
 #[derive(Debug)]
 pub struct State {
@@ -124,6 +136,10 @@ pub struct State {
     /// What the run currently wants said about itself: the idle prompt, a device-change or
     /// mic-stall notice, the stopping line. Cleared when a session opens.
     pub notice: Option<String>,
+    /// The overrun of the live session's meeting, once the run has announced one. Dies with the
+    /// meeting pane: a new session, a hand pick and a hand removal all change what the session
+    /// is measured against.
+    pub overrun: Option<OverrunView>,
     /// The calendar's offers for the live session, projected so far as the frame may show
     /// them: what the selector lists. Empty when there is no grant or nothing nearby -- the
     /// degraded view, not an error.
@@ -185,6 +201,7 @@ impl State {
             session: None,
             last: None,
             notice: None,
+            overrun: None,
             trouble: Vec::new(),
             narration: String::new(),
             offered: Vec::new(),
@@ -205,6 +222,7 @@ impl State {
     /// The meeting pane dies with the session it described: a new session starting and a
     /// session finishing both call it, rather than spelling the assignments twice.
     fn clear_meeting_pane(&mut self) {
+        self.overrun = None;
         self.offered.clear();
         self.guess = None;
         self.settled = None;
@@ -281,6 +299,7 @@ impl State {
                 // stuck is what confirms it, not the keypress -- so a pick the run drops never
                 // reads as one.
                 self.settled = Some(label.clone());
+                self.overrun = None;
                 self.cleared = false;
                 self.selector_open = false;
             }
@@ -290,6 +309,7 @@ impl State {
                 // offers stay -- choosing one afterwards is how the removal is undone.
                 self.guess = None;
                 self.settled = None;
+                self.overrun = None;
                 self.cleared = true;
                 self.selector_open = false;
                 self.roster = None;
@@ -335,6 +355,18 @@ impl State {
                     }
                     .to_string(),
                 );
+            }
+            Note::Overrun {
+                title,
+                end,
+                holders,
+                ..
+            } => {
+                self.overrun = Some(OverrunView {
+                    title: title.clone(),
+                    end: *end,
+                    holders: holders.clone(),
+                });
             }
             Note::NoNewSession => {
                 self.phase = Phase::Idle;
@@ -749,6 +781,37 @@ mod tests {
             !s.selector_open,
             "the offer arrives with the selector closed"
         );
+    }
+
+    fn overrun_note() -> Note {
+        Note::Overrun {
+            title: "Standup".to_owned(),
+            end: "2026-08-15T11:00:00Z".parse().unwrap(),
+            over: std::time::Duration::from_secs(600),
+            holders: vec![],
+        }
+    }
+
+    #[test]
+    fn the_overrun_clears_when_the_next_session_starts() {
+        let mut s = State::default();
+        s.apply(&started(1));
+        s.apply(&overrun_note());
+        assert_eq!(
+            s.overrun.as_ref().map(|o| o.title.as_str()),
+            Some("Standup")
+        );
+        s.apply(&started(2));
+        assert!(s.overrun.is_none());
+    }
+
+    #[test]
+    fn a_hand_pick_or_removal_drops_the_overrun_of_the_meeting_it_replaces() {
+        let mut s = State::default();
+        s.apply(&started(1));
+        s.apply(&overrun_note());
+        s.apply(&Note::MeetingCleared);
+        assert!(s.overrun.is_none());
     }
 
     /// The cursor wraps at both ends and does nothing on an empty list -- where `confirm`

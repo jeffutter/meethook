@@ -286,6 +286,10 @@ trait Capture {
     /// Returning nothing is always a legal answer, and a capture with no way to look may return it
     /// unconditionally: this is a diagnostic, and no session's correctness depends on it.
     fn observe_mic_apps(&mut self) -> AppIdentities;
+    /// Every process the trigger currently sees capturing, counted or not, for the overrun
+    /// notice. Asked only when a notice is about to be emitted, since the walk costs about one
+    /// re-check. An empty answer is legal and is stated as such.
+    fn mic_holders(&mut self) -> Vec<MicHolderText>;
     /// Whether the microphone track has stopped receiving audio.
     ///
     /// Asked only while a session is live, once per `Timing::recheck`. The live backend
@@ -432,6 +436,19 @@ pub(crate) enum Note {
         cleared: bool,
     },
 
+    /// The live session has run past the end of the meeting it is attached to, and nothing
+    /// will stop it: how far past, and who the microphone trigger says is holding the input.
+    ///
+    /// Display only -- see `meethook_session::overrun_past`. Carries `end` as well as the
+    /// figure at emission: the plain run prints the snapshot, while the frame keeps `end` and
+    /// recomposes against its own clock on every draw, through the same composer.
+    Overrun {
+        title: String,
+        end: jiff::Timestamp,
+        over: Duration,
+        holders: Vec<MicHolderText>,
+    },
+
     // ---- stderr class ----
     /// The first failed attempt to open a session, in full.
     BeginFailed(String),
@@ -497,6 +514,15 @@ impl Note {
                 *cleared,
             ),
             Note::GivingUp(attempts) => giving_up_line(*attempts),
+            Note::Overrun {
+                title,
+                over,
+                holders,
+                ..
+            } => format!(
+                "{}\n",
+                overrun_lines(title, *over, holders, Some(OVERRUN_PLAIN_HINT))
+            ),
         }
     }
 
@@ -546,6 +572,84 @@ pub(crate) const NO_NEW_SESSION: &str =
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const NO_ROSTER: &str =
     "This meeting lists no attendees, so there is no roster to correct";
+
+/// How long past the end of its meeting a live session must be before either presenter says so.
+///
+/// Short enough to be useful the moment a room runs long, long enough that an event ending a
+/// minute early or a rounded clock announces nothing. A measured decision, not a flag.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const OVERRUN_GRACE: Duration = Duration::from_secs(120);
+
+/// How much further the overrun must grow before the plain run says it again, so a runaway
+/// found hours later in a scrollback or log shows a growing trail rather than one stale figure.
+#[cfg(any(target_os = "macos", test))]
+const OVERRUN_STEP: Duration = Duration::from_secs(300);
+
+/// The stop advice the line-based run appends. The frame leaves it off, because its footer
+/// already advertises `s` (end this session, keep watching) and Ctrl-C (quit) side by side.
+#[cfg(any(target_os = "macos", test))]
+const OVERRUN_PLAIN_HINT: &str = "Press Ctrl-C to stop.";
+
+/// One microphone holder as the overrun notice quotes it: the trigger's own identity text, and
+/// the reason the trigger does not count it, if it does not.
+///
+/// A bin-crate mirror of `meethook_record::MicHolder`, which is macOS-only: the loop and both
+/// presenters compile and are tested elsewhere.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MicHolderText {
+    pub identity: String,
+    pub not_counted_because: Option<String>,
+}
+
+/// An overrun as a short figure: `45s` under a minute, `12m` under an hour, `1h04m` beyond.
+///
+/// Not `format_elapsed`, which is a `mm:ss` stopwatch and would read as a duration of
+/// recording rather than as lateness.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn overrun_figure(over: Duration) -> String {
+    let secs = over.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        _ => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
+/// The overrun block, without a trailing newline: the single composer both presenters use.
+///
+/// Names the meeting by title only (never attendees) and, one line per holder, the identity
+/// text the `[activity]` debug log prints, with that log's own `<- excluded:` marker. An empty
+/// list says so plainly: the trigger is provably true -- the session is running -- yet names
+/// nobody, which is itself the finding.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn overrun_lines(
+    title: &str,
+    over: Duration,
+    holders: &[MicHolderText],
+    hint: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "Recording has run {} past the end of {title:?} and will not stop on its own.",
+        overrun_figure(over)
+    );
+    if let Some(hint) = hint {
+        out.push(' ');
+        out.push_str(hint);
+    }
+    if holders.is_empty() {
+        out.push_str("\n  holding   none reported by the trigger");
+    }
+    for holder in holders {
+        out.push_str("\n  holding   ");
+        out.push_str(&holder.identity);
+        if let Some(reason) = &holder.not_counted_because {
+            out.push_str("   <- excluded: ");
+            out.push_str(reason);
+        }
+    }
+    out
+}
 
 /// The line naming a session as it opens.
 #[cfg(any(target_os = "macos", test))]
@@ -909,6 +1013,17 @@ impl Capture for SessionCapture<'_> {
         observed
     }
 
+    fn mic_holders(&mut self) -> Vec<MicHolderText> {
+        self.watcher
+            .holders()
+            .into_iter()
+            .map(|h| MicHolderText {
+                identity: h.identity,
+                not_counted_because: h.not_counted_because,
+            })
+            .collect()
+    }
+
     fn mic_stalled(&mut self, sink: &mut dyn Reporter) -> bool {
         // Nothing running cannot be stalled. The loop only asks while a session is live, so
         // defining the case away here is cheaper than a branch that can only ever be wrong --
@@ -1035,6 +1150,7 @@ pub fn record(paths: &Paths, plain: bool) -> Result<()> {
         &LiveEvents::new(rx),
         &mut capture,
         &|| watcher.recheck(),
+        &jiff::Timestamp::now,
         already_active,
         Timing::LIVE,
         &mut sink,
@@ -1064,12 +1180,16 @@ pub fn record(paths: &Paths, plain: bool) -> Result<()> {
 /// microphone track is still receiving audio. That question has no listener behind it, so this
 /// poll is its detection mechanism rather than a safety net; see `Timing::recheck`.
 ///
+/// `now` is the wall clock the overrun notice measures against `Meeting::end`; an argument so a
+/// test can place a session inside or past its meeting without sleeping.
+///
 /// `already_active` skips the first idle wait, because a call that was already in progress
 /// when this process started will not produce a start edge.
 fn record_loop(
     rx: &dyn Events,
     capture: &mut dyn Capture,
     recheck: &dyn Fn() -> bool,
+    now: &dyn Fn() -> jiff::Timestamp,
     already_active: bool,
     timing: Timing,
     sink: &mut dyn Reporter,
@@ -1142,6 +1262,9 @@ fn record_loop(
         // Dies with this block so a device-change or stall restart cannot inherit a predecessor's
         // roster, the same reason `hand` and `roster_edit` live here.
         let mut mic_apps = capture.observe_mic_apps();
+        // The overrun last announced on the plain path, declared here so it dies with the
+        // session: "the notice is gone for the next session" is then structure, not a reset.
+        let mut announced: Option<Duration> = None;
 
         let outcome = loop {
             match rx.recv_timeout(timing.recheck) {
@@ -1165,6 +1288,8 @@ fn record_loop(
                         .cloned()
                     {
                         hand = Some(HandLabel::Pick(meeting.clone()));
+                        // A new deadline: the overrun is measured afresh against it.
+                        announced = None;
                         // Lifted out before the Confirmed stamp moves the meeting into the
                         // label: the supersedure below needs the same id.
                         let event_id = meeting.event_id.clone();
@@ -1201,6 +1326,7 @@ fn record_loop(
                 // not consulted here or at finish.
                 Ok(Event::MeetingCleared) => {
                     hand = Some(HandLabel::Clear);
+                    announced = None;
                     roster_edit = None;
                     sink.note(Note::MeetingCleared);
                 }
@@ -1257,6 +1383,28 @@ fn record_loop(
                     // the session on this pass, and a holder sampled then would be attributed to a
                     // session that is already over.
                     mic_apps.merge(&capture.observe_mic_apps());
+                    // Visibility, never a stop: a hand pick moves the meeting the session is
+                    // measured against, and a session with none attached has nothing to
+                    // overrun. Announced at the crossing and then once per step, and the
+                    // holders are asked only when a notice is actually emitted.
+                    let target = match &hand {
+                        Some(HandLabel::Pick(m)) => Some(m),
+                        Some(HandLabel::Clear) => None,
+                        None => offered.chosen.as_ref(),
+                    };
+                    if let Some(m) = target
+                        && let Some(over) =
+                            meethook_session::overrun_past(m.end, now(), OVERRUN_GRACE)
+                        && announced.is_none_or(|last| over.saturating_sub(last) >= OVERRUN_STEP)
+                    {
+                        announced = Some(over);
+                        sink.note(Note::Overrun {
+                            title: m.title.clone(),
+                            end: m.end,
+                            over,
+                            holders: capture.mic_holders(),
+                        });
+                    }
                     let _ = recheck();
                 }
                 // Every sender is gone, so no edge can arrive again.
@@ -1619,6 +1767,7 @@ mod tests {
             rx,
             capture,
             recheck,
+            &|| test_now(),
             already_active,
             LOOP_TIMING,
             &mut silent,
@@ -1654,11 +1803,18 @@ mod tests {
             rx,
             capture,
             recheck,
+            &|| test_now(),
             already_active,
             LOOP_TIMING,
             &mut noted,
         );
         noted.notes
+    }
+
+    /// The wall clock the loop tests run on: inside `meeting_of`'s window (10:00 to 11:00), so
+    /// no test is told its session overran unless it asks.
+    fn test_now() -> jiff::Timestamp {
+        "2026-08-15T10:30:00Z".parse().unwrap()
     }
 
     /// A candidate meeting, the way the record crate's lookup would hand one over: the fit
@@ -1900,6 +2056,11 @@ mod tests {
         /// argument for this design, and a device walk on some other cadence would be the way it
         /// quietly regresses.
         observations: usize,
+        /// What `mic_holders` answers with.
+        holders: Vec<super::MicHolderText>,
+        /// Calendar answers for sessions after the first, consumed one per `candidates` call
+        /// once `candidates` itself has answered the first.
+        later_candidates: VecDeque<Offered>,
     }
 
     impl Capture for FakeCapture {
@@ -1946,7 +2107,16 @@ mod tests {
 
         fn candidates(&mut self) -> Offered {
             self.candidate_calls += 1;
+            if self.candidate_calls > 1
+                && let Some(next) = self.later_candidates.pop_front()
+            {
+                return next;
+            }
             self.candidates.clone().unwrap_or_default()
+        }
+
+        fn mic_holders(&mut self) -> Vec<super::MicHolderText> {
+            self.holders.clone()
         }
 
         fn mic_stalled(&mut self, _sink: &mut dyn super::Reporter) -> bool {
@@ -2287,7 +2457,15 @@ mod tests {
             ..FakeCapture::default()
         };
         let mut silent = Silent;
-        record_loop(&rx, &mut capture, &|| true, false, timing, &mut silent);
+        record_loop(
+            &rx,
+            &mut capture,
+            &|| true,
+            &|| test_now(),
+            false,
+            timing,
+            &mut silent,
+        );
 
         assert_eq!(capture.calls, ["start", "finish"]);
         let finished = capture
@@ -2617,7 +2795,15 @@ mod tests {
         let mut plain = Plain::writing_to(out, err);
 
         let mut capture = FakeCapture::default();
-        record_loop(&rx, &mut capture, &|| true, false, LOOP_TIMING, &mut plain);
+        record_loop(
+            &rx,
+            &mut capture,
+            &|| true,
+            &|| test_now(),
+            false,
+            LOOP_TIMING,
+            &mut plain,
+        );
 
         assert!(out_log.refusals() > 0, "the shutdown was narrated anyway");
         assert_eq!(err_log.refusals(), 0, "no fault note was owed");
@@ -3530,6 +3716,217 @@ mod tests {
         );
     }
 
+    // ---- overrun notice ----
+
+    /// A clock that starts `first` seconds past the 11:00Z end `meeting_of` uses and moves on
+    /// `per_call` seconds each time the loop reads it.
+    fn clock_past_the_end(first: i64, per_call: i64) -> impl Fn() -> jiff::Timestamp {
+        let calls = Cell::new(0_i64);
+        move || {
+            let n = calls.get();
+            calls.set(n + 1);
+            let end: jiff::Timestamp = "2026-08-15T11:00:00Z".parse().unwrap();
+            end + jiff::SignedDuration::from_secs(first + n * per_call)
+        }
+    }
+
+    /// Like `run_noted`, on a caller-supplied wall clock.
+    fn run_noted_at(
+        rx: &Script,
+        capture: &mut FakeCapture,
+        now: &dyn Fn() -> jiff::Timestamp,
+    ) -> Vec<Note> {
+        let mut noted = Noted::default();
+        record_loop(rx, capture, &|| true, now, false, LOOP_TIMING, &mut noted);
+        noted.notes
+    }
+
+    fn one_call() -> (Sender, Script) {
+        script(vec![
+            (BLIP, Event::Started),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ])
+    }
+
+    fn overruns(notes: &[Note]) -> Vec<&Note> {
+        notes
+            .iter()
+            .filter(|n| matches!(n, Note::Overrun { .. }))
+            .collect()
+    }
+
+    fn standup_chosen() -> Option<Offered> {
+        let m = meeting_of("A", "Standup");
+        Some(Offered {
+            meetings: vec![m.clone()],
+            chosen: Some(m),
+        })
+    }
+
+    fn mic_holder(identity: &str, why: Option<&str>) -> super::MicHolderText {
+        super::MicHolderText {
+            identity: identity.to_owned(),
+            not_counted_because: why.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn no_overrun_notice_before_the_meeting_end_plus_grace() {
+        // 119 seconds past the end: inside the grace, so silent.
+        let (_tx, rx) = one_call();
+        let mut capture = FakeCapture {
+            candidates: standup_chosen(),
+            ..FakeCapture::default()
+        };
+        let notes = run_noted_at(&rx, &mut capture, &clock_past_the_end(119, 0));
+        assert!(overruns(&notes).is_empty());
+
+        // And the default test clock, inside the meeting itself.
+        let (_tx, rx) = one_call();
+        let mut capture = FakeCapture {
+            candidates: standup_chosen(),
+            ..FakeCapture::default()
+        };
+        assert!(overruns(&run_noted(&rx, &mut capture, &|| true, false)).is_empty());
+    }
+
+    #[test]
+    fn a_session_that_outlives_its_meeting_names_the_holders_keeping_it_alive() {
+        let (_tx, rx) = one_call();
+        let mut capture = FakeCapture {
+            candidates: standup_chosen(),
+            holders: vec![
+                mic_holder("pid=9848 exe=/Users/j/mic-hold", None),
+                mic_holder("pid=1 exe=/usr/bin/meethook", Some("our own capture")),
+            ],
+            ..FakeCapture::default()
+        };
+        let notes = run_noted_at(&rx, &mut capture, &clock_past_the_end(720, 0));
+        let found = overruns(&notes);
+        assert_eq!(
+            found.len(),
+            1,
+            "a steady clock announces once, not every tick"
+        );
+        assert!(!found[0].to_stderr());
+        assert_eq!(
+            found[0].composed(),
+            "Recording has run 12m past the end of \"Standup\" and will not stop on its own. Press Ctrl-C to stop.\n\
+             \x20 holding   pid=9848 exe=/Users/j/mic-hold\n\
+             \x20 holding   pid=1 exe=/usr/bin/meethook   <- excluded: our own capture\n"
+        );
+    }
+
+    #[test]
+    fn an_overrun_is_announced_again_only_after_another_step() {
+        let (_tx, rx) = one_call();
+        let mut capture = FakeCapture {
+            candidates: standup_chosen(),
+            ..FakeCapture::default()
+        };
+        // 120s, 270s, 420s, 570s, 720s ...: only the crossing and each 300s of growth speak.
+        let notes = run_noted_at(&rx, &mut capture, &clock_past_the_end(120, 150));
+        let overs: Vec<u64> = overruns(&notes)
+            .iter()
+            .map(|n| match n {
+                Note::Overrun { over, .. } => over.as_secs(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(overs.len() >= 3, "several ticks pass: {overs:?}");
+        assert_eq!(overs[..3], [120, 420, 720]);
+    }
+
+    #[test]
+    fn the_overrun_does_not_follow_the_recorder_into_the_next_session() {
+        let later = meeting_of("B", "Retro");
+        let later = Meeting::new(
+            later.event_id.clone(),
+            later.title.clone(),
+            "Work".to_owned(),
+            "2026-08-15T11:00:00Z".parse().unwrap(),
+            "2026-08-15T12:00:00Z".parse().unwrap(),
+        );
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Started),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+        let mut capture = FakeCapture {
+            candidates: standup_chosen(),
+            later_candidates: [Offered {
+                meetings: vec![later.clone()],
+                chosen: Some(later),
+            }]
+            .into_iter()
+            .collect(),
+            ..FakeCapture::default()
+        };
+        // 11:10Z: past the first meeting, inside the second.
+        let notes = run_noted_at(&rx, &mut capture, &clock_past_the_end(600, 0));
+        let sequence: Vec<&str> = notes
+            .iter()
+            .filter_map(|n| match n {
+                Note::Overrun { .. } => Some("overrun"),
+                Note::MeetingOffered { .. } => Some("session"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sequence, ["session", "overrun", "session"]);
+    }
+
+    #[test]
+    fn a_hand_pick_moves_the_deadline_the_session_is_measured_against() {
+        let later = Meeting::new(
+            "B".to_owned(),
+            "Retro".to_owned(),
+            "Work".to_owned(),
+            "2026-08-15T11:00:00Z".parse().unwrap(),
+            "2026-08-15T12:00:00Z".parse().unwrap(),
+        );
+        let (_tx, rx) = script(vec![
+            (BLIP, Event::Started),
+            (BLIP / 4, Event::MeetingPicked("B".to_owned())),
+            (SETTLE, Event::Stopped),
+            (SETTLE, Event::Interrupt),
+        ]);
+        let mut capture = FakeCapture {
+            candidates: Some(Offered {
+                meetings: vec![meeting_of("A", "Standup"), later],
+                chosen: Some(meeting_of("A", "Standup")),
+            }),
+            ..FakeCapture::default()
+        };
+        let notes = run_noted_at(&rx, &mut capture, &clock_past_the_end(600, 0));
+        assert!(
+            overruns(&notes).is_empty(),
+            "10 minutes past A's end is inside B"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_attached_meeting_reports_no_overrun() {
+        let (_tx, rx) = one_call();
+        let mut capture = FakeCapture::default();
+        let notes = run_noted_at(&rx, &mut capture, &clock_past_the_end(7200, 0));
+        assert!(overruns(&notes).is_empty());
+    }
+
+    #[test]
+    fn the_overrun_block_says_plainly_when_the_trigger_names_no_holder() {
+        assert_eq!(
+            super::overrun_lines("Standup", Duration::from_secs(3840), &[], None),
+            "Recording has run 1h04m past the end of \"Standup\" and will not stop on its own.\n\
+             \x20 holding   none reported by the trigger"
+        );
+        assert_eq!(super::overrun_figure(Duration::from_secs(45)), "45s");
+        assert_eq!(super::overrun_figure(Duration::from_secs(3599)), "59m");
+        assert_eq!(super::overrun_figure(Duration::from_secs(3600)), "1h00m");
+    }
+
     /// The plain mode's guarantee, pinned: every composer produces the pre-interface literal
     /// verbatim. This suite is what makes AC #4 a test rather than a review -- a rewording
     /// that slipped into a composer fails here instead of showing up in a user's scrollback.
@@ -3557,6 +3954,17 @@ mod tests {
         assert!(!Note::MicStalled.to_stderr());
         assert!(!Note::Stopping.to_stderr());
         assert!(!Note::NoNewSession.to_stderr());
+        // Stdout class: a notice the user is meant to read, and `refusals() == 0` in the
+        // hung-up-terminal test depends on it not being a fault.
+        assert!(
+            !Note::Overrun {
+                title: "Standup".to_owned(),
+                end: "2026-08-15T11:00:00Z".parse().unwrap(),
+                over: Duration::from_secs(45 * 60),
+                holders: vec![],
+            }
+            .to_stderr()
+        );
         assert!(
             !Note::Recorded {
                 id: id.clone(),

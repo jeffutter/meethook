@@ -74,7 +74,7 @@ pub use interrupted::{
 };
 pub use metadata::{
     Attendee, AttendeeStatus, HandLabel, Meeting, MeetingFit, RosterEdit, SESSION_SCHEMA_VERSION,
-    SessionMetadata, TrackSync,
+    SessionMetadata, TrackSync, overrun_past,
 };
 pub use paths::{Paths, SessionPaths};
 pub use record_lock::{Acquisition, Holder, LockState, RecordLock};

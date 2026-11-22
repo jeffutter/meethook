@@ -30,7 +30,8 @@ use meethook_session::AttendeeStatus;
 ///
 /// `elapsed` is a parameter rather than a [`State`] field, for the same reason enroll's draw
 /// takes its playback progress: it is derived from a clock, and the state machine is documented
-/// as having none in it. `None` outside recording. `keys` is the table the footer and the help
+/// as having none in it. `None` outside recording. `overrun` is the composed past-the-end block
+/// for the same reason: the shell owns the clock, `render` only lays out the string it is handed. `keys` is the table the footer and the help
 /// overlay read, and `help` the overlay itself when it is open.
 pub fn draw(
     frame: &mut Frame,
@@ -38,6 +39,7 @@ pub fn draw(
     keys: &Keys,
     help: Option<&mut HelpOverlay>,
     elapsed: Option<Duration>,
+    overrun: Option<&str>,
 ) {
     let whole = frame.area();
     // Too small to mean anything; drawing into it would only produce a wall of borders.
@@ -90,6 +92,16 @@ pub fn draw(
     );
 
     let mut body_lines: Vec<Line> = vec![status_line(state, elapsed)];
+
+    // Directly under the status line and above the session id, so it reads as being about
+    // that session. One composed block, one styled row per line.
+    if let Some(block) = overrun {
+        body_lines.extend(
+            block
+                .lines()
+                .map(|l| Line::from(Span::raw(l.to_owned()).yellow())),
+        );
+    }
 
     if let Some(session) = &state.session {
         body_lines.push(Line::from(Span::raw(session_id_line(&session.id))).bold());
@@ -309,7 +321,16 @@ mod tests {
     fn painted(width: u16, height: u16, state: &State, elapsed: Option<Duration>) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
         terminal
-            .draw(|frame| draw(frame, state, &Keys::new(Theme::default()), None, elapsed))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    state,
+                    &Keys::new(Theme::default()),
+                    None,
+                    elapsed,
+                    None,
+                )
+            })
             .expect("drawing into a buffer cannot fail");
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -321,6 +342,67 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_frame_shows_the_overrun_above_the_session_it_belongs_to() {
+        let mut state = State::default();
+        state.apply(&started(1));
+        state.apply(&Note::MeetingOffered {
+            offered: vec![],
+            guess: Some(MeetingLabel::from(&meeting_of(
+                "A",
+                "Standup",
+                MeetingFit::Started,
+            ))),
+        });
+        let block = crate::record::overrun_lines(
+            "Standup",
+            Duration::from_secs(720),
+            &[crate::record::MicHolderText {
+                identity: "pid=9 exe=/bin/hold".to_owned(),
+                not_counted_because: None,
+            }],
+            None,
+        );
+        // The 80x24 floor: the notice must not push the session id, the meeting clause or the
+        // key hints out; and a narrow terminal must keep the session id too.
+        for (w, h) in [(80, 24), (40, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw(
+                        f,
+                        &state,
+                        &Keys::new(Theme::default()),
+                        None,
+                        Some(Duration::from_secs(5)),
+                        Some(&block),
+                    )
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let rows: Vec<String> = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect();
+            let at = |needle: &str| rows.iter().position(|r| r.contains(needle));
+            let over = at("Recording has run 12m").unwrap_or_else(|| panic!("{w}: {rows:#?}"));
+            let session = at("Session 20260809").unwrap_or_else(|| panic!("{w}: {rows:#?}"));
+            assert!(over < session, "{w}: the notice sits above the session id");
+            assert!(
+                at("stop").is_some() || at("quit").is_some(),
+                "{w}: the footer keys survive: {rows:#?}"
+            );
+        }
+        let rows = painted(80, 24, &state, Some(Duration::from_secs(5)));
+        assert!(!rows.iter().any(|r| r.contains("past the end")));
+        assert!(rows.iter().any(|r| r.contains("Standup")));
     }
 
     fn started(n: u8) -> Note {
@@ -355,7 +437,16 @@ mod tests {
     ) -> Vec<(String, bool)> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
         terminal
-            .draw(|frame| draw(frame, state, &Keys::new(Theme::default()), None, elapsed))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    state,
+                    &Keys::new(Theme::default()),
+                    None,
+                    elapsed,
+                    None,
+                )
+            })
             .expect("drawing into a buffer cannot fail");
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -610,7 +701,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut help = HelpOverlay::default();
         terminal
-            .draw(|f| draw(f, &state, &keys, Some(&mut help), None))
+            .draw(|f| draw(f, &state, &keys, Some(&mut help), None, None))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let text: String = (0..24)

@@ -422,9 +422,23 @@ fn run(
             _ => None,
         };
         let elapsed = recording_since.map(|since| since.elapsed());
+        // Recomposed on every draw from the held inputs, so the figure ticks with the clock
+        // while the plain run prints snapshots: same composer, different cadence. The frame
+        // leaves the stop advice off because its footer already carries the keys.
+        let overrun = match (state.phase, &state.overrun) {
+            (Phase::Recording, Some(view)) => meethook_session::overrun_past(
+                view.end,
+                jiff::Timestamp::now(),
+                crate::record::OVERRUN_GRACE,
+            )
+            .map(|over| crate::record::overrun_lines(&view.title, over, &view.holders, None)),
+            _ => None,
+        };
 
         if *dirty || got_note || state.phase == Phase::Recording {
-            term.draw(|f| render::draw(f, state, &keys, help.as_mut(), elapsed))?;
+            term.draw(|f| {
+                render::draw(f, state, &keys, help.as_mut(), elapsed, overrun.as_deref())
+            })?;
             *dirty = false;
         }
     }

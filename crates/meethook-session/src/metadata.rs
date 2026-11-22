@@ -567,3 +567,65 @@ impl SessionMetadata {
         serde_json::from_slice(&bytes).map_err(|e| Error::json(path, e))
     }
 }
+
+/// How far `now` lies past a meeting's `end`, once `grace` has gone by; `None` while `now` is
+/// inside the meeting or inside the grace.
+///
+/// **A display measurement, and deliberately not an input to [`MeetingFit`] or to meeting
+/// selection.** The fit is about a session's start only (decision-009; see [`MeetingFit`]): a
+/// recording that outlives its event is the most ordinary outcome there is. This figure exists
+/// so a presenter can say that a live session has run past its meeting, and nothing else may
+/// consume it.
+///
+/// Both arguments are wall-clock instants, the basis `Meeting::end` is stored on. A monotonic
+/// clock is the wrong one here: on macOS it stops during system sleep and would under-read
+/// against a calendar timestamp.
+pub fn overrun_past(
+    end: Timestamp,
+    now: Timestamp,
+    grace: std::time::Duration,
+) -> Option<std::time::Duration> {
+    // `SignedDuration` to `std::time::Duration` fails only for a negative value, which is the
+    // "still inside the meeting" case; an overflow clamps rather than becoming an error path.
+    let past = std::time::Duration::try_from(now.duration_since(end)).ok()?;
+    (past >= grace).then_some(past)
+}
+
+#[cfg(test)]
+mod overrun_tests {
+    use std::time::Duration;
+
+    use super::overrun_past;
+
+    const GRACE: Duration = Duration::from_secs(120);
+
+    fn at(s: &str) -> jiff::Timestamp {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn nothing_inside_the_meeting_or_the_grace() {
+        let end = at("2026-08-15T11:00:00Z");
+        assert_eq!(overrun_past(end, at("2026-08-15T10:30:00Z"), GRACE), None);
+        assert_eq!(overrun_past(end, end, GRACE), None);
+        assert_eq!(
+            overrun_past(end, at("2026-08-15T11:01:59Z"), GRACE),
+            None,
+            "a second short of the grace is still silent"
+        );
+    }
+
+    #[test]
+    fn reports_the_whole_overrun_once_the_grace_has_gone_by() {
+        let end = at("2026-08-15T11:00:00Z");
+        assert_eq!(
+            overrun_past(end, at("2026-08-15T11:02:00Z"), GRACE),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            overrun_past(end, at("2026-08-15T12:04:00Z"), GRACE),
+            Some(Duration::from_secs(3840)),
+            "arithmetic is exact across an hour boundary"
+        );
+    }
+}
