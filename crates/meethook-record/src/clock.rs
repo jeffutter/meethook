@@ -3,7 +3,7 @@
 //! Nothing here computes an offset between the two tracks. The recorder's whole
 //! contribution to synchronization is recording, exactly and losslessly, *when* each track
 //! delivered its first sample; turning two tick counts into a sample offset is
-//! `transcribe`'s job and happens once, against both WAV headers.
+//! `transcribe`'s job and happens once, against both track headers.
 
 use std::sync::OnceLock;
 

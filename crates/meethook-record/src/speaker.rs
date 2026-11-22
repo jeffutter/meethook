@@ -203,7 +203,7 @@ impl SpeakerCapture {
 }
 
 impl crate::teardown::Engine for SpeakerCapture {
-    /// Stops the stream and finalizes the WAV.
+    /// Stops the stream and finalizes the FLAC.
     ///
     /// A stream that died mid-meeting is reported here rather than swallowed: without this,
     /// a dropped stream would produce a short file and a cheerful success message.
@@ -211,7 +211,7 @@ impl crate::teardown::Engine for SpeakerCapture {
         self.stop_capturing(true)
     }
 
-    /// Stops the stream, finalizes the WAV, and reports nothing.
+    /// Stops the stream, finalizes the FLAC, and reports nothing.
     ///
     /// The difference from [`Engine::settle`](crate::teardown::Engine::settle) is the wait and
     /// everything the wait buys. The
@@ -226,13 +226,13 @@ impl crate::teardown::Engine for SpeakerCapture {
 }
 
 impl SpeakerCapture {
-    /// The one teardown: stop the stream, detach the output, finalize the WAV.
+    /// The one teardown: stop the stream, detach the output, finalize the FLAC.
     ///
     /// `waited` says whether to block on the completion handler, which decides both how long
     /// this may take and whether anything is reported: `settle` waits because a stream that
     /// died mid-meeting is worth saying so about, `abandon` because a hang while the process is
     /// unwinding is worse than the capture it leaves behind. Both orders of business end at the
-    /// same finalized WAV.
+    /// same finalized FLAC.
     fn stop_capturing(self, waited: bool) -> Result<TrackSummary> {
         let SpeakerCapture {
             stream,
@@ -277,7 +277,7 @@ impl SpeakerCapture {
             )
         });
 
-        // Finalize before reporting any error: a half-written WAV helps nobody.
+        // Finalize before reporting any error: a half-written FLAC helps nobody.
         let summary = writer.finish();
 
         if !waited {

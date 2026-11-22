@@ -47,7 +47,7 @@
 //!   missing. A dead input device leaves exactly one track on disk, and saying "both tracks" then
 //!   is the same class of untruth as saying "crashed".
 //! - **Per track, never blended.** The two tracks are written by independent threads that
-//!   checkpoint independently, so their headers may disagree with each other; reporting both
+//!   flush independently, so what each declares may disagree with the other; reporting both
 //!   separately is information, and reporting a sum would hide it.
 //! - **No repair is advertised.** Nothing here offers to rebuild a header or recover a track: the
 //!   design record refuses reopening finalized files, and naming a capability the tool does not
@@ -65,7 +65,7 @@ use crate::wav::{TrackEvidence, TrackSpan, Unfinished};
 
 /// What an unfinished directory means *right now*, which is the question its wording depends on.
 ///
-/// A directory holding WAVs and no `session.json` is what a call in progress looks like as often
+/// A directory holding raw tracks and no `session.json` is what a call in progress looks like as often
 /// as it is what an abandoned one left behind, and the two deserve different sentences. Carrying
 /// the tracks inside the variant that has them makes it impossible to render the stopped case
 /// without having asked, and impossible to render the live case with a measurement attached.
@@ -247,7 +247,7 @@ pub fn interrupted_detail(tracks: &Unfinished) -> Vec<String> {
 
 /// The hedge a report prints when a recorder holds the root right now.
 ///
-/// A directory holding WAVs and no `session.json` describes a call being captured at this second
+/// A directory holding raw tracks and no `session.json` describes a call being captured at this second
 /// as often as it describes one that stopped, and only [`crate::RecordLock::probe`] can tell those
 /// apart. Print this *instead of* asserting interruption whenever
 /// [`crate::LockState::recorder_may_be_live`] is true -- including when the probe could not get an

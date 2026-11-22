@@ -360,13 +360,13 @@ impl MicCapture {
         self.channels
     }
 
-    /// Frames the tap has delivered into `mic.wav` so far. A diagnostic, not the file's
+    /// Frames the tap has delivered into `mic.flac` so far. A diagnostic, not the file's
     /// length: see [`TrackProgress::frames`].
     pub fn frames_delivered(&self) -> u64 {
         self.progress.frames()
     }
 
-    /// Whether the tap has stopped delivering audio into `mic.wav`.
+    /// Whether the tap has stopped delivering audio into `mic.flac`.
     ///
     /// Costs one relaxed atomic load, so it is cheap enough to ask on a poll the caller is
     /// already making. `&mut self` because the standstill is measured across calls.
@@ -376,7 +376,7 @@ impl MicCapture {
 }
 
 impl crate::teardown::Engine for MicCapture {
-    /// Stops the engine and finalizes the WAV.
+    /// Stops the engine and finalizes the FLAC.
     fn settle(self) -> Result<TrackSummary> {
         let MicCapture {
             engine,
@@ -392,7 +392,7 @@ impl crate::teardown::Engine for MicCapture {
         // A raise here is swallowed rather than returned, which is the opposite of what `start`
         // does with the same calls, and deliberately so. This runs on the finalize path: the
         // audio is already on disk and `writer.finish` is the only thing between it and a valid
-        // WAV. An engine whose device has disappeared is exactly what provokes a raise on the
+        // FLAC. An engine whose device has disappeared is exactly what provokes a raise on the
         // way down -- and that is exactly the situation this recorder finalizes *in response
         // to*, so letting it cost the recording would invert the point of finalizing at all.
         // SAFETY: both are live objects owned by this struct.
@@ -407,7 +407,7 @@ impl crate::teardown::Engine for MicCapture {
     /// The mic has no cheaper form of stopping than [`Engine::settle`](crate::teardown::Engine::settle):
     /// `AVAudioEngine.stop` is synchronous and returns nothing (`AVAudioEngine.h:386`), so there
     /// is no completion handler to skip. The only wait left is the writer join, which the drop
-    /// path *wants* -- it is what makes an orphan's WAV complete rather than checkpoint-short.
+    /// path *wants* -- it is what makes an orphan's FLAC complete rather than flush-short.
     fn abandon(self) {
         let _ = self.settle();
     }
@@ -427,7 +427,7 @@ mod tests {
     /// A live track, plus a sink to push buffers through it.
     fn track() -> (tempfile::TempDir, TrackWriter) {
         let dir = tempfile::tempdir().unwrap();
-        let writer = TrackWriter::create(&dir.path().join("mic.wav"), 48_000).unwrap();
+        let writer = TrackWriter::create(&dir.path().join("mic.flac"), 48_000).unwrap();
         (dir, writer)
     }
 

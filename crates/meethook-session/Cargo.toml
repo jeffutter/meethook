@@ -11,14 +11,21 @@ license.workspace = true
 # A session-contract crate depends on an audio library because it owns the *spelling* of the
 # tracks it names, not only their file names: see `wav`, which corrects the channel mask hound
 # hardcodes so a mono recording does not arrive in one ear.
+# The raw-track FLAC writer lives here with the rest of the track spelling: flacenc encodes,
+# md-5 computes STREAMINFO's digest, rubato brings the capture rate down to the stored 16 kHz,
+# and rusty_flac reads back what a killed recorder left (see `wav::track`).
+flacenc = { workspace = true }
 hound = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
 # For the OFD lock syscalls behind `record_lock`: `open` with `O_CLOEXEC` and `fcntl`
 # `F_OFD_SETLK`. Chosen over a wrapper crate so that the descriptor flags are stated in this
 # crate's code rather than trusted to a dependency's backend.
 libc = { workspace = true }
+md-5 = { workspace = true }
 minijinja = { workspace = true }
 regex = { workspace = true }
+rubato = { workspace = true }
+rusty_flac = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

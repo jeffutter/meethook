@@ -3,8 +3,8 @@
 //! A live session owns two engines that record into files on disk. Until now the only way to
 //! stop them was [`crate::RunningSession::finish`], which consumes the session -- so every
 //! path that *didn't* finish one (a panic anywhere in the record loop, an early return added
-//! by a later edit, any unwind at all) left `AVAudioEngine` recording into `mic.wav` and the
-//! `SCStream` still capturing system audio, with writer threads appending to WAV files nobody
+//! by a later edit, any unwind at all) left `AVAudioEngine` recording into `mic.flac` and the
+//! `SCStream` still capturing system audio, with writer threads appending to FLAC files nobody
 //! would ever finalize. The process could be gone and the microphone still claimed.
 //!
 //! This module holds the rule that fixes it: the two engines live in one slot, and only two
@@ -31,8 +31,8 @@
 //! ticks and the mach timebase) exists only in memory until `session.json`, so a session that
 //! never wrote one cannot be aligned honestly, and no `session.json` is written for it -- the
 //! directory stays an orphan, which is the classification the rest of the tool already
-//! understands. Both paths do finalize both WAV headers, though: it costs one join that is
-//! already bounded, and it turns an orphan from playable-minus-the-checkpoint-slack into
+//! understands. Both paths do finalize both FLAC headers, though: it costs one join that is
+//! already bounded, and it turns an orphan from decodable-minus-the-flush-slack into
 //! complete to the last sample.
 
 use crate::Result;
@@ -45,14 +45,14 @@ use crate::track::TrackSummary;
 /// mid-session (sample rate, stall detection) stay inherent methods on the real captures,
 /// reached through [`Engines::mic`], rather than growing this trait into a shadow copy of them.
 pub(crate) trait Engine {
-    /// Stops the engine, waits wherever waiting buys an answer, finalizes the WAV, and reports
+    /// Stops the engine, waits wherever waiting buys an answer, finalizes the FLAC, and reports
     /// what it learned.
     fn settle(self) -> Result<TrackSummary>;
 
     /// Stops the engine and walks away: no completion-handler wait, nothing reported. For the
     /// paths that cannot afford to block and have nobody left to tell.
     ///
-    /// Still finalizes the WAV. Total silence is the point; a truncated file is not.
+    /// Still finalizes the FLAC. Total silence is the point; a truncated file is not.
     fn abandon(self);
 }
 
@@ -88,7 +88,7 @@ impl<M: Engine, S: Engine> Engines<M, S> {
     /// than returned. See the caught arm below for why.
     ///
     /// Deciding which failure wins is `finish`'s job, not this one's: returning early on a mic
-    /// failure would leave the speaker WAV unfinalized, which is a worse outcome than a late
+    /// failure would leave the speaker FLAC unfinalized, which is a worse outcome than a late
     /// error. That ordering is why this returns a tuple rather than a `Result`.
     ///
     /// Consumes the guard, so there is no "already settled" state left behind for a second
@@ -128,7 +128,7 @@ impl<M: Engine, S: Engine> Engines<M, S> {
                 //
                 // What the caught mic costs: unwind glue drops its `TrackWriter`, the sender
                 // disconnects, and the writer thread leaves its receive loop -- but still reaches
-                // the `finalize()` that closes the WAV, since that sits after the loop. Lost for
+                // the `finalize()` that closes the FLAC, since that sits after the loop. Lost for
                 // good is whatever samples were still queued when the loop bailed, and any
                 // certainty the thread ran at all: nothing joins it here, because `join` lives in
                 // the `finish` this mic never reached. The promise is therefore "the speaker is

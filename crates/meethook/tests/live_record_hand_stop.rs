@@ -1042,22 +1042,21 @@ fn sessions(paths: &Paths) -> Vec<DiscoveredSession> {
 /// some other session than the one under discussion.
 fn tracks(found: &DiscoveredSession) -> (TrackEvidence, TrackEvidence) {
     (
-        wav::track(&found.paths.mic_wav()),
-        wav::track(&found.paths.speaker_wav()),
+        wav::track(&found.paths.mic_track()),
+        wav::track(&found.paths.speaker_track()),
     )
 }
 
 /// Whether a track file proves capture is happening *right now*.
 ///
-/// Mid-session a track legitimately declares fewer bytes than it holds (`BeyondDeclaration`, the
-/// shape of a writer that has not finalized yet) and may disagree with itself in the other
-/// direction; what it must not be is absent, not-a-WAV, unreadable, or a header that has never had
-/// a sample written under it.
+/// Mid-session a live FLAC track holds whole frames under a placeholder header that declares no
+/// length (`NoDeclaredLength`, the shape of a writer that has not finished yet); what it must not
+/// be is absent, not-an-audio-file, unreadable, or a header that has never had a whole frame written
+/// under it.
 ///
-/// `NoDeclaredLength` is deliberately absent from that list for the same reason `BeyondDeclaration`
-/// is: a file in that state holds audio, which is precisely what this predicate asks. Nothing the
-/// recorder writes can produce it either -- `track.rs` checkpoints a real length -- so listing it
-/// here would assert something untrue about a file to guard against a shape that cannot occur.
+/// `NoDeclaredLength` is deliberately absent from that list: a file in that state holds audio,
+/// which is precisely what this predicate asks, and it is the state every live FLAC track is in
+/// until the recorder stops cleanly.
 fn capturing(evidence: TrackEvidence) -> bool {
     !matches!(
         evidence,
@@ -1069,7 +1068,7 @@ fn capturing(evidence: TrackEvidence) -> bool {
 }
 
 fn mic_bytes(found: &DiscoveredSession) -> u64 {
-    std::fs::metadata(found.paths.mic_wav())
+    std::fs::metadata(found.paths.mic_track())
         .map(|m| m.len())
         .unwrap_or(0)
 }
@@ -1228,7 +1227,7 @@ fn the_real_frame_ends_a_live_session_on_s_and_keeps_watching() {
     let after_growth = mic_bytes(&found);
     assert!(
         after_growth > before_growth,
-        "mic.wav did not grow across {GROWTH_WAIT:?}, which is longer than the 5 s checkpoint \
+        "mic.flac did not grow across {GROWTH_WAIT:?}, which is longer than the 1 s flush \
          interval: nothing was being captured, so ending this session would prove nothing about \
          ending a call.\n{}",
         frame.evidence()

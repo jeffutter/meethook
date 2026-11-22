@@ -137,7 +137,7 @@ fn measure(paths: &Paths, args: &Args, item: &Item, models: &mut Models) -> Resu
     }
     levels("speaker.wav", &built.speaker);
 
-    let measured = measure_built(args, &built.paths.speaker_wav(), item, models);
+    let measured = measure_built(args, &built.paths.speaker_track(), item, models);
 
     if !args.keep_sessions {
         // The disk cost of a manifest is transient by construction: one built session at a

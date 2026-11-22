@@ -16,9 +16,9 @@
 //!
 //! # The shape of a constructed session
 //!
-//! **The supplied audio goes on `speaker.wav`, and `mic.wav` gets digital silence.** Both
-//! files must exist -- [`crate::transcribe_session`] treats an unreadable `mic.wav` as fatal
-//! while an absent `speaker.wav` merely degrades to a mic-only transcript -- but only one of
+//! **The supplied audio goes on `speaker.flac`, and `mic.flac` gets digital silence.** Both
+//! files must exist -- [`crate::transcribe_session`] treats an unreadable mic track as fatal
+//! while an absent speaker track merely degrades to a mic-only transcript -- but only one of
 //! them can carry a measurement, because diarization and embedding are run over the speaker
 //! track and nothing else. Audio placed on the mic track could never reach diarization
 //! or enrollment.
@@ -52,7 +52,7 @@ use crate::{Error, Result};
 /// first turn of the next.
 pub const SPLICE_GAP_S: f64 = 0.5;
 
-/// How much digital silence `mic.wav` gets when the caller supplies no local track.
+/// How much digital silence `mic.flac` gets when the caller supplies no local track.
 ///
 /// One second rather than zero: below the `asr` module's minimum, whisper.cpp pads the buffer
 /// itself, and a track that exists is the difference between a session `transcribe` reads and
@@ -94,7 +94,7 @@ pub struct BuiltSession {
     pub id: SessionId,
     pub paths: SessionPaths,
     pub speaker_sources: Vec<ImportedSource>,
-    /// Empty when `mic.wav` is the constructed silence rather than supplied audio.
+    /// Empty when `mic.flac` is the constructed silence rather than supplied audio.
     pub mic_sources: Vec<ImportedSource>,
     pub speaker: LevelSummary,
     pub mic: LevelSummary,
@@ -134,8 +134,8 @@ pub fn build_session(
     // careful.
     let (id, paths) = create_session_dir(root, &ZonedDateTime::now())?;
 
-    audio::write_track_16k_mono(&paths.speaker_wav(), &speaker)?;
-    audio::write_track_16k_mono(&paths.mic_wav(), &mic)?;
+    audio::write_raw_track_flac(&paths.speaker_flac(), &speaker)?;
+    audio::write_raw_track_flac(&paths.mic_flac(), &mic)?;
 
     // Equal ticks on both tracks: neither started before the other, because neither was
     // captured. `session.json` is written last, since its presence is what marks the session
@@ -367,8 +367,8 @@ mod tests {
 
             // The strict reader is what `transcribe` opens both tracks with, so a track it
             // refuses is a session nothing can transcribe.
-            let speaker = audio::read_track_16k_mono(&built.paths.speaker_wav()).unwrap();
-            let mic = audio::read_track_16k_mono(&built.paths.mic_wav()).unwrap();
+            let speaker = audio::read_track_16k_mono(&built.paths.speaker_track()).unwrap();
+            let mic = audio::read_track_16k_mono(&built.paths.mic_track()).unwrap();
             assert_eq!(speaker.len(), TARGET_RATE as usize * 2, "{spec:?}");
             assert_eq!(mic.len(), TARGET_RATE as usize, "{spec:?}");
             assert!(mic.iter().all(|s| *s == 0.0), "{spec:?}");
@@ -425,7 +425,7 @@ mod tests {
 
         let gap = (f64::from(TARGET_RATE) * SPLICE_GAP_S) as usize;
 
-        let speaker = audio::read_track_16k_mono(&built.paths.speaker_wav()).unwrap();
+        let speaker = audio::read_track_16k_mono(&built.paths.speaker_track()).unwrap();
         assert_eq!(speaker.len(), TARGET_RATE as usize * 3 + gap * 2);
         // The gaps land exactly where the arithmetic says, which is the part diarization
         // depends on.
@@ -530,11 +530,26 @@ mod tests {
             BTreeSet::from([
                 "sessions".to_string(),
                 format!("sessions/{id}"),
-                format!("sessions/{id}/mic.wav"),
+                format!("sessions/{id}/mic.flac"),
                 format!("sessions/{id}/session.json"),
-                format!("sessions/{id}/speaker.wav"),
+                format!("sessions/{id}/speaker.flac"),
             ])
         );
+
+        // And they are FLAC in content, in the format the recorder writes, not WAV under a new name.
+        for track in [built.paths.mic_flac(), built.paths.speaker_flac()] {
+            let bytes = std::fs::read(track).unwrap();
+            let decoder = rusty_flac::Decoder::new(&bytes).unwrap();
+            let info = decoder.streaminfo();
+            assert_eq!(
+                (info.sample_rate, info.channels, info.bits_per_sample),
+                (16_000, 1, 16)
+            );
+            assert!(
+                info.total_samples > 0,
+                "a finished track declares its length"
+            );
+        }
     }
 
     /// A caller with a genuine two-track recording can supply both, and the mic track is then

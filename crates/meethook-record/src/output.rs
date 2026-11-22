@@ -9,7 +9,7 @@
 //! That combination costs a recording. [`crate::RunningSession::finish`] prints its
 //! diagnostics through [`crate::calendar`] and this module *before* it writes
 //! `session.json`, so a print that panics lands between stopping the engines and finalizing
-//! the session: both WAVs are on disk, nothing says what they are, and no later command will
+//! the session: both tracks are on disk, nothing says what they are, and no later command will
 //! claim them. A diagnostic nobody read is the cheaper loss, so the write failure is absorbed
 //! here and the first refusal latches the stream shut -- everything after it is discarded
 //! without another attempt at the descriptor.

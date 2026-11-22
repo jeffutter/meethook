@@ -305,9 +305,9 @@ pub(crate) fn enroll_session(
     // Read after that check, so a session with nothing to ask about never resamples an hour
     // of audio in order to then ask nothing. Unreadable is empty rather than fatal: a voice
     // with no clip can still be named from its snippets.
-    let track = read_track_16k_mono(&session.paths.speaker_wav()).unwrap_or_default();
+    let track = read_track_16k_mono(&session.paths.speaker_track()).unwrap_or_default();
 
-    // Turn times are on the session timeline; a snippet's are offsets into `speaker.wav`.
+    // Turn times are on the session timeline; a snippet's are offsets into the speaker track.
     // `Err` is a degenerate timebase in `session.json`: the two clocks cannot be related at
     // all, so the snippets get no audio rather than audio a second out -- the same tolerance
     // an unreadable `speaker.wav` already gets a line above, and for the same reason. `clip`

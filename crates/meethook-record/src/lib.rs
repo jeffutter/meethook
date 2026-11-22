@@ -1,6 +1,6 @@
 //! Dual-track macOS meeting capture.
 //!
-//! Two independent capture engines write two independent WAV tracks into one
+//! Two independent capture engines write two independent FLAC tracks into one
 //! [`meethook_session`] session directory:
 //!
 //! - **speaker** -- system-wide audio from ScreenCaptureKit (`SCStream`)
@@ -130,11 +130,12 @@ pub enum Error {
     )]
     SilentTrack { track: &'static str, dir: PathBuf },
 
-    #[error("wav error at {path}: {source}")]
-    Wav {
+    /// A track's capture rate could not be brought down to the 16 kHz it is stored at.
+    #[error("resampling the track written to {path} failed: {source}")]
+    Resample {
         path: PathBuf,
         #[source]
-        source: hound::Error,
+        source: meethook_session::ResampleError,
     },
 
     #[error("i/o error at {path}: {source}")]
@@ -144,7 +145,7 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("the wav writer thread for {path} panicked")]
+    #[error("the track writer thread for {path} panicked")]
     WriterPanic { path: PathBuf },
 
     #[error(transparent)]
@@ -154,8 +155,11 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
-    pub(crate) fn wav(path: impl Into<PathBuf>, source: hound::Error) -> Self {
-        Error::Wav {
+    pub(crate) fn resample(
+        path: impl Into<PathBuf>,
+        source: meethook_session::ResampleError,
+    ) -> Self {
+        Error::Resample {
             path: path.into(),
             source,
         }
@@ -216,11 +220,11 @@ impl Recorder {
         // directory creation leaves by one path, and that path discards the directory. The
         // failures here are the transient ones a device swap produces, so the caller retries --
         // five times, in `begin` -- and without the discard each attempt would leave behind a
-        // directory holding two empty WAV headers and no `session.json`, which at a glance
+        // directory holding two empty FLAC headers and no `session.json`, which at a glance
         // reads like a recording that went wrong rather than one that never started.
         let started = (|| {
-            let speaker = speaker::SpeakerCapture::start(&display, &session_paths.speaker_wav())?;
-            match input.start(&session_paths.mic_wav()) {
+            let speaker = speaker::SpeakerCapture::start(&display, &session_paths.speaker_flac())?;
+            match input.start(&session_paths.mic_flac()) {
                 Ok(mic) => Ok((speaker, mic)),
                 Err(e) => {
                     // The speaker stream is already live; stop it so a failed start does not
@@ -325,13 +329,13 @@ impl RunningSession {
     }
 
     /// Frames the microphone tap has delivered so far. A diagnostic for the record loop's
-    /// debug output, not the length of `mic.wav`. Answers 0 once the engines have been
+    /// debug output, not the length of `mic.flac`. Answers 0 once the engines have been
     /// released, which no caller can observe: both ways of stopping them end the session.
     pub fn mic_frames_delivered(&self) -> u64 {
         self.engines.mic().map_or(0, |mic| mic.frames_delivered())
     }
 
-    /// Stops both engines, finalizes both WAV headers, and writes `session.json`.
+    /// Stops both engines, finalizes both FLAC headers, and writes `session.json`.
     ///
     /// The metadata write is last and atomic, so the presence of `session.json` keeps
     /// meaning "this recording completed and both tracks are finalized".
@@ -382,7 +386,7 @@ impl RunningSession {
         } = self;
 
         // Stop both before inspecting either result: returning early on a mic failure would
-        // leave the speaker WAV unfinalized, which is a worse outcome than a late error. The
+        // leave the speaker FLAC unfinalized, which is a worse outcome than a late error. The
         // ordering lives in `teardown` because `Drop` uses the same slot -- and once this has
         // run, the `Drop` that follows at the end of `finish` finds it empty.
         let (mic_stop, speaker_stop) = engines.settle();
@@ -610,7 +614,7 @@ pub struct Recording {
 /// stopped and everything left to know is plain data.
 ///
 /// What it therefore cannot decide is anything about the engines themselves -- whether a
-/// stream really stopped, whether a WAV header got finalized, whether the calendar daemon
+/// stream really stopped, whether a FLAC header got finalized, whether the calendar daemon
 /// answers -- all of which need a display, an input device, or a grant, and none of which the
 /// finalize step can observe anyway: it works only from the summaries it was handed.
 #[cfg(test)]

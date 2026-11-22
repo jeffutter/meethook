@@ -7,10 +7,13 @@
 
 use std::path::Path;
 
-use hound::{SampleFormat, WavReader, WavSpec};
-use meethook_session::write_atomic_with;
-use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
-use rubato::{Fft, FixedSync, Resampler, WindowFunction};
+#[cfg(test)]
+use hound::WavSpec;
+use hound::{SampleFormat, WavReader};
+use meethook_session::{
+    FLAC_BLOCK_SAMPLES, FLAC_SCALE, FlacTrackWriter, ResampleError, Resampler, quantize_sample,
+    write_atomic_with,
+};
 
 use crate::progress::Phase;
 use crate::{Error, Result};
@@ -18,32 +21,16 @@ use crate::{Error, Result};
 /// The sample rate whisper.cpp requires. Not configurable: it is a property of the model.
 pub const TARGET_RATE: u32 = 16_000;
 
-/// The header on every track meethook writes for itself.
-///
-/// One spelling, because a track written at a different rate or width than
-/// [`read_track_16k_mono`] insists on would be rejected by the very next thing to open it.
+/// The header of the legacy WAV raw track, which only tests still write (to stand in for a
+/// session recorded before FLAC). Recorded and imported tracks are FLAC; see
+/// [`write_raw_track_flac`].
+#[cfg(test)]
 const TRACK_SPEC: WavSpec = WavSpec {
     channels: 1,
     sample_rate: TARGET_RATE,
     bits_per_sample: 32,
     sample_format: SampleFormat::Float,
 };
-
-/// 16-bit full scale: the divisor from FLAC samples to `f32`, the multiplier back.
-const FLAC_SCALE: f32 = 32_768.0;
-
-/// Samples per FLAC frame. One size throughout, because afconvert needs STREAMINFO's minimum
-/// and maximum block sizes to agree.
-const FLAC_BLOCK_SAMPLES: usize = 4096;
-
-/// Input frames handed to the resampler at a time.
-///
-/// Together with `SUB_CHUNKS` this sets the internal FFT size, and therefore both the
-/// anti-aliasing filter's length and its group delay. These values give a filter of a few
-/// hundred taps and a delay of a few milliseconds -- ample rejection for a 3:1 decimation,
-/// and a delay far below the 10 ms granularity Whisper reports timestamps at.
-const CHUNK_FRAMES: usize = 4096;
-const SUB_CHUNKS: usize = 16;
 
 /// Reads a mono float WAV or a mono 16-bit FLAC and returns it as 16 kHz mono `f32`.
 ///
@@ -231,11 +218,9 @@ pub(crate) fn resample_to_target(samples: &[f32], source_rate: u32) -> Result<Ve
     resample_between(samples, source_rate, TARGET_RATE)
 }
 
-/// Writes a track in the one format everything downstream reads: 16 kHz mono float,
-/// atomically.
-///
-/// Atomic because every one of these files is something another command classifies a session
-/// by; a reader must see a whole track or no file, never a truncated one.
+/// Writes a legacy-format raw track: 16 kHz mono float WAV, atomically. Test-only, to build
+/// the session a pre-FLAC recorder left behind and prove it still reads.
+#[cfg(test)]
 pub(crate) fn write_track_16k_mono(path: &Path, audio: &[f32]) -> Result<()> {
     write_atomic_with(path, |file| {
         // Buffered: hound writes each sample straight through, and an hour of audio is 57
@@ -259,6 +244,31 @@ pub(crate) fn write_track_16k_mono(path: &Path, audio: &[f32]) -> Result<()> {
     })
 }
 
+/// Writes a raw track (`mic.flac`, `speaker.flac`) in the format the recorder writes: 16 kHz
+/// mono 16-bit FLAC, atomically.
+///
+/// The same writer the recorder streams through, so an imported session is indistinguishable
+/// from a recorded one. Samples are quantised to the 16-bit grid; a track whose length leaves a
+/// final block under 32 samples gains up to 2 ms of trailing silence (see
+/// [`meethook_session::FlacTrackWriter`]).
+pub(crate) fn write_raw_track_flac(path: &Path, audio: &[f32]) -> Result<()> {
+    let flac_err = |e: std::io::Error| Error::Flac {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    };
+    write_atomic_with(path, |file| {
+        let mut writer = FlacTrackWriter::new(file).map_err(flac_err)?;
+        let mut phase = Phase::start(format!("writing {}", file_name(path)));
+        for (index, block) in audio.chunks(FLAC_BLOCK_SAMPLES).enumerate() {
+            phase.at(index * FLAC_BLOCK_SAMPLES, audio.len());
+            writer.push(block).map_err(flac_err)?;
+        }
+        writer.finish().map_err(flac_err)?;
+        phase.done();
+        Ok(())
+    })
+}
+
 /// Snaps a float track to the 16-bit grid a FLAC holds, in place.
 ///
 /// Applied to the in-memory cleaned track before it is written, so recognition hears exactly
@@ -270,14 +280,6 @@ pub(crate) fn quantize_to_16_bit(audio: &mut [f32]) {
     }
 }
 
-/// One sample on the 16-bit grid, as the integer FLAC stores. NaN clamps to NaN and casts to
-/// 0, which is silence: the right reading of a sample that carries no signal.
-fn quantize_sample(sample: f32) -> i32 {
-    (sample.clamp(-1.0, 1.0) * FLAC_SCALE)
-        .round()
-        .clamp(-32768.0, 32767.0) as i32
-}
-
 /// Writes the cleaned mic track as 16 kHz mono 16-bit FLAC, atomically.
 ///
 /// This is where a float track is quantised to 16 bits: samples are clamped to [-1, 1],
@@ -286,7 +288,7 @@ fn quantize_sample(sample: f32) -> i32 {
 /// is far coarser than that, but the cost is measured per session rather than assumed -- see
 /// MH-40.2.
 ///
-/// Atomic for the same reason as [`write_track_16k_mono`]: `mic.cleaned.flac` is what the
+/// Atomic for the same reason as [`write_raw_track_flac`]: `mic.cleaned.flac` is what the
 /// next run reads, and it must be a whole track or no file.
 pub(crate) fn write_cleaned_track_flac(path: &Path, audio: &[f32]) -> Result<()> {
     use flacenc::component::BitRepr;
@@ -367,126 +369,46 @@ impl flacenc::source::Source for QuantizedTrack<'_> {
     }
 }
 
-/// A fixed-ratio sample-rate conversion, fed one sample at a time.
+/// A fixed-ratio sample-rate conversion into a growing in-memory result, fed one sample at a
+/// time.
 ///
-/// Push-shaped rather than slice-shaped because the caller that matters is reading a file:
-/// holding an hour of 48 kHz audio *and* its 16 kHz result at once costs ~900 MB, which is
-/// the whole reason the read loop above is streaming.
-///
-/// Rubato 1.0 and later route every `process` call through the `audioadapter` buffer traits
-/// instead of taking raw slices. `SequentialSliceOfVecs` is their name for the old
-/// `&[&[f32]]` shape -- one vector per channel -- so the chunk loop below keeps its old form
-/// and only pays for the wrapper struct, not for copying samples into an intermediate
-/// buffer.
+/// A thin holder over [`meethook_session::Resampler`], which owns the filter, its delay
+/// compensation and the exact output length (the recorder streams through the same one).
+/// Push-shaped because the caller that matters is reading a file: holding an hour of 48 kHz
+/// audio *and* its 16 kHz result at once costs ~900 MB, which is the whole reason the read
+/// loop above is streaming.
 struct Resample {
-    resampler: Fft<f32>,
-    /// Input frames still waiting for a full [`CHUNK_FRAMES`] to hand the resampler.
-    chunk: Vec<f32>,
+    inner: Resampler,
     out: Vec<f32>,
-    /// Leading output frames belonging to the filter's own group delay.
-    delay: usize,
-    /// How many output frames the conversion should yield once that delay is dropped.
-    expected: usize,
-    pushed: usize,
 }
 
 impl Resample {
     /// `frames` is the input length, used to size the output exactly. It is a promise about
     /// how much will be pushed, not a limit: pushing fewer simply yields a shorter track.
     fn new(source_rate: u32, target_rate: u32, frames: usize) -> Result<Self> {
-        // Checked here rather than left to rubato, both because a rate of zero would divide
-        // by zero below and because "a header claiming 0 Hz" is a diagnosis, where a
-        // resampler-internal message would not be.
-        if source_rate == 0 || target_rate == 0 {
-            return Err(Error::Resample(
-                "the file's header reports a sample rate of 0".to_string(),
-            ));
-        }
-
-        // BlackmanHarris2 is what the pre-1.0 `FftFixedIn` used internally, so the
-        // anti-aliasing filter is the same one the timestamps were measured against.
-        let resampler = Fft::<f32>::new_custom(
-            source_rate as usize,
-            target_rate as usize,
-            CHUNK_FRAMES,
-            SUB_CHUNKS,
-            1,
-            WindowFunction::BlackmanHarris2,
-            FixedSync::Input,
-        )
-        .map_err(|e| Error::Resample(e.to_string()))?;
-
-        // The filter is linear-phase, so its output lags its input by a known, constant
-        // number of frames. Dropping exactly that many leading output frames keeps the
-        // resampled track aligned with the original rather than uniformly late.
-        let delay = resampler.output_delay();
+        let inner = Resampler::new(source_rate, target_rate).map_err(resample_error)?;
         let expected =
             (frames as u128 * u128::from(target_rate) / u128::from(source_rate)) as usize;
-
         Ok(Resample {
-            resampler,
-            chunk: Vec::with_capacity(CHUNK_FRAMES),
-            out: Vec::with_capacity(expected + delay + CHUNK_FRAMES),
-            delay,
-            expected,
-            pushed: 0,
+            inner,
+            out: Vec::with_capacity(expected),
         })
     }
 
-    /// Hands `chunk` to the resampler. `partial_len` says how many of its frames are real
-    /// when the last chunk is shorter than [`CHUNK_FRAMES`]; the resampler pads the missing
-    /// tail with silence itself, which is what `process_partial` did in the pre-1.0 API.
-    fn process_chunk(&mut self, chunk: &Vec<f32>, partial_len: Option<usize>) -> Result<()> {
-        let frames = partial_len.unwrap_or(chunk.len());
-        // One vector per channel; mono means the single vector is the whole track.
-        let buffer = SequentialSliceOfVecs::new(std::slice::from_ref(chunk), 1, frames)
-            .map_err(|e| Error::Resample(format!("{e:?}")))?;
-        let indexing = partial_len.map(|len| rubato::Indexing {
-            input_offset: 0,
-            output_offset: 0,
-            partial_len: Some(len),
-            active_channels_mask: None,
-        });
-        let produced = self
-            .resampler
-            .process(&buffer, indexing.as_ref())
-            .map_err(|e| Error::Resample(e.to_string()))?;
-        // Mono: interleaved order is the sample order, so the buffer is the output itself.
-        self.out.extend_from_slice(&produced.take_data());
-        Ok(())
-    }
-
     fn push(&mut self, sample: f32) -> Result<()> {
-        self.pushed += 1;
-        self.chunk.push(sample);
-        if self.chunk.len() == CHUNK_FRAMES {
-            // Swap out the full chunk for a fresh pre-sized buffer: `process_chunk` needs
-            // `&mut self`, so the chunk cannot be borrowed across the call.
-            let full = std::mem::replace(&mut self.chunk, Vec::with_capacity(CHUNK_FRAMES));
-            self.process_chunk(&full, None)?;
-        }
-        Ok(())
+        self.inner
+            .push(std::slice::from_ref(&sample), &mut self.out)
+            .map_err(resample_error)
     }
 
     fn finish(mut self) -> Result<Vec<f32>> {
-        if !self.chunk.is_empty() {
-            let partial = std::mem::take(&mut self.chunk);
-            self.process_chunk(&partial, Some(partial.len()))?;
-        }
-
-        // Silence pumped through the filter pushes the samples still sitting in it out, so
-        // the last fraction of a second of speech is not lost to the resampler's own
-        // latency. Pump until the expected length is reached rather than flushing a fixed
-        // number of times: the truncation below discards the excess either way.
-        let zeros = vec![0.0f32; self.resampler.input_frames_next()];
-        while self.out.len() < self.expected {
-            self.process_chunk(&zeros, None)?;
-        }
-
-        self.out.drain(..self.delay.min(self.out.len()));
-        self.out.truncate(self.expected);
+        self.inner.finish(&mut self.out).map_err(resample_error)?;
         Ok(self.out)
     }
+}
+
+fn resample_error(e: ResampleError) -> Error {
+    Error::Resample(e.0)
 }
 
 /// Synthetic tracks, plus the two measurements needed to read them back.

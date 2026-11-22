@@ -19,10 +19,12 @@
 //!   models/                       lazily fetched model weights
 //!   sessions/
 //!     <YYYYMMDD-HHMMSS>[-N]/      local-time id, numeric suffix on same-second collision
-//!       mic.wav                   raw microphone track (never modified after recording)
+//!       mic.flac                  raw microphone track: 16 kHz mono 16-bit FLAC, never modified
+//!                                   after recording (a session recorded before FLAC holds mic.wav,
+//!                                   mono 32-bit float at the capture rate)
 //!       mic.cleaned.flac          echo-cancelled derivative (16 kHz, 16-bit FLAC), written by transcribe
 //!                                   (a session transcribed before FLAC may still hold mic.cleaned.wav)
-//!       speaker.wav               system/speaker track
+//!       speaker.flac              system/speaker track, same format (or speaker.wav)
 //!       session.json              presence == "valid/complete session"
 //!       speaker_clusters.json     diarization output reused by enroll
 //!       speaker_names.json        voices named by hand in this session only
@@ -35,10 +37,12 @@ mod atomic;
 mod cleaning;
 mod discovery;
 mod exclusions;
+mod flac;
 mod id;
 mod metadata;
 mod paths;
 mod record_lock;
+mod resample;
 mod speaker_clusters;
 mod speaker_names;
 mod speakers;
@@ -60,6 +64,9 @@ pub use cleaning::{
 };
 pub use discovery::{Classification, DiscoveredSession, discover_sessions};
 pub use exclusions::{AppExclusions, AppIdentities, EXCLUSIONS_SCHEMA_VERSION};
+pub use flac::{
+    FLAC_BLOCK_SAMPLES, FLAC_SCALE, FlacTrackWriter, TRACK_RATE, declared_samples, quantize_sample,
+};
 pub use id::{SessionId, create_session_dir, discard_session_dir};
 pub use interrupted::{
     RootNow, UnfinishedNow, interrupted_brief, interrupted_detail, recording_in_progress,
@@ -71,6 +78,7 @@ pub use metadata::{
 };
 pub use paths::{Paths, SessionPaths};
 pub use record_lock::{Acquisition, Holder, LockState, RecordLock};
+pub use resample::{ResampleError, Resampler};
 pub use speaker_clusters::{
     MIN_REPRESENTATIVE_SECONDS, RepresentativeSegment, SPEAKER_CLUSTERS_SCHEMA_VERSION,
     SpeakerCluster, SpeakerClusters, unknown_labels,
@@ -92,7 +100,7 @@ use std::path::PathBuf;
 
 /// Everything that can go wrong while working with the on-disk contract.
 ///
-/// Note what is *not* in here: an orphaned session (WAVs but no `session.json`) is a normal,
+/// Note what is *not* in here: an orphaned session (tracks but no `session.json`) is a normal,
 /// expected classification, never an error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

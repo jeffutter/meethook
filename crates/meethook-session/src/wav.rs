@@ -25,6 +25,10 @@
 //! a single track file proves about itself, which is how an unfinished session directory gets
 //! described in measured terms rather than in guesses about what happened to the recorder. It
 //! lives here because this crate owns the byte layout of these files, and nowhere else.
+//!
+//! Raw tracks are FLAC now (see [`crate::FlacTrackWriter`]); [`track`] tells a FLAC by its marker
+//! and answers in the same states, and the WAV half remains for sessions recorded before that and
+//! for the legacy WAV writer used by tests.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -442,7 +446,71 @@ pub fn track(path: &Path) -> TrackEvidence {
         return TrackEvidence::Unreadable;
     }
 
+    // A FLAC track (the recorder's format since MH-40.3) is told by its marker, not its name.
+    if window.starts_with(b"fLaC") {
+        return flac_evidence(path, &window, file_len);
+    }
+
     evidence(&window, file_len)
+}
+
+/// What a FLAC raw track proves about itself, in the same states a WAV does.
+///
+/// A killed recorder leaves the placeholder STREAMINFO it wrote at the start: total samples
+/// zero, which FLAC defines as unknown. That is [`TrackEvidence::NoDeclaredLength`] over
+/// however many whole frames follow, measured by decoding them, because a FLAC frame is
+/// self-contained and a header cannot say how many there are. A clean stop leaves a positive
+/// total, which is [`TrackEvidence::CompleteAsDeclared`]; like the WAV answer it says the file
+/// agrees with its own header, and the frames are not decoded to prove it. Marker and header
+/// with no whole frame behind them is [`TrackEvidence::HeaderOnly`]. `ShortBy` and
+/// `BeyondDeclaration` are WAV states: FLAC states totals, not byte lengths, and a placeholder
+/// never over-declares.
+///
+/// The bytes in a measured span are the 16-bit PCM those samples decode to, so they and the
+/// milliseconds describe the same audio.
+fn flac_evidence(path: &Path, window: &[u8], file_len: u64) -> TrackEvidence {
+    let Some((rate, total)) = crate::flac::declared_samples(window) else {
+        // A marker with no STREAMINFO behind it, or a cut inside it.
+        return if file_len < 42 {
+            TrackEvidence::HeaderOnly
+        } else {
+            TrackEvidence::Unknown
+        };
+    };
+    if rate == 0 {
+        return TrackEvidence::Unknown;
+    }
+    if total > 0 {
+        return TrackEvidence::CompleteAsDeclared;
+    }
+
+    // Unknown length: measure the whole frames. The decoder works on a byte slice, so this
+    // holds the file once (about 70 MB for a 79 minute track), and only for a track no clean
+    // stop ever closed.
+    let Ok(bytes) = std::fs::read(path) else {
+        return TrackEvidence::Unreadable;
+    };
+    let Ok(mut decoder) = rusty_flac::Decoder::new(&bytes) else {
+        return TrackEvidence::Unknown;
+    };
+    let mut samples = 0u64;
+    let mut block: Vec<i32> = Vec::new();
+    loop {
+        block.clear();
+        match decoder.next_frame_interleaved::<i32>(&mut block) {
+            Ok(Some(_)) => samples += block.len() as u64,
+            // `Truncated` is the frame the kill cut; the whole ones before it count.
+            Ok(None) | Err(rusty_flac::DecodeError::Truncated) => break,
+            Err(_) => return TrackEvidence::Unknown,
+        }
+    }
+    if samples == 0 {
+        return TrackEvidence::HeaderOnly;
+    }
+    TrackEvidence::NoDeclaredLength(TrackSpan {
+        bytes: samples * 2,
+        millis: samples * 1_000 / u64::from(rate),
+    })
 }
 
 /// What the two tracks of an unfinished session prove.
@@ -451,8 +519,8 @@ pub fn track(path: &Path) -> TrackEvidence {
 /// that are not WAVs at all: each side answers for itself.
 pub fn unfinished(session: &SessionPaths) -> Unfinished {
     Unfinished {
-        mic: track(&session.mic_wav()),
-        speaker: track(&session.speaker_wav()),
+        mic: track(&session.mic_track()),
+        speaker: track(&session.speaker_track()),
     }
 }
 
@@ -1257,5 +1325,80 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         assert_eq!(track(&path), TrackEvidence::Unreadable);
+    }
+
+    fn flac_samples(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i % 200) as f32 - 100.0) / 1000.0)
+            .collect()
+    }
+
+    /// A recorder killed after some whole frames reached disk: placeholder header, measured
+    /// frames, and a cut last frame that is not counted.
+    #[test]
+    fn a_flac_track_the_recorder_never_finished_is_measured_by_its_whole_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mic.flac");
+        let mut writer = crate::FlacTrackWriter::new(File::create(&path).unwrap()).unwrap();
+        // 4 whole frames of 4096, then killed.
+        writer.push(&flac_samples(4 * 4096)).unwrap();
+        drop(writer); // BufWriter's drop pushes what it holds, as the OS would keep it.
+
+        // Cut the last frame in half.
+        let len = std::fs::metadata(&path).unwrap().len();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 10)
+            .unwrap();
+
+        assert_eq!(
+            track(&path),
+            TrackEvidence::NoDeclaredLength(TrackSpan {
+                bytes: 3 * 4096 * 2,
+                millis: 3 * 4096 * 1_000 / 16_000,
+            })
+        );
+    }
+
+    #[test]
+    fn a_finished_flac_track_is_whole_as_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("speaker.flac");
+        let mut writer = crate::FlacTrackWriter::new(File::create(&path).unwrap()).unwrap();
+        writer.push(&flac_samples(10_000)).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(track(&path), TrackEvidence::CompleteAsDeclared);
+    }
+
+    #[test]
+    fn a_flac_track_with_no_frame_holds_no_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mic.flac");
+        let writer = crate::FlacTrackWriter::new(File::create(&path).unwrap()).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(track(&path), TrackEvidence::HeaderOnly);
+
+        // A recorder killed before its first block was whole: marker and placeholder only.
+        let mut writer = crate::FlacTrackWriter::new(File::create(&path).unwrap()).unwrap();
+        writer.push(&flac_samples(100)).unwrap();
+        drop(writer);
+        assert_eq!(track(&path), TrackEvidence::HeaderOnly);
+    }
+
+    #[test]
+    fn unfinished_reads_flac_tracks_and_falls_back_to_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionPaths::new(dir.path());
+        let mut writer =
+            crate::FlacTrackWriter::new(File::create(session.mic_flac()).unwrap()).unwrap();
+        writer.push(&flac_samples(5_000)).unwrap();
+        writer.finish().unwrap();
+        std::fs::write(session.speaker_wav(), b"RIFF\0\0\0\0WAVE").unwrap();
+
+        let unfinished = unfinished(&session);
+        assert_eq!(unfinished.mic, TrackEvidence::CompleteAsDeclared);
+        assert_eq!(unfinished.speaker, TrackEvidence::Unknown);
     }
 }

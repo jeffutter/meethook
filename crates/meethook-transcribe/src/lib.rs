@@ -361,7 +361,7 @@ pub fn transcribe_session_isolating(
     // An unreadable or absent `speaker.wav` is not fatal here, unlike `mic.wav`: it is the
     // far end of the call, and a call with no far end recorded is still a call.
     let speaker_track =
-        audio::read_track_16k_mono(&session.paths.speaker_wav()).unwrap_or_default();
+        audio::read_track_16k_mono(&session.paths.speaker_track()).unwrap_or_default();
     let (mic_track, cleaning) = clean_mic_track(
         session,
         &speaker_track,
@@ -685,7 +685,7 @@ fn clean_mic_track(
     mic_minus_speaker_s: f64,
     progress: &mut dyn Write,
 ) -> Result<(Vec<f32>, meethook_session::Cleaning)> {
-    let mic = audio::read_track_16k_mono(&session.paths.mic_wav())?;
+    let mic = audio::read_track_16k_mono(&session.paths.mic_track())?;
 
     let mut cleaned = aec::cancel_bleed(&mic, speaker, mic_minus_speaker_s);
     writeln!(progress, "{}  {}", session.id, cleaned.cleaning)?;
@@ -1977,7 +1977,9 @@ mod tests {
              got {:?}",
             record.outcome
         );
-        let raw_mic = audio::read_track_16k_mono(&session.paths.mic_wav()).unwrap();
+        let mut raw_mic = audio::read_track_16k_mono(&session.paths.mic_track()).unwrap();
+        // On the 16-bit grid, which is what the recognizer is handed since MH-40.2.
+        audio::quantize_to_16_bit(&mut raw_mic);
         assert_eq!(
             asr.heard[0], raw_mic,
             "with nothing cancellable, the recognizer must see the raw mic track verbatim"
@@ -2229,7 +2231,9 @@ mod tests {
         )
         .unwrap();
 
-        let raw = audio::read_track_16k_mono(&session.paths.mic_wav()).unwrap();
+        let mut raw = audio::read_track_16k_mono(&session.paths.mic_track()).unwrap();
+        // On the 16-bit grid, which is what the recognizer is handed since MH-40.2.
+        audio::quantize_to_16_bit(&mut raw);
         assert_eq!(
             asr.heard,
             std::slice::from_ref(&raw),

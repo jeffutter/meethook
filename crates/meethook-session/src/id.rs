@@ -112,13 +112,13 @@ pub fn create_session_dir(paths: &Paths, now: &ZonedDateTime) -> Result<(Session
 ///
 /// The inverse of [`create_session_dir`], for the window between that call and the point where
 /// a recorder has both of its capture engines live. A start that fails inside that window
-/// leaves two WAV headers and no `session.json` behind, and since such a start is retried,
+/// leaves two track headers and no `session.json` behind, and since such a start is retried,
 /// it leaves one such directory per attempt -- on-disk litter that reads exactly like a
 /// recording that went wrong rather than one that never began.
 ///
 /// Deliberately narrow, and deliberately infallible:
 ///
-/// - Only the two track files a start can have created are removed, by name, and the directory
+/// - Only the track files a start can have created are removed, by name (both spellings, so a leftover from before FLAC goes too), and the directory
 ///   goes with `remove_dir` rather than `remove_dir_all`. Anything else inside means this is
 ///   not the directory this function believes it is, and `remove_dir` refuses a non-empty one,
 ///   so the surprising case leaves the data alone instead of deleting it.
@@ -126,7 +126,12 @@ pub fn create_session_dir(paths: &Paths, now: &ZonedDateTime) -> Result<(Session
 ///   prompted the discard is the one worth surfacing; returning a `Result` here would only
 ///   invite a failure to tidy up to shadow the failure that mattered.
 pub fn discard_session_dir(paths: &SessionPaths) {
-    for track in [paths.mic_wav(), paths.speaker_wav()] {
+    for track in [
+        paths.mic_flac(),
+        paths.speaker_flac(),
+        paths.mic_wav(),
+        paths.speaker_wav(),
+    ] {
         let _ = fs::remove_file(track);
     }
     let _ = fs::remove_dir(paths.dir());
@@ -175,7 +180,7 @@ mod tests {
     }
 
     /// The ordinary case: a start that brought both writers up and then failed leaves the two
-    /// WAV headers, and the discard takes the whole directory with them.
+    /// track headers, and the discard takes the whole directory with them.
     #[test]
     fn discarding_removes_a_directory_holding_only_the_two_track_headers() {
         let root = tempfile::tempdir().unwrap();

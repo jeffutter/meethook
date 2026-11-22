@@ -1096,7 +1096,6 @@ version = "0.4.0"
 dependencies = [
  "block2",
  "dispatch2",
- "hound",
  "jiff",
  "libc",
  "mach2",
@@ -1119,11 +1118,15 @@ dependencies = [
 name = "meethook-session"
 version = "0.4.0"
 dependencies = [
+ "flacenc",
  "hound",
  "jiff",
  "libc",
+ "md-5",
  "minijinja",
  "regex",
+ "rubato",
+ "rusty_flac",
  "serde",
  "serde_json",
  "tempfile",

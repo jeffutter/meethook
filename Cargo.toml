@@ -189,6 +189,9 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # used internally, keeping the anti-aliasing filter -- and the timestamps measured against
 # it -- unchanged across the bump.
 rubato = "5"
+# The MD5 a FLAC STREAMINFO carries, computed by meethook-session::flac as the track streams. Already
+# in the tree through flacenc, which links it unconditionally.
+md-5 = "0.10"
 rusty_flac = "=0.5.1"
 
 # Real-input FFT, for the GCC-PHAT delay estimate in meethook-transcribe::align. It wraps

@@ -77,7 +77,7 @@ pub fn report_tentative(paths: &Paths, args: &Args, items: &[Item], voices: &[Vo
                 continue;
             }
         };
-        let track = match read_track_16k_mono(&built.paths.speaker_wav()) {
+        let track = match read_track_16k_mono(&built.paths.speaker_track()) {
             Ok(track) => track,
             Err(e) => {
                 println!("  skipped: {e}");

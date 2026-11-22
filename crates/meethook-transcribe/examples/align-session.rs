@@ -42,11 +42,11 @@ fn main() {
     let mic_minus_speaker_s =
         mic_offset_seconds(&metadata).unwrap() - speaker_offset_seconds(&metadata).unwrap();
 
-    let mic = read_track_16k_mono(&paths.mic_wav()).unwrap_or_else(|e| {
-        eprintln!("{}: unreadable mic.wav: {e}", paths.mic_wav().display());
+    let mic = read_track_16k_mono(&paths.mic_track()).unwrap_or_else(|e| {
+        eprintln!("{}: unreadable mic track: {e}", paths.mic_track().display());
         std::process::exit(1);
     });
-    let speaker = read_track_16k_mono(&paths.speaker_wav()).unwrap_or_default();
+    let speaker = read_track_16k_mono(&paths.speaker_track()).unwrap_or_default();
 
     println!("{}", dir.display());
     println!(

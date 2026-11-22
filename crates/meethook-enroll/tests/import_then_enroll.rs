@@ -248,7 +248,7 @@ fn a_session_built_from_a_wav_file_transcribes_enrolls_and_stores_that_audio() {
     assert_eq!(stored.speakers.len(), 1);
     assert_eq!(stored.speakers[0].name, "Alice");
 
-    let written = read_track_16k_mono(&paths.session(&session).speaker_wav()).unwrap();
+    let written = read_track_16k_mono(&paths.session(&session).speaker_track()).unwrap();
     let expected = fingerprint(&written);
     assert_eq!(stored.speakers[0].embedding.len(), expected.len());
     for (got, want) in stored.speakers[0].embedding.iter().zip(&expected) {

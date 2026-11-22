@@ -1137,6 +1137,8 @@ fn paths_are_derived_from_the_root_alone() {
         session.dir(),
         Path::new("/tmp/meethook-root/sessions/20260809-052607")
     );
+    assert_eq!(session.mic_flac().file_name().unwrap(), "mic.flac");
+    assert_eq!(session.speaker_flac().file_name().unwrap(), "speaker.flac");
     assert_eq!(session.mic_wav().file_name().unwrap(), "mic.wav");
     assert_eq!(session.speaker_wav().file_name().unwrap(), "speaker.wav");
     assert_eq!(session.session_json().file_name().unwrap(), "session.json");

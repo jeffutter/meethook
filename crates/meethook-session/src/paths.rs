@@ -8,8 +8,10 @@ use crate::SessionId;
 /// the point of this module is that a name is spelled exactly once in the codebase, and a
 /// name that is first spelled in the slice that needs it will be spelled twice by the time
 /// two slices need it.
+const MIC_FLAC: &str = "mic.flac";
 const MIC_WAV: &str = "mic.wav";
 const MIC_CLEANED_FLAC: &str = "mic.cleaned.flac";
+const SPEAKER_FLAC: &str = "speaker.flac";
 const SPEAKER_WAV: &str = "speaker.wav";
 const MEETING_OPUS: &str = "meeting.opus";
 const SESSION_JSON: &str = "session.json";
@@ -127,18 +129,45 @@ impl SessionPaths {
         &self.dir
     }
 
-    /// The raw microphone track. Never rewritten after recording finishes.
+    /// The raw microphone track as the recorder writes it now: 16 kHz mono 16-bit FLAC.
+    /// Never rewritten after recording finishes. A session recorded before FLAC holds
+    /// [`Self::mic_wav`] instead; [`Self::mic_track`] picks whichever exists.
+    pub fn mic_flac(&self) -> PathBuf {
+        self.dir.join(MIC_FLAC)
+    }
+
+    /// The raw microphone track of a session recorded before raw tracks became FLAC: mono
+    /// 32-bit float at the capture rate. Nothing writes this name any more except tests and
+    /// old sessions; read through [`Self::mic_track`].
     pub fn mic_wav(&self) -> PathBuf {
         self.dir.join(MIC_WAV)
     }
 
-    /// The echo-cancelled derivative of [`Self::mic_wav`], written by `transcribe`.
+    /// The raw microphone track this session actually has: `mic.flac` when present, else
+    /// `mic.wav` so a session recorded before FLAC keeps working. When neither exists it is
+    /// the FLAC name, which is what a recorder would have written.
+    pub fn mic_track(&self) -> PathBuf {
+        first_existing(self.mic_flac(), self.mic_wav())
+    }
+
+    /// The echo-cancelled derivative of [`Self::mic_track`], written by `transcribe`.
     pub fn mic_cleaned_flac(&self) -> PathBuf {
         self.dir.join(MIC_CLEANED_FLAC)
     }
 
+    /// The raw system-audio track as the recorder writes it now; see [`Self::mic_flac`].
+    pub fn speaker_flac(&self) -> PathBuf {
+        self.dir.join(SPEAKER_FLAC)
+    }
+
+    /// The system-audio track of a session recorded before FLAC; see [`Self::mic_wav`].
     pub fn speaker_wav(&self) -> PathBuf {
         self.dir.join(SPEAKER_WAV)
+    }
+
+    /// The system-audio track this session actually has; see [`Self::mic_track`].
+    pub fn speaker_track(&self) -> PathBuf {
+        first_existing(self.speaker_flac(), self.speaker_wav())
     }
 
     /// Both tracks mixed to one compressed stereo file, for listening back to the meeting.
@@ -167,7 +196,7 @@ impl SessionPaths {
         self.dir.join(SPEAKER_NAMES_JSON)
     }
 
-    /// Outcome of the AEC pre-pass over `mic.wav`. Absent for a session transcribed before this
+    /// Outcome of the AEC pre-pass over the raw mic track. Absent for a session transcribed before this
     /// file existed.
     pub fn cleaning_json(&self) -> PathBuf {
         self.dir.join(CLEANING_JSON)
@@ -188,5 +217,36 @@ impl SessionPaths {
     /// caption file that disagrees with its transcript about who said what.
     pub fn transcript_vtt(&self) -> PathBuf {
         self.dir.join(TRANSCRIPT_VTT)
+    }
+}
+
+/// `preferred` if it exists, else `fallback` if it does, else `preferred`.
+fn first_existing(preferred: PathBuf, fallback: PathBuf) -> PathBuf {
+    if !preferred.exists() && fallback.exists() {
+        fallback
+    } else {
+        preferred
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_raw_track_resolves_to_flac_then_wav_then_the_flac_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionPaths::new(dir.path());
+        assert_eq!(session.mic_track(), session.mic_flac(), "neither exists");
+
+        std::fs::write(session.mic_wav(), b"").unwrap();
+        std::fs::write(session.speaker_wav(), b"").unwrap();
+        assert_eq!(session.mic_track(), session.mic_wav());
+        assert_eq!(session.speaker_track(), session.speaker_wav());
+
+        std::fs::write(session.mic_flac(), b"").unwrap();
+        std::fs::write(session.speaker_flac(), b"").unwrap();
+        assert_eq!(session.mic_track(), session.mic_flac());
+        assert_eq!(session.speaker_track(), session.speaker_flac());
     }
 }

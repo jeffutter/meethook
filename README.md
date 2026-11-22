@@ -157,14 +157,16 @@ A PPID of 1 means no terminal owns that process any more. Then check that it is 
 rather than merely alive:
 
 ```sh
-ls -l "$ROOT"/sessions/<id>/mic.wav
+ls -l "$ROOT"/sessions/<id>/mic.flac
 sleep 5
-ls -l "$ROOT"/sessions/<id>/mic.wav
+ls -l "$ROOT"/sessions/<id>/mic.flac
 ```
 
-A size that grew is the proof. `du -sh "$ROOT"/sessions/*` sizes the damage instead — each track
-runs close to 690 MB an hour, so both together are close to 1.4 GB — and says nothing about
-liveness. `lsof "$ROOT"/sessions/<id>/mic.wav` asks the same question in one shot: it names the
+A size that grew is the proof (the recorder pushes what it has to disk about once a second).
+`du -sh "$ROOT"/sessions/*` sizes the damage instead — a raw track is 16 kHz 16-bit FLAC and runs
+to tens of megabytes an hour (a 79 minute mic track measured 55 MB), where the float WAVs
+earlier versions wrote ran close to 690 MB an hour each — and says nothing about
+liveness. `lsof "$ROOT"/sessions/<id>/mic.flac` asks the same question in one shot: it names the
 writer, and prints nothing once no process holds the file. Read sizes with `ls -l` or `wc -c <`;
 inside the dev shell GNU coreutils `stat` shadows BSD `stat`, where `-f` means "file system".
 
@@ -182,25 +184,27 @@ and no later pass attaches a meeting. The frame then shows the meeting as `none 
 and drops the roster pane; Enter afterwards picks an event again, which undoes the removal.
 
 What you get back depends on how it ended. An interrupted run writes `session.json` and
-transcribes normally. A panicked or unwound run leaves an orphan whose WAVs were finalized on the
-way out anyway, complete to the last sample. A `kill -9` leaves an orphan that is valid up to the
-last five-second checkpoint - the header stops there, so `afinfo` reports a duration up to five
-seconds shorter than what was recorded, and those last seconds are undeclared. Die before that
-first checkpoint and the header declares nothing at all: `afinfo` then calls such a file zero
-seconds long although the audio is on disk (ffmpeg reads it whole, see below). Either orphan
-is skipped, never repaired:
+transcribes normally. A panicked or unwound run leaves an orphan whose tracks were finalized on the
+way out anyway, complete to the last sample. A `kill -9` leaves an orphan whose FLAC tracks decode
+up to the last frame that reached disk, about a second short of what was recorded: every frame is
+self-contained, and the header written when the track was opened declares no length (FLAC's
+"unknown"), which is also what it says about audio that is there. `afinfo` and ffmpeg both read such
+a file up to its last whole frame. A clean stop replaces that header with the real length and
+checksum. Either orphan is skipped, never repaired. The line below is for a float-WAV orphan from
+before FLAC (a FLAC one says "holds 4.3 s with no length declared" in the same place):
 
 ```text
 20260818-143027  skipped: no session.json: no transcript is possible; the speaker track holds 4.3 s past the end its header declares
 ```
 
 `transcribe` prints that and exits 0; `enroll` passes the session over in the same words; `meethook
-sessions` lists every such directory at once, without running either. The part the header declares
-plays everywhere. What lies past it plays depending on the reader: ffmpeg reads past a zero
-declaration by default and prints `Ignoring maximum wav data size`, `-ignore_length` is needed only
-for a header that declares a short nonzero length, and a header declaring `0xFFFFFFFF` says "unknown
-length" - which CoreAudio honours by playing to the end. Nothing here repairs a header to make any
-of that moot.
+sessions` lists every such directory at once, without running either. For an orphan from before
+raw tracks became FLAC (`mic.wav` and `speaker.wav`, float WAVs at the capture rate), the header
+declares what the last five-second checkpoint reached and what lies past it plays depending on the
+reader: ffmpeg reads past a zero declaration by default and prints `Ignoring maximum wav data size`,
+`-ignore_length` is needed only for a header that declares a short nonzero length, and a header
+declaring `0xFFFFFFFF` says "unknown length" - which CoreAudio honours by playing to the end.
+Nothing here repairs a header to make any of that moot.
 
 To keep it from happening again, name whatever keeps the trigger true:
 

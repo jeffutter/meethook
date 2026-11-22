@@ -6,7 +6,9 @@ when working with code in this repository.
 ## What this is
 
 `meethook` is a local-first macOS/Linux meeting recorder and transcriber: it records both
-sides of a call to independent WAV tracks, diarizes and transcribes them, matches speakers
+sides of a call to independent 16 kHz mono 16-bit FLAC tracks (`mic.flac`, `speaker.flac`;
+sessions recorded before that hold float WAVs; the old promise of a lossless native-rate
+capture is dropped on purpose, since every stage downstream works at 16 kHz and 16 bits), diarizes and transcribes them, matches speakers
 against an enrolled-voice database, and renders a `transcript.md`. The design record for
 *why* lives in the numbered files in `backlog/decisions/` - read the relevant one, including
 its `## Consequences` section, before making an architectural change in that area (ASR,
@@ -188,7 +190,7 @@ session directory.** That contract is the thing to understand before touching an
   `Consequence`, `Forget`'s cost report) that runs the same logic as the real write over a
   copy, so a preview and a write can't drift apart. Prefer extending that shared path over
   adding a second computation for `--dry-run`/`--list`/report output.
-- An orphaned session (WAVs with no `session.json`) is a normal, expected classification
+- An orphaned session (raw tracks with no `session.json`) is a normal, expected classification
   throughout the codebase, never an error.
 - Numeric CLI options that come from measured/settled constants (mixdown pan, LUFS target,
   boost cap, bitrate) are range-refused at the parser edge rather than clamped — clamping a

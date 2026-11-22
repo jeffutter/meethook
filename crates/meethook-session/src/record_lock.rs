@@ -238,7 +238,7 @@ impl RecordLock {
     /// ([`crate::Paths::record_lock`]), and a probe that created the file would break the
     /// assertion that non-`record` commands never touch it.
     ///
-    /// This is what lets a report say "this directory holds WAVs and no `session.json`, so
+    /// This is what lets a report say "this directory holds raw tracks and no `session.json`, so
     /// something interrupted it" without lying about a recording that is happening this second:
     /// `enroll`, `transcribe` and `speakers` are built to run alongside a live `record`, so an
     /// unfinished directory legitimately means *being recorded* as often as it means *was

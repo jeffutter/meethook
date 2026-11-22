@@ -122,7 +122,7 @@ fn main() {
 
     // The cleaned track if `transcribe` has already run over this session, the raw one
     // otherwise -- and say which, because the whole source arm below is about that difference.
-    let raw_mic = read_track_16k_mono(&paths.mic_wav()).unwrap();
+    let raw_mic = read_track_16k_mono(&paths.mic_track()).unwrap();
     let cleaned_mic = match read_track_16k_mono(&paths.mic_cleaned_flac()) {
         Ok(track) => track,
         Err(e) => {
@@ -130,7 +130,7 @@ fn main() {
             raw_mic.clone()
         }
     };
-    let speaker = read_track_16k_mono(&paths.speaker_wav()).unwrap_or_default();
+    let speaker = read_track_16k_mono(&paths.speaker_track()).unwrap_or_default();
 
     // Everything measurable about the levelling, before a single file exists -- so that a run
     // that turns out not to be worth listening to costs one pass over the tracks rather than a

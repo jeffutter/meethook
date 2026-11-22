@@ -37,7 +37,7 @@ use crate::{Error, Result};
 /// Unwind safety is asserted here rather than demanded of the caller, and that is sound by
 /// construction: on the raising path every object the closure touched is dropped unused. Each
 /// caller either returns the error immediately, or -- in [`MicCapture::settle`](crate::teardown::Engine::settle)
-/// for the mic -- goes on to finalize a WAV that the framework never held a reference to.
+/// for the mic -- goes on to finalize a FLAC that the framework never held a reference to.
 /// Requiring
 /// `UnwindSafe` of the closure instead would push an `AssertUnwindSafe` out to every call
 /// site, each of which would have to re-derive this same argument.
