@@ -334,6 +334,22 @@ mod tests {
             .fold(0.0, f32::max)
     }
 
+    /// Speaker-activity decisions (probability above 0.5) that differ from the reference, and
+    /// how many of those the reference itself was confident about (more than PROB_TOL from 0.5).
+    fn flips(got: &[f32], want: &[f32]) -> (usize, usize) {
+        let flipped: Vec<f32> = got
+            .iter()
+            .zip(want)
+            .filter(|(a, b)| (**a > 0.5) != (**b > 0.5))
+            .map(|(_, b)| *b)
+            .collect();
+        let confident = flipped
+            .iter()
+            .filter(|b| (**b - 0.5).abs() > PROB_TOL)
+            .count();
+        (flipped.len(), confident)
+    }
+
     /// Step 0 (empty cache) and step 1 (cache + FIFO from the step-0 fixture) of the fixture
     /// clip, with the reference logits and chunk embeddings of each.
     #[test]
@@ -368,12 +384,12 @@ mod tests {
             .map(|&x| sigmoid(x))
             .collect();
         let prob_diff = max_diff(&got, &probs[..rows * SPEAKERS]);
-        let flips = got
-            .iter()
-            .zip(&probs[..rows * SPEAKERS])
-            .filter(|(a, b)| (**a > 0.5) != (**b > 0.5))
-            .count();
-        eprintln!("step 0: max abs probability diff {prob_diff}, 0.5 flips {flips}");
+        let (flips0, confident0) = flips(&got, &probs[..rows * SPEAKERS]);
+        eprintln!(
+            "step 0: max abs probability diff {prob_diff}, 0.5 flips {flips0} of {} \
+             ({confident0} where the reference is confident)",
+            got.len()
+        );
 
         // Step 1: the step-0 cache rows then FIFO rows as cached_embeds, next chunk's mel.
         let (n_cache, n_fifo) = (u32_at(CACHE0, 0), u32_at(CACHE0, 1));
@@ -394,22 +410,42 @@ mod tests {
         assert_eq!(n_in1, cached_frames + CHUNK + RIGHT);
         let want1 = f32s(&UPDATE1[24..24 + n_in1 * STACK * SPEAKERS * 4]);
         let logit_diff1 = max_diff(&out1.logits, &want1);
-        eprintln!("step 1: max abs logit diff {logit_diff1}");
+        let got1: Vec<f32> = out1.logits.iter().map(|&x| sigmoid(x)).collect();
+        let want1_probs: Vec<f32> = want1.iter().map(|&x| sigmoid(x)).collect();
+        let prob_diff1 = max_diff(&got1, &want1_probs);
+        let (flips1, confident1) = flips(&got1, &want1_probs);
+        eprintln!(
+            "step 1: max abs logit diff {logit_diff1}, probability diff {prob_diff1}, \
+             0.5 flips {flips1} of {} ({confident1} where the reference is confident)",
+            got1.len()
+        );
 
         // Tolerances set from the measured differences of the fp16 graph against the fp32
         // Hugging Face reference (see the TASK-088.05 notes for the numbers).
         assert!(prob_diff <= PROB_TOL, "probability diff {prob_diff}");
-        assert_eq!(flips, 0, "0.5 threshold flips");
+        assert_eq!(
+            confident0, 0,
+            "0.5 threshold flips the reference is confident about"
+        );
         assert!(embed_diff <= EMBED_TOL, "chunk embed diff {embed_diff}");
         assert!(logit_diff1 <= LOGIT_TOL, "step 1 logit diff {logit_diff1}");
+        assert!(
+            prob_diff1 <= PROB_TOL,
+            "step 1 probability diff {prob_diff1}"
+        );
+        assert_eq!(
+            confident1, 0,
+            "step 1 flips the reference is confident about"
+        );
     }
 
-    // Measured on the first run (CoreML-accepted fp16 graph against the fp32 reference):
-    // logits 0.020, chunk embeddings 0.031, probabilities 1.6e-3, no 0.5 flip. The fp32
-    // fixtures' own 1e-4 does not apply to fp16 weights; these are about 3x the measurement.
+    // fp16 graph against the fp32 reference. ONNX Runtime 1.27: logits 0.020 (both steps),
+    // chunk embeddings 0.031, probabilities 1.6e-3. 1.31 (the static macOS build): logits
+    // 0.033 and 0.068, embeddings 0.065, probabilities 2.4e-3, one flip of a frame within
+    // 2.3e-3 of 0.5. The fp32 fixtures' own 1e-4 does not apply to fp16 weights.
     const PROB_TOL: f32 = 5e-3;
     const EMBED_TOL: f32 = 0.1;
-    const LOGIT_TOL: f32 = 0.06;
+    const LOGIT_TOL: f32 = 0.1;
 
     #[test]
     fn a_step_over_5000_frames_returns_our_error() {
