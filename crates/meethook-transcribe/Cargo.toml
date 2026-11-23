@@ -68,8 +68,8 @@ ort = { workspace = true, features = ["coreml", "download-binaries", "tls-native
 # avoid. This is what makes `WhisperContextParameters::use_gpu` default to true on macOS;
 # see the assertion in `asr` that keeps that honest.
 whisper-rs = { workspace = true, features = ["metal"] }
-# The voice isolator on the GPU through MLX. Optional only so that a sandboxed `nix build` can
-# turn it off (`--no-default-features`); see the workspace entry and MLX.md.
+# The voice isolator on the GPU through MLX. Optional only so that the flake's sandbox-safe
+# `meethook-cpu` package can turn it off (`--no-default-features`); see the workspace entry and MLX.md.
 mlx-rs = { workspace = true, optional = true }
 # The compiled shaders are embedded zstd-compressed and unpacked on first use, so the release is
 # one file; `mlx-sys` is here for `DEP_MLX_INCLUDE` (see build.rs and MLX.md).

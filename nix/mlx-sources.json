@@ -1,0 +1,25 @@
+{
+  "MLX": {
+    "github": "ml-explore/mlx",
+    "rev": "v0.32.2",
+    "hash": "sha256-pAQZ1RJq9Mb66qXMdZUt3znNKY+bhpxYckY708i0CmY="
+  },
+  "FMT": {
+    "github": "fmtlib/fmt",
+    "rev": "12.1.0",
+    "hash": "sha256-ZmI1Dv0ZabPlxa02OpERI47jp7zFfjpeWCy1WyuPYZ0="
+  },
+  "GGUFLIB": {
+    "github": "antirez/gguf-tools",
+    "rev": "8fa6eb65236618e28fd7710a0fba565f7faa1848",
+    "hash": "sha256-15FvyPOFqTOr5vdWQoPnZz+mYH919++EtghjozDlnSA="
+  },
+  "JSON": {
+    "url": "https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz",
+    "hash": "sha256-cnGfiVhXzqfj5Fay823wntWcTnbh8r2SefDLslb1Dh0="
+  },
+  "METAL_CPP": {
+    "url": "https://developer.apple.com/metal/cpp/files/metal-cpp_26.zip",
+    "hash": "sha256-7n2eI2lw/S+Us6l7YPAATKwcIbRRpaQ8VmES7S8ZjY8="
+  }
+}

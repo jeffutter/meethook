@@ -132,7 +132,7 @@
           craneLib = crane.mkLib pkgs;
 
           # macOS only: an `xcrun` that finds the host Xcode's Metal compiler, for the `mlx-sys`
-          # build. Used by the dev shell below, which unlike a sandboxed `nix build` can reach
+          # build. Used by the dev shell and the unsandboxed MLX package below, which can reach
           # the host Xcode. See nix/xcrun-metal-shim.sh.
           xcrunMetalShim = pkgs.writeScriptBin "xcrun" (builtins.readFile ./nix/xcrun-metal-shim.sh);
 
@@ -151,40 +151,95 @@
           # it exactly as a local `cargo build --workspace` already does.
           src = nixpkgs.lib.cleanSourceWith { src = craneLib.path ./.; };
 
-          commonArgs = {
-            inherit src;
-            buildInputs = commonBuildInputs;
-            nativeBuildInputs = commonNativeBuildInputs;
-            # `--no-default-features` turns off meethook-transcribe's `mlx` feature, the voice
-            # isolator's GPU engine, which is on by default on macOS. It compiles Metal shaders,
-            # which needs Xcode, and Xcode does not exist in a sandboxed build (nixpkgs' own MLX
-            # package sets MLX_BUILD_METAL=false for the same reason). A package built here runs
-            # the isolator on the ONNX CPU engine instead, about 15x slower; a `cargo build` in
-            # the dev shell, which is what the release tarballs use, has MLX.
-            cargoExtraArgs = "--locked --no-default-features";
-          } // commonEnv;
-
-          # version is deliberately NOT the release version here: buildDepsOnly's output only
-          # depends on Cargo.lock, but Nix hashes a derivation's name (pname-version) into its
-          # store path, so tying this to the release version would invalidate the deps cache
-          # on every release even when no dependency actually changed.
-          cargoArtifacts = craneLib.buildDepsOnly (
-            commonArgs // { pname = "meethook-workspace"; version = "deps"; }
+          # `mlx` is meethook-transcribe's `mlx` feature, the voice isolator's GPU engine, about
+          # 15x the ONNX CPU engine. It compiles Metal shaders with the host Xcode's Metal
+          # Toolchain, which a sandboxed build cannot reach, so the MLX package sets `__noChroot`:
+          # it builds where nix's `sandbox` is `false` (the macOS default) or `relaxed`, and
+          # Nix refuses it where `sandbox = true`. `mlx-sys` also calls /usr/bin/cc directly.
+          # The CPU package (`--no-default-features`) is pure and builds anywhere.
+          # The sources mlx-sys's CMake would download at configure time (FetchContent), keyed by
+          # FetchContent name and pinned so the MLX build needs no network. They must match the
+          # revs mlx-sys's mlx-c and MLX's CMakeLists name; see MLX.md for how to update them.
+          mlxSources = builtins.mapAttrs
+            (name: source:
+              if source ? github then
+                let ownerRepo = nixpkgs.lib.splitString "/" source.github; in
+                pkgs.fetchFromGitHub {
+                  owner = builtins.elemAt ownerRepo 0;
+                  repo = builtins.elemAt ownerRepo 1;
+                  inherit (source) rev hash;
+                }
+              else pkgs.fetchzip { inherit (source) url hash; })
+            (builtins.fromJSON (builtins.readFile ./nix/mlx-sources.json));
+          # The `cmake` crate passes CMAKE_TOOLCHAIN_FILE from the environment through to CMake,
+          # the only hook it offers for extra cache variables.
+          mlxFetchContentToolchain = pkgs.writeText "mlx-fetchcontent.cmake" (
+            nixpkgs.lib.concatStrings (nixpkgs.lib.mapAttrsToList
+              (name: source: ''
+                set(FETCHCONTENT_SOURCE_DIR_${name} "${source}" CACHE PATH "" FORCE)
+              '')
+              mlxSources)
           );
 
-          # doCheck is off: CI's `test` job already runs the full suite via `cargo nextest`
-          # on every push, including the AEC3/onnxruntime/whisper fixtures that a Nix build
-          # sandbox has no useful way to exercise. Re-running it inside crane's checkPhase
-          # would be redundant at best.
-          meethook = craneLib.buildPackage (
-            commonArgs
-            // {
-              inherit cargoArtifacts version;
-              pname = "meethook";
-              cargoExtraArgs = "--locked --no-default-features --bin meethook";
-              doCheck = false;
-            }
-          );
+          # MLX's CMake runs `zsh -c` to read the Metal version. nixpkgs' zsh sources the host's
+          # /etc/zshenv, which on nix-darwin resets PATH and drops the xcrun shim; the command is
+          # plain POSIX shell, so bash runs it.
+          mlxZsh = pkgs.writeShellScriptBin "zsh" ''exec ${pkgs.bash}/bin/bash "$@"'';
+
+          mkMeethook = { mlx }:
+            let
+              features = if mlx then "" else " --no-default-features";
+              commonArgs = {
+                inherit src;
+                buildInputs = commonBuildInputs;
+                nativeBuildInputs = commonNativeBuildInputs;
+                cargoExtraArgs = "--locked${features}";
+              }
+              // commonEnv
+              // nixpkgs.lib.optionalAttrs mlx {
+                __noChroot = true;
+                CMAKE_TOOLCHAIN_FILE = mlxFetchContentToolchain;
+                nativeBuildInputs = commonNativeBuildInputs ++ [ mlxZsh ];
+                # Ahead of nix's xcrun stub, so `mlx-sys` can compile Metal; see the definition.
+                # mlx-sys writes a metallib copy under $HOME unless told otherwise; HOME is read-only.
+                # MLX's CMake also runs the host's sw_vers to read the macOS version.
+                preBuild = ''
+                  mkdir -p "$TMPDIR/host-bin"
+                  ln -sf /usr/bin/sw_vers "$TMPDIR/host-bin/sw_vers"
+                  export PATH="${xcrunMetalShim}/bin:$PATH:$TMPDIR/host-bin"
+                  export MLX_RS_METAL_PATH="$TMPDIR/mlx-metallib"
+                '';
+              };
+
+              # version is deliberately NOT the release version here: buildDepsOnly's output only
+              # depends on Cargo.lock, but Nix hashes a derivation's name (pname-version) into its
+              # store path, so tying this to the release version would invalidate the deps cache
+              # on every release even when no dependency actually changed.
+              # The MLX package builds in one derivation: unsandboxed builds run in a random
+              # directory, and mlx-sys's CMake output does not survive the move to a second one.
+              cargoArtifacts =
+                if mlx then null
+                else craneLib.buildDepsOnly (
+                  commonArgs // { pname = "meethook-workspace"; version = "deps"; }
+                );
+            in
+            # doCheck is off: CI's `test` job already runs the full suite via `cargo nextest`
+            # on every push, including the AEC3/onnxruntime/whisper fixtures that a Nix build
+            # sandbox has no useful way to exercise. Re-running it inside crane's checkPhase
+            # would be redundant at best.
+            craneLib.buildPackage (
+              commonArgs
+              // {
+                inherit cargoArtifacts version;
+                pname = "meethook";
+                cargoExtraArgs = "--locked${features} --bin meethook";
+                doCheck = false;
+              }
+            );
+
+          meethook-cpu = mkMeethook { mlx = false; };
+          # Off macOS the `mlx` feature is a no-op, so the CPU package is the package.
+          meethook = if isMacos then mkMeethook { mlx = true; } else meethook-cpu;
         in
         {
           devShell = pkgs.mkShell {
@@ -219,7 +274,7 @@
             '';
           };
 
-          inherit meethook;
+          inherit meethook meethook-cpu;
 
           formatter = pkgs.nixpkgs-fmt;
         };
@@ -230,7 +285,7 @@
       devShells = nixpkgs.lib.genAttrs systems (system: { default = envs.${system}.devShell; });
       packages = nixpkgs.lib.genAttrs systems (system: {
         default = envs.${system}.meethook;
-        inherit (envs.${system}) meethook;
+        inherit (envs.${system}) meethook meethook-cpu;
       });
       formatter = nixpkgs.lib.genAttrs systems (system: envs.${system}.formatter);
     };

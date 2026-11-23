@@ -32,7 +32,7 @@ tempfile = { workspace = true }
 [features]
 # Passes through to `meethook-transcribe/mlx`: the voice isolator on the GPU. On by default; a
 # no-op off macOS. `--no-default-features` is for builds that cannot compile Metal (the flake's
-# sandboxed package).
+# `meethook-cpu` package).
 default = ["mlx"]
 mlx = ["meethook-transcribe/mlx"]
 

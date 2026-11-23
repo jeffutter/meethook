@@ -102,7 +102,7 @@ EOF
 The loader needs `format_version` 3, `in_pad_multiple` 1 and no quantization; it checks the encoder's
 shape and the absence of `.scales` tensors and refuses anything else with a clear error.
 
-**`mlx-rs` or MLX upgrade.** Bump the tilde pins (`mlx-rs` and `mlx-sys`), then build and run the checks; if the build stops in `build.rs` saying it cannot read `mlx.metallib`, `mlx-sys`'s output layout moved (see Building). The calls this uses:
+**`mlx-rs` or MLX upgrade.** Bump the tilde pins (`mlx-rs` and `mlx-sys`), then build and run the checks; if the build stops in `build.rs` saying it cannot read `mlx.metallib`, `mlx-sys`'s output layout moved (see Building). Then make `nix/mlx-sources.json` name the same sources as the new `mlx-sys` fetches: see `FetchContent_Declare` in its `src/mlx-c/CMakeLists.txt`, and in MLX's own `CMakeLists.txt` and `mlx/io/CMakeLists.txt`. After editing a `rev` or `url`, `nix/update-mlx-sources.sh` refreshes the hashes. `nix build .#meethook` is the check. The calls this uses:
 `MetalKernel::new` / `apply`, `fast::layer_norm`, `fast::scaled_dot_product_attention`,
 `Array::load_safetensors`, `ops::{addmm, concatenate, stack, take_axis, ...}`,
 `memory::clear_cache`.
@@ -141,12 +141,23 @@ xcodebuild -downloadComponent MetalToolchain
   compiler detection.
 - **CI.** `.github/scripts/ensure-metal-toolchain.sh` installs the toolchain on macOS runners
   before the jobs that build the workspace (`ci.yml` test, clippy, docs; `cd.yml` build).
-- **`nix build .#meethook`.** A sandboxed build has no Xcode and cannot compile Metal (nixpkgs
-  builds MLX with `MLX_BUILD_METAL=false` for that reason), so the flake builds with
-  `--no-default-features` and the package runs the ONNX engine. Release tarballs come from
-  `cd.yml`'s native `cargo build` in the dev shell, so they have MLX. `VoiceIsolator::required_model()`
-  tells the caller which weights the build needs, so a package without MLX downloads the ONNX
-  graph, not the MLX file.
+- **`nix build .#meethook` (macOS).** The package has MLX, but the build is impure: it sets
+  `__noChroot`, so it builds where nix's `sandbox` setting is `false` (the macOS default) or
+  `relaxed`, and Nix refuses it where `sandbox = true`. It uses the host's Metal Toolchain
+  (through the shim), `/usr/bin/cc` (hard-coded by `mlx-sys`) and `/usr/bin/sw_vers` (MLX's
+  CMake reads the macOS version). The rest is pinned:
+  - MLX's CMake downloads MLX, metal-cpp, json, fmt and gguflib at configure time. The flake
+    fetches them from `nix/mlx-sources.json` instead, and a CMake toolchain file points
+    `FETCHCONTENT_SOURCE_DIR_<NAME>` at them. The build does not use the network.
+  - It builds in one derivation, with no separate deps cache. Every rebuild compiles MLX again
+    (about 4 minutes). An unsandboxed build runs in a random directory, and `mlx-sys`'s CMake
+    output does not survive crane's move into a second one.
+  - MLX's CMake reads the Metal version through `zsh -c`, and nixpkgs' zsh sources nix-darwin's
+    `/etc/zshenv`, which resets `PATH` and drops the shim. The flake's `zsh` is bash.
+- **`nix build .#meethook-cpu`.** The pure build: `--no-default-features`, the ONNX engine, any
+  sandbox. On Linux both package names are this build. `VoiceIsolator::required_model()` tells the
+  caller which weights the build needs, so a package without MLX downloads the ONNX graph, not the
+  MLX file. Release tarballs come from `cd.yml`'s native `cargo build` in the dev shell.
 - **The macOS release is one file, and nothing links outside the system.** Three pieces:
   the MLX shaders are embedded (below); ONNX Runtime is linked statically; and `libiconv` is
   re-pointed at the system's. The dev shell has no onnxruntime on macOS on purpose

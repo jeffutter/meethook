@@ -270,9 +270,8 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
 # cmake and compiles its Metal shaders, which needs Xcode's Metal Toolchain (`xcodebuild
 # -downloadComponent MetalToolchain`) and an `xcrun` that can find it; the flake's dev shell
 # provides that (see `nix/xcrun-metal-shim.sh`) and CI installs the toolchain. A sandboxed
-# `nix build` cannot compile Metal at all (nixpkgs builds MLX with `MLX_BUILD_METAL=false` for
-# that reason), so the flake's package builds with `--no-default-features` and runs the ONNX
-# engine instead. Tilde pin: a 0.x crate. How the isolator was ported, and how to update it:
+# `nix build` cannot compile Metal at all, so the flake's MLX package builds unsandboxed and its
+# `meethook-cpu` package builds with `--no-default-features` (MLX.md, Building). Tilde pin: a 0.x crate. How the isolator was ported, and how to update it:
 # MLX.md.
 mlx-rs = "~0.34"
 # `mlx-rs`'s own build dependency. Declared here as well because only a direct dependent sees

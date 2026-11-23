@@ -266,7 +266,7 @@ track is affected: `mic.cleaned.flac`, `meeting.opus` and the speaker track are 
 the speaker track is never isolated. The weights are downloaded once on first use (only when
 there is something to transcribe) into `models/`: 152 MiB on macOS, where the isolator runs on the
 GPU through MLX, or 260 MB where it runs on the CPU (Linux, or a macOS binary built without the
-`mlx` feature, such as `nix build`). `--no-isolate` avoids the download. If the model cannot be
+`mlx` feature, such as `nix build .#meethook-cpu`). `--no-isolate` avoids the download. If the model cannot be
 fetched or loaded, `transcribe` says so and uses the plain mic track; if the GPU refuses part of
 the work, that stretch is left as it was and the progress line says how many batches failed. What
 each run did is recorded in the session's `cleaning.json`.

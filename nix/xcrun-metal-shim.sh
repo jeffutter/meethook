@@ -1,5 +1,5 @@
 #!/bin/bash
-# An `xcrun` for the flake's dev shell on macOS that finds Apple's Metal compiler.
+# An `xcrun` for the flake's dev shell and MLX package on macOS that finds Apple's Metal compiler.
 #
 # MLX's CMake build (the `mlx-sys` crate, for the voice isolator's GPU engine) runs
 # `xcrun -sdk macosx metal` to compile its shaders. In the dev shell the first `xcrun` on PATH is
@@ -8,7 +8,7 @@
 # host Xcode's Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain` installs it; the
 # toolchain is selected by its identifier, which is version specific, so it is read from
 # `xcodebuild -showComponent` and cached), and every other call goes to the next `xcrun` on PATH
-# unchanged. A sandboxed `nix build` has no host Xcode, so the package builds without MLX instead
+# unchanged. A sandboxed `nix build` has no host Xcode, so the MLX package builds unsandboxed
 # (see flake.nix).
 shim_dir=$(cd "$(dirname "$0")" && pwd)
 case " $* " in
