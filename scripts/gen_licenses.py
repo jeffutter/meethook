@@ -15,7 +15,7 @@ Two parts, because two kinds of code end up in the binary:
 Standard library only. See licenses/README.md for how to update either part.
 """
 
-import difflib
+import hashlib
 import pathlib
 import subprocess
 import sys
@@ -129,6 +129,18 @@ def rust_section() -> str:
     return result.stdout
 
 
+def groups(text: str) -> dict[str, str]:
+    """License groups of the Rust section, keyed by heading + crate list + hash of the text."""
+    out = {}
+    for chunk in text.split("=" * 80 + "\n")[1:]:
+        heading = chunk.splitlines()[0]
+        crates = [line for line in chunk.splitlines() if line.startswith("- ")]
+        digest = hashlib.sha1(chunk.encode()).hexdigest()[:10]
+        summary = f"{heading} text={digest} crates={crates}"
+        out[summary] = summary
+    return out
+
+
 def main() -> None:
     text = HEADER + native_section() + "\n" + rust_section()
     # One trailing newline, whatever the template produced.
@@ -138,14 +150,16 @@ def main() -> None:
         if current == text:
             print("THIRD_PARTY_LICENSES.md is up to date")
             return
-        # Show what differs: CI runs this on Linux, where a failure that does not reproduce on a
-        # Mac is otherwise undiagnosable from the log alone.
-        diff = difflib.unified_diff(
-            current.splitlines(), text.splitlines(), "committed", "generated", lineterm="", n=1
-        )
-        print("\n".join(list(diff)[:200]), file=sys.stderr)
+        # Show what differs, per license group (heading, crates, hash of the text): CI runs this
+        # on Linux, where a failure that does not reproduce on a Mac is otherwise undiagnosable
+        # from the log, and a raw line diff is dominated by the license texts themselves.
+        old, new = groups(current), groups(text)
+        for label, only, other in (("committed only", old, new), ("generated only", new, old)):
+            for key, body in only.items():
+                if key not in other:
+                    print(f"--- {label}: {body}", file=sys.stderr)
         sys.exit(
-            "THIRD_PARTY_LICENSES.md is out of date (diff above, first 200 lines): run "
+            "THIRD_PARTY_LICENSES.md is out of date (groups that differ above): run "
             "`python3 scripts/gen_licenses.py` and commit the result"
         )
     OUT.write_text(text)
