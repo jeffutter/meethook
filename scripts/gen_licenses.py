@@ -136,6 +136,7 @@ def main() -> None:
     if "--check" in sys.argv:
         current = OUT.read_text()
         if current == text:
+            print("THIRD_PARTY_LICENSES.md is up to date")
             return
         # Show what differs: CI runs this on Linux, where a failure that does not reproduce on a
         # Mac is otherwise undiagnosable from the log alone.
