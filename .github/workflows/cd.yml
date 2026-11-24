@@ -125,6 +125,11 @@ jobs:
         with:
           name: jeffutter
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      # On macOS `.#meethook` is the MLX package, which builds unsandboxed against the host's
+      # Metal Toolchain (flake.nix, `__noChroot`); the runner image does not ship it.
+      - name: Install the Metal Toolchain
+        if: runner.os == 'macOS'
+        run: bash .github/scripts/ensure-metal-toolchain.sh
       - run: nix build .#meethook --option log-lines 200
       - run: nix flake check
 
