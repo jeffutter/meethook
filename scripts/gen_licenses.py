@@ -15,6 +15,7 @@ Two parts, because two kinds of code end up in the binary:
 Standard library only. See licenses/README.md for how to update either part.
 """
 
+import difflib
 import pathlib
 import subprocess
 import sys
@@ -133,11 +134,18 @@ def main() -> None:
     # One trailing newline, whatever the template produced.
     text = text.rstrip("\n") + "\n"
     if "--check" in sys.argv:
-        if OUT.read_text() == text:
+        current = OUT.read_text()
+        if current == text:
             return
+        # Show what differs: CI runs this on Linux, where a failure that does not reproduce on a
+        # Mac is otherwise undiagnosable from the log alone.
+        diff = difflib.unified_diff(
+            current.splitlines(), text.splitlines(), "committed", "generated", lineterm="", n=1
+        )
+        print("\n".join(list(diff)[:200]), file=sys.stderr)
         sys.exit(
-            "THIRD_PARTY_LICENSES.md is out of date: run `python3 scripts/gen_licenses.py` "
-            "and commit the result"
+            "THIRD_PARTY_LICENSES.md is out of date (diff above, first 200 lines): run "
+            "`python3 scripts/gen_licenses.py` and commit the result"
         )
     OUT.write_text(text)
     print(f"wrote {OUT} ({len(text) // 1024} KiB)")
