@@ -84,13 +84,51 @@ impl TurnEmbedder for WeSpeaker {
     }
 }
 
+/// The longest stretch fed to the embedding network in one run.
+///
+/// CoreML fails the run with "Error in dynamically resizing for sequence length (error: -1)"
+/// once the input passes roughly 16,000 fbank frames (160 s; 16,000 runs, 17,000 does not,
+/// measured on the ONNX Runtime CoreML provider this build links). The diarizer can hand over
+/// a turn that long: a slot that latches onto a noisy track holds one run of many minutes.
+/// 120 s keeps clear of the limit, and a voice does not need more audio than that to be
+/// described.
+const MAX_WINDOW_SECONDS: f64 = 120.0;
+
 /// One turn's voice as a unit vector, or `None` if there was not enough audio to describe.
 ///
 /// Turns are embedded one at a time rather than batched. A meeting has hundreds of them,
 /// not millions, and batching would mean padding every turn to a common length and telling
 /// the network to ignore the padding -- a mask to get wrong in exchange for a saving nobody
 /// has measured.
+///
+/// A turn longer than [`MAX_WINDOW_SECONDS`] is cut into equal windows, each embedded alone,
+/// and the result is the normalized mean of those -- the same combination a cluster's
+/// reference uses. Equal rather than "full windows plus a remainder" so that no window is a
+/// scrap too short to describe anyone.
 pub(crate) fn embed(
+    fbank: &mut Fbank,
+    session: &mut Session,
+    samples: &[f32],
+) -> Result<Option<Vec<f32>>> {
+    let max_window = (MAX_WINDOW_SECONDS * TARGET_RATE as f64) as usize;
+    let windows = samples.len().div_ceil(max_window).max(1);
+    if windows == 1 {
+        return embed_window(fbank, session, samples);
+    }
+
+    let size = samples.len().div_ceil(windows);
+    let mut embeddings = Vec::with_capacity(windows);
+    for window in samples.chunks(size) {
+        if let Some(embedding) = embed_window(fbank, session, window)? {
+            embeddings.push(embedding);
+        }
+    }
+    let vectors: Vec<&[f32]> = embeddings.iter().map(Vec::as_slice).collect();
+    Ok(group_mean(&vectors).map(|(unit, _)| unit))
+}
+
+/// One run of the network over `samples`, which must fit in [`MAX_WINDOW_SECONDS`].
+fn embed_window(
     fbank: &mut Fbank,
     session: &mut Session,
     samples: &[f32],
@@ -340,5 +378,30 @@ mod tests {
             same < different,
             "one voice is {same} from itself but {different} from another voice"
         );
+    }
+
+    /// The failure this window cap exists for: a 20-minute turn made the CoreML run fail
+    /// outright, which aborted the whole transcription. It must come back as an embedding, and
+    /// one that still matches the same voice heard for a few seconds.
+    #[test]
+    fn a_turn_longer_than_the_network_can_take_in_one_run_still_embeds() {
+        let Some(mut embedder) = model(&crate::EMBEDDING_MODEL) else {
+            return;
+        };
+        let mut fbank = Fbank::new();
+        let mut embedding = |samples: Vec<f32>| {
+            embed(&mut fbank, &mut embedder, &samples)
+                .unwrap()
+                .expect("audio this long must produce an embedding")
+        };
+
+        let formants = [730.0, 1090.0, 2440.0];
+        let long = embedding(voice(1200.0, 130.0, formants));
+        let short = embedding(voice(6.0, 130.0, formants));
+        let other = embedding(voice(6.0, 300.0, [270.0, 2300.0, 3000.0]));
+
+        let distance =
+            |a: &[f32], b: &[f32]| 1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        assert!(distance(&long, &short) < distance(&long, &other));
     }
 }
