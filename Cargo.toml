@@ -41,6 +41,7 @@ tag-name = "v{{version}}"
 consolidate-commits = true
 pre-release-commit-message = "chore: release {{version}}"
 tag-message = "meethook {{version}}"
+pre-release-hook = ["sh", "-c", "\"$(git rev-parse --show-toplevel)/scripts/refresh-locks.sh\""]
 
 # A `cargo run` has to be usable on a real session, and at opt-level 0 it is not: the
 # transcribe pre-pass is scalar float DSP over ~141 M samples per track -- rubato's

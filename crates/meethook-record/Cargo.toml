@@ -39,6 +39,7 @@ license = "MIT"
 [package.metadata.release]
 tag = false
 push = false
+pre-release-hook = ["sh", "-c", "\"$(git rev-parse --show-toplevel)/scripts/refresh-locks.sh\""]
 
 [workspace]
 
