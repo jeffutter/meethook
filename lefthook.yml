@@ -80,8 +80,14 @@ pre-push:
         cargo clippy --all-targets --workspace -- -D warnings &&
         cargo nextest run --workspace &&
         RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --workspace
-    audit:
+    licenses:
       priority: 6
+      # Mirrors the CI `licenses` job: THIRD_PARTY_LICENSES.md is built into the binary and
+      # goes stale when a dependency is added or changes license. Fix with
+      # `python3 scripts/gen_licenses.py` (needs cargo-about, which the devShell has).
+      run: python3 scripts/gen_licenses.py --check
+    audit:
+      priority: 7
       # Default DB location ($CARGO_HOME/advisory-db, fetched on each run) is deliberate.
       # It does not work from an agent sandbox -- $CARGO_HOME is read-only there and the
       # TLS interception breaks cargo-audit's fetch -- but a real `git push`, which is
@@ -94,7 +100,7 @@ pre-push:
       # pre-push.
       run: cargo audit
     live-proof-notice:
-      priority: 7
+      priority: 8
       # The hand-stop live proof (crates/meethook/tests/live_record_hand_stop.rs) cannot live in
       # the automatic gate above. It needs a real process capturing through the default input
       # device -- the recorder triggers on *which processes are capturing*, so no scripted capture
@@ -116,7 +122,7 @@ pre-push:
         echo "    cargo build --manifest-path crates/meethook-record/Cargo.toml --example mic-hold"
         echo "    cargo nextest run -p meethook --run-ignored only -E 'binary(live_record_hand_stop)' --nocapture)"
     live-proof:
-      priority: 7
+      priority: 8
       # The same job as a blocking gate, for the one shell that can satisfy it: a person pushing
       # from a terminal that holds the Microphone and Screen & System Audio Recording grants. The
       # switch is read from the pushing shell through `${MEETHOOK_LIVE_PROOF:-0}` rather than
