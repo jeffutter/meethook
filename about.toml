@@ -35,3 +35,18 @@ accepted = [
     "CDLA-Permissive-2.0",
     "Unicode-3.0",
 ]
+
+# minijinja's LICENSE is the stock Apache-2.0 text with different indentation than most crates. Left
+# to its own detection, cargo-about on CI sometimes grouped minijinja with the canonical text and
+# sometimes with ring's copy of this file, so the same commit passed and failed the `licenses` job.
+# Naming the file and its checksum makes the text a fact of the crate version, not of detection.
+# If the checksum does not match (a new minijinja release, or different bytes on some host),
+# cargo-about does NOT fail: it silently falls back to detection, i.e. the old flaky behaviour.
+# `cargo about clarify LICENSE path <crate source dir>` prints a fresh entry.
+[minijinja.clarify]
+license = "Apache-2.0"
+
+[[minijinja.clarify.files]]
+path = "LICENSE"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+license = "Apache-2.0"
