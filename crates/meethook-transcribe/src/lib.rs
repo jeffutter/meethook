@@ -99,6 +99,7 @@ pub use nemotron_mel::NemotronMel;
 pub use nemotron_stream::{SpeakerStep, speaker_probabilities};
 pub use nemotron_turns::{SlotTurn, slot_turns};
 pub use onnx::{Loaded, open_session};
+pub use progress::{Download, note};
 pub use reference_policies::{
     ArmReport, ClosedSet, Misattribution, PolicyItem, PolicyReport, PolicySweep, PolicyVerdict,
     ReferencePolicy, policy_references, policy_sweep,
@@ -581,7 +582,11 @@ pub fn run_batch(
 
     let mut engines = open_engine().map_err(|source| Error::Engine { source })?;
 
-    for session in work {
+    let session_count = work.len();
+    for (index, session) in work.into_iter().enumerate() {
+        // Held to the end of this iteration, so every phase inside it is headed by the
+        // session it belongs to, and the next session's phases are not.
+        let _scope = progress::session(index + 1, session_count, &session.id);
         writeln!(out, "{}  transcribing...", session.id)?;
         match transcribe_and_write(
             session,

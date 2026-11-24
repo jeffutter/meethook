@@ -334,9 +334,10 @@ impl WhisperEngine {
                 s.end_s += from as f64 / rate;
             }
             if (0..redone.len()).any(|k| loop_run_len(&redone[k..]) > 0) {
-                eprintln!(
+                crate::note!(
                     "repeat guard: {:.1}-{:.1} s still repeats after a fresh decode; keeping one",
-                    first.start_s, last.end_s
+                    first.start_s,
+                    last.end_s
                 );
                 out.push(AsrSegment {
                     start_s: first.start_s,
@@ -344,9 +345,10 @@ impl WhisperEngine {
                     text: first.text.clone(),
                 });
             } else {
-                eprintln!(
+                crate::note!(
                     "repeat guard: {:.1}-{:.1} s repeated one sentence {run} times; re-decoded",
-                    first.start_s, last.end_s
+                    first.start_s,
+                    last.end_s
                 );
                 out.extend(redone);
             }
@@ -359,7 +361,7 @@ impl WhisperEngine {
     fn decode(&mut self, audio_16k_mono: &[f32]) -> Result<Vec<AsrSegment>> {
         // Opens the bracket the detector's own heartbeat ticks inside (a `Phase`, silent unless
         // the scan is slow) and the `report` line below closes with the answer.
-        eprintln!(
+        crate::note!(
             "speech gate: scanning {:.0} s for speech...",
             audio_16k_mono.len() as f64 / f64::from(TARGET_RATE)
         );
@@ -459,9 +461,21 @@ impl WhisperEngine {
         //    nothing ever reclaims it -- `FullParams` has no `Drop` and clears its own safe
         //    field. So this leaks one small box per call, two per session. That is acceptable
         //    for a per-meeting cost, but it is deliberate rather than missed.
-        let mut phase = crate::progress::Phase::start("transcribing");
+        //
+        // The phase sits behind a shared handle so this function can close it after `full`
+        // returns: the leaked closure never drops, which would leave its bar on screen.
+        let phase = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            crate::progress::Phase::start("transcribing speech"),
+        )));
+        let callback_phase = std::sync::Arc::clone(&phase);
         params.set_progress_callback_safe(move |percent: i32| {
-            phase.at(percent.max(0) as usize, 100);
+            if let Some(phase) = callback_phase
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                phase.at(percent.max(0) as usize, 100);
+            }
         });
 
         // Two settings follow screenpipe's whisper_rs use (`screenpipe-audio`,
@@ -484,7 +498,11 @@ impl WhisperEngine {
         // temperature-fallback loop. None of them is what let the silence hallucinations
         // through, so none of them is changed here.
 
-        state.full(params, audio).map_err(|e| Error::Asr {
+        let decoded = state.full(params, audio);
+        if let Some(phase) = phase.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            phase.done();
+        }
+        decoded.map_err(|e| Error::Asr {
             source: Box::new(e),
         })?;
 
@@ -572,7 +590,7 @@ fn report(total_samples: usize, plan: Option<&gate::Splice>) {
         Some(splice) => {
             let total = splice.total_duration_s();
             let speech = splice.speech_duration_s();
-            eprintln!(
+            crate::note!(
                 "speech gate: {total:.1} s in, {speech:.1} s of speech in {} region(s) ({:.1}%), \
                  {} window(s) to decode",
                 splice.piece_count(),
@@ -584,7 +602,7 @@ fn report(total_samples: usize, plan: Option<&gate::Splice>) {
         // this path: a track with no speech is exactly the case that produced no `Splice`.
         None => {
             let total = total_samples as f64 / f64::from(TARGET_RATE);
-            eprintln!("speech gate: {total:.1} s in, no speech detected; nothing decoded");
+            crate::note!("speech gate: {total:.1} s in, no speech detected; nothing decoded");
         }
     }
 }

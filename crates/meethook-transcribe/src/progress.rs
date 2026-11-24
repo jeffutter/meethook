@@ -14,18 +14,152 @@
 //! `report`, and it is also what makes this module usable from places the writer does not
 //! reach at all -- inside AEC3's frame loop, or inside a `'static` whisper.cpp callback.
 //!
-//! *Lines are ordinary lines.* No `\r`, no ANSI: unlike the model download, which rewrites
-//! one line in place and therefore turns into a single enormous line when redirected, a
-//! phase's output has to read correctly in `2> progress.log` as well as in a terminal. It
-//! also means no phase has to arrange to terminate its own last line, which matters for the
-//! whisper callback, since nothing can reach into it once decoding starts.
+//! *A terminal gets bars, anything else gets lines.* When stderr is a terminal each phase
+//! over [`SHOW_AFTER`] draws an indicatif bar headed by the session it belongs to
+//! (`[2/5] 20261123-115624`), and leaves a `done` line behind when it finishes, so the
+//! screen reads as a trail of what has been done and one bar for what is being done. When
+//! stderr is redirected (`2> progress.log`) there is no `\r`, no ANSI and no bar: the same
+//! phases print the ordinary heartbeat lines they always did, now carrying the same session
+//! prefix. Either way [`note`] is how a one-off line gets out, because a bare `eprintln!`
+//! under a live bar tears it.
 //!
 //! *A phase that is quick says nothing at all.* Throttling on elapsed time rather than on
 //! units done is what keeps unit tests, short tracks and the `import`/`levels`/`trials` paths
 //! silent with no size threshold to pick: a phase that finishes inside [`INTERVAL`] never
 //! reaches its first line, and never prints a closing one either.
 
+use std::fmt::Display;
+use std::io::IsTerminal;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+
+/// How long a phase must run before a bar is drawn for it on a terminal.
+///
+/// Shorter than [`INTERVAL`] because a bar is not noise the way a line is, but not zero: a
+/// phase that takes 300 ms should not flash a bar and leave a `done` line behind.
+const SHOW_AFTER: Duration = Duration::from_secs(1);
+
+/// The one place indicatif draws, so that bars and [`note`] lines do not overwrite each other.
+fn display() -> &'static MultiProgress {
+    static DISPLAY: OnceLock<MultiProgress> = OnceLock::new();
+    DISPLAY.get_or_init(|| MultiProgress::with_draw_target(ProgressDrawTarget::stderr()))
+}
+
+/// Whether stderr is a terminal that can redraw a bar.
+fn interactive() -> bool {
+    static INTERACTIVE: OnceLock<bool> = OnceLock::new();
+    *INTERACTIVE.get_or_init(|| std::io::stderr().is_terminal())
+}
+
+/// Which session the phases now starting belong to, as `[2/5] 20261123-115624`.
+static CONTEXT: Mutex<Option<String>> = Mutex::new(None);
+
+fn context() -> Option<String> {
+    CONTEXT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Names the session being worked on until the returned guard drops.
+///
+/// Every phase started while it is alive carries `[index/total] id`, on its bar or its plain
+/// lines. A process-wide setting rather than a parameter because the phases are started
+/// from a dozen places, some of them inside whisper.cpp's callback, and none of them know
+/// which session they are in. `transcribe` works one session at a time, so there is only
+/// ever one.
+pub fn session(index: usize, total: usize, id: impl Display) -> SessionScope {
+    *CONTEXT.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("[{index}/{total}] {id}"));
+    SessionScope(())
+}
+
+/// Clears the session [`session`] named when dropped.
+pub struct SessionScope(());
+
+impl Drop for SessionScope {
+    fn drop(&mut self) {
+        *CONTEXT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Prints one line on stderr without tearing any bar that is on screen.
+pub fn note(line: impl Display) {
+    if interactive() {
+        let _ = display().println(line.to_string());
+    } else {
+        eprintln!("{line}");
+    }
+}
+
+/// `eprintln!` that is safe under a live bar; see [`note`].
+#[macro_export]
+macro_rules! note {
+    ($($arg:tt)*) => {
+        $crate::note(::std::format_args!($($arg)*))
+    };
+}
+
+/// Progress of one model download: a byte bar on a terminal, a line per quarter otherwise.
+pub struct Download {
+    bar: Option<ProgressBar>,
+    name: String,
+    next_quarter: u64,
+    finished: bool,
+}
+
+impl Download {
+    /// Announces `name` (`total` bytes) and begins tracking it.
+    pub fn start(name: &str, total: u64) -> Download {
+        let size = if total >= 1_000_000_000 {
+            format!("{:.1} GB", total as f64 / 1e9)
+        } else {
+            format!("{:.0} MB", total as f64 / 1e6)
+        };
+        let bar = interactive().then(|| {
+            let bar = ProgressBar::hidden();
+            bar.set_length(total);
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "{prefix:.bold} {wide_bar:.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
+                )
+                .expect("a literal template parses")
+                .progress_chars("=> "),
+            );
+            bar.set_prefix(format!("downloading {name} (one time)"));
+            display().add(bar)
+        });
+        if bar.is_none() {
+            note(format!("Fetching {name} ({size}, one time)"));
+        }
+        Download {
+            bar,
+            name: name.to_owned(),
+            next_quarter: 1,
+            finished: false,
+        }
+    }
+
+    /// Reports `done` of `total` bytes.
+    pub fn update(&mut self, done: u64, total: u64) {
+        if self.finished {
+            return;
+        }
+        if let Some(bar) = &self.bar {
+            bar.set_length(total);
+            bar.set_position(done);
+            if done >= total {
+                bar.finish_and_clear();
+                self.finished = true;
+                note(format!("downloaded {}", self.name));
+            }
+            return;
+        }
+        let quarter = (done * 4).checked_div(total).unwrap_or(0);
+        if quarter >= self.next_quarter {
+            self.next_quarter = quarter + 1;
+            note(format!("  {}: {}%", self.name, quarter * 25));
+        }
+    }
+}
 
 /// How long a phase stays quiet between lines.
 ///
@@ -80,6 +214,10 @@ pub(crate) struct Phase {
     /// first line is therefore [`INTERVAL`] after the start, not immediately.
     last_spoke: Instant,
     spoke: bool,
+    /// The session this phase belongs to, fixed when it starts.
+    context: Option<String>,
+    /// The terminal bar, once the phase has run long enough to deserve one.
+    bar: Option<ProgressBar>,
 }
 
 impl Phase {
@@ -105,6 +243,8 @@ impl Phase {
             started: now,
             last_spoke: now,
             spoke: false,
+            context: context(),
+            bar: None,
         }
     }
 
@@ -121,18 +261,58 @@ impl Phase {
     /// reads and go quiet for the whole phase. Overstating `total` only costs extra clock
     /// reads, so an upper bound is safe where an exact count is not available.
     pub(crate) fn at(&mut self, done: usize, total: usize) {
-        if let Some(line) = self.tick(done, total, Instant::now) {
+        if interactive() {
+            self.bar_at(done, total);
+        } else if let Some(line) = self.tick(done, total, Instant::now) {
             eprintln!("{line}");
         }
     }
 
-    /// Ends the phase, printing a closing line only if it ever spoke.
+    /// Ends the phase. On a terminal a phase that drew a bar leaves `done` in its place; in a
+    /// log a phase that spoke prints a closing line.
     ///
-    /// The condition is what keeps a fast phase from leaving an orphan `done` line with no
-    /// progress above it.
-    pub(crate) fn done(self) {
-        if let Some(line) = self.closing(Instant::now()) {
+    /// Both conditions keep a fast phase from leaving an orphan `done` with no progress
+    /// above it.
+    pub(crate) fn done(mut self) {
+        let now = Instant::now();
+        if let Some(bar) = self.bar.take() {
+            bar.set_style(finished_style());
+            bar.set_prefix(self.prefix());
+            bar.set_message(self.label.clone());
+            bar.finish_with_message(format!(
+                "\u{2713} {}  {}",
+                self.label,
+                elapsed(now.saturating_duration_since(self.started))
+            ));
+        } else if let Some(line) = self.closing(now) {
             eprintln!("{line}");
+        }
+    }
+
+    /// `[2/5] 20261123-115624`, or empty outside a session.
+    fn prefix(&self) -> String {
+        self.context.clone().unwrap_or_default()
+    }
+
+    /// The terminal half of [`Phase::at`]: the same stride, then the bar instead of a line.
+    fn bar_at(&mut self, done: usize, total: usize) {
+        let Some(now) = self.due(total, Instant::now) else {
+            return;
+        };
+        if self.bar.is_none() {
+            if now.saturating_duration_since(self.started) < SHOW_AFTER {
+                return;
+            }
+            // Configured before it is added, or its first frame draws with no text.
+            let bar = ProgressBar::hidden();
+            bar.set_length(100);
+            bar.set_style(running_style());
+            bar.set_prefix(self.prefix());
+            bar.set_message(self.label.clone());
+            self.bar = Some(display().add(bar));
+        }
+        if let Some(bar) = &self.bar {
+            bar.set_position(percent(done, total));
         }
     }
 
@@ -148,6 +328,23 @@ impl Phase {
         total: usize,
         clock: F,
     ) -> Option<String> {
+        let now = self.due(total, clock)?;
+        if !should_speak(self.last_spoke, now) {
+            return None;
+        }
+        self.last_spoke = now;
+        self.spoke = true;
+        Some(line(
+            self.context.as_deref(),
+            &self.label,
+            done,
+            total,
+            now.saturating_duration_since(self.started),
+        ))
+    }
+
+    /// The current time if this call is one that reads the clock (see [`CLOCK_READS`]).
+    fn due<F: FnOnce() -> Instant>(&mut self, total: usize, clock: F) -> Option<Instant> {
         if total != self.total {
             self.total = total;
             self.mask = stride_for(total) - 1;
@@ -157,26 +354,15 @@ impl Phase {
         if self.ticks & self.mask != 0 {
             return None;
         }
-
-        let now = clock();
-        if !should_speak(self.last_spoke, now) {
-            return None;
-        }
-        self.last_spoke = now;
-        self.spoke = true;
-        Some(line(
-            &self.label,
-            done,
-            total,
-            now.saturating_duration_since(self.started),
-        ))
+        Some(clock())
     }
 
     /// The closing line, or `None` for a phase that was quiet throughout.
     fn closing(&self, now: Instant) -> Option<String> {
         self.spoke.then(|| {
             format!(
-                "{}: done ({})",
+                "{}{}: done ({})",
+                prefixed(self.context.as_deref()),
                 self.label,
                 elapsed(now.saturating_duration_since(self.started))
             )
@@ -198,13 +384,48 @@ fn should_speak(last_spoke: Instant, now: Instant) -> bool {
     now.saturating_duration_since(last_spoke) >= INTERVAL
 }
 
-/// One progress line: `cancelling echo: 42% (1m12s)`.
-fn line(label: &str, done: usize, total: usize, since_start: Duration) -> String {
+/// One progress line: `[2/5] 20261123-115624  cancelling echo: 42% (1m12s)`.
+fn line(
+    context: Option<&str>,
+    label: &str,
+    done: usize,
+    total: usize,
+    since_start: Duration,
+) -> String {
     format!(
-        "{label}: {}% ({})",
+        "{}{label}: {}% ({})",
+        prefixed(context),
         percent(done, total),
         elapsed(since_start)
     )
+}
+
+/// The session prefix of a plain line, with its separator, or nothing.
+fn prefixed(context: Option<&str>) -> String {
+    context.map(|c| format!("{c}  ")).unwrap_or_default()
+}
+
+fn running_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{prefix:.bold}  {msg:<30} {bar:30.cyan/blue} {pos:>3}%  {elapsed_precise}  eta {eta}",
+    )
+    .expect("a literal template parses")
+    .progress_chars("=> ")
+}
+
+fn finished_style() -> ProgressStyle {
+    ProgressStyle::with_template("{prefix:.bold}  {msg:.green}").expect("a literal template parses")
+}
+
+/// A phase that is dropped without `done` (an error unwound through it) takes its bar off the
+/// screen: the failure is reported on its own line, and a half-full bar left above it would
+/// read as work still going.
+impl Drop for Phase {
+    fn drop(&mut self) {
+        if let Some(bar) = self.bar.take() {
+            bar.finish_and_clear();
+        }
+    }
 }
 
 /// `done` as a percentage of `total`, clamped to 0..=100.
@@ -309,6 +530,19 @@ mod tests {
     }
 
     #[test]
+    fn a_session_prefixes_the_plain_lines_of_the_phases_inside_it() {
+        let clock = FakeClock::new();
+        let scope = session(2, 5, "20261123-115624");
+        let mut phase = Phase::started_at("cancelling echo", clock.base);
+        drop(scope);
+        clock.advance(Duration::from_secs(72));
+
+        let line = phase.tick(42, 100, || clock.now()).unwrap();
+
+        assert_eq!(line, "[2/5] 20261123-115624  cancelling echo: 42% (1m12s)");
+    }
+
+    #[test]
     fn a_phase_that_spoke_closes_with_a_done_line() {
         let clock = FakeClock::new();
         let mut phase = Phase::started_at("diarize: segmenting", clock.base);
@@ -364,7 +598,7 @@ mod tests {
     fn an_empty_phase_reports_zero_rather_than_dividing_by_it() {
         assert_eq!(percent(0, 0), 0);
         assert_eq!(
-            line("reading mic.wav", 0, 0, Duration::from_secs(7)),
+            line(None, "reading mic.wav", 0, 0, Duration::from_secs(7)),
             "reading mic.wav: 0% (7s)"
         );
     }

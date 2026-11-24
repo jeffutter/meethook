@@ -34,6 +34,8 @@ serde = { workspace = true }
 ropus = { workspace = true }
 rubato = { workspace = true }
 thiserror = { workspace = true }
+# The terminal progress bars behind `progress::Phase`; plain lines when stderr is not a terminal.
+indicatif = { workspace = true }
 
 # Base entry carries no backend feature: the `metal` feature is added under the macOS target
 # gate below. Off macOS, whisper.cpp compiles for the CPU and `use_gpu` defaults to false --

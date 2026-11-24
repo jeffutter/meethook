@@ -25,10 +25,10 @@ use crate::screen::{Interface, Shared};
 #[cfg(target_os = "macos")]
 use meethook_transcribe::CPU_ENV_VAR;
 use meethook_transcribe::{
-    Attribution, Diarize, EMBEDDING_MODEL, Engines, FIRERED_VAD_MODEL, FireRedVad,
+    Attribution, Diarize, Download, EMBEDDING_MODEL, Engines, FIRERED_VAD_MODEL, FireRedVad,
     GateSpeechFinder, Isolation, IsolationStage, NEMOTRON_DIARIZATION_DATA,
     NEMOTRON_DIARIZATION_GRAPH, NemotronDiarizer, VocabularyChoice, VoiceIsolator, WHISPER_MODEL,
-    WhisperEngine, run_batch,
+    WhisperEngine, note, run_batch,
 };
 
 /// Transcribes recorded sessions.
@@ -70,7 +70,7 @@ pub fn transcribe(
                 .join(NEMOTRON_DIARIZATION_DATA.file_name)
                 .is_file()
             {
-                eprintln!(
+                note!(
                     "Note: first run downloads 199 MB of diarization weights; later runs do not."
                 );
             }
@@ -87,7 +87,7 @@ pub fn transcribe(
             if !accelerated {
                 // Correct but several times slower. Worth a line: the alternative is a user
                 // wondering why transcribing a meeting suddenly takes minutes.
-                eprintln!("Note: CoreML declined these graphs; diarization is running on CPU.");
+                note!("Note: CoreML declined these graphs; diarization is running on CPU.");
             }
             #[cfg(not(target_os = "macos"))]
             let _ = accelerated;
@@ -108,7 +108,7 @@ pub fn transcribe(
             if !asr.accelerated() {
                 // Only reachable via MEETHOOK_CPU, so this confirms an explicit choice rather
                 // than reporting a surprise -- and says out loud what that choice costs.
-                eprintln!(
+                note!(
                     "Note: {CPU_ENV_VAR} is set; speech recognition is running on the CPU and \
                      will be much slower."
                 );
@@ -154,7 +154,7 @@ fn open_isolation(models_dir: &Path, vad: &Path) -> Isolation {
     let load = || -> std::result::Result<IsolationStage, Box<dyn std::error::Error>> {
         let model = VoiceIsolator::required_model();
         if !models_dir.join(model.file_name).is_file() {
-            eprintln!(
+            note!(
                 "Note: first run with mic isolation downloads {} MB of weights; later runs \
                  do not. Pass --no-isolate to skip it.",
                 model.size_bytes / 1_000_000
@@ -171,67 +171,26 @@ fn open_isolation(models_dir: &Path, vad: &Path) -> Isolation {
     match load() {
         Ok(stage) => Isolation::Ready(stage),
         Err(e) => {
-            eprintln!("Note: mic isolation unavailable ({e}); using the un-isolated mic track.");
+            note!("Note: mic isolation unavailable ({e}); using the un-isolated mic track.");
             Isolation::Unavailable(e.to_string())
         }
     }
 }
 
 /// Acquires one model, reporting its download identically to every other model's.
+///
+/// The bar is made when the first byte arrives, so a model already on disk (which calls the
+/// callback never, or once with everything done) draws nothing.
 fn fetch(
     models_dir: &std::path::Path,
     spec: &'static ModelSpec,
 ) -> meethook_models::Result<PathBuf> {
-    let mut report = DownloadProgress::new(spec);
+    let mut download: Option<Download> = None;
     ensure_model(models_dir, spec, &mut |done, total| {
-        report.update(done, total)
+        download
+            .get_or_insert_with(|| Download::start(spec.file_name, total))
+            .update(done, total)
     })
-}
-
-/// Prints download progress on stderr, one line, rewritten in place.
-///
-/// stderr rather than stdout so the batch's own output stays a clean, greppable record of
-/// what happened to each session. Throttled to whole percent because a 1.6 GB download at a
-/// megabyte a chunk would otherwise emit sixteen hundred lines.
-struct DownloadProgress {
-    spec: &'static ModelSpec,
-    last_percent: u64,
-    started: bool,
-}
-
-impl DownloadProgress {
-    fn new(spec: &'static ModelSpec) -> DownloadProgress {
-        DownloadProgress {
-            spec,
-            last_percent: 0,
-            started: false,
-        }
-    }
-
-    fn update(&mut self, done: u64, total: u64) {
-        if !self.started {
-            self.started = true;
-            // Megabytes for the two diarization graphs, gigabytes for Whisper: "0.0 GB"
-            // against a 6 MB file reads as a bug in the downloader.
-            let size = if total >= 1_000_000_000 {
-                format!("{:.1} GB", total as f64 / 1e9)
-            } else {
-                format!("{:.0} MB", total as f64 / 1e6)
-            };
-            eprintln!("Fetching {} ({size}, one time)", self.spec.file_name);
-        }
-        let percent = (done * 100).checked_div(total).unwrap_or(0);
-        if percent == self.last_percent && done < total {
-            return;
-        }
-        self.last_percent = percent;
-        let mut stderr = io::stderr();
-        let _ = write!(stderr, "\r  {percent}%");
-        if done >= total {
-            let _ = writeln!(stderr);
-        }
-        let _ = stderr.flush();
-    }
 }
 
 pub fn enroll(paths: &Paths, args: &EnrollArgs, template: Option<&Path>) -> Result<()> {
