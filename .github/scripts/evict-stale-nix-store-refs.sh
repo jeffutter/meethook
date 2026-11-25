@@ -30,7 +30,7 @@ find . -type f \( -name CMakeCache.txt -o -name build.ninja \) 2>/dev/null | whi
   # An earlier hit may have removed the whole target dir this file was in.
   [[ -f "$cache_file" ]] || continue
   stale_path=""
-  for store_path in $(grep -oE '/nix/store/[a-z0-9]{32}-[^"'"'"'[:space:]]*' "$cache_file" | sort -u); do
+  for store_path in $(grep -oE '/nix/store/[a-z0-9]{32}-[^"'"'"'[:space:]:;]*' "$cache_file" | sort -u); do
     if [[ ! -e "$store_path" ]]; then
       stale_path="$store_path"
       break
