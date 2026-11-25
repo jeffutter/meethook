@@ -9,11 +9,22 @@
 //! The input is the AEC-cleaned 16 kHz mic track (`mic.cleaned.flac`), not the raw `mic.wav`:
 //! the raw track still holds the far end that [`crate::cancel_bleed`] removed, the isolator
 //! keeps voices, and remote speech would come back into the transcript. Each span is upsampled
-//! to the isolator's 48 kHz, isolated, and decimated back. The 16 kHz result is spliced into a
-//! *copy* of the cleaned track, inside the speech regions only, so the output has the cleaned
-//! track's length and timeline by construction and every sample outside a region is bit for bit
-//! the input's. The result is held in memory and handed to recognition; `mic.cleaned.flac` and
-//! the mixdown keep the pre-isolation track (see `write_mixdown`).
+//! to the isolator's 48 kHz, isolated, and decimated back. Two tracks come out of the 16 kHz
+//! result, both held in memory and both the cleaned track's length and timeline by
+//! construction ([`IsolatedMic`]):
+//!
+//! - `for_recognition` is the result spliced into a *copy* of the cleaned track, inside the
+//!   speech regions only, so every sample outside a region is bit for bit the input's.
+//!   Recognition hears this, so what it hears outside a region is what it always heard.
+//! - `for_mixdown` is the same isolated audio with silence everywhere else, for `meeting.opus`.
+//!   Splicing isolated speech into a still-noisy track would make the background noise step on
+//!   and off at every region edge, so the mix gets the isolated regions alone, crossfaded in
+//!   from silence over the same [`FADE_S`]. A stretch whose isolator call failed is not
+//!   silenced: it carries the cleaned audio, because losing speech from the recording is worse
+//!   than leaving it noisy. With no regions at all nothing was isolated, so the whole cleaned
+//!   track is kept rather than a silent one.
+//!
+//! `mic.cleaned.flac` keeps the pre-isolation track.
 //!
 //! # Context, batching and edges
 //!
@@ -98,6 +109,15 @@ pub enum Isolation {
     Unavailable(String),
 }
 
+/// The two tracks one isolation pass produces, both the length and timeline of its input. See
+/// the module docs for what differs between them and why.
+pub struct IsolatedMic {
+    /// The isolated speech spliced into the cleaned track; what recognition hears.
+    pub for_recognition: Vec<f32>,
+    /// The isolated speech alone, silent between regions; what `meeting.opus` is mixed from.
+    pub for_mixdown: Vec<f32>,
+}
+
 /// What one isolation pass did.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IsolationReport {
@@ -135,8 +155,8 @@ impl std::fmt::Display for IsolationReport {
 }
 
 impl IsolationStage {
-    /// Isolates the speech in `cleaned_16k`, returning a track of the same length.
-    pub fn run(&mut self, cleaned_16k: &[f32]) -> Result<(Vec<f32>, IsolationReport)> {
+    /// Isolates the speech in `cleaned_16k`, returning tracks of the same length.
+    pub fn run(&mut self, cleaned_16k: &[f32]) -> Result<(IsolatedMic, IsolationReport)> {
         isolate_mic(
             self.isolator.as_mut(),
             self.finder.as_mut(),
@@ -151,10 +171,10 @@ impl IsolationStage {
         cleaned_16k: &[f32],
         label: &str,
         progress: &mut dyn Write,
-    ) -> Result<(Vec<f32>, IsolationReport)> {
-        let (audio, report) = self.run(cleaned_16k)?;
+    ) -> Result<(IsolatedMic, IsolationReport)> {
+        let (tracks, report) = self.run(cleaned_16k)?;
         writeln!(progress, "{label}  {report}")?;
-        Ok((audio, report))
+        Ok((tracks, report))
     }
 }
 
@@ -230,10 +250,17 @@ fn isolate_mic(
     finder: &mut dyn SpeechFinder,
     cleaned_16k: &[f32],
     mut phase: Phase,
-) -> Result<(Vec<f32>, IsolationReport)> {
+) -> Result<(IsolatedMic, IsolationReport)> {
     let regions = finder.speech_regions(cleaned_16k)?;
     let spans = plan_spans(&regions, cleaned_16k.len());
     let mut out = cleaned_16k.to_vec();
+    // Silent until a region writes into it. With no regions nothing is isolated and nothing is
+    // gated: the mix keeps the whole cleaned track rather than a silent one.
+    let mut gated = if regions.is_empty() {
+        cleaned_16k.to_vec()
+    } else {
+        vec![0.0; cleaned_16k.len()]
+    };
     let fade = to_samples(FADE_S, usize::MAX).max(1);
     let mut isolated_samples = 0usize;
     let mut failed_batches = 0usize;
@@ -244,17 +271,19 @@ fn isolate_mic(
         let audio = &cleaned_16k[span.start..span.end];
         let up = resample_between(audio, TARGET_RATE, ISOLATOR_RATE)?;
         // An engine error costs this span its isolation, not the session its transcript: the
-        // span keeps the cleaned audio it already has, and the report says so.
-        let voice_48k = match isolator.isolate(&up) {
-            Ok(voice) => voice,
+        // span keeps the cleaned audio it already has, in the mix as well, and the report says
+        // so.
+        let voice = match isolator.isolate(&up) {
+            Ok(voice_48k) => {
+                isolated_samples += audio.len();
+                resample_between(&voice_48k, ISOLATOR_RATE, TARGET_RATE)?
+            }
             Err(e) => {
                 failed_batches += 1;
                 first_error.get_or_insert_with(|| e.to_string());
-                continue;
+                Vec::new()
             }
         };
-        let voice = resample_between(&voice_48k, ISOLATOR_RATE, TARGET_RATE)?;
-        isolated_samples += audio.len();
 
         for piece in &span.pieces {
             let (start, end) = (piece.start, piece.end);
@@ -273,11 +302,13 @@ fn isolate_mic(
                     1.0
                 };
                 let weight = into.min(outof).min(1.0);
-                // A resampler that came up a sample short leaves the tail as it was.
-                let Some(&iso) = voice.get(i - span.start) else {
-                    continue;
-                };
-                out[i] = cleaned_16k[i] + weight * (iso - cleaned_16k[i]);
+                // No isolated sample here: the span failed, or a resampler came up a sample
+                // short. Both tracks keep the cleaned audio.
+                let iso = voice.get(i - span.start).copied();
+                if let Some(iso) = iso {
+                    out[i] = cleaned_16k[i] + weight * (iso - cleaned_16k[i]);
+                }
+                gated[i] = weight * iso.unwrap_or(cleaned_16k[i]);
             }
         }
     }
@@ -291,7 +322,13 @@ fn isolate_mic(
         failed_batches,
         first_error,
     };
-    Ok((out, report))
+    Ok((
+        IsolatedMic {
+            for_recognition: out,
+            for_mixdown: gated,
+        },
+        report,
+    ))
 }
 
 #[cfg(test)]
@@ -349,16 +386,66 @@ mod tests {
             .collect()
     }
 
+    fn run_tracks(
+        gain: f32,
+        regions: Vec<SpeechRegion>,
+        audio: &[f32],
+    ) -> (IsolatedMic, IsolationReport, usize) {
+        let mut isolator = CountingIsolator { gain, calls: 0 };
+        let mut finder = FixedRegions(regions);
+        let (tracks, report) =
+            isolate_mic(&mut isolator, &mut finder, audio, Phase::start("t")).unwrap();
+        (tracks, report, isolator.calls)
+    }
+
+    /// The track recognition hears, which is what most tests here are about.
     fn run(
         gain: f32,
         regions: Vec<SpeechRegion>,
         audio: &[f32],
     ) -> (Vec<f32>, IsolationReport, usize) {
-        let mut isolator = CountingIsolator { gain, calls: 0 };
-        let mut finder = FixedRegions(regions);
-        let (out, report) =
-            isolate_mic(&mut isolator, &mut finder, audio, Phase::start("t")).unwrap();
-        (out, report, isolator.calls)
+        let (tracks, report, calls) = run_tracks(gain, regions, audio);
+        (tracks.for_recognition, report, calls)
+    }
+
+    #[test]
+    fn the_mix_is_silent_outside_regions_and_isolated_inside() {
+        let audio = signal(20 * 16_000);
+        let (tracks, _, _) = run_tracks(0.5, vec![region(5.0, 8.0), region(14.0, 15.0)], &audio);
+        assert_eq!(tracks.for_mixdown.len(), audio.len());
+        for (i, &sample) in tracks.for_mixdown.iter().enumerate() {
+            let s = i as f64 / 16_000.0;
+            let inside = (5.0..8.0).contains(&s) || (14.0..15.0).contains(&s);
+            if !inside {
+                assert_eq!(sample, 0.0, "sample {i} should be silent");
+            }
+        }
+        let mid = 6 * 16_000;
+        assert!((tracks.for_mixdown[mid] - 0.5 * audio[mid]).abs() < 0.01);
+        // Recognition's track is unaffected by the mix being gated.
+        assert_eq!(tracks.for_recognition[0].to_bits(), audio[0].to_bits());
+    }
+
+    #[test]
+    fn the_mix_fades_in_from_silence_at_a_region_edge() {
+        let audio = vec![0.5; 4 * 16_000];
+        let (tracks, _, _) = run_tracks(1.0, vec![region(1.0, 3.0)], &audio);
+        let edge = 16_000;
+        assert_eq!(
+            tracks.for_mixdown[edge], 0.0,
+            "weight is 0 at the edge sample"
+        );
+        assert!(tracks.for_mixdown[edge + 1] > 0.0);
+        assert!(tracks.for_mixdown[edge + 1] < tracks.for_mixdown[edge + 100]);
+        assert!((tracks.for_mixdown[edge + 16_000] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_regions_leaves_the_mix_as_the_cleaned_track_not_silence() {
+        let audio = signal(3 * 16_000);
+        let (tracks, report, calls) = run_tracks(0.5, Vec::new(), &audio);
+        assert_eq!((report.regions, calls), (0, 0));
+        assert_eq!(tracks.for_mixdown, audio);
     }
 
     #[test]
@@ -468,8 +555,9 @@ mod tests {
         let audio = signal(60 * 16_000);
         let mut isolator = FlakyIsolator { ok: 1, calls: 0 };
         let mut finder = FixedRegions(vec![region(5.0, 6.0), region(30.0, 31.0)]);
-        let (out, report) =
+        let (tracks, report) =
             isolate_mic(&mut isolator, &mut finder, &audio, Phase::start("t")).unwrap();
+        let out = tracks.for_recognition;
         assert_eq!((report.batches, report.failed_batches), (2, 1));
         assert!(
             report
@@ -488,6 +576,10 @@ mod tests {
             audio[second].to_bits(),
             "the failed span is untouched"
         );
+        // The mix must not lose speech to a failure: the failed region carries the cleaned
+        // audio at full weight in its interior, the isolated one the isolated audio.
+        assert!((tracks.for_mixdown[first] - 0.5 * audio[first]).abs() < 0.01);
+        assert!((tracks.for_mixdown[second] - audio[second]).abs() < 1e-6);
         assert!(report.to_string().contains("1 of them failed"), "{report}");
         // Only what was isolated counts: one span of 1 s plus 1 s of context on each side.
         assert!(

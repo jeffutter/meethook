@@ -245,9 +245,10 @@ fn time_stage(input: &std::path::Path, minutes: f64, real_track: bool, only: Opt
         )),
     };
     let started = Instant::now();
-    let (audio, report) = stage.run(&track).unwrap_or_else(|e| fail(&format!("{e}")));
+    let (tracks, report) = stage.run(&track).unwrap_or_else(|e| fail(&format!("{e}")));
     let wall = started.elapsed().as_secs_f64();
-    assert_eq!(audio.len(), track.len());
+    assert_eq!(tracks.for_recognition.len(), track.len());
+    assert_eq!(tracks.for_mixdown.len(), track.len());
     println!("{report}");
     println!(
         "stage: {seconds:.0} s of audio in {wall:.0} s wall = {:.2}x realtime",

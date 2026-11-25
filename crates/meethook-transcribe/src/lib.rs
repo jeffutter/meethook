@@ -81,7 +81,8 @@ pub use identify::{
 pub use import::{BuiltSession, ImportedSource, MIC_SILENCE_S, SPLICE_GAP_S, build_session};
 pub use levels::{LevelSummary, RUN_BRIDGE_S, SILENCE_FLOOR};
 pub use mic_isolation::{
-    GateSpeechFinder, Isolation, IsolationReport, IsolationStage, SpeechFinder, VoiceIsolation,
+    GateSpeechFinder, IsolatedMic, Isolation, IsolationReport, IsolationStage, SpeechFinder,
+    VoiceIsolation,
 };
 // The measurement only, not the module: `loudness` stays private because its constants and
 // block arithmetic are BS.1770's business rather than a caller's. The one number comes out so
@@ -339,10 +340,11 @@ pub fn transcribe_session(
 /// [`transcribe_session`] with an optional mic-isolation stage.
 ///
 /// With [`Isolation::Ready`], the voice isolator runs over the speech regions of the AEC-cleaned mic track
-/// after the cleaned track and the mixdown are written and before recognition, and recognition
-/// hears the isolated track (same length and timeline). `mic.cleaned.flac` and `meeting.opus`
-/// stay pre-isolation: isolating regions only would make background noise step on and off in
-/// the mix, and the files keep one meaning with the stage on or off. The speaker track, the
+/// after the cleaned track is written and before recognition, and recognition hears the
+/// isolated track (same length and timeline). `meeting.opus` is mixed from the isolated speech
+/// with silence between regions ([`IsolatedMic`]) rather than from the recognition track:
+/// splicing isolated regions into a noisy track would make the background noise step on and
+/// off in the mix. `mic.cleaned.flac` stays pre-isolation. The speaker track, the
 /// echo canceller's reference, diarization's input and the speaker pass are never touched.
 /// One progress line says what the stage did. With [`Isolation::Off`] this is exactly
 /// [`transcribe_session`]. With [`Isolation::Unavailable`] recognition hears the un-isolated
@@ -370,18 +372,10 @@ pub fn transcribe_session_isolating(
         progress,
     )?;
 
-    write_mixdown(
-        session,
-        &mic_track,
-        &speaker_track,
-        &metadata,
-        mixdown_settings,
-    )?;
-
     let label = session.id.to_string();
-    let (mic_for_asr, isolation_outcome) = match isolation {
+    let (mic_for_asr, gated_mic, isolation_outcome) = match isolation {
         Isolation::Ready(stage) => {
-            let (audio, report) = stage.run_reporting(&mic_track, &label, progress)?;
+            let (tracks, report) = stage.run_reporting(&mic_track, &label, progress)?;
             let outcome = if report.regions == 0 {
                 IsolationOutcome::Skipped {
                     reason: IsolationSkip::NoSpeech,
@@ -393,9 +387,9 @@ pub fn transcribe_session_isolating(
                     total_s: report.total_s,
                 }
             };
-            (audio, outcome)
+            (tracks.for_recognition, Some(tracks.for_mixdown), outcome)
         }
-        Isolation::Off => (mic_track, IsolationOutcome::DisabledByFlag),
+        Isolation::Off => (mic_track, None, IsolationOutcome::DisabledByFlag),
         Isolation::Unavailable(reason) => {
             writeln!(
                 progress,
@@ -403,6 +397,7 @@ pub fn transcribe_session_isolating(
             )?;
             (
                 mic_track,
+                None,
                 IsolationOutcome::Skipped {
                     reason: IsolationSkip::ModelUnavailable {
                         detail: reason.clone(),
@@ -411,6 +406,15 @@ pub fn transcribe_session_isolating(
             )
         }
     };
+    // Written before recognition, the slow part, so a run stopped during it still leaves a
+    // listenable recording. Without isolation the mix takes the same track recognition hears.
+    write_mixdown(
+        session,
+        gated_mic.as_deref().unwrap_or(&mic_for_asr),
+        &speaker_track,
+        &metadata,
+        mixdown_settings,
+    )?;
     CleaningRecord::new(session.id.clone(), cleaning)
         .with_isolation(isolation_outcome)
         .write(&session.paths)?;
@@ -713,11 +717,11 @@ fn clean_mic_track(
 ///
 /// *The cleaned mic track, not the raw one.* Both are in memory here, and the raw one still
 /// carries the far end bleeding back in through the microphone, delayed by the acoustic path.
-/// Summing that into a partly-panned mix is comb filtering and audible echo. The cleaned track
-/// is also what the transcript heard, so the recording and the text tell the same story.
-/// Mic isolation ([`transcribe_session_isolating`]) never feeds the mixdown: isolating only the
-/// speech regions would make background noise step on and off audibly, and the mixdown is then
-/// identical with the stage on or off.
+/// Summing that into a partly-panned mix is comb filtering and audible echo. When mic isolation
+/// ([`transcribe_session_isolating`]) ran, `mic` is its gated track instead: the isolated speech
+/// with silence between regions, so the recording has the isolated voice and none of the noise
+/// it removed. Either way the mix is made from the mic audio recognition hears inside speech
+/// regions, so the recording and the text tell the same story.
 ///
 /// *The 16 kHz tracks already in memory, not a second read at the native rate.* Both are
 /// already loaded and resampled by this point, so the mixdown costs one pass over memory and
@@ -1212,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn isolation_changes_what_the_mic_pass_hears_and_nothing_else() {
+    fn isolation_changes_what_the_mic_pass_hears_and_the_mix_and_nothing_else() {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::new(root.path());
         let session = make_session(&paths, "20260809-052600", 1_000_000);
@@ -1240,11 +1244,16 @@ mod tests {
         let mut stage = Isolation::Ready(offset_stage());
         let (on_asr, on_diarizer) = run(&mut stage, &mut on_progress);
         let mut on_files = snapshot(session.paths.dir());
-        // `cleaning.json` differs on purpose: it records the isolation choice.
+        // `cleaning.json` differs on purpose: it records the isolation choice. So does
+        // `meeting.opus`, which is mixed from the isolated speech (asserted below).
+        let off_opus = off_files.remove("meeting.opus").unwrap();
+        let on_opus = on_files.remove("meeting.opus").unwrap();
+        assert_ne!(off_opus, on_opus, "the mix must come from the isolated mic");
         off_files.remove("cleaning.json");
         on_files.remove("cleaning.json");
 
-        // AC 6/5: every file written is identical, and the speaker side heard the same audio.
+        // AC 6/5: every other file written is identical, and the speaker side heard the same
+        // audio.
         assert_eq!(off_files, on_files);
         let speaker = audio::read_track_16k_mono(&session.paths.speaker_wav()).unwrap();
         assert_eq!(off_diarizer, vec![speaker.clone()]);
