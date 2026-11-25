@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "meethook"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "meethook-enroll"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "hound",
  "jiff",
@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "meethook-models"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sha2",
  "tempfile",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "meethook-session"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flacenc",
  "hound",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "meethook-transcribe"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flacenc",
  "hound",

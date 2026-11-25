@@ -22,7 +22,7 @@ exclude = ["crates/meethook-record"]
 # workspace entry nothing here inherits is dead and trips cargo's unused-dependency lint.
 
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 # 1.92 because `ort` rc.15 declares that floor (`ropus` alone needs 1.88), so an older toolchain can no longer
 # build this workspace and saying otherwise would be a false claim rather than a conservative
